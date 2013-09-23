@@ -1,0 +1,1013 @@
+# HG changeset patch
+# Parent aa733d4fc507183157f14c2335a5c851e598f1b8
+# User Brian Grinstead <bgrinstead@mozilla.com>
+Bug 913509: [rule view] Papercuts - Inconsistent behavior when modifying CSS declarations
+
+diff --git a/browser/devtools/shared/inplace-editor.js b/browser/devtools/shared/inplace-editor.js
+--- a/browser/devtools/shared/inplace-editor.js
++++ b/browser/devtools/shared/inplace-editor.js
+@@ -200,20 +200,19 @@ function InplaceEditor(aOptions, aEvent)
+ 
+   this.input.addEventListener("blur", this._onBlur, false);
+   this.input.addEventListener("keypress", this._onKeyPress, false);
+   this.input.addEventListener("input", this._onInput, false);
+   this.input.addEventListener("mousedown", function(aEvt) {
+                                              aEvt.stopPropagation();
+                                            }, false);
+ 
+-  this.warning = aOptions.warning;
+   this.validate = aOptions.validate;
+ 
+-  if (this.warning && this.validate) {
++  if (this.validate) {
+     this.input.addEventListener("keyup", this._onKeyup, false);
+   }
+ 
+   if (aOptions.start) {
+     aOptions.start(this, aEvent);
+   }
+ 
+   EventEmitter.decorate(this);
+@@ -249,25 +248,25 @@ InplaceEditor.prototype = {
+     this.input.removeEventListener("keypress", this._onKeyPress, false);
+     this.input.removeEventListener("keyup", this._onKeyup, false);
+     this.input.removeEventListener("oninput", this._onInput, false);
+     this._stopAutosize();
+ 
+     this.elt.style.display = this.originalDisplay;
+     this.elt.focus();
+ 
+-    if (this.destroy) {
+-      this.destroy();
+-    }
+-
+     this.elt.parentNode.removeChild(this.input);
+     this.input = null;
+ 
+     delete this.elt.inplaceEditor;
+     delete this.elt;
++
++    if (this.destroy) {
++      this.destroy();
++    }
+   },
+ 
+   /**
+    * Keeps the editor close to the size of its input string.  This is pretty
+    * crappy, suggestions for improvement welcome.
+    */
+   _autosize: function InplaceEditor_autosize()
+   {
+@@ -347,17 +346,17 @@ InplaceEditor.prototype = {
+                                            selectionEnd);
+ 
+     if (!newValue) {
+       return false;
+     }
+ 
+     this.input.value = newValue.value;
+     this.input.setSelectionRange(newValue.start, newValue.end);
+-    this.warning.hidden = this.validate(this.input.value);
++    this._doValidation();
+ 
+     return true;
+   },
+ 
+   /**
+    * Increment the property value based on the property type.
+    *
+    * @param {string} value
+@@ -763,18 +762,20 @@ InplaceEditor.prototype = {
+       let input = this.input;
+       let pre = input.value.slice(0, input.selectionStart);
+       let post = input.value.slice(input.selectionEnd, input.value.length);
+       let item = this.popup.selectedItem;
+       let toComplete = item.label.slice(item.preLabel.length);
+       input.value = pre + toComplete + post;
+       input.setSelectionRange(pre.length, pre.length + toComplete.length);
+       this._updateSize();
++
+       // This emit is mainly for the purpose of making the test flow simpler.
+       this.emit("after-suggest");
++      this._doValidation();
+     }
+ 
+     if (aEvent.keyCode === Ci.nsIDOMKeyEvent.DOM_VK_BACK_SPACE ||
+         aEvent.keyCode === Ci.nsIDOMKeyEvent.DOM_VK_DELETE ||
+         aEvent.keyCode === Ci.nsIDOMKeyEvent.DOM_VK_LEFT ||
+         aEvent.keyCode === Ci.nsIDOMKeyEvent.DOM_VK_RIGHT) {
+       if (this.popup && this.popup.isOpen) {
+         this.popup.hidePopup();
+@@ -850,43 +851,49 @@ InplaceEditor.prototype = {
+       aEvent.preventDefault();
+     }
+   },
+ 
+   /**
+    * Handle the input field's keyup event.
+    */
+   _onKeyup: function(aEvent) {
+-    // Validate the entered value.
+-    this.warning.hidden = this.validate(this.input.value);
+     this._applied = false;
+   },
+ 
+   /**
+    * Handle changes to the input text.
+    */
+   _onInput: function InplaceEditor_onInput(aEvent)
+   {
+     // Validate the entered value.
+-    if (this.warning && this.validate) {
+-      this.warning.hidden = this.validate(this.input.value);
+-    }
++    this._doValidation();
+ 
+     // Update size if we're autosizing.
+     if (this._measurement) {
+       this._updateSize();
+     }
+ 
+     // Call the user's change handler if available.
+     if (this.change) {
+       this.change(this.input.value.trim());
+     }
+   },
+ 
+   /**
++   * Fire validation callback with current input
++   */
++  _doValidation: function()
++  {
++    if (this.validate && this.input) {
++      this.validate(this.input.value);
++    }
++  },
++
++  /**
+    * Handles displaying suggestions based on the current input.
+    */
+   _maybeSuggestCompletion: function() {
+     // Since we are calling this method from a keypress event handler, the
+     // |input.value| does not include currently typed character. Thus we perform
+     // this method async.
+     this.doc.defaultView.setTimeout(() => {
+       if (this._preventSuggestions) {
+@@ -975,16 +982,17 @@ InplaceEditor.prototype = {
+       if (finalList.length > 1) {
+         this.popup.setItems(finalList);
+         this.popup.openPopup(this.input);
+       } else {
+         this.popup.hidePopup();
+       }
+       // This emit is mainly for the purpose of making the test flow simpler.
+       this.emit("after-suggest");
++      this._doValidation();
+     }, 0);
+   }
+ };
+ 
+ /**
+  * Copy text-related styles from one element to another.
+  */
+ function copyTextStyles(aFrom, aTo)
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -520,31 +520,36 @@ Rule.prototype = {
+    *
+    * @param {string} [aName]
+    *        A text property name (such as "background" or "border-top") used
+    *        when calling from setPropertyValue & setPropertyName to signify
+    *        that the property should be saved in store.userProperties.
+    */
+   applyProperties: function Rule_applyProperties(aModifications, aName)
+   {
++    this.elementStyle.markOverriddenAll();
++
+     if (!aModifications) {
+       aModifications = this.style.startModifyingProperties();
+     }
+     let disabledProps = [];
+     let store = this.elementStyle.store;
+ 
+     for (let prop of this.textProps) {
+       if (!prop.enabled) {
+         disabledProps.push({
+           name: prop.name,
+           value: prop.value,
+           priority: prop.priority
+         });
+         continue;
+       }
++      if (prop.value.trim() === "") {
++        continue;
++      }
+ 
+       aModifications.setProperty(prop.name, prop.value, prop.priority);
+ 
+       prop.updateComputed();
+     }
+ 
+     // Store disabled properties in the disabled store.
+     let disabled = this.elementStyle.store.disabled;
+@@ -624,16 +629,17 @@ Rule.prototype = {
+    * @param {string} aPriority
+    *        The property's priority (either "important" or an empty string).
+    */
+   setPropertyValue: function Rule_setPropertyValue(aProperty, aValue, aPriority)
+   {
+     if (aValue === aProperty.value && aPriority === aProperty.priority) {
+       return;
+     }
++
+     aProperty.value = aValue;
+     aProperty.priority = aPriority;
+     this.applyProperties(null, aProperty.name);
+   },
+ 
+   /**
+    * Disables or enables given TextProperty.
+    */
+@@ -841,16 +847,55 @@ Rule.prototype = {
+     // value.
+     if (match.prop) {
+       match.prop.set(aNewProp);
+       return true;
+     }
+ 
+     return false;
+   },
++
++  /**
++   * Jump between editable properties in the UI.  Will begin editing the next
++   * name, if possible.  If this is the last element in the set, then begin
++   * editing the previous value.  If this is the *only* element in the set,
++   * then settle for focusing the new property editor.
++   *
++   * @param {TextProperty} aTextProperty
++   *        The text property that will be left to focus on a sibling.
++   *
++   */
++  editClosestTextProperty: function Rule__editClosestTextProperty(aTextProperty)
++  {
++    let index = this.textProps.indexOf(aTextProperty);
++    let previous = false;
++
++    // If this is the last element, move to the previous instead of next
++    if (index === this.textProps.length - 1) {
++      index = index - 1;
++      previous = true;
++    }
++    else {
++      index = index + 1;
++    }
++
++    let nextProp = this.textProps[index];
++
++    // If possible, begin editing the next name or previous value.
++    // Otherwise, settle for focusing the new property element.
++    if (nextProp) {
++      if (previous) {
++        nextProp.editor.valueSpan.click();
++      } else {
++        nextProp.editor.nameSpan.click();
++      }
++    } else {
++      aTextProperty.rule.editor.closeBrace.focus();
++    }
++  }
+ };
+ 
+ /**
+  * A single property in a rule's cssText.
+  *
+  * @param {Rule} aRule
+  *        The rule this TextProperty came from.
+  * @param {string} aName
+@@ -1268,17 +1313,17 @@ CssRuleView.prototype = {
+           this.togglePseudoElementVisibility(!this.showPseudoElements);
+         }, false);
+ 
+         div.insertBefore(twisty, div.firstChild);
+         this.element.appendChild(div);
+       }
+ 
+       if (!rule.editor) {
+-        new RuleEditor(this, rule);
++        rule.editor = new RuleEditor(this, rule);
+       }
+ 
+       this.element.appendChild(rule.editor.element);
+     }
+ 
+     this.togglePseudoElementVisibility(this.showPseudoElements);
+   },
+ 
+@@ -1328,17 +1373,16 @@ CssRuleView.prototype = {
+  *        The Rule object we're editing.
+  * @constructor
+  */
+ function RuleEditor(aRuleView, aRule)
+ {
+   this.ruleView = aRuleView;
+   this.doc = this.ruleView.doc;
+   this.rule = aRule;
+-  this.rule.editor = this;
+ 
+   this._onNewProperty = this._onNewProperty.bind(this);
+   this._newPropertyDestroy = this._newPropertyDestroy.bind(this);
+ 
+   this._create();
+ }
+ 
+ RuleEditor.prototype = {
+@@ -1392,27 +1436,16 @@ RuleEditor.prototype = {
+       let selection = this.doc.defaultView.getSelection();
+       if (selection.isCollapsed) {
+         this.newProperty();
+       }
+     }.bind(this), false);
+ 
+     this.element.addEventListener("mousedown", function() {
+       this.doc.defaultView.focus();
+-
+-      let editorNodes =
+-        this.doc.querySelectorAll(".styleinspector-propertyeditor");
+-
+-      if (editorNodes) {
+-        for (let node of editorNodes) {
+-          if (node.inplaceEditor) {
+-            node.inplaceEditor._clear();
+-          }
+-        }
+-      }
+     }.bind(this), false);
+ 
+     this.propertyList = createChild(code, "ul", {
+       class: "ruleview-propertylist"
+     });
+ 
+     this.populate();
+ 
+@@ -1461,18 +1494,18 @@ RuleEditor.prototype = {
+           class: cls,
+           textContent: selector
+         });
+       });
+     }
+ 
+     for (let prop of this.rule.textProps) {
+       if (!prop.editor) {
+-        new TextPropertyEditor(this, prop);
+-        this.propertyList.appendChild(prop.editor.element);
++        let editor = new TextPropertyEditor(this, prop);
++        this.propertyList.appendChild(editor.element);
+       }
+     }
+   },
+ 
+   /**
+    * Programatically add a new property to the rule.
+    *
+    * @param {string} aName
+@@ -1576,34 +1609,39 @@ RuleEditor.prototype = {
+ function TextPropertyEditor(aRuleEditor, aProperty)
+ {
+   this.ruleEditor = aRuleEditor;
+   this.doc = this.ruleEditor.doc;
+   this.popup = this.ruleEditor.ruleView.popup;
+   this.prop = aProperty;
+   this.prop.editor = this;
+   this.browserWindow = this.doc.defaultView.top;
++  this.removeOnRevert = this.prop.value === "";
+ 
+   let sheet = this.prop.rule.sheet;
+   let href = sheet ? (sheet.href || sheet.nodeHref) : null;
+   if (href) {
+     this.sheetURI = IOService.newURI(href, null, null);
+   }
+ 
+   this._onEnableClicked = this._onEnableClicked.bind(this);
+   this._onExpandClicked = this._onExpandClicked.bind(this);
+   this._onStartEditing = this._onStartEditing.bind(this);
+   this._onNameDone = this._onNameDone.bind(this);
+   this._onValueDone = this._onValueDone.bind(this);
++  this._onValidate = throttle(this._livePreview, 10, this, this.browserWindow);
+ 
+   this._create();
+   this.update();
+ }
+ 
+ TextPropertyEditor.prototype = {
++  /**
++   * Boolean indicating if the name or value is being currently edited.
++   */
+   get editing() {
+     return !!(this.nameSpan.inplaceEditor || this.valueSpan.inplaceEditor);
+   },
+ 
+   /**
+    * Create the property editor's DOM.
+    */
+   _create: function TextPropertyEditor_create()
+@@ -1622,55 +1660,56 @@ TextPropertyEditor.prototype = {
+     this.expander = createChild(this.element, "span", {
+       class: "ruleview-expander theme-twisty"
+     });
+     this.expander.addEventListener("click", this._onExpandClicked, true);
+ 
+     this.nameContainer = createChild(this.element, "span", {
+       class: "ruleview-namecontainer"
+     });
+-    this.nameContainer.addEventListener("click", function(aEvent) {
++    this.nameContainer.addEventListener("click", (aEvent) => {
+       // Clicks within the name shouldn't propagate any further.
+       aEvent.stopPropagation();
+       if (aEvent.target === propertyContainer) {
+         this.nameSpan.click();
+       }
+-    }.bind(this), false);
++    }, false);
+ 
+     // Property name, editable when focused.  Property name
+     // is committed when the editor is unfocused.
+     this.nameSpan = createChild(this.nameContainer, "span", {
+       class: "ruleview-propertyname theme-fg-color5",
+       tabindex: "0",
+     });
+ 
+     editableField({
+       start: this._onStartEditing,
+       element: this.nameSpan,
+       done: this._onNameDone,
++      destroy: this.update.bind(this),
+       advanceChars: ':',
+       contentType: InplaceEditor.CONTENT_TYPES.CSS_PROPERTY,
+       popup: this.popup
+     });
+ 
+     appendText(this.nameContainer, ": ");
+ 
+     // Create a span that will hold the property and semicolon.
+     // Use this span to create a slightly larger click target
+     // for the value.
+     let propertyContainer = createChild(this.element, "span", {
+       class: "ruleview-propertycontainer"
+     });
+-    propertyContainer.addEventListener("click", function(aEvent) {
++    propertyContainer.addEventListener("click", (aEvent) => {
+       // Clicks within the value shouldn't propagate any further.
+       aEvent.stopPropagation();
+       if (aEvent.target === propertyContainer) {
+         this.valueSpan.click();
+       }
+-    }.bind(this), false);
++    }, false);
+ 
+     // Property value, editable when focused.  Changes to the
+     // property value are applied as they are typed, and reverted
+     // if the user presses escape.
+     this.valueSpan = createChild(propertyContainer, "span", {
+       class: "ruleview-propertyvalue theme-fg-color1",
+       tabindex: "0",
+     });
+@@ -1679,33 +1718,33 @@ TextPropertyEditor.prototype = {
+     // for restoring after pressing escape.
+     this.committed = { name: this.prop.name,
+                        value: this.prop.value,
+                        priority: this.prop.priority };
+ 
+     appendText(propertyContainer, ";");
+ 
+     this.warning = createChild(this.element, "div", {
++      class: "ruleview-warning",
+       hidden: "",
+-      class: "ruleview-warning",
+       title: CssLogic.l10n("rule.warning.title"),
+     });
+ 
+     // Holds the viewers for the computed properties.
+     // will be populated in |_updateComputed|.
+     this.computed = createChild(this.element, "ul", {
+       class: "ruleview-computedlist",
+     });
+ 
+     editableField({
+       start: this._onStartEditing,
+       element: this.valueSpan,
+       done: this._onValueDone,
+-      validate: this._validate.bind(this),
+-      warning: this.warning,
++      destroy: this.update.bind(this),
++      validate: this._onValidate,
+       advanceChars: ';',
+       contentType: InplaceEditor.CONTENT_TYPES.CSS_VALUE,
+       property: this.prop,
+       popup: this.popup
+     });
+   },
+ 
+   /**
+@@ -1746,32 +1785,33 @@ TextPropertyEditor.prototype = {
+     if (this.prop.enabled) {
+       this.enable.style.removeProperty("visibility");
+       this.enable.setAttribute("checked", "");
+     } else {
+       this.enable.style.visibility = "visible";
+       this.enable.removeAttribute("checked");
+     }
+ 
+-    if (this.prop.overridden && !this.editing) {
++    this.warning.hidden = this.editing || this.isValid();
++
++    if ((this.prop.overridden || !this.prop.enabled) && !this.editing) {
+       this.element.classList.add("ruleview-overridden");
+     } else {
+       this.element.classList.remove("ruleview-overridden");
+     }
+ 
+     let name = this.prop.name;
+     this.nameSpan.textContent = name;
+ 
+     // Combine the property's value and priority into one string for
+     // the value.
+     let val = this.prop.value;
+     if (this.prop.priority) {
+       val += " !" + this.prop.priority;
+     }
+-
+     // Treat URLs differently than other properties.
+     // Allow the user to click a link to the resource and open it.
+     let resourceURI = this.getResourceURI();
+     if (resourceURI) {
+       this.valueSpan.textContent = "";
+ 
+       appendText(this.valueSpan, val.split(resourceURI)[0]);
+ 
+@@ -1792,33 +1832,32 @@ TextPropertyEditor.prototype = {
+ 
+       }, false);
+ 
+       appendText(this.valueSpan, val.split(resourceURI)[1]);
+     } else {
+       this.valueSpan.textContent = val;
+     }
+ 
+-    this.warning.hidden = this._validate();
+-
+     let store = this.prop.rule.elementStyle.store;
+     let propDirty = store.userProperties.contains(this.prop.rule.style, name);
+     if (propDirty) {
+       this.element.setAttribute("dirty", "");
+     } else {
+       this.element.removeAttribute("dirty");
+     }
+ 
+     // Populate the computed styles.
+     this._updateComputed();
+   },
+ 
+   _onStartEditing: function TextPropertyEditor_onStartEditing()
+   {
+     this.element.classList.remove("ruleview-overridden");
++    this._livePreview(this.prop.value);
+   },
+ 
+   /**
+    * Populate the list of computed styles.
+    */
+   _updateComputed: function TextPropertyEditor_updateComputed()
+   {
+     // Clear out existing viewers.
+@@ -1901,29 +1940,23 @@ TextPropertyEditor.prototype = {
+    *
+    * @param {string} aValue
+    *        The value contained in the editor.
+    * @param {boolean} aCommit
+    *        True if the change should be applied.
+    */
+   _onNameDone: function TextPropertyEditor_onNameDone(aValue, aCommit)
+   {
+-    if (!aCommit) {
+-      if (this.prop.overridden) {
+-        this.element.classList.add("ruleview-overridden");
++    if (aCommit) {
++      if (aValue.trim() === "") {
++        this.remove();
++      } else {
++        this.prop.setName(aValue);
+       }
+-
+-      return;
+     }
+-    if (!aValue) {
+-      this.prop.remove();
+-      this.element.parentNode.removeChild(this.element);
+-      return;
+-    }
+-    this.prop.setName(aValue);
+   },
+ 
+   /**
+    * Pull priority (!important) out of the value provided by a
+    * value editor.
+    *
+    * @param {string} aValue
+    *        The value from the text editor.
+@@ -1934,70 +1967,110 @@ TextPropertyEditor.prototype = {
+     let pieces = aValue.split("!", 2);
+     return {
+       value: pieces[0].trim(),
+       priority: (pieces.length > 1 ? pieces[1].trim() : "")
+     };
+   },
+ 
+   /**
++   * Remove property from style and the editors from DOM.
++   * Begin editing next available property.
++   */
++  remove: function TextPropertyEditor_remove()
++  {
++    this.element.parentNode.removeChild(this.element);
++    this.ruleEditor.rule.editClosestTextProperty(this.prop);
++    this.prop.remove();
++  },
++
++  /**
+    * Called when a value editor closes.  If the user pressed escape,
+    * revert to the value this property had before editing.
+    *
+    * @param {string} aValue
+    *        The value contained in the editor.
+    * @param {bool} aCommit
+    *        True if the change should be applied.
+    */
+    _onValueDone: function PropertyEditor_onValueDone(aValue, aCommit)
+   {
+     if (aCommit) {
+       let val = this._parseValue(aValue);
+-      this.prop.setValue(val.value, val.priority);
+-      this.committed.value = this.prop.value;
+-      this.committed.priority = this.prop.priority;
+-      if (this.prop.overridden) {
+-        this.element.classList.add("ruleview-overridden");
++      // Any property should be removed if has an empty value.
++      if (val.value.trim() === "") {
++        this.remove();
++      } else {
++        this.prop.setValue(val.value, val.priority);
++        this.removeOnRevert = false;
++        this.committed.value = this.prop.value;
++        this.committed.priority = this.prop.priority;
+       }
+     } else {
+-      this.prop.setValue(this.committed.value, this.committed.priority);
++      // A new property should be removed when escape is pressed.
++      if (this.removeOnRevert) {
++        this.remove();
++      } else {
++        this.prop.setValue(this.committed.value, this.committed.priority);
++      }
+     }
+   },
+ 
+   /**
+-   * Validate this property.
++   * Live preview this property, without committing changes.
+    *
+    * @param {string} [aValue]
+-   *        Override the actual property value used for validation without
+-   *        applying property values e.g. validate as you type.
++   *        The value to set the current property to.
++   */
++  _livePreview: function TextPropertyEditor_livePreview(aValue)
++  {
++    // Since function call is throttled, we need to make sure we are still editing
++    if (!this.editing) {
++      return;
++    }
++
++    let val = this._parseValue(aValue);
++
++    // Live previewing the change without committing just yet, that'll be done in _onValueDone
++    // If it was not a valid value, apply an empty string to reset the live preview
++    this.ruleEditor.rule.setPropertyValue(this.prop, val.value, val.priority);
++  },
++
++  /**
++   * Validate this property. Does it make sense for this value to be assigned
++   * to this property name? This does not apply the property value
++   *
++   * @param {string} [aValue]
++   *        The property value used for validation.
++   *        Defaults to the current value for this.prop
+    *
+    * @return {bool} true if the property value is valid, false otherwise.
+    */
+-  _validate: function TextPropertyEditor_validate(aValue)
++  isValid: function TextPropertyEditor_isValid(aValue)
+   {
+     let name = this.prop.name;
+     let value = typeof aValue == "undefined" ? this.prop.value : aValue;
+     let val = this._parseValue(value);
+ 
+     let style = this.doc.createElementNS(HTML_NS, "div").style;
+     let prefs = Services.prefs;
+ 
+     // We toggle output of errors whilst the user is typing a property value.
+-    let prefVal = Services.prefs.getBoolPref("layout.css.report_errors");
++    let prefVal = prefs.getBoolPref("layout.css.report_errors");
+     prefs.setBoolPref("layout.css.report_errors", false);
+ 
++    let validValue = false;
+     try {
+       style.setProperty(name, val.value, val.priority);
+-      // Live previewing the change without committing yet just yet, that'll be done in _onValueDone
+-      this.ruleEditor.rule.setPropertyValue(this.prop, val.value, val.priority);
++      validValue = style.getPropertyValue(name) !== "" || val.value === "";
+     } finally {
+       prefs.setBoolPref("layout.css.report_errors", prefVal);
+     }
+-    return !!style.getPropertyValue(name);
+-  },
++    return validValue;
++  }
+ };
+ 
+ /**
+  * Store of CSSStyleDeclarations mapped to properties that have been changed by
+  * the user.
+  */
+ function UserProperties()
+ {
+@@ -2112,16 +2185,32 @@ function createMenuItem(aMenu, aAttribut
+   item.setAttribute("accesskey", _strings.GetStringFromName(aAttributes.accesskey));
+   item.addEventListener("command", aAttributes.command);
+ 
+   aMenu.appendChild(item);
+ 
+   return item;
+ }
+ 
++
++function throttle(func, wait, scope, window) {
++  var timer = null;
++  return function() {
++    if(timer) {
++      window.clearTimeout(timer);
++    }
++    var args = arguments;
++    timer = window.setTimeout(function() {
++      timer = null;
++      func.apply(scope, args);
++    }, wait);
++  };
++}
++
++
+ /**
+  * Append a text node to an element.
+  */
+ function appendText(aParent, aText)
+ {
+   aParent.appendChild(aParent.ownerDocument.createTextNode(aText));
+ }
+ 
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_editor_changedvalues.js b/browser/devtools/styleinspector/test/browser_ruleview_editor_changedvalues.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_editor_changedvalues.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_editor_changedvalues.js
+@@ -65,48 +65,86 @@ function testCreateNew()
+         is(elementRuleEditor.rule.textProps.length,  1, "Should have created a new text property.");
+         is(elementRuleEditor.propertyList.children.length, 1, "Should have created a property editor.");
+         let textProp = elementRuleEditor.rule.textProps[0];
+         is(aEditor, inplaceEditor(textProp.editor.valueSpan), "Should be editing the value span now.");
+         aEditor.input.value = "#XYZ";
+         waitForEditorBlur(aEditor, function() {
+           promiseDone(expectRuleChange(elementRuleEditor.rule).then(() => {
+             is(textProp.value, "#XYZ", "Text prop should have been changed.");
+-            is(textProp.editor._validate(), false, "#XYZ should not be a valid entry");
+-            testEditProperty();
++            is(textProp.editor.isValid(), false, "#XYZ should not be a valid entry");
++            testCreateNewEscape();
+           }));
+         });
+         aEditor.input.blur();
+       }));
+     });
+     EventUtils.synthesizeKey("VK_RETURN", {}, ruleWindow);
+   });
+ 
+   EventUtils.synthesizeMouse(elementRuleEditor.closeBrace, 1, 1,
+                              { },
+                              ruleWindow);
+ }
+ 
++function testCreateNewEscape()
++{
++  // Create a new property.
++  let elementRuleEditor = ruleView.element.children[0]._ruleEditor;
++  waitForEditorFocus(elementRuleEditor.element, function onNewElement(aEditor) {
++    is(inplaceEditor(elementRuleEditor.newPropSpan), aEditor, "Next focused editor should be the new property editor.");
++    let input = aEditor.input;
++    input.value = "color";
++
++    waitForEditorFocus(elementRuleEditor.element, function onNewValue(aEditor) {
++      promiseDone(expectRuleChange(elementRuleEditor.rule).then(() => {
++        is(elementRuleEditor.rule.textProps.length,  2, "Should have created a new text property.");
++        is(elementRuleEditor.propertyList.children.length, 2, "Should have created a property editor.");
++        let textProp = elementRuleEditor.rule.textProps[1];
++        is(aEditor, inplaceEditor(textProp.editor.valueSpan), "Should be editing the value span now.");
++        aEditor.input.value = "red";
++        EventUtils.synthesizeKey("VK_ESCAPE", {}, ruleWindow);
++
++        // Make sure previous input is focused.
++        let focusedElement = inplaceEditor(elementRuleEditor.rule.textProps[0].editor.valueSpan).input;
++        is(focusedElement, focusedElement.ownerDocument.activeElement, "Correct element has focus");
++
++        EventUtils.synthesizeKey("VK_ESCAPE", {}, ruleWindow);
++
++        is(elementRuleEditor.rule.textProps.length,  1, "Should have removed the new text property.");
++        is(elementRuleEditor.propertyList.children.length, 1, "Should have removed the property editor.");
++
++        testEditProperty();
++      }));
++    });
++    EventUtils.synthesizeKey("VK_RETURN", {}, ruleWindow);
++  });
++
++  EventUtils.synthesizeMouse(elementRuleEditor.closeBrace, 1, 1,
++                             { },
++                             ruleWindow);
++}
++
+ function testEditProperty()
+ {
+   let idRuleEditor = ruleView.element.children[1]._ruleEditor;
+   let propEditor = idRuleEditor.rule.textProps[0].editor;
+   waitForEditorFocus(propEditor.element, function onNewElement(aEditor) {
+     is(inplaceEditor(propEditor.nameSpan), aEditor, "Next focused editor should be the name editor.");
+     let input = aEditor.input;
+     waitForEditorFocus(propEditor.element, function onNewName(aEditor) {
+       promiseDone(expectRuleChange(idRuleEditor.rule).then(() => {
+         input = aEditor.input;
+         is(inplaceEditor(propEditor.valueSpan), aEditor, "Focus should have moved to the value.");
+ 
+         waitForEditorBlur(aEditor, function() {
+           promiseDone(expectRuleChange(idRuleEditor.rule).then(() => {
+             let value = idRuleEditor.rule.domRule._rawStyle().getPropertyValue("border-color");
+             is(value, "red", "border-color should have been set.");
+-            is(propEditor._validate(), true, "red should be a valid entry");
++            is(propEditor.isValid(), true, "red should be a valid entry");
+             finishTest();
+           }));
+         });
+ 
+         for (let ch of "red;") {
+           EventUtils.sendChar(ch, ruleWindow);
+         }
+       }));
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_livepreview.js b/browser/devtools/styleinspector/test/browser_ruleview_livepreview.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_livepreview.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_livepreview.js
+@@ -12,17 +12,24 @@ let inspector;
+ 
+ // Format
+ // {
+ //   value : what to type in the field
+ //   expected : expected computed style on the targeted element
+ // }
+ let testData = [
+   {value: "inline", expected: "inline"},
+-  {value: "something", expected: "inline"}
++  {value: "inline-block", expected: "inline-block"},
++
++  // Invalid property values should not apply, and should fall back to default
++  {value: "red", expected: "block"},
++  {value: "something", expected: "block"},
++
++  {escape: true, value: "inline", expected: "block"},
++  {escape: true, value: "block", expected: "block"}
+ ];
+ 
+ function startTest()
+ {
+   let style = '#testid {display:block;}';
+ 
+   let styleNode = addStyle(doc, style);
+   doc.body.innerHTML = '<div id="testid">Styled Node</div><span>inline element</span>';
+@@ -44,28 +51,34 @@ function loopTestData(index)
+     return;
+   }
+ 
+   let idRuleEditor = ruleView.element.children[1]._ruleEditor;
+   let propEditor = idRuleEditor.rule.textProps[0].editor;
+   waitForEditorFocus(propEditor.element, function(aEditor) {
+     is(inplaceEditor(propEditor.valueSpan), aEditor, "Focused editor should be the value.");
+ 
++    let thisTest = testData[index];
++
+     // Entering a correct value for the property
+-    for (let ch of testData[index].value) {
++    for (let ch of thisTest.value) {
+       EventUtils.sendChar(ch, ruleWindow);
+     }
++    if (thisTest.escape) {
++      EventUtils.synthesizeKey("VK_ESCAPE", {});
++    } else {
++      EventUtils.synthesizeKey("VK_RETURN", {});
++    }
+ 
+     // While the editor is still focused in, the display should have changed already
+     executeSoon(() => {
+       is(content.getComputedStyle(testElement).display,
+         testData[index].expected,
+         "Element should be previewed as " + testData[index].expected);
+ 
+-      EventUtils.synthesizeKey("VK_RETURN", {});
+       loopTestData(index + 1);
+     });
+   });
+ 
+   EventUtils.synthesizeMouse(propEditor.valueSpan, 1, 1, {}, ruleWindow);
+ }
+ 
+ function finishTest()
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_ui.js b/browser/devtools/styleinspector/test/browser_ruleview_ui.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_ui.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_ui.js
+@@ -147,17 +147,17 @@ function testEditProperty()
+                 "props[" + i + "] marked dirty as appropriate");
+             }
+             testDisableProperty();
+           }));
+         });
+ 
+         for (let ch of "red;") {
+           EventUtils.sendChar(ch, ruleWindow);
+-          is(propEditor.warning.hidden, ch == "d" || ch == ";",
++          is(propEditor.warning.hidden, true,
+             "warning triangle is hidden or shown as appropriate");
+         }
+       }));
+     });
+     for (let ch of "border-color:") {
+       EventUtils.sendChar(ch, ruleWindow);
+     }
+   });
+diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/actors/styles.js
+--- a/toolkit/devtools/server/actors/styles.js
++++ b/toolkit/devtools/server/actors/styles.js
+@@ -6,16 +6,17 @@
+ 
+ const {Cc, Ci} = require("chrome");
+ const protocol = require("devtools/server/protocol");
+ const {Arg, Option, method, RetVal, types} = protocol;
+ const events = require("sdk/event/core");
+ const object = require("sdk/util/object");
+ const { Class } = require("sdk/core/heritage");
+ 
++loader.lazyImporter(this, "Services", "resource://gre/modules/Services.jsm");
+ loader.lazyGetter(this, "CssLogic", () => require("devtools/styleinspector/css-logic").CssLogic);
+ loader.lazyGetter(this, "DOMUtils", () => Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils));
+ 
+ // The PageStyle actor flattens the DOM CSS objects a little bit, merging
+ // Rules and their Styles into one actor.  For elements (which have a style
+ // but no associated rule) we fake a rule with the following style id.
+ const ELEMENT_STYLE = 100;
+ exports.ELEMENT_STYLE = ELEMENT_STYLE;
+@@ -705,23 +706,33 @@ var StyleRuleActor = protocol.ActorClass
+    * {
+    *   type: "remove",
+    *   name: <string>,
+    * }
+    *
+    * @returns the rule with updated properties
+    */
+   modifyProperties: method(function(modifications) {
++    let validProps = new Map();
++
++    // Use a fresh element for each call to this function to prevent side effects
++    // that pop up based on property values that were already set on the element.
++    let tempElement = Services.appShell.hiddenDOMWindow.
++      document.createElement("div");
++
+     for (let mod of modifications) {
+       if (mod.type === "set") {
+-        this.rawStyle.setProperty(mod.name, mod.value, mod.priority || "");
++        tempElement.style.setProperty(mod.name, mod.value, mod.priority || "");
++        this.rawStyle.setProperty(mod.name,
++          tempElement.style.getPropertyValue(mod.name), mod.priority || "");
+       } else if (mod.type === "remove") {
+         this.rawStyle.removeProperty(mod.name);
+       }
+     }
++
+     return this;
+   }, {
+     request: { modifications: Arg(0, "array:json") },
+     response: { rule: RetVal("domstylerule") }
+   })
+ });
+ 
+ /**

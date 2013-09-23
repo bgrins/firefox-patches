@@ -1,0 +1,153 @@
+# HG changeset patch
+# User Dave Camp <dcamp@mozilla.com>
+# Date 1378739482 25200
+#      Mon Sep 09 08:11:22 2013 -0700
+# Node ID 8e3a119f62ae3dcb9e5cd46269a948096b878ff5
+# Parent 493dd25e60c2a89ba9630089487453c9a74eb9ec
+imported patch fix-unload.diff
+
+diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
+--- a/browser/devtools/inspector/inspector-panel.js
++++ b/browser/devtools/inspector/inspector-panel.js
+@@ -295,16 +295,18 @@ InspectorPanel.prototype = {
+    * Reset the inspector on navigate away.
+    */
+   onNavigatedAway: function InspectorPanel_onNavigatedAway() {
+     this._defaultNode = null;
+     this.selection.setNodeFront(null);
+     this._destroyMarkup();
+     this.isDirty = false;
+ 
++    this.walker.dropNodes();
++
+     this._getDefaultNodeForSelection().then(defaultNode => {
+       if (this._destroyPromise) {
+         return;
+       }
+       this.selection.setNodeFront(defaultNode, "navigateaway");
+ 
+       this._initMarkup();
+       this.once("markuploaded", () => {
+diff --git a/browser/devtools/inspector/test/Makefile.in b/browser/devtools/inspector/test/Makefile.in
+--- a/browser/devtools/inspector/test/Makefile.in
++++ b/browser/devtools/inspector/test/Makefile.in
+@@ -33,14 +33,15 @@ MOCHITEST_BROWSER_FILES := \
+ 		browser_inspector_bug_650804_search.js \
+ 		browser_inspector_bug_650804_search.html \
+ 		browser_inspector_bug_831693_input_suggestion.js \
+ 		browser_inspector_bug_831693_combinator_suggestions.js \
+ 		browser_inspector_bug_831693_search_suggestions.html \
+ 		browser_inspector_bug_835722_infobar_reappears.js \
+ 		browser_inspector_bug_840156_destroy_after_navigation.js \
+ 		browser_inspector_reload.js \
++		browser_inspector_navigation.js \
+ 		browser_inspector_select_last_selected.js \
+ 		browser_inspector_select_last_selected.html \
+ 		browser_inspector_select_last_selected2.html \
+ 		browser_inspector_basic_highlighter.js \
+ 		head.js \
+ 		$(NULL)
+diff --git a/browser/devtools/inspector/test/browser_inspector_navigation.js b/browser/devtools/inspector/test/browser_inspector_navigation.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/inspector/test/browser_inspector_navigation.js
+@@ -0,0 +1,67 @@
++/* -*- Mode: Javascript; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++
++function test() {
++  let inspector, toolbox;
++
++  waitForExplicitFinish();
++
++  gBrowser.selectedTab = gBrowser.addTab();
++  gBrowser.selectedBrowser.addEventListener("load", function onload() {
++    gBrowser.selectedBrowser.removeEventListener("load", onload, true);
++    waitForFocus(function() {
++      let target = TargetFactory.forTab(gBrowser.selectedTab);
++      gDevTools.showToolbox(target, "inspector").then(function(toolbox) {
++        startInspectorTests(toolbox);
++      }).then(null, console.error);
++    }, content);
++  }, true);
++
++  content.location = "http://test1.example.org/browser/browser/devtools/inspector/test/browser_inspector_breadcrumbs.html";
++
++  function startInspectorTests(aToolbox)
++  {
++    toolbox = aToolbox;
++    inspector = toolbox.getCurrentPanel();
++    info("Inspector started");
++    let node = content.document.querySelector("#i1");
++    inspector.selection.setNode(node);
++    inspector.once("inspector-updated", () => {
++      is(inspector.selection.node, node, "Node selected.");
++      inspector.once("markuploaded", onSecondLoad);
++      content.location = "http://test2.example.org/browser/browser/devtools/inspector/test/browser_inspector_breadcrumbs.html";
++    });
++  }
++
++  function onSecondLoad() {
++    info("New page loaded");
++    let node = content.document.querySelector("#i1");
++    inspector.selection.setNode(node);
++
++    inspector.once("inspector-updated", () => {
++      is(inspector.selection.node, node, "Node re-selected.");
++      inspector.once("markuploaded", onThirdLoad);
++      content.history.go(-1);
++    });
++  }
++
++  function onThirdLoad() {
++    info("Old page loaded");
++    is(content.location.href, "http://test1.example.org/browser/browser/devtools/inspector/test/browser_inspector_breadcrumbs.html");
++    let node = content.document.querySelector("#i1");
++    inspector.selection.setNode(node);
++    inspector.once("inspector-updated", () => {
++      is(inspector.selection.node, node, "Node re-selected.");
++      inspector.once("markuploaded", onThirdLoad);
++      toolbox.destroy();
++      gBrowser.removeCurrentTab();
++      finish();
++    });
++  }
++}
++
++
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -1860,16 +1860,28 @@ var WalkerFront = exports.WalkerFront = 
+ 
+   // Update the object given a form representation off the wire.
+   form: function(json) {
+     this.actorID = json.actor;
+     this.rootNode = types.getType("domnode").read(json.root, this);
+     this._rootNodeDeferred.resolve(this.rootNode);
+   },
+ 
++  dropNodes: function() {
++    if (!this.rootNode) {
++      return;
++    }
++
++    // Release the document node and all of its children, even retained.
++    this._releaseFront(this.rootNode, true);
++
++    this.rootNode = null;
++    this._rootNodeDeferred = promise.defer();
++  },
++
+   /**
+    * Clients can use walker.rootNode to get the current root node of the
+    * walker, but during a reload the root node might be null.  This
+    * method returns a promise that will resolve to the root node when it is
+    * set.
+    */
+   getRootNode: function() {
+     return this._rootNodeDeferred.promise;

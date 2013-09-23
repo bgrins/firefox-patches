@@ -1,0 +1,440 @@
+# HG changeset patch
+# Parent 5ff2f1f40c5a6587f712484cd84fa04564f31740
+# User Tetsuharu OHZEKI <saneyuki.s.snyk@gmail.com>
+Bug 694019 - Style Inspector's rule view supports ::pseudo-element. r=?
+
+diff --git a/browser/devtools/styleinspector/CssRuleView.jsm b/browser/devtools/styleinspector/CssRuleView.jsm
+--- a/browser/devtools/styleinspector/CssRuleView.jsm
++++ b/browser/devtools/styleinspector/CssRuleView.jsm
+@@ -22,16 +22,21 @@ const FOCUS_BACKWARD = Ci.nsIFocusManage
+  */
+ 
+ // Used to split on css line separators
+ const CSS_LINE_RE = /(?:[^;\(]*(?:\([^\)]*?\))?[^;\(]*)*;?/g;
+ 
+ // Used to parse a single property line.
+ const CSS_PROP_RE = /\s*([^:\s]*)\s*:\s*(.*?)\s*(?:! (important))?;?$/;
+ 
++// CSS pseudo elements list.
++const PSEUDO_ELEMENTS_PREFIXED = [":-moz-selection"];
++const PSEUDO_ELEMENTS = [":first-line", ":first-letter", ":before", ":after", ":selection",
++                         ...PSEUDO_ELEMENTS_PREFIXED];
++
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource:///modules/devtools/CssLogic.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ 
+ this.EXPORTED_SYMBOLS = ["CssRuleView",
+                          "_ElementStyle",
+                          "editableItem",
+                          "_editableField",
+@@ -145,45 +150,56 @@ ElementStyle.prototype = {
+     // We're done with the previous list of rules.
+     delete this._refreshRules;
+   },
+ 
+   _addElementRules: function ElementStyle_addElementRules(aElement)
+   {
+     let inherited = aElement !== this.element ? aElement : null;
+ 
++    let pseudoElements = (inherited === null) ? ["", ...PSEUDO_ELEMENTS] : [""];
++
+     // Include the element's style first.
+     this._maybeAddRule({
+       style: aElement.style,
+       selectorText: CssLogic.l10n("rule.sourceElement"),
+       inherited: inherited
+     });
+ 
+-    // Get the styles that apply to the element.
+-    var domRules = this.domUtils.getCSSStyleRules(aElement);
+-
+-    // getCSStyleRules returns ordered from least-specific to
+-    // most-specific.
+-    for (let i = domRules.Count() - 1; i >= 0; i--) {
+-      let domRule = domRules.GetElementAt(i);
+-
+-      // XXX: Optionally provide access to system sheets.
+-      let contentSheet = CssLogic.isContentStylesheet(domRule.parentStyleSheet);
+-      if (!contentSheet) {
++    for (let pseudoElem of pseudoElements) {
++      // Get the styles that apply to the element.
++      let domRules = this.domUtils.getCSSStyleRules(aElement, pseudoElem);
++      if (!domRules) {
+         continue;
+       }
+ 
+-      if (domRule.type !== Ci.nsIDOMCSSRule.STYLE_RULE) {
+-        continue;
++      // getCSStyleRules returns ordered from least-specific to
++      // most-specific.
++      for (let i = domRules.Count() - 1; i >= 0; i--) {
++        let domRule = domRules.GetElementAt(i);
++
++        // XXX: Optionally provide access to system sheets.
++        let contentSheet = CssLogic.isContentStylesheet(domRule.parentStyleSheet);
++        if (!contentSheet) {
++          continue;
++        }
++
++        if (domRule.type !== Ci.nsIDOMCSSRule.STYLE_RULE) {
++          continue;
++        }
++
++        this._maybeAddRule({
++          domRule: domRule,
++          inherited: inherited,
++          // XXX: the current inIDOMUtils.getCSSStyleRules() requires
++          // a CSS2-style pseudo element selector.
++          // So we make a CSS3-style pseudo selector.
++          pseudoElmType: (pseudoElem.length > 0) ? ":" + pseudoElem : "",
++        });
+       }
+-
+-      this._maybeAddRule({
+-        domRule: domRule,
+-        inherited: inherited
+-      });
+     }
+   },
+ 
+   /**
+    * Add a rule if it's one we care about.  Filters out duplicates and
+    * inherited styles with no inherited properties.
+    *
+    * @param {object} aOptions
+@@ -226,78 +242,92 @@ ElementStyle.prototype = {
+   },
+ 
+   /**
+    * Mark the properties listed in this.rules with an overridden flag
+    * if an earlier property overrides it.
+    */
+   markOverridden: function ElementStyle_markOverridden()
+   {
+-    // Gather all the text properties applied by these rules, ordered
+-    // from more- to less-specific.
+-    let textProps = [];
+-    for each (let rule in this.rules) {
++    // Separate each of pseudo element types
++    // for avoid that the pseudo element's style sets the override flag to
++    // the other one's style.
++    // (e.g. This avoids ::before's "content" property overrides ::after's
++    // "content" property in Rule view.)
++    let pseudoElmTypeMap = new Map();
++    for (let rule of this.rules) {
++      let pseudoElmType = rule.pseudoElmType;
++      if (!pseudoElmTypeMap.has(pseudoElmType)) {
++        pseudoElmTypeMap.set(pseudoElmType, []);
++      }
++      let textProps = pseudoElmTypeMap.get(pseudoElmType);
++
++      // Gather all the text properties applied by these rules, ordered
++      // from more- to less-specific.
+       textProps = textProps.concat(rule.textProps.slice(0).reverse());
++      pseudoElmTypeMap.set(pseudoElmType, textProps);
+     }
+ 
+-    // Gather all the computed properties applied by those text
+-    // properties.
+-    let computedProps = [];
+-    for each (let textProp in textProps) {
+-      computedProps = computedProps.concat(textProp.computed);
+-    }
+-
+-    // Walk over the computed properties.  As we see a property name
+-    // for the first time, mark that property's name as taken by this
+-    // property.
+-    //
+-    // If we come across a property whose name is already taken, check
+-    // its priority against the property that was found first:
+-    //
+-    //   If the new property is a higher priority, mark the old
+-    //   property overridden and mark the property name as taken by
+-    //   the new property.
+-    //
+-    //   If the new property is a lower or equal priority, mark it as
+-    //   overridden.
+-    //
+-    // _overriddenDirty will be set on each prop, indicating whether its
+-    // dirty status changed during this pass.
+-    let taken = {};
+-    for each (let computedProp in computedProps) {
+-      let earlier = taken[computedProp.name];
+-      let overridden;
+-      if (earlier
+-          && computedProp.priority === "important"
+-          && earlier.priority !== "important") {
+-        // New property is higher priority.  Mark the earlier property
+-        // overridden (which will reverse its dirty state).
+-        earlier._overriddenDirty = !earlier._overriddenDirty;
+-        earlier.overridden = true;
+-        overridden = false;
+-      } else {
+-        overridden = !!earlier;
++    for (let [, textProps] of pseudoElmTypeMap) {
++      // Gather all the computed properties applied by those text
++      // properties.
++      let computedProps = [];
++      for (let textProp of textProps) {
++        computedProps = computedProps.concat(textProp.computed);
+       }
+ 
+-      computedProp._overriddenDirty = (!!computedProp.overridden != overridden);
+-      computedProp.overridden = overridden;
+-      if (!computedProp.overridden && computedProp.textProp.enabled) {
+-        taken[computedProp.name] = computedProp;
++      // Walk over the computed properties.  As we see a property name
++      // for the first time, mark that property's name as taken by this
++      // property.
++      //
++      // If we come across a property whose name is already taken, check
++      // its priority against the property that was found first:
++      //
++      //   If the new property is a higher priority, mark the old
++      //   property overridden and mark the property name as taken by
++      //   the new property.
++      //
++      //   If the new property is a lower or equal priority, mark it as
++      //   overridden.
++      //
++      // _overriddenDirty will be set on each prop, indicating whether its
++      // dirty status changed during this pass.
++      let taken = {};
++      for (let computedProp of computedProps) {
++        let earlier = taken[computedProp.name];
++        let overridden;
++        if (earlier
++            && computedProp.priority === "important"
++            && earlier.priority !== "important") {
++          // New property is higher priority.  Mark the earlier property
++          // overridden (which will reverse its dirty state).
++          earlier._overriddenDirty = !earlier._overriddenDirty;
++          earlier.overridden = true;
++          overridden = false;
++        } else {
++          overridden = !!earlier;
++        }
++
++        computedProp._overriddenDirty = (!!computedProp.overridden != overridden);
++        computedProp.overridden = overridden;
++        if (!computedProp.overridden && computedProp.textProp.enabled) {
++          taken[computedProp.name] = computedProp;
++        }
+       }
+-    }
+-
+-    // For each TextProperty, mark it overridden if all of its
+-    // computed properties are marked overridden.  Update the text
+-    // property's associated editor, if any.  This will clear the
+-    // _overriddenDirty state on all computed properties.
+-    for each (let textProp in textProps) {
+-      // _updatePropertyOverridden will return true if the
+-      // overridden state has changed for the text property.
+-      if (this._updatePropertyOverridden(textProp)) {
+-        textProp.updateEditor();
++
++      // For each TextProperty, mark it overridden if all of its
++      // computed properties are marked overridden.  Update the text
++      // property's associated editor, if any.  This will clear the
++      // _overriddenDirty state on all computed properties.
++      for (let textProp of textProps) {
++        // _updatePropertyOverridden will return true if the
++        // overridden state has changed for the text property.
++        if (this._updatePropertyOverridden(textProp)) {
++          textProp.updateEditor();
++        }
+       }
+     }
+   },
+ 
+   /**
+    * Mark a given TextProperty as overridden or not depending on the
+    * state of its computed properties.  Clears the _overriddenDirty state
+    * on all computed properties.
+@@ -344,32 +374,34 @@ ElementStyle.prototype = {
+  */
+ function Rule(aElementStyle, aOptions)
+ {
+   this.elementStyle = aElementStyle;
+   this.domRule = aOptions.domRule || null;
+   this.style = aOptions.style || this.domRule.style;
+   this.selectorText = aOptions.selectorText || this.domRule.selectorText;
+   this.inherited = aOptions.inherited || null;
++  this.pseudoElmType = aOptions.pseudoElmType || "";
+ 
+   if (this.domRule) {
+     let parentRule = this.domRule.parentRule;
+     if (parentRule && parentRule.type == Ci.nsIDOMCSSRule.MEDIA_RULE) {
+       this.mediaText = parentRule.media.mediaText;
+     }
+   }
+ 
+   // Populate the text properties with the style's current cssText
+   // value, and add in any disabled properties from the store.
+   this.textProps = this._getTextProperties();
+   this.textProps = this.textProps.concat(this._getDisabledProperties());
+ }
+ 
+ Rule.prototype = {
+   mediaText: "",
++  _pseudoElmText: "",
+ 
+   get title()
+   {
+     if (this._title) {
+       return this._title;
+     }
+     this._title = CssLogic.shortSource(this.sheet);
+     if (this.domRule) {
+@@ -391,16 +423,27 @@ Rule.prototype = {
+         eltText += "#" + this.inherited.id;
+       }
+       this._inheritedSource =
+         CssLogic._strings.formatStringFromName("rule.inheritedFrom", [eltText], 1);
+     }
+     return this._inheritedSource;
+   },
+ 
++  get pseudoElmText ()
++  {
++    if (this._pseudoElmText) {
++      return this._pseudoElmText;
++    }
++    else if (this.pseudoElmType.length > 0) {
++      return this._pseudoElmText =
++        CssLogic._strings.formatStringFromName("rule.pseudoElement", [this.pseudoElmType], 1);
++    }
++  },
++
+   /**
+    * The rule's stylesheet.
+    */
+   get sheet()
+   {
+     return this.domRule ? this.domRule.parentStyleSheet : null;
+   },
+ 
+@@ -1034,18 +1077,28 @@ CssRuleView.prototype = {
+   /**
+    * Creates editor UI for each of the rules in _elementStyle.
+    */
+   _createEditors: function CssRuleView_createEditors()
+   {
+     // Run through the current list of rules, attaching
+     // their editors in order.  Create editors if needed.
+     let lastInheritedSource = "";
++    let lastPseudoElmText = "";
+     for each (let rule in this._elementStyle.rules) {
+ 
++      let pseudoElmText = rule.pseudoElmText;
++      if (pseudoElmText && pseudoElmText !== lastPseudoElmText) {
++        let h2 = this.doc.createElementNS(HTML_NS, "div");
++        h2.className = "ruleview-rule-pseudoElement";
++        h2.textContent = pseudoElmText;
++        lastPseudoElmText = pseudoElmText;
++        this.element.appendChild(h2);
++      }
++
+       let inheritedSource = rule.inheritedSource;
+       if (inheritedSource != lastInheritedSource) {
+         let h2 = this.doc.createElementNS(HTML_NS, "div");
+         h2.className = "ruleview-rule-inheritance";
+         h2.textContent = inheritedSource;
+         lastInheritedSource = inheritedSource;
+         this.element.appendChild(h2);
+       }
+diff --git a/browser/locales/en-US/chrome/browser/devtools/styleinspector.properties b/browser/locales/en-US/chrome/browser/devtools/styleinspector.properties
+--- a/browser/locales/en-US/chrome/browser/devtools/styleinspector.properties
++++ b/browser/locales/en-US/chrome/browser/devtools/styleinspector.properties
+@@ -31,16 +31,21 @@ rule.sourceInline=inline
+ rule.sourceElement=element
+ 
+ # LOCALIZATION NOTE (rule.inheritedFrom): Shown for CSS rules
+ # that were inherited from a parent node. Will be passed a node
+ # identifier of the parent node.
+ # e.g "Inherited from body#bodyID"
+ rule.inheritedFrom=Inherited from %S
+ 
++# LOCALIZATION NOTE (rule.pseudoElement): Shown for CSS rules
++# that is pseudo element. Will be passed a type of the pseudo element.
++# e.g "::first-letter pseudo element"
++rule.pseudoElement=%S pseudo element
++
+ # LOCALIZATION NOTE (helpLinkTitle): For each style property
+ # the user can hover it and get a help link button which allows one to
+ # quickly jump to the documentation from the Mozilla Developer Network site.
+ # This is the link title shown in the hover tooltip.
+ helpLinkTitle=Read the documentation for this property
+ 
+ # LOCALIZATION NOTE (rule.warning.title): When an invalid property value is
+ # entered into the rule view a warning icon is displayed. This text is used for
+diff --git a/browser/themes/gnomestripe/devtools/csshtmltree.css b/browser/themes/gnomestripe/devtools/csshtmltree.css
+--- a/browser/themes/gnomestripe/devtools/csshtmltree.css
++++ b/browser/themes/gnomestripe/devtools/csshtmltree.css
+@@ -149,17 +149,18 @@
+   color: hsl(90,2%,46%); /* grey */
+   -moz-padding-start: 5px;
+   cursor: pointer;
+   text-align: right;
+   float: right;
+   -moz-user-select: none;
+ }
+ 
+-.ruleview-rule-inheritance {
++.ruleview-rule-inheritance,
++.ruleview-rule-pseudoElement {
+   background-color: hsl(0,0%,90%);
+   color: hsl(0,0%,50%);
+   border-top: 1px solid hsl(0,0%,65%);
+   border-bottom: 1px solid hsl(0,0%,65%);
+   padding: 1px 4px;
+   margin-top: 4px;
+   -moz-user-select: none;
+ }
+diff --git a/browser/themes/pinstripe/devtools/csshtmltree.css b/browser/themes/pinstripe/devtools/csshtmltree.css
+--- a/browser/themes/pinstripe/devtools/csshtmltree.css
++++ b/browser/themes/pinstripe/devtools/csshtmltree.css
+@@ -151,17 +151,18 @@
+   color: hsl(90,2%,46%); /* grey */
+   -moz-padding-start: 5px;
+   cursor: pointer;
+   text-align: right;
+   float: right;
+   -moz-user-select: none;
+ }
+ 
+-.ruleview-rule-inheritance {
++.ruleview-rule-inheritance,
++.ruleview-rule-pseudoElement {
+   background-color: hsl(0,0%,90%);
+   color: hsl(0,0%,50%);
+   border-top: 1px solid hsl(0,0%,65%);
+   border-bottom: 1px solid hsl(0,0%,65%);
+   padding: 1px 4px;
+   margin-top: 4px;
+   -moz-user-select: none;
+ }
+diff --git a/browser/themes/winstripe/devtools/csshtmltree.css b/browser/themes/winstripe/devtools/csshtmltree.css
+--- a/browser/themes/winstripe/devtools/csshtmltree.css
++++ b/browser/themes/winstripe/devtools/csshtmltree.css
+@@ -151,17 +151,18 @@
+   color: hsl(90,2%,46%); /* grey */
+   -moz-padding-start: 5px;
+   cursor: pointer;
+   text-align: right;
+   float: right;
+   -moz-user-select: none;
+ }
+ 
+-.ruleview-rule-inheritance {
++.ruleview-rule-inheritance,
++.ruleview-rule-pseudoElement {
+   background-color: hsl(0,0%,90%);
+   color: hsl(0,0%,50%);
+   border-top: 1px solid hsl(0,0%,65%);
+   border-bottom: 1px solid hsl(0,0%,65%);
+   padding: 1px 4px;
+   margin-top: 4px;
+   -moz-user-select: none;
+ }

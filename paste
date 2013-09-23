@@ -1,0 +1,564 @@
+# HG changeset patch
+# Parent b3cef9e126926c219fd843b7e159ef12251e57ff
+# User Brian Grinstead <bgrinstead@mozilla.com>
+[rule view] Pasting in multiple CSS declarations should automatically split them up
+
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -502,20 +502,28 @@ Rule.prototype = {
+    *
+    * @param {string} aName
+    *        The text property name (such as "background" or "border-top").
+    * @param {string} aValue
+    *        The property's value (not including priority).
+    * @param {string} aPriority
+    *        The property's priority (either "important" or an empty string).
+    */
+-  createProperty: function Rule_createProperty(aName, aValue, aPriority)
++  createProperty: function Rule_createProperty(aName, aValue, aPriority, aSiblingProp)
+   {
+     let prop = new TextProperty(this, aName, aValue, aPriority);
+-    this.textProps.push(prop);
++
++    if (aSiblingProp) {
++      let ind = this.textProps.indexOf(aSiblingProp);
++      this.textProps.push(prop);
++    }
++    else {
++      this.textProps.push(prop);
++    }
++
+     this.applyProperties();
+     return prop;
+   },
+ 
+   /**
+    * Reapply all the properties in this rule, and update their
+    * computed styles.  Store disabled properties in the element
+    * style's store.  Will re-mark overridden properties.
+@@ -558,17 +566,17 @@ Rule.prototype = {
+     if (disabledProps.length > 0) {
+       disabled.set(this.style, disabledProps);
+     } else {
+       disabled.delete(this.style);
+     }
+ 
+     let promise = aModifications.apply().then(() => {
+       let cssProps = {};
+-      for (let cssProp of this._parseCSSText(this.style.cssText)) {
++      for (let cssProp of parseCSSText(this.style.cssText)) {
+         cssProps[cssProp.name] = cssProp;
+       }
+ 
+       for (let textProp of this.textProps) {
+         if (!textProp.enabled) {
+           continue;
+         }
+         let cssProp = cssProps[textProp.name];
+@@ -664,45 +672,25 @@ Rule.prototype = {
+     this.textProps = this.textProps.filter(function(prop) prop != aProperty);
+     let modifications = this.style.startModifyingProperties();
+     modifications.removeProperty(aProperty.name);
+     // Need to re-apply properties in case removing this TextProperty
+     // exposes another one.
+     this.applyProperties(modifications);
+   },
+ 
+-  _parseCSSText: function Rule_parseProperties(aCssText)
+-  {
+-    let lines = aCssText.match(CSS_LINE_RE);
+-    let props = [];
+-
+-    for (let line of lines) {
+-      let [, name, value, priority] = CSS_PROP_RE.exec(line) || []
+-      if (!name || !value) {
+-        continue;
+-      }
+-
+-      props.push({
+-        name: name,
+-        value: value,
+-        priority: priority || ""
+-      });
+-    }
+-    return props;
+-  },
+-
+   /**
+    * Get the list of TextProperties from the style.  Needs
+    * to parse the style's cssText.
+    */
+   _getTextProperties: function Rule_getTextProperties()
+   {
+     let textProps = [];
+     let store = this.elementStyle.store;
+-    let props = this._parseCSSText(this.style.cssText);
++    let props = parseCSSText(this.style.cssText);
+     for (let prop of props) {
+       let name = prop.name;
+       if (this.inherited && !domUtils.isInheritedProperty(name)) {
+         continue;
+       }
+       let value = store.userProperties.getProperty(this.style, name, prop.value);
+       let textProp = new TextProperty(this, name, value, prop.priority);
+       textProps.push(textProp);
+@@ -1466,19 +1454,19 @@ RuleEditor.prototype = {
+ 
+     this.closeBrace = createChild(code, "div", {
+       class: "ruleview-ruleclose",
+       tabindex: "0",
+       textContent: "}"
+     });
+ 
+     // Create a property editor when the close brace is clicked.
+-    editableItem({ element: this.closeBrace }, function(aElement) {
++    editableItem({ element: this.closeBrace }, (aElement) => {
+       this.newProperty();
+-    }.bind(this));
++    });
+   },
+ 
+   /**
+    * Update the rule editor with the contents of the rule.
+    */
+   populate: function RuleEditor_populate()
+   {
+     // Clear out existing viewers.
+@@ -1536,22 +1524,59 @@ RuleEditor.prototype = {
+   {
+     let prop = this.rule.createProperty(aName, aValue, aPriority);
+     let editor = new TextPropertyEditor(this, prop);
+     this.propertyList.appendChild(editor.element);
+     return prop;
+   },
+ 
+   /**
++   * Programatically add a new property to the rule.  Focus the UI
++   * to the proper location after adding (either focus the value on the
++   * last property if it is empty, or create a new property and focus is).
++   *
++   * @param {Array} aProperties
++   *        Array of properties, which are objects with this signature:
++   *        {
++   *          name: {string},
++   *          value: {string},
++   *          priority: {string}
++   *        }
++   * @param {TextProperty} aSiblingProp
++   *        Optional, the property next to which all new props should be added.
++   */
++  addProperties: function RuleEditor_addProperties(aProperties, aSiblingProp)
++  {
++    if (!aProperties || !aProperties.length) {
++      return;
++    }
++
++    let lastProperty;
++    for (let p of aProperties) {
++      lastProperty = this.addProperty(p.name, p.value, p.priority);
++    }
++
++    // Either focus on the last value if incomplete, or start a new one.
++    if (lastProperty.value.trim() === "") {
++      lastProperty.editor.valueSpan.click();
++    } else {
++      this.newProperty();
++    }
++  },
++
++
++
++  /**
+    * Create a text input for a property name.  If a non-empty property
+    * name is given, we'll create a real TextProperty and add it to the
+    * rule.
+    */
+   newProperty: function RuleEditor_newProperty()
+   {
++    console.log("On new property: ", this.closeBrace.hasAttribute("tabindex"))
+     // If we're already creating a new property, ignore this.
+     if (!this.closeBrace.hasAttribute("tabindex")) {
+       return;
+     }
+ 
+     // While we're editing a new property, it doesn't make sense to
+     // start a second new property editor, so disable focusing the
+     // close brace for now.
+@@ -1561,24 +1586,43 @@ RuleEditor.prototype = {
+       class: "ruleview-property ruleview-newproperty",
+     });
+ 
+     this.newPropSpan = createChild(this.newPropItem, "span", {
+       class: "ruleview-propertyname",
+       tabindex: "0"
+     });
+ 
+-    new InplaceEditor({
++    this.multipleAddedProperties = null;
++
++    let editor = new InplaceEditor({
+       element: this.newPropSpan,
+       done: this._onNewProperty,
+       destroy: this._newPropertyDestroy,
++      stopOnReturn: true,
+       advanceChars: ":",
++      // TODO: validate may allow us to handle some weird focus cases better than
++      // advanceChars 
++      // validate: (aValue) => {
++      //   if (aValue.match(/\:$/)) {
++      //     editor.input.blur();
++      //   }
++      // },
+       contentType: InplaceEditor.CONTENT_TYPES.CSS_PROPERTY,
+       popup: this.ruleView.popup
+     });
++
++    // Auto-close the input if multiple rules get pasted into new property.
++    editor.input.addEventListener("paste", (e) => {
++      setTimeout(() => {
++        if (parseCSSText(e.target.value).length) {
++          editor.input.blur();
++        }
++      }, 0);
++    }, false);
+   },
+ 
+   /**
+    * Called when the new property input has been dismissed.
+    * Will create a new TextProperty if necessary.
+    *
+    * @param {string} aValue
+    *        The value in the editor.
+@@ -1586,34 +1630,43 @@ RuleEditor.prototype = {
+    *        True if the value should be committed.
+    */
+   _onNewProperty: function RuleEditor__onNewProperty(aValue, aCommit)
+   {
+     if (!aValue || !aCommit) {
+       return;
+     }
+ 
+-    // Create an empty-valued property and start editing it.
+-    let prop = this.rule.createProperty(aValue, "", "");
+-    let editor = new TextPropertyEditor(this, prop);
+-    this.propertyList.appendChild(editor.element);
+-    editor.valueSpan.click();
++    // Deal with multiple declarations later (once editor has been destroyed).
++    // If aValue is just a name, make a new property with empty value.
++    this.multipleAddedProperties = parseCSSText(aValue);
++    if (!this.multipleAddedProperties.length) {
++      let addedProperty = this.addProperty(aValue, "", "");
++      addedProperty.editor.valueSpan.click();
++    }
+   },
+ 
+   /**
+    * Called when the new property editor is destroyed.
+    */
+   _newPropertyDestroy: function RuleEditor__newPropertyDestroy()
+   {
+     // We're done, make the close brace focusable again.
+     this.closeBrace.setAttribute("tabindex", "0");
+ 
+     this.propertyList.removeChild(this.newPropItem);
+     delete this.newPropItem;
+     delete this.newPropSpan;
++
++    // If properties were added, we want to focus the proper element.
++    // If the last new property has no value, focus the value on it.
++    // Otherwise, start a new property and focus that field.
++    if (this.multipleAddedProperties && this.multipleAddedProperties.length) {
++      this.addProperties(this.multipleAddedProperties);
++    }
+   }
+ };
+ 
+ /**
+  * Create a TextPropertyEditor.
+  *
+  * @param {RuleEditor} aRuleEditor
+  *        The rule editor that owns this TextPropertyEditor.
+@@ -1637,17 +1690,17 @@ function TextPropertyEditor(aRuleEditor,
+     this.sheetURI = IOService.newURI(href, null, null);
+   }
+ 
+   this._onEnableClicked = this._onEnableClicked.bind(this);
+   this._onExpandClicked = this._onExpandClicked.bind(this);
+   this._onStartEditing = this._onStartEditing.bind(this);
+   this._onNameDone = this._onNameDone.bind(this);
+   this._onValueDone = this._onValueDone.bind(this);
+-  this._onValidate = throttle(this._livePreview, 10, this, this.browserWindow);
++  this._onValidate = throttle(this._livePreview, 10, this);
+ 
+   this._create();
+   this.update();
+ }
+ 
+ TextPropertyEditor.prototype = {
+   /**
+    * Boolean indicating if the name or value is being currently edited.
+@@ -1700,16 +1753,25 @@ TextPropertyEditor.prototype = {
+       element: this.nameSpan,
+       done: this._onNameDone,
+       destroy: this.update.bind(this),
+       advanceChars: ':',
+       contentType: InplaceEditor.CONTENT_TYPES.CSS_PROPERTY,
+       popup: this.popup
+     });
+ 
++    // Auto blur name field on multiple CSS rules paste.
++    this.nameContainer.addEventListener("paste", (e) => {
++      setTimeout(() => {
++        if (parseCSSText(e.target.value).length) {
++          this.nameSpan.inplaceEditor.input.blur();
++        }
++      }, 0);
++    }, false);
++
+     appendText(this.nameContainer, ": ");
+ 
+     // Create a span that will hold the property and semicolon.
+     // Use this span to create a slightly larger click target
+     // for the value.
+     let propertyContainer = createChild(this.element, "span", {
+       class: "ruleview-propertycontainer"
+     });
+@@ -1959,17 +2021,30 @@ TextPropertyEditor.prototype = {
+    *        True if the change should be applied.
+    */
+   _onNameDone: function TextPropertyEditor_onNameDone(aValue, aCommit)
+   {
+     if (aCommit) {
+       if (aValue.trim() === "") {
+         this.remove();
+       } else {
+-        this.prop.setName(aValue);
++
++        // TODO Adding multiple rules inside of name field overwrites the current
++        // property with the first, then adds any more onto the property list.
++        // SHOULD move the multi adding up a level to prevent this from getting too complicated?
++        let properties = parseCSSText(aValue);
++        if (properties.length > 0) {
++          this.prop.setName(properties[0].name);
++          this.prop.setValue(properties[0].value, properties[0].priority);
++          console.log("Multiple properties detected in onNameDone.  ", JSON.stringify(properties, null, 2));
++
++          this.ruleEditor.addProperties(properties.slice(1), this.prop);
++        } else {
++          this.prop.setName(aValue);
++        }
+       }
+     }
+   },
+ 
+   /**
+    * Pull priority (!important) out of the value provided by a
+    * value editor.
+    *
+@@ -2003,34 +2078,66 @@ TextPropertyEditor.prototype = {
+    *
+    * @param {string} aValue
+    *        The value contained in the editor.
+    * @param {bool} aCommit
+    *        True if the change should be applied.
+    */
+    _onValueDone: function PropertyEditor_onValueDone(aValue, aCommit)
+   {
+-    if (aCommit) {
+-      let val = this._parseValue(aValue);
+-      // Any property should be removed if has an empty value.
+-      if (val.value.trim() === "") {
+-        this.remove();
+-      } else {
+-        this.prop.setValue(val.value, val.priority);
+-        this.removeOnRevert = false;
+-        this.committed.value = this.prop.value;
+-        this.committed.priority = this.prop.priority;
+-      }
+-    } else {
++    if (!aCommit) {
+       // A new property should be removed when escape is pressed.
+       if (this.removeOnRevert) {
+         this.remove();
+       } else {
+         this.prop.setValue(this.committed.value, this.committed.priority);
+       }
++
++      return;
++    }
++
++    // TODO Adding multiple rules inside of value sets value with the first,
++    // then adds any more onto the property list.
++    let properties = parseCSSText(aValue);
++    let propertiesToAdd = [];
++    let firstValue = aValue;
++    if (properties.length > 0) {
++
++      // If text like "red; width: 1px;" was pasted in, handle this as two
++      // separate properties (setting value here to red and adding a new).
++      let propertiesNoName = parseCSSText("a:" + aValue);
++      let enteredValueFirst = propertiesNoName.length > properties.length;
++
++      let firstProp = properties[0];
++      propertiesToAdd = properties.slice(1);
++
++      if (enteredValueFirst) {
++        firstProp = propertiesNoName[0];
++        propertiesToAdd = propertiesNoName.slice(1);
++      }
++
++      // If "red; width: 1px", then set value to "red"
++      // If "color: red; width: 1px;", then set value to "color: red;"
++      firstValue = enteredValueFirst ?
++       firstProp.value + "!" + firstProp.priority :
++       firstProp.name + ": " + firstProp.value + "!" + firstProp.priority;
++    }
++
++    let val = this._parseValue(firstValue);
++
++    // Any property should be removed if has an empty value.
++    if (val.value.trim() === "") {
++      this.remove();
++    } else {
++      this.prop.setValue(val.value, val.priority);
++      this.removeOnRevert = false;
++      this.committed.value = this.prop.value;
++      this.committed.priority = this.prop.priority;
++
++      this.ruleEditor.addProperties(propertiesToAdd, this.prop);
+     }
+   },
+ 
+   /**
+    * Live preview this property, without committing changes.
+    *
+    * @param {string} [aValue]
+    *        The value to set the current property to.
+@@ -2200,31 +2307,64 @@ function createMenuItem(aMenu, aAttribut
+   item.setAttribute("accesskey", _strings.GetStringFromName(aAttributes.accesskey));
+   item.addEventListener("command", aAttributes.command);
+ 
+   aMenu.appendChild(item);
+ 
+   return item;
+ }
+ 
++function setTimeout()
++{
++  let window = Services.appShell.hiddenDOMWindow;
++  return window.setTimeout.apply(window, arguments);
++}
+ 
+-function throttle(func, wait, scope, window) {
++function clearTimeout()
++{
++  let window = Services.appShell.hiddenDOMWindow;
++  return window.clearTimeout.apply(window, arguments);
++}
++
++function throttle(func, wait, scope)
++{
+   var timer = null;
+   return function() {
+     if(timer) {
+-      window.clearTimeout(timer);
++      clearTimeout(timer);
+     }
+     var args = arguments;
+-    timer = window.setTimeout(function() {
++    timer = setTimeout(function() {
+       timer = null;
+       func.apply(scope, args);
+     }, wait);
+   };
+ }
+ 
++function parseCSSText(aCssText)
++{
++  let lines = aCssText.match(CSS_LINE_RE);
++  let props = [];
++
++  for (let line of lines) {
++    let [, name, value, priority] = CSS_PROP_RE.exec(line) || []
++    if (!name) {
++      continue;
++    }
++
++    props.push({
++      name: name,
++      value: value,
++      priority: priority || ""
++    });
++  }
++  return props;
++}
++
++
+ 
+ /**
+  * Append a text node to an element.
+  */
+ function appendText(aParent, aText)
+ {
+   aParent.appendChild(aParent.ownerDocument.createTextNode(aText));
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_editor_changedvalues.js b/browser/devtools/styleinspector/test/browser_ruleview_editor_changedvalues.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_editor_changedvalues.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_editor_changedvalues.js
+@@ -107,19 +107,55 @@ function testCreateNewEscape()
+         let focusedElement = inplaceEditor(elementRuleEditor.rule.textProps[0].editor.valueSpan).input;
+         is(focusedElement, focusedElement.ownerDocument.activeElement, "Correct element has focus");
+ 
+         EventUtils.synthesizeKey("VK_ESCAPE", {}, ruleWindow);
+ 
+         is(elementRuleEditor.rule.textProps.length,  1, "Should have removed the new text property.");
+         is(elementRuleEditor.propertyList.children.length, 1, "Should have removed the property editor.");
+ 
++        testCreateNewMulti();
++      }));
++    });
++    EventUtils.synthesizeKey("VK_RETURN", {}, ruleWindow);
++  });
++
++  EventUtils.synthesizeMouse(elementRuleEditor.closeBrace, 1, 1,
++                             { },
++                             ruleWindow);
++}
++
++function testCreateNewMulti()
++{
++  // Create a new property.
++  let elementRuleEditor = ruleView.element.children[0]._ruleEditor;
++  waitForEditorFocus(elementRuleEditor.element, function onNewElement(aEditor) {
++    is(inplaceEditor(elementRuleEditor.newPropSpan), aEditor, "Next focused editor should be the new property editor.");
++    is(elementRuleEditor.rule.textProps.length,  1, "Should be starting with one new text property.");
++    is(elementRuleEditor.propertyList.children.length, 2, "Should be starting with two property editors.");
++
++    let input = aEditor.input;
++    input.value = "color:blue;background : orange   ; text-align:center; border-color: ";
++
++    waitForEditorFocus(elementRuleEditor.element, function onNewValue(aEditor) {
++      promiseDone(expectRuleChange(elementRuleEditor.rule).then(() => {
++        is(elementRuleEditor.rule.textProps.length, 5, "Should have created a new text property.");
++        is(elementRuleEditor.propertyList.children.length, 5, "Should have created a property editor.");
++
++        EventUtils.synthesizeKey("r", {}, ruleWindow);
++        EventUtils.synthesizeKey("e", {}, ruleWindow);
++        EventUtils.synthesizeKey("d", {}, ruleWindow);
++        EventUtils.synthesizeKey("VK_ENTER", {}, ruleWindow);
++        is(elementRuleEditor.rule.textProps.length, 5, "Should have added the changed value.");
++        is(elementRuleEditor.propertyList.children.length, 5, "Should have added the changed value editor.");
++
+         testEditProperty();
+       }));
+     });
++
+     EventUtils.synthesizeKey("VK_RETURN", {}, ruleWindow);
+   });
+ 
+   EventUtils.synthesizeMouse(elementRuleEditor.closeBrace, 1, 1,
+                              { },
+                              ruleWindow);
+ }
+ 

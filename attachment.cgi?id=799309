@@ -1,0 +1,804 @@
+# HG changeset patch
+# User Patrick Brosset <pbrosset@mozilla.com>
+WITH FILES MERGED!
+
+New markup structure for the markup-view inspector.
+This allows for tags to have a full edge-to-edge line.
+So highlight and click areas are easier to use.
+
+- First integration of the new markup behind the markup-view. Working ok so far
+- splitting files and wiring deps
+- making vertical spacing consistent with the rest of the devetools
+
+Temporary file merge to make review easier
+
+Temporary file merge to make review easier
+
+
+diff --git a/browser/devtools/inspector/test/browser_inspector_scrolling.js b/browser/devtools/inspector/test/browser_inspector_scrolling.js
+index b2ef6e2..7b521ea 100644
+--- a/browser/devtools/inspector/test/browser_inspector_scrolling.js
++++ b/browser/devtools/inspector/test/browser_inspector_scrolling.js
+@@ -38,16 +38,18 @@ function inspectNode(aInspector)
+     inspector.highlighter.unlock();
+     inspector.selection.setNode(div, "");
+   });
+ }
+ 
+ function performScrollingTest()
+ {
+   executeSoon(function() {
++    // FIXME: this will fail on retina displays. EventUtils will only scroll
++    // 25px down instead of 50.
+     EventUtils.synthesizeWheel(div, 10, 10,
+       { deltaY: 50.0, deltaMode: WheelEvent.DOM_DELTA_PIXEL },
+       iframe.contentWindow);
+   });
+ 
+   gBrowser.selectedBrowser.addEventListener("scroll", function() {
+     gBrowser.selectedBrowser.removeEventListener("scroll", arguments.callee,
+       false);
+diff --git a/browser/devtools/markupview/markup-view.css b/browser/devtools/markupview/markup-view.css
+index 75c85ec..f4fce0b 100644
+--- a/browser/devtools/markupview/markup-view.css
++++ b/browser/devtools/markupview/markup-view.css
+@@ -1,47 +1,82 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-ul {
++/* Need this wrapper to contain our negative margin */
++#root-wrapper {
++  overflow: hidden;
++}
++/* Because of the way we deal with indentation */
++#root {
++  margin-left: -1000em;
++}
++
++.children {
+   list-style: none;
++  padding: 0;
++  margin: 0;
++}
++.child {
++  /* Indentation of sub-nodes works thanks to sub nodes having their
++  font sizes bigger and bigger.
++  1.001em is the smallest increment we can get. That way, even if nesting
++  is really deep, the indentation size won't appear to be growing at
++  each level */
++  font-size: 1.001em;
++}
++.tag-line {
++  /* The right padding here is in em and hence is based on the em font-size
++  of the current child */
++  padding-left: 1000em;
++  cursor: pointer;
++  min-height: 1.4rem;
++  line-height: 1.4rem;
++  position: relative;
+ }
+ 
+-ul.children:not([expanded]) {
+-  display: none;
++.tag-line > .editor {
++  font-size: 1rem;
+ }
+ 
+-.codebox {
++.expander {
+   display: inline-block;
++  margin-left: -14px;
++  vertical-align: middle;
++}
++
++.child.collapsed .child {
++  display: none;
++}
++.child > .tag-line:first-child .close {
++  display: none;
++}
++.child.collapsed > .tag-line:first-child .close {
++  display: inline;
++}
++.child.collapsed > .tag-line ~ .tag-line {
++  display: none;
++}
++.child.collapsed .close {
++  display: inline;
+ }
+ 
+ .newattr {
+   display: inline-block;
+   width: 1em;
+   height: 1ex;
+   margin-right: -1em;
++  padding: 1px 0;
+ }
+ 
+ .newattr:focus {
+   margin-right: 0;
+ }
+ 
+-.closing-bracket {
+-  pointer-events: none;
+-}
+-
+-.summary {
+-  cursor: pointer;
+-}
+-
+-.summary[expanded] {
+-  display: none;
+-}
+-
+ /* Preview */
+ 
+ #previewbar {
+   position: fixed;
+   top: 0;
+   right: 0;
+   width: 90px;
+   background: black;
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+index b03aefd..589b6e4 100644
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -3,31 +3,28 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ const {Cc, Cu, Ci} = require("chrome");
+ 
+ // Page size for pageup/pagedown
+ const PAGE_SIZE = 10;
+-
+ const PREVIEW_AREA = 700;
+ const DEFAULT_MAX_CHILDREN = 100;
+ 
+-let {UndoStack} = require("devtools/shared/undo");
+-let EventEmitter = require("devtools/shared/event-emitter");
+-let {editableField, InplaceEditor} = require("devtools/shared/inplace-editor");
+-let promise = require("sdk/core/promise");
++const {UndoStack} = require("devtools/shared/undo");
++const {editableField, InplaceEditor} = require("devtools/shared/inplace-editor");
++const promise = require("sdk/core/promise");
+ 
+ Cu.import("resource:///modules/devtools/LayoutHelpers.jsm");
+ Cu.import("resource://gre/modules/devtools/Templater.jsm");
+ Cu.import("resource://gre/modules/Services.jsm");
+-Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ 
+-loader.lazyGetter(this, "DOMParser", function() {
++loader.lazyGetter(this, "DOMParser", () => {
+  return Cc["@mozilla.org/xmlextras/domparser;1"].createInstance(Ci.nsIDOMParser);
+ });
+ loader.lazyGetter(this, "AutocompletePopup", () => require("devtools/shared/autocomplete-popup").AutocompletePopup);
+ 
+ /**
+  * Vocabulary for the purposes of this file:
+  *
+  * MarkupContainer - the structure that holds an editor and its
+@@ -358,17 +355,17 @@ MarkupView.prototype = {
+   {
+     for (let mutation of aMutations) {
+       let type = mutation.type;
+       let target = mutation.target;
+ 
+       if (mutation.type === "documentUnload") {
+         // Treat this as a childList change of the child (maybe the protocol
+         // should do this).
+-        type = "childList"
++        type = "childList";
+         target = mutation.targetParent;
+         if (!target) {
+           continue;
+         }
+       }
+ 
+       let container = this._containers.get(target);
+       if (!container) {
+@@ -383,17 +380,16 @@ MarkupView.prototype = {
+         this._updateChildren(container);
+       }
+     }
+     this._waitForChildren().then(() => {
+       this._inspector.emit("markupmutation");
+     });
+   },
+ 
+-
+   /**
+    * Make sure the given node's parents are expanded and the
+    * node is scrolled on to screen.
+    */
+   showNode: function MT_showNode(aNode, centered)
+   {
+     let container = this.importNode(aNode);
+     let parent = aNode;
+@@ -412,17 +408,17 @@ MarkupView.prototype = {
+ 
+   /**
+    * Expand the container's children.
+    */
+   _expandContainer: function MT__expandContainer(aContainer)
+   {
+     return this._updateChildren(aContainer, true).then(() => {
+       aContainer.expanded = true;
+-    })
++    });
+   },
+ 
+   /**
+    * Expand the node's children.
+    */
+   expandNode: function MT_expandNode(aNode)
+   {
+     let container = this._containers.get(aNode);
+@@ -800,90 +796,84 @@ MarkupView.prototype = {
+     let win = this._frame.contentWindow;
+     this._previewBar.classList.add("hide");
+     win.clearTimeout(this._resizePreviewTimeout);
+ 
+     win.setTimeout(function() {
+       this._updatePreview();
+       this._previewBar.classList.remove("hide");
+     }.bind(this), 1000);
+-  },
+-
++  }
+ };
+ 
+ 
+ /**
+  * The main structure for storing a document node in the markup
+  * tree.  Manages creation of the editor for the node and
+  * a <ul> for placing child elements, and expansion/collapsing
+  * of the element.
+  *
+  * @param MarkupView aMarkupView
+  *        The markup view that owns this container.
+  * @param DOMNode aNode
+  *        The node to display.
+  */
+-function MarkupContainer(aMarkupView, aNode)
+-{
++function MarkupContainer(aMarkupView, aNode) {
+   this.markup = aMarkupView;
+   this.doc = this.markup.doc;
+   this.undo = this.markup.undo;
+   this.node = aNode;
+ 
+   if (aNode.nodeType == Ci.nsIDOMNode.TEXT_NODE) {
+     this.editor = new TextEditor(this, aNode, "text");
+   } else if (aNode.nodeType == Ci.nsIDOMNode.COMMENT_NODE) {
+     this.editor = new TextEditor(this, aNode, "comment");
+   } else if (aNode.nodeType == Ci.nsIDOMNode.ELEMENT_NODE) {
+     this.editor = new ElementEditor(this, aNode);
+   } else if (aNode.nodeType == Ci.nsIDOMNode.DOCUMENT_TYPE_NODE) {
+     this.editor = new DoctypeEditor(this, aNode);
+   } else {
+-    this.editor = new GenericEditor(this.markup, aNode);
++    this.editor = new GenericEditor(this, aNode);
+   }
+ 
+   // The template will fill the following properties
+   this.elt = null;
+   this.expander = null;
+-  this.codeBox = null;
++  this.tagLine = null;
+   this.children = null;
+   this.markup.template("container", this);
+   this.elt.container = this;
+   this.children.container = this;
+ 
+-  this.expander.addEventListener("click", function() {
+-    this.markup.navigate(this);
++  // Expanding/collapsing the node on dblclick of the whole tag-line element
++  this._boundTagLineDblCkick = this._onTagLineDblClick.bind(this);
++  this.tagLine.addEventListener("dblclick", this._boundTagLineDblCkick, false);
++  this.expander.addEventListener("click", this._boundTagLineDblCkick, false);
+ 
+-    this.markup.setNodeExpanded(this.node, !this.expanded);
+-  }.bind(this));
++  // Dealing with the highlighting of the row via javascript rather than :hover
++  // This is to allow highlighting the closing tag-line as well as reusing the
++  // theme css classes (which wouldn't have been possible with a :hover pseudo)
++  this._boundTagLineOver = this._onTagLineOver.bind(this);
++  this.tagLine.addEventListener("mouseover", this._boundTagLineOver, false);
+ 
+-  this.codeBox.insertBefore(this.editor.elt, this.children);
++  this._boundTagLineOut = this._onTagLineOut.bind(this);
++  this.tagLine.addEventListener("mouseout", this._boundTagLineOut, false);
+ 
+-  this.editor.elt.addEventListener("mousedown", function(evt) {
++  // Appending the editor element and attaching event listeners
++  this.tagLine.appendChild(this.editor.elt);
++
++  this.tagLine.addEventListener("mousedown", function() {
+     this.markup.navigate(this);
+   }.bind(this), false);
+-
+-  if (this.editor.summaryElt) {
+-    this.editor.summaryElt.addEventListener("click", function(evt) {
+-      this.markup.navigate(this);
+-      this.markup.expandNode(this.node);
+-    }.bind(this), false);
+-    this.codeBox.appendChild(this.editor.summaryElt);
+-  }
+-
+-  if (this.editor.closeElt) {
+-    this.editor.closeElt.addEventListener("mousedown", function(evt) {
+-      this.markup.navigate(this);
+-    }.bind(this), false);
+-    this.codeBox.appendChild(this.editor.closeElt);
+-  }
+ }
+ 
+ MarkupContainer.prototype = {
+-  toString: function() { return "[MarkupContainer for " + this.node + "]" },
++  toString: function() {
++    return "[MarkupContainer for " + this.node + "]";
++  },
+ 
+   /**
+    * True if the current node has children.  The MarkupView
+    * will set this attribute for the MarkupContainer.
+    */
+   _hasChildren: false,
+ 
+   get hasChildren() {
+@@ -902,104 +892,153 @@ MarkupContainer.prototype = {
+   parentContainer: function() {
+     return this.elt.parentNode ? this.elt.parentNode.container : null;
+   },
+ 
+   /**
+    * True if the node has been visually expanded in the tree.
+    */
+   get expanded() {
+-    return this.children.hasAttribute("expanded");
++    return !this.elt.classList.contains("collapsed");
+   },
+ 
+   set expanded(aValue) {
+-    if (aValue) {
++    if (aValue && this.elt.classList.contains("collapsed")) {
++      // Expanding a node means cloning its "inline" closing tag into a new
++      // tag-line that the user can interact with and showing the children.
++      if (this.editor instanceof ElementEditor) {
++        let closingTag = this.elt.querySelector(".close");
++        if (closingTag) {
++          if (!this.closeTagLine) {
++            let line = this.markup.doc.createElement("div");
++            line.classList.add("tag-line");
++            line.appendChild(closingTag.cloneNode(true));
++            line.addEventListener("dblclick", this._boundTagLineDblCkick, false);
++            line.addEventListener("mouseover", this._boundTagLineOver, false);
++            line.addEventListener("mouseout", this._boundTagLineOut, false);
++            this.closeTagLine = line;
++          }
++          this.elt.appendChild(this.closeTagLine);
++        }
++      }
++      this.elt.classList.remove("collapsed");
+       this.expander.setAttribute("open", "");
+-      this.children.setAttribute("expanded", "");
+-      if (this.editor.summaryElt) {
+-        this.editor.summaryElt.setAttribute("expanded", "");
++      this.highlighted = false;
++    } else if (!aValue) {
++      if (this.editor instanceof ElementEditor) {
++        this.elt.removeChild(this.closeTagLine);
+       }
+-    } else {
++      this.elt.classList.add("collapsed");
+       this.expander.removeAttribute("open");
+-      this.children.removeAttribute("expanded");
+-      if (this.editor.summaryElt) {
+-        this.editor.summaryElt.removeAttribute("expanded");
++    }
++  },
++
++  _onTagLineDblClick: function() {
++    this.markup.navigate(this);
++    this.markup.setNodeExpanded(this.node, !this.expanded);
++  },
++
++  _onTagLineOver: function() {
++    this.highlighted = true;
++  },
++
++  _onTagLineOut: function() {
++    this.highlighted = false;
++  },
++
++  _highlighted: false,
++
++  /**
++   * Highlight the currently hovered tag + its closing tag if necessary
++   * (that is if the tag is expanded)
++   */
++  set highlighted(aValue) {
++    this._highlighted = aValue;
++    if (aValue) {
++      if (!this.selected) {
++        this.tagLine.classList.add("theme-bg-darker");
++      }
++      if (this.closeTagLine) {
++        this.closeTagLine.classList.add("theme-bg-darker");
++      }
++    } else {
++      this.tagLine.classList.remove("theme-bg-darker");
++      if (this.closeTagLine) {
++        this.closeTagLine.classList.remove("theme-bg-darker");
+       }
+     }
+   },
+ 
+   /**
+    * True if the container is visible in the markup tree.
+    */
+-  get visible()
+-  {
++  get visible() {
+     return this.elt.getBoundingClientRect().height > 0;
+   },
+ 
+   /**
+    * True if the container is currently selected.
+    */
+   _selected: false,
+ 
+   get selected() {
+     return this._selected;
+   },
+ 
+   set selected(aValue) {
+     this._selected = aValue;
+     this.editor.selected = aValue;
+     if (this._selected) {
+-      this.editor.elt.classList.add("theme-selected");
+-      if (this.editor.closeElt) {
+-        this.editor.closeElt.classList.add("theme-selected");
+-      }
++      this.tagLine.setAttribute("selected", "");
++      this.tagLine.classList.add("theme-selected");
+     } else {
+-      this.editor.elt.classList.remove("theme-selected");
+-      if (this.editor.closeElt) {
+-        this.editor.closeElt.classList.remove("theme-selected");
+-      }
++      this.tagLine.removeAttribute("selected");
++      this.tagLine.classList.remove("theme-selected");
+     }
+   },
+ 
+   /**
+    * Update the container's editor to the current state of the
+    * viewed node.
+    */
+-  update: function MC_update()
+-  {
++  update: function() {
+     if (this.editor.update) {
+       this.editor.update();
+     }
+   },
+ 
+   /**
+    * Try to put keyboard focus on the current editor.
+    */
+-  focus: function MC_focus()
+-  {
++  focus: function() {
+     let focusable = this.editor.elt.querySelector("[tabindex]");
+     if (focusable) {
+       focusable.focus();
+     }
+-  },
+-}
++  }
++};
+ 
+ /**
+  * Dummy container node used for the root document element.
+  */
+-function RootContainer(aMarkupView, aNode)
+-{
++function RootContainer(aMarkupView, aNode) {
+   this.doc = aMarkupView.doc;
+   this.elt = this.doc.createElement("ul");
+   this.elt.container = this;
+   this.children = this.elt;
+   this.node = aNode;
+   this.toString = function() { return "[root container]"}
+ }
+ 
++RootContainer.prototype = {
++  hasChildren: true,
++  expanded: true,
++  update: function() {}
++};
++
+ /**
+  * Creates an editor for simple nodes.
+  */
+ function GenericEditor(aContainer, aNode)
+ {
+   this.elt = aContainer.doc.createElement("span");
+   this.elt.className = "editor";
+   this.elt.textContent = aNode.nodeName;
+@@ -1110,37 +1149,29 @@ function ElementEditor(aContainer, aNode)
+ {
+   this.doc = aContainer.doc;
+   this.undo = aContainer.undo;
+   this.template = aContainer.markup.template.bind(aContainer.markup);
+   this.container = aContainer;
+   this.markup = this.container.markup;
+   this.node = aNode;
+ 
+-  this.attrs = { };
++  this.attrs = {};
+ 
+   // The templates will fill the following properties
+   this.elt = null;
+   this.tag = null;
++  this.closeTag = null;
+   this.attrList = null;
+   this.newAttr = null;
+-  this.summaryElt = null;
+   this.closeElt = null;
+ 
+   // Create the main editor
+   this.template("element", this);
+ 
+-  if (this.node.hasChildren) {
+-    // Create the summary placeholder
+-    this.template("elementContentSummary", this);
+-  }
+-
+-  // Create the closing tag
+-  this.template("elementClose", this);
+-
+   this.rawNode = aNode.rawNode();
+ 
+   // Make the tag name editable (unless this is a remote node or
+   // a document element)
+   if (this.rawNode && !aNode.isDocumentElement) {
+     this.tag.setAttribute("tabindex", "0");
+     editableField({
+       element: this.tag,
+@@ -1331,17 +1362,16 @@ ElementEditor.prototype = {
+    *        user put them.
+    */
+   _applyAttributes: function EE__applyAttributes(aValue, aAttrNode, aDoMods, aUndoMods)
+   {
+     let attrs = parseAttributeValues(aValue, this.doc);
+     for (let attr of attrs) {
+       // Create an attribute editor next to the current attribute if needed.
+       this._createAttribute(attr, aAttrNode ? aAttrNode.nextSibling : null);
+-
+       this._saveAttribute(attr.name, aUndoMods);
+       aDoMods.setAttribute(attr.name, attr.value);
+     }
+   },
+ 
+   /**
+    * Saves the current state of the given attribute into an attribute
+    * modification list.
+@@ -1409,40 +1439,31 @@ ElementEditor.prototype = {
+         if (newContainer.selected) {
+           this.markup.navigate(this.container);
+         }
+       });
+     }).then(null, console.error);
+   }
+ }
+ 
+-
+-
+-RootContainer.prototype = {
+-  hasChildren: true,
+-  expanded: true,
+-  update: function RC_update() {}
+-};
+-
+ function nodeDocument(node) {
+   return node.ownerDocument || (node.nodeType == Ci.nsIDOMNode.DOCUMENT_NODE ? node : null);
+ }
+ 
+ /**
+  * Parse attribute names and values from a string.
+  *
+  * @param  {String} attr
+  *         The input string for which names/values are to be parsed.
+  * @param  {HTMLDocument} doc
+  *         A document that can be used to test valid attributes.
+  * @return {Array}
+  *         An array of attribute names and their values.
+  */
+ function parseAttributeValues(attr, doc) {
+-
+   attr = attr.trim();
+ 
+   // Handle bad user inputs by appending a " or ' if it fails to parse without them.
+   let el = DOMParser.parseFromString("<div " + attr + "></div>", "text/html").body.childNodes[0] ||
+            DOMParser.parseFromString("<div " + attr + "\"></div>", "text/html").body.childNodes[0] ||
+            DOMParser.parseFromString("<div " + attr + "'></div>", "text/html").body.childNodes[0];
+   let div = doc.createElement("div");
+ 
+@@ -1459,24 +1480,11 @@ function parseAttributeValues(attr, doc) {
+     }
+     catch(e) { }
+   }
+ 
+   // Attributes return from DOMParser in reverse order from how they are entered.
+   return attributes.reverse();
+ }
+ 
+-/**
+- * A tree walker filter for avoiding empty whitespace text nodes.
+- */
+-function whitespaceTextFilter(aNode)
+-{
+-    if (aNode.nodeType == Ci.nsIDOMNode.TEXT_NODE &&
+-        !/[^\s]/.exec(aNode.nodeValue)) {
+-      return Ci.nsIDOMNodeFilter.FILTER_SKIP;
+-    } else {
+-      return Ci.nsIDOMNodeFilter.FILTER_ACCEPT;
+-    }
+-}
+-
+ loader.lazyGetter(MarkupView.prototype, "strings", () => Services.strings.createBundle(
+   "chrome://browser/locale/devtools/inspector.properties"
+ ));
+diff --git a/browser/devtools/markupview/markup-view.xhtml b/browser/devtools/markupview/markup-view.xhtml
+index f415052..5ded397 100644
+--- a/browser/devtools/markupview/markup-view.xhtml
++++ b/browser/devtools/markupview/markup-view.xhtml
+@@ -10,38 +10,41 @@
+   <link rel="stylesheet" href="chrome://browser/content/devtools/markup-view.css" type="text/css"/>
+   <link rel="stylesheet" href="chrome://browser/skin/devtools/markup-view.css" type="text/css"/>
+   <link rel="stylesheet" href="chrome://browser/skin/devtools/common.css" type="text/css"/>
+ 
+   <script type="application/javascript;version=1.8" src="theme-switching.js"/>
+ 
+ </head>
+ <body class="theme-body devtools-monospace" role="application">
+-  <div id="root"></div>
++  <div id="root-wrapper">
++    <div id="root"></div>
++  </div>
+   <div id="templates" style="display:none">
+-    <ul>
+-      <li id="template-container" save="${elt}" class="container"><span save="${codeBox}" class="codebox"><span save="${expander}" class="theme-twisty expander"></span><ul save="${children}" class="children"></ul></span></li>
++
++    <ul class="children">
++      <li id="template-container" save="${elt}" class="child collapsed">
++        <div save="${tagLine}" class="tag-line"><span save="${expander}" class="theme-twisty expander"></span></div>
++        <ul save="${children}" class="children"></ul>
++      </li>
+ 
+       <li id="template-more-nodes" class="more-nodes devtools-class-comment" save="${elt}"><span>${showing}</span> <button href="#" onclick="${allButtonClick}">${showAll}</button></li>
+     </ul>
+ 
+-    <span id="template-element" save="${elt}" class="editor"><span>&lt;</span><span save="${tag}" class="tagname theme-fg-color3"></span><span save="${attrList}"></span><span save="${newAttr}" class="newattr" tabindex="0"></span><span class="closing-bracket">&gt;</span></span>
++    <span id="template-element" save="${elt}" class="editor"><span class="open">&lt;<span save="${tag}" class="tag theme-fg-color3" tabindex="0"></span><span save="${attrList}"></span><span save="${newAttr}" class="newattr" tabindex="0"></span>&gt;</span><span class="close">&lt;/<span save="${closeTag}" class="tag theme-fg-color3"></span>&gt;</span></span>
+ 
+-    <span id="template-attribute" save="${attr}" data-attr="${attrName}" class="attreditor" style="display:none"> <span class="editable" save="${inner}" tabindex="0"><span save="${name}" class="attrname theme-fg-color2"></span>=&quot;<span save="${val}" class="attrvalue theme-fg-color6"></span>&quot;</span></span>
++    <span id="template-attribute" save="${attr}" data-attr="${attrName}" class="attreditor" style="display:none"> <span class="editable" save="${inner}" tabindex="0"><span save="${name}" class="attr-name theme-fg-color2"></span>=&quot;<span save="${val}" class="attr-value theme-fg-color6"></span>&quot;</span></span>
+ 
+     <span id="template-text" save="${elt}" class="editor text">
+       <pre save="${value}" style="display:inline-block;" tabindex="0"></pre>
+     </span>
+ 
+-    <span id="template-comment" save="${elt}" class="editor comment theme-comment">
+-      <span>&lt;!--</span><pre save="${value}" style="display:inline-block;" tabindex="0"></pre><span>--&gt;</span>
+-    </span>
++    <span id="template-comment" save="${elt}" class="editor comment theme-comment"><span>&lt;!--</span><pre save="${value}" style="display:inline-block;" tabindex="0"></pre><span>--&gt;</span></span>
+ 
+-    <span id="template-elementContentSummary" save="${summaryElt}" class="summary"> … </span>
++    <!-- span id="template-elementClose" save="${closeElt}">&lt;/<span save="${closeTag}" class="tagname theme-fg-color3"></span>&gt;</span -->
+ 
+-    <span id="template-elementClose" save="${closeElt}">&lt;/<span save="${closeTag}" class="tagname theme-fg-color3"></span>&gt;</span>
+-   </div>
+-   <div id="previewbar" class="disabled">
++  </div>
++  <div id="previewbar" class="disabled">
+      <div id="preview"/>
+      <div id="viewbox"/>
+-   </div>
++  </div>
+ </body>
+ </html>
+diff --git a/browser/themes/shared/devtools/dark-theme.css b/browser/themes/shared/devtools/dark-theme.css
+index e04e0b2..59cd839 100644
+--- a/browser/themes/shared/devtools/dark-theme.css
++++ b/browser/themes/shared/devtools/dark-theme.css
+@@ -43,17 +43,17 @@
+   background-position: -42px 0;
+ }
+ 
+ .theme-selected {
+   background: #26394D;
+ }
+ 
+ .theme-bg-darker {
+-  background-color: rgba(0,0,0,0.1);
++  background-color: rgba(0,0,0,0.5);
+ }
+ 
+ .theme-link { /* blue */
+   color: #3689b2;
+ }
+ 
+ .theme-comment { /* grey */
+   color: #5c6773;
+diff --git a/browser/themes/shared/devtools/light-theme.css b/browser/themes/shared/devtools/light-theme.css
+index f26aa5f..6466d87 100644
+--- a/browser/themes/shared/devtools/light-theme.css
++++ b/browser/themes/shared/devtools/light-theme.css
+@@ -43,17 +43,17 @@
+   background-position: -14px 0;
+ }
+ 
+ .theme-selected {
+   background-color: #CCC;
+ }
+ 
+ .theme-bg-darker {
+-  background: #F9F9F9;
++  background: #EFEFEF;
+ }
+ 
+ .theme-link { /* blue */
+   color: hsl(208,56%,40%);
+ }
+ 
+ .theme-comment { /* grey */
+   color: hsl(90,2%,46%);
+diff --git a/browser/themes/shared/devtools/markup-view.css b/browser/themes/shared/devtools/markup-view.css
+index 47f89b7..bd92434 100644
+--- a/browser/themes/shared/devtools/markup-view.css
++++ b/browser/themes/shared/devtools/markup-view.css
+@@ -2,37 +2,15 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ * {
+   padding: 0;
+   margin: 0;
+ }
+ 
+-.newattr {
+-  cursor: pointer;
+-  padding: 1px 0;
+-}
+-
+-li.container {
+-  padding: 2px 0 0 2px;
+-}
+-
+-.codebox {
+-  padding-left: 14px;
+-}
+-
+-.codebox > * {
+-  vertical-align: middle;
+-}
+-
+-.expander {
+-  display: inline-block;
+-  margin-left: -14px;
+-}
+-
+ .more-nodes {
+   padding-left: 16px;
+ }
+ 
+ .styleinspector-propertyeditor {
+   border: 1px solid #CCC;
+ }

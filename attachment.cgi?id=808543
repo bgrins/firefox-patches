@@ -1,0 +1,315 @@
+# HG changeset patch
+# Parent d50f590056fdca521a53af8562e3aee754b6c863
+# User Patrick Brosset <pbrosset@mozilla.com>
+Bug 917448 - Avoids dead-object exceptions in markup-view due to delete iframe during load; r=paul
+
+diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
+--- a/browser/devtools/inspector/inspector-panel.js
++++ b/browser/devtools/inspector/inspector-panel.js
+@@ -163,17 +163,17 @@ InspectorPanel.prototype = {
+     }
+     let walker = this.walker;
+     let rootNode = null;
+ 
+     // If available, set either the previously selected node or the body
+     // as default selected, else set documentElement
+     return walker.getRootNode().then(aRootNode => {
+       rootNode = aRootNode;
+-      return walker.querySelector(aRootNode, this.selectionCssSelector);
++      return walker.querySelector(rootNode, this.selectionCssSelector);
+     }).then(front => {
+       if (front) {
+         return front;
+       }
+       return walker.querySelector(rootNode, "body");
+     }).then(front => {
+       if (front) {
+         return front;
+@@ -340,38 +340,41 @@ InspectorPanel.prototype = {
+       return null;
+     }
+   },
+ 
+   /**
+    * When a new node is selected.
+    */
+   onNewSelection: function InspectorPanel_onNewSelection(event, value, reason) {
+-    this.cancelLayoutChange();
++    // We want to skip cases where the selection was set to null
++    if (value) {
++      this.cancelLayoutChange();
+ 
+-    // Wait for all the known tools to finish updating and then let the
+-    // client know.
+-    let selection = this.selection.nodeFront;
++      // Wait for all the known tools to finish updating and then let the
++      // client know.
++      let selection = this.selection.nodeFront;
+ 
+-    // On any new selection made by the user, store the unique css selector
+-    // of the selected node so it can be restored after reload of the same page
+-    if (reason !== "navigateaway" &&
+-        this.selection.node &&
+-        this.selection.isElementNode()) {
+-      this.selectionCssSelector = CssLogic.findCssSelector(this.selection.node);
++      // On any new selection made by the user, store the unique css selector
++      // of the selected node so it can be restored after reload of the same page
++      if (reason !== "navigateaway" &&
++          this.selection.node &&
++          this.selection.isElementNode()) {
++        this.selectionCssSelector = CssLogic.findCssSelector(this.selection.node);
++      }
++
++      let selfUpdate = this.updating("inspector-panel");
++      Services.tm.mainThread.dispatch(() => {
++        try {
++          selfUpdate(selection);
++        } catch(ex) {
++          console.error(ex);
++        }
++      }, Ci.nsIThread.DISPATCH_NORMAL);
+     }
+-
+-    let selfUpdate = this.updating("inspector-panel");
+-    Services.tm.mainThread.dispatch(() => {
+-      try {
+-        selfUpdate(selection);
+-      } catch(ex) {
+-        console.error(ex);
+-      }
+-    }, Ci.nsIThread.DISPATCH_NORMAL);
+   },
+ 
+   /**
+    * Delay the "inspector-updated" notification while a tool
+    * is updating itself.  Returns a function that must be
+    * invoked when the tool is done updating with the node
+    * that the tool is viewing.
+    */
+diff --git a/browser/devtools/inspector/test/Makefile.in b/browser/devtools/inspector/test/Makefile.in
+--- a/browser/devtools/inspector/test/Makefile.in
++++ b/browser/devtools/inspector/test/Makefile.in
+@@ -38,10 +38,12 @@ MOCHITEST_BROWSER_FILES := \
+ 		browser_inspector_bug_835722_infobar_reappears.js \
+ 		browser_inspector_bug_840156_destroy_after_navigation.js \
+ 		browser_inspector_reload.js \
+ 		browser_inspector_navigation.js \
+ 		browser_inspector_select_last_selected.js \
+ 		browser_inspector_select_last_selected.html \
+ 		browser_inspector_select_last_selected2.html \
+ 		browser_inspector_basic_highlighter.js \
++		browser_inspector_dead_node_exception.html \
++		browser_inspector_dead_node_exception.js \
+ 		head.js \
+ 		$(NULL)
+diff --git a/browser/devtools/inspector/test/browser_inspector_dead_node_exception.html b/browser/devtools/inspector/test/browser_inspector_dead_node_exception.html
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/inspector/test/browser_inspector_dead_node_exception.html
+@@ -0,0 +1,35 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++  <meta charset="UTF-8">
++  <title>iframe creation/deletion test</title>
++</head>
++<body>
++  <div id="yay"></div>
++  <script type="text/javascript">
++      var yay = document.querySelector("#yay");
++      yay.textContent = "nothing";
++
++      var iframe = document.createElement('iframe');
++      document.body.appendChild(iframe);
++      iframe.parentNode.removeChild(iframe);
++
++      yay.textContent = "before events";
++
++      document.addEventListener("DOMContentLoaded", function() {
++        var iframe = document.createElement('iframe');
++        document.body.appendChild(iframe);
++        iframe.parentNode.removeChild(iframe);
++
++        yay.textContent = "DOMContentLoaded";
++      });
++      window.addEventListener("load", function() {
++        var iframe = document.createElement('iframe');
++        document.body.appendChild(iframe);
++        iframe.parentNode.removeChild(iframe);
++
++        yay.textContent = "load";
++      });
++  </script>
++</body>
++</html>
+\ No newline at end of file
+diff --git a/browser/devtools/inspector/test/browser_inspector_dead_node_exception.js b/browser/devtools/inspector/test/browser_inspector_dead_node_exception.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/inspector/test/browser_inspector_dead_node_exception.js
+@@ -0,0 +1,56 @@
++/* Any copyright", " is dedicated to the Public Domain.
++http://creativecommons.org/publicdomain/zero/1.0/ */
++
++function test() {
++  let contentTab, contentDoc, inspector;
++
++  waitForExplicitFinish();
++
++  // Create a tab
++  contentTab = gBrowser.selectedTab = gBrowser.addTab();
++
++  // Open the toolbox's inspector first
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++  gDevTools.showToolbox(target, "inspector").then(function(toolbox) {
++    inspector = toolbox.getCurrentPanel();
++
++    inspector.selection.setNode(content.document.querySelector("body"));
++    inspector.once("inspector-updated", () => {
++      is(inspector.selection.node.tagName, "BODY", "Inspector displayed");
++
++      // Then load our test page
++      gBrowser.selectedBrowser.addEventListener("load", function onload() {
++        gBrowser.selectedBrowser.removeEventListener("load", onload, true);
++        contentDoc = content.document;
++
++        // The content doc contains a script that creates an iframe and deletes
++        // it immediately after. This is what used to make the inspector go
++        // blank when navigating to that page.
++
++        var iframe = contentDoc.createElement("iframe");
++        contentDoc.body.appendChild(iframe);
++        iframe.parentNode.removeChild(iframe);
++
++        is(contentDoc.querySelector("iframe"), null, "Iframe has been removed");
++
++        inspector.once("markuploaded", () => {
++          // Assert that the markup-view is displayed and works
++          is(contentDoc.querySelector("iframe"), null, "Iframe has been removed");
++          is(contentDoc.getElementById("yay").textContent, "load", "Load event fired");
++
++          inspector.selection.setNode(contentDoc.getElementById("yay"));
++          inspector.once("inspector-updated", () => {
++            ok(inspector.selection.node, "Inspector still displayed");
++
++            // Clean up and go
++            contentTab, contentDoc, inspector = null;
++            gBrowser.removeTab(contentTab);
++            finish();
++          });
++        });
++      }, true);
++      content.location = "http://mochi.test:8888/browser/browser/devtools/" +
++       "inspector/test/browser_inspector_dead_node_exception.html";
++    });
++  });
++}
+diff --git a/toolkit/devtools/LayoutHelpers.jsm b/toolkit/devtools/LayoutHelpers.jsm
+--- a/toolkit/devtools/LayoutHelpers.jsm
++++ b/toolkit/devtools/LayoutHelpers.jsm
+@@ -367,27 +367,29 @@ LayoutHelpers.prototype = {
+   /**
+    * like win.frameElement, but goes through mozbrowsers and mozapps iframes.
+    */
+   getFrameElement: function LH_getFrameElement(win) {
+     if (this.isTopLevelWindow(win)) {
+       return null;
+     }
+ 
++    // Get the docShell for that window, and its same-type parent
++    // ignoring mozBrowser and mozApp boundaries
+     let docShell = win.QueryInterface(Ci.nsIInterfaceRequestor)
+                    .getInterface(Ci.nsIWebNavigation)
+                    .QueryInterface(Ci.nsIDocShell);
++    let parentDocShell = docShell.getSameTypeParentIgnoreBrowserAndAppBoundaries();
+ 
+-    if (docShell.isBrowserOrApp) {
+-      let parentDocShell = docShell.getSameTypeParentIgnoreBrowserAndAppBoundaries();
+-      let parentDoc = parentDocShell.contentViewer.DOMDocument;
+-      let allIframes = parentDoc.querySelectorAll("iframe");
+-      for (let f of allIframes) {
+-        if (f.contentWindow === win) {
+-          return f;
+-        }
++    // Once we have a parent, get all its iframes and loop through them
++    // to find `win`. If we do, it means win is a nested iframe
++    let parentDoc = parentDocShell.contentViewer.DOMDocument;
++    let allIframes = parentDoc.querySelectorAll("iframe");
++    for (let f of allIframes) {
++      if (f.contentWindow === win) {
++        return f;
+       }
+-      return null;
+-    } else {
+-      return win.frameElement;
+     }
++
++    // Otherwise, win is a top level window
++    return null;
+   },
+ };
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -719,35 +719,36 @@ var ProgressListener = Class({
+     try {
+       this.webProgress.removeProgressListener(this);
+     } catch(ex) {
+       // This can throw during browser shutdown.
+     }
+     this.webProgress = null;
+   },
+ 
+-  onStateChange: makeInfallible(function stateChange(progress, request, flag, status) {
++  onStateChange: makeInfallible(function stateChange(progress, request, flags, status) {
+     if (!this.webProgress) {
+       console.warn("got an onStateChange after destruction");
+       return;
+     }
+ 
+-    let isWindow = flag & Ci.nsIWebProgressListener.STATE_IS_WINDOW;
+-    let isDocument = flag & Ci.nsIWebProgressListener.STATE_IS_DOCUMENT;
++    let isWindow = flags & Ci.nsIWebProgressListener.STATE_IS_WINDOW;
++    let isDocument = flags & Ci.nsIWebProgressListener.STATE_IS_DOCUMENT;
+     if (!(isWindow || isDocument)) {
+       return;
+     }
+ 
+-    if (isDocument && (flag & Ci.nsIWebProgressListener.STATE_START)) {
++    if (isDocument && (flags & Ci.nsIWebProgressListener.STATE_START)) {
+       events.emit(this, "windowchange-start", progress.DOMWindow);
+     }
+-    if (isWindow && (flag & Ci.nsIWebProgressListener.STATE_STOP)) {
++    if (isWindow && (flags & Ci.nsIWebProgressListener.STATE_STOP)) {
+       events.emit(this, "windowchange-stop", progress.DOMWindow);
+     }
+   }),
++
+   onProgressChange: function() {},
+   onSecurityChange: function() {},
+   onStatusChange: function() {},
+   onLocationChange: function() {},
+ });
+ 
+ /**
+  * Server side of the DOM walker.
+@@ -1731,17 +1732,18 @@ var WalkerActor = protocol.ActorClass({
+         mutation.added = addedActors;
+       }
+       this.queueMutation(mutation);
+     }
+   },
+ 
+   onFrameLoad: function(window) {
+     let frame = this.layoutHelpers.getFrameElement(window);
+-    if (!frame && !this.rootDoc) {
++    let isTopLevel = this.layoutHelpers.isTopLevelWindow(window);
++    if (!frame && !this.rootDoc && isTopLevel) {
+       this.rootDoc = window.document;
+       this.rootNode = this.document();
+       this.queueMutation({
+         type: "newRoot",
+         target: this.rootNode.form()
+       });
+     }
+     let frameActor = this._refMap.get(frame);

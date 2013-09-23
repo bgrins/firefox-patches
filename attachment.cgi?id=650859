@@ -1,0 +1,692 @@
+# HG changeset patch
+# User Paul Rouget <paul@mozilla.com>
+# Date 1344603936 -7200
+# Node ID 43e1e0ecda9e77ee183d17e961b7f2a55921d3c3
+# Parent  8abc5ba17f5a52810e828abbfd9f3162c0e70c00
+Bug 663778 - [layout] Draw layout information of the selected node
+
+diff --git a/browser/base/content/highlighter.css b/browser/base/content/highlighter.css
+--- a/browser/base/content/highlighter.css
++++ b/browser/base/content/highlighter.css
+@@ -16,16 +16,22 @@
+   overflow: hidden;
+   position: relative;
+ }
+ 
+ #highlighter-outline {
+   position: absolute;
+ }
+ 
++.highlighter-layout-region {
++  -moz-box-sizing: border-box;
++  position: absolute;
++  border-style: solid;
++}
++
+ #highlighter-outline:not([disable-transitions]) {
+   transition-property: opacity, top, left, width, height;
+   transition-duration: 0.1s;
+   transition-timing-function: linear;
+ }
+ 
+ .inspector-breadcrumbs-button {
+   direction: ltr;
+@@ -42,21 +48,16 @@
+ 
+ #highlighter-outline[hidden],
+ #highlighter-nodeinfobar-container[hidden] {
+   opacity: 0;
+   pointer-events: none;
+   display: -moz-box;
+ }
+ 
+-#highlighter-outline[hidden] {
+-}
+-#highlighter-nodeinfobar-container[hidden] {
+-}
+-
+ #highlighter-nodeinfobar-container:not([disable-transitions]),
+ #highlighter-nodeinfobar-container[disable-transitions][force-transitions] {
+   transition-property: transform, opacity, top, left;
+   transition-duration: 0.1s;
+   transition-timing-function: linear;
+ }
+ 
+ #highlighter-nodeinfobar-text {
+diff --git a/browser/devtools/highlighter/highlighter.jsm b/browser/devtools/highlighter/highlighter.jsm
+--- a/browser/devtools/highlighter/highlighter.jsm
++++ b/browser/devtools/highlighter/highlighter.jsm
+@@ -67,16 +67,23 @@ const PSEUDO_CLASSES = [":hover", ":acti
+  *   boolean isNodeHighlightable(aNode);
+  *
+  *   // Show/hide the outline and the infobar
+  *   void showInfobar();
+  *   void hideInfobar();
+  *   void showOutline();
+  *   void hideOutline();
+  *
++ *   // Layout highlighter (regions)
++ *   void highlightMargins(map); // See ../layoutview/LayoutView.jsm for map definition
++ *   void highlightBorders(map);
++ *   void highlightPadding(map);
++ *   void highlightContent(map);
++ *   void hideRegion();
++ *
+  *   // Add/Remove listeners
+  *   // @param aEvent - event name
+  *   // @param aListener - function callback
+  *   void addListener(aEvent, aListener);
+  *   void removeListener(aEvent, aListener);
+  *
+  * Events:
+  *
+@@ -114,18 +121,23 @@ Highlighter.prototype = {
+ 
+     this.highlighterContainer = this.chromeDoc.createElement("stack");
+     this.highlighterContainer.id = "highlighter-container";
+ 
+     this.outline = this.chromeDoc.createElement("box");
+     this.outline.setAttribute("flex", "0");
+     this.outline.id = "highlighter-outline";
+ 
++    this.layoutRegion = this.chromeDoc.createElement("box");
++    this.layoutRegion.setAttribute("flex", "0");
++    this.layoutRegion.className = "highlighter-layout-region";
++
+     let outlineContainer = this.chromeDoc.createElement("box");
+     outlineContainer.appendChild(this.outline);
++    outlineContainer.appendChild(this.layoutRegion);
+     outlineContainer.id = "highlighter-outline-container";
+     outlineContainer.setAttribute("align", "start");
+ 
+     // The controlsBox will host the different interactive
+     // elements of the highlighter (buttons, toolbars, ...).
+     let controlsBox = this.chromeDoc.createElement("box");
+     controlsBox.id = "highlighter-controls";
+     this.highlighterContainer.appendChild(outlineContainer);
+@@ -229,17 +241,18 @@ Highlighter.prototype = {
+ 
+     if (this.node && this.isNodeHighlightable(this.node)) {
+ 
+       if (aScroll &&
+           this.node.scrollIntoView) { // XUL elements don't have such method
+         this.node.scrollIntoView();
+       }
+       let clientRect = this.node.getBoundingClientRect();
+-      rect = LayoutHelpers.getDirtyRect(this.node);
++      let win = this.node.ownerDocument.defaultView;
++      rect = LayoutHelpers.getDirtyRect(win, clientRect);
+     }
+ 
+     this.highlightRectangle(rect);
+ 
+     this.moveInfobar();
+ 
+     if (this._highlighting) {
+       this.emitEvent("highlighting");
+@@ -360,16 +373,150 @@ Highlighter.prototype = {
+   /**
+    * Show the outline
+    */
+    showOutline: function Highlighter_showOutline() {
+      if (this._highlighting)
+        this.outline.removeAttribute("hidden");
+    },
+ 
++   /*      LAYOUT REGIONS      */
++
++   /**
++    * Compute the region surrounded by the borders
++    */
++   _getBorderInnerBox: function Highlighter__getBorderBox(map) {
++     let rect = LayoutHelpers.getWritableBoundingClientRect(this.node);
++     rect = {
++       top:    rect.top + map.borderTop.value,
++       left:   rect.left + map.borderLeft.value,
++       width:  rect.width - map.borderLeft.value - map.borderRight.value,
++       height: rect.height - map.borderTop.value - map.borderBottom.value,
++     }
++     return rect;
++   },
++
++   /**
++    * Compute the region surrounded by the padding box
++    */
++   _getPaddingInnerBox: function Highlighter__getPaddingInnerBox(map) {
++     let rect = this._getBorderInnerBox(map);
++     rect = {
++       top:    rect.top + map.paddingTop.value,
++       left:   rect.left + map.paddingLeft.value,
++       width:  rect.width - map.paddingLeft.value - map.paddingRight.value,
++       height: rect.height - map.paddingTop.value - map.paddingBottom.value,
++     }
++     return rect;
++   },
++
++   /**
++    * Highlight the margins
++    */
++   highlightMargins: function Highlighter_highlightMargins(map) {
++     let offsetTop =    map.marginTop.value ==    "auto" ? 0 : map.marginTop.value ;
++     let offsetBottom = map.marginBottom.value == "auto" ? 0 : map.marginBottom.value ;
++     let offsetLeft =   map.marginLeft.value ==   "auto" ? 0 : map.marginLeft.value ;
++     let offsetRight =  map.marginRight.value ==  "auto" ? 0 : map.marginRight.value ;
++
++     offsetTop =    Math.max(offsetTop,     0);
++     offsetBottom = Math.max(offsetBottom,  0);
++     offsetLeft =   Math.max(offsetLeft,    0);
++     offsetRight =  Math.max(offsetRight,   0);
++
++     let innerRect = LayoutHelpers.getWritableBoundingClientRect(this.node);
++     let outerRect = {
++       top:    innerRect.top - offsetTop,
++       left:   innerRect.left - offsetLeft,
++       width:  innerRect.width + offsetLeft + offsetRight,
++       height: innerRect.height + offsetTop + offsetBottom,
++     }
++     this.drawRegion(outerRect, innerRect);
++   },
++
++   /**
++    * Highlight the borders
++    */
++   highlightBorders: function Highlighter_highlightBorders(map) {
++     let outerRect = LayoutHelpers.getWritableBoundingClientRect(this.node);
++     let innerRect = this._getBorderInnerBox(map);
++     this.drawRegion(outerRect, innerRect);
++   },
++
++   /**
++    * Highlight the padding area.
++    */
++   highlightPadding: function Highlighter_highlightPadding(map) {
++     let outerRect = this._getBorderInnerBox(map);
++     let innerRect = this._getPaddingInnerBox(map);
++     this.drawRegion(outerRect, innerRect);
++   },
++
++   /**
++    * Highlight the content area.
++    */
++   highlightContent: function Highlighter_highlightContent(map) {
++     let outerRect = this._getPaddingInnerBox(map);
++     this.drawRegion(outerRect, null);
++   },
++
++   /**
++    * Hide any highlighted regions.
++    */
++   hideRegion: function Highlighter_hideRegion(map) {
++     this.layoutRegion.removeAttribute("style");
++     this.layoutRegion.setAttribute("hidden", "true");
++     this.showOutline();
++   },
++
++   /**
++    * Draw the highlighted region.
++    */
++   drawRegion: function(outerRect, innerRect) {
++     this.hideOutline();
++
++     let win = this.node.ownerDocument.defaultView;
++
++     outerRect = LayoutHelpers.getDirtyRect(win, outerRect);
++     outerRect = LayoutHelpers.getZoomedRect(win, outerRect);
++
++     let top, left, width, height, borders,
++         borderTop, borderRight, borderBottom, borderLeft;
++
++     top =    "top:" +    outerRect.top + "px;";
++     left =   "left:" +   outerRect.left + "px;";
++     width =  "width:" +  outerRect.width + "px;";
++     height = "height:" + outerRect.height + "px;";
++
++     if (innerRect) {
++       innerRect = LayoutHelpers.getDirtyRect(win, innerRect);
++       innerRect = LayoutHelpers.getZoomedRect(win, innerRect);
++       borderTop = innerRect.top - outerRect.top;
++       borderLeft = innerRect.left - outerRect.left;
++       borderBottom = outerRect.height - borderTop - innerRect.height;
++       borderRight = outerRect.width - borderLeft - innerRect.width;
++     } else {
++       borderTop = outerRect.height;
++       borderLeft = outerRect.width;
++       borderRight = 0;
++       borderBottom = 0;
++     }
++
++     borders = "border-width:" +
++                borderTop      + "px " +
++                borderRight    + "px " +
++                borderBottom   + "px " +
++                borderLeft     + "px;";
++
++     this.layoutRegion.removeAttribute("hidden");
++     this.layoutRegion.setAttribute("style",
++                                     top + left + width + height +
++                                     borders);
++   },
++
+   /**
+    * Build the node Infobar.
+    *
+    * <box id="highlighter-nodeinfobar-container">
+    *   <box id="Highlighter-nodeinfobar-arrow-top"/>
+    *   <hbox id="highlighter-nodeinfobar">
+    *     <toolbarbutton class="highlighter-nodeinfobar-button" id="highlighter-nodeinfobar-inspectbutton"/>
+    *     <hbox id="highlighter-nodeinfobar-text">
+diff --git a/browser/devtools/highlighter/inspector.jsm b/browser/devtools/highlighter/inspector.jsm
+--- a/browser/devtools/highlighter/inspector.jsm
++++ b/browser/devtools/highlighter/inspector.jsm
+@@ -99,16 +99,23 @@ Inspector.prototype = {
+   /**
+    * The chrome window the inspector lives in.
+    */
+   get chromeWindow() {
+     return this._IUI.chromeWin;
+   },
+ 
+   /**
++   * The highlighter instance
++   */
++   get highlighter() {
++     return this._IUI.highlighter;
++   },
++
++  /**
+    * Notify the inspector that the current selection has changed.
+    *
+    * @param string aContext
+    *        An string that will be passed to the change event.  Allows
+    *        a tool to recognize when it sent a change notification itself
+    *        to avoid unnecessary refresh.
+    */
+   change: function Inspector_change(aContext)
+diff --git a/browser/devtools/layoutview/LayoutView.jsm b/browser/devtools/layoutview/LayoutView.jsm
+--- a/browser/devtools/layoutview/LayoutView.jsm
++++ b/browser/devtools/layoutview/LayoutView.jsm
+@@ -23,17 +23,16 @@ function LayoutView(aOptions)
+   this.init();
+ }
+ 
+ LayoutView.prototype = {
+   init: function LV_init() {
+     this.cssLogic = new CssLogic();
+ 
+     this.update = this.update.bind(this);
+-    this.onMessage = this.onMessage.bind(this);
+ 
+     this.isOpen = false;
+     this.documentReady = false;
+ 
+     // Is the layout view was open before?
+     if (!("_layoutViewIsOpen" in this.inspector)) {
+       this.inspector._layoutViewIsOpen =
+         Services.prefs.getBoolPref("devtools.layoutview.open");
+@@ -67,19 +66,16 @@ LayoutView.prototype = {
+     this.inspector.on("unlocked", this.onUnlock);
+ 
+     // Build the layout view in the sidebar.
+     this.buildView();
+ 
+     this.bound_handleKeypress = this.handleKeypress.bind(this);
+     this.iframe.addEventListener("keypress", this.bound_handleKeypress, true);
+ 
+-    // Get messages from the iframe.
+-    this.inspector.chromeWindow.addEventListener("message", this.onMessage, true);
+-
+     // Store for the different dimensions of the node.
+     // 'selector' refers to the element that holds the value in view.xhtml;
+     // 'property' is what we are measuring;
+     // 'value' is the computed dimension, computed in update().
+     this.map = {
+       marginTop: {selector: ".margin.top > span",
+                   property: "margin-top",
+                   value: undefined},
+@@ -118,35 +114,49 @@ LayoutView.prototype = {
+                   value: undefined},
+     };
+   },
+ 
+   /**
+    * Destroy the nodes. Remove listeners.
+    */
+   destroy: function LV_destroy() {
++    if (this._creationListener) {
++      this.iframe.removeEventListener("DOMWindowCreated", this._creationListener, true);
++      delete this._creationListener;
++    }
++
+     this.inspector.removeListener("select", this.onSelect);
+     this.inspector.removeListener("unlocked", this.onUnlock);
+     this.browser.removeEventListener("MozAfterPaint", this.update, true);
+     this.iframe.removeEventListener("keypress", this.bound_handleKeypress, true);
+-    this.inspector.chromeWindow.removeEventListener("message", this.onMessage, true);
+     this.close();
+     this.iframe = null;
+     this.view.parentNode.removeChild(this.view);
+   },
+ 
+   /**
+    * Build the Layout container:
+    *
+    * <vbox id="inspector-layoutview-container">
+    *  <iframe src="chrome://browser/content/devtools/layoutview/view.xhtml"/>
+    * </vbox>
+    */
+   buildView: function LV_buildPanel() {
+     this.iframe = this.chromeDoc.createElement("iframe");
++
++    // When the global is created, give it a reference to the LayoutView so
++    // the frame can communicate with us.
++    this._creationListener = function onWindowCreated() {
++      this.iframe.removeEventListener("DOMWindowCreated", this._creationListener);
++      delete this._creationListener;
++      this.iframe.contentWindow.gLayoutView = this;
++    }.bind(this);
++    this.iframe.addEventListener("DOMWindowCreated", this._creationListener, true);
++
+     this.iframe.setAttribute("src", "chrome://browser/content/devtools/layoutview/view.xhtml");
+ 
+     this.view = this.chromeDoc.createElement("vbox");
+     this.view.id = "inspector-layoutview-container";
+     this.view.appendChild(this.iframe);
+ 
+     let sidebar = this.chromeDoc.getElementById("devtools-sidebar-box");
+     sidebar.appendChild(this.view);
+@@ -171,32 +181,16 @@ LayoutView.prototype = {
+       this.open();
+     } else {
+       this.close();
+     }
+ 
+   },
+ 
+   /**
+-   * This is where we get messages from the layout view iframe.
+-   */
+-  onMessage: function LV_onMessage(e) {
+-    switch (e.data) {
+-      case "layoutview-toggle-view":
+-        this.toggle(true);
+-        break;
+-      case "layoutview-ready":
+-        this.onDocumentReady();
+-        break;
+-      default:
+-        break;
+-    }
+-  },
+-
+-  /**
+    * Handle keypress.
+    */
+    handleKeypress: function LV_handleKeypress(event) {
+      let win = this.inspector.chromeWindow;
+ 
+      // avoid scroll
+      if (event.keyCode == win.KeyEvent.DOM_VK_LEFT ||
+          event.keyCode == win.KeyEvent.DOM_VK_RIGHT ||
+@@ -237,16 +231,17 @@ LayoutView.prototype = {
+   /**
+    * Close the view container.
+    *
+    * @param aUserAction Is the action triggered by the user (click on the
+    * open/close button in the view)
+    */
+   close: function LV_close(aUserAction) {
+     this.isOpen = false;
++    this.hideRegion();
+     if (this.documentReady)
+       this.doc.body.classList.remove("open");
+     if (aUserAction) {
+       this.inspector._layoutViewIsOpen = false;
+       Services.prefs.setBoolPref("devtools.layoutview.open", false);
+       this.view.removeAttribute("disable-transitions");
+     } else {
+       this.view.setAttribute("disable-transitions", "true");
+@@ -349,9 +344,30 @@ LayoutView.prototype = {
+       let selectors = info.matchedSelectors;
+       if (selectors && selectors.length > 0 && selectors[0].value == "auto") {
+         margins[prop] = "auto";
+       }
+     }
+ 
+     return margins;
+   },
++
++  showRegion: function LV_showRegion(region) {
++    switch(region) {
++      case "margins":
++        this.inspector.highlighter.highlightMargins(this.map);
++        break;
++      case "borders":
++        this.inspector.highlighter.highlightBorders(this.map);
++        break;
++      case "padding":
++        this.inspector.highlighter.highlightPadding(this.map);
++        break;
++      case "content":
++        this.inspector.highlighter.highlightContent(this.map);
++        break;
++    }
++  },
++
++  hideRegion: function LV_hideRegion(region) {
++    this.inspector.highlighter.hideRegion();
++  },
+ }
+diff --git a/browser/devtools/layoutview/view.xhtml b/browser/devtools/layoutview/view.xhtml
+--- a/browser/devtools/layoutview/view.xhtml
++++ b/browser/devtools/layoutview/view.xhtml
+@@ -17,54 +17,55 @@
+       let elts;
+       let tooltip;
+ 
+       const Ci = Components.interfaces;
+       const Cc = Components.classes;
+ 
+       window.onload = function() {
+ 
+-        // Tooltip mechanism
+-        elts = document.querySelectorAll("*[tooltip]");
++        // What happens when the mouse is overring a region:
++        elts = document.querySelectorAll("*[region]");
+         tooltip = document.querySelector(".tooltip");
+         for (let i = 0; i < elts.length; i++) {
+           let elt = elts[i];
+           elt.addEventListener("mouseover", onmouseover, true);
+           elt.addEventListener("mouseout", onmouseout, true);
+         }
+ 
+         // Mark document as RTL or LTR:
+         let chromeReg = Cc["@mozilla.org/chrome/chrome-registry;1"].
+           getService(Ci.nsIXULChromeRegistry);
+         let dir = chromeReg.isLocaleRTL("global");
+         document.body.setAttribute("dir", dir ? "rtl" : "ltr");
+ 
+-        window.parent.postMessage("layoutview-ready", "*");
++        gLayoutView.onDocumentReady();
+       }
+ 
+       window.onunload = function() {
+         if (elts) {
+           for (let i = 0; i < elts.length; i++) {
+             let elt = elts[i];
+             elt.removeEventListener("mouseover", onmouseover, true);
+             elt.removeEventListener("mouseout", onmouseout, true);
+           }
+         }
+       }
+ 
+       function onmouseover(e) {
+         tooltip.textContent = e.target.getAttribute("tooltip");
++        gLayoutView.showRegion(e.target.getAttribute("region"));
+       }
+ 
+       function onmouseout(e) {
+-        tooltip.textContent = "";
++        gLayoutView.hideRegion();
+       }
+ 
+       function toggleView() {
+-        window.parent.postMessage("layoutview-toggle-view", "*");
++        gLayoutView.toggle(true);
+       }
+     ]]>
+     </script>
+ 
+     <link rel="stylesheet" href="chrome://browser/skin/devtools/layoutview.css" type="text/css"/>
+     <link rel="stylesheet" href="view.css" type="text/css"/>
+ 
+   </head>
+@@ -74,40 +75,40 @@
+     <a onclick="toggleView()" href="#" id="header">
+         <span id="element-size"></span>
+         <span id="togglebutton"></span>
+     </a>
+ 
+     <!-- Boxes: hidden when the view is closed. -->
+     <div id="main">
+ 
+-      <div id="margins" tooltip="&margins.tooltip;">
+-        <div id="borders" tooltip="&borders.tooltip;">
+-          <div id="padding" tooltip="&padding.tooltip;">
+-            <div id="content" tooltip="&content.tooltip;">
++      <div id="margins" tooltip="&margins.tooltip;" region="margins">
++        <div id="borders" tooltip="&borders.tooltip;" region="borders">
++          <div id="padding" tooltip="&padding.tooltip;" region="padding">
++            <div id="content" tooltip="&content.tooltip;" region="content">
+             </div>
+           </div>
+         </div>
+       </div>
+ 
+-      <p class="border top"><span tooltip="border-top"></span></p>
+-      <p class="border right"><span tooltip="border-right"></span></p>
+-      <p class="border bottom"><span tooltip="border-bottom"></span></p>
+-      <p class="border left"><span tooltip="border-left"></span></p>
++      <p class="border top"><span tooltip="border-top" region="borders"></span></p>
++      <p class="border right"><span tooltip="border-right" region="borders"></span></p>
++      <p class="border bottom"><span tooltip="border-bottom" region="borders"></span></p>
++      <p class="border left"><span tooltip="border-left" region="borders"></span></p>
+ 
+-      <p class="margin top"><span tooltip="margin-top"></span></p>
+-      <p class="margin right"><span tooltip="margin-right"></span></p>
+-      <p class="margin bottom"><span tooltip="margin-bottom"></span></p>
+-      <p class="margin left"><span tooltip="margin-left"></span></p>
++      <p class="margin top"><span tooltip="margin-top" region="margins"></span></p>
++      <p class="margin right"><span tooltip="margin-right" region="margins"></span></p>
++      <p class="margin bottom"><span tooltip="margin-bottom" region="margins"></span></p>
++      <p class="margin left"><span tooltip="margin-left" region="margins"></span></p>
+ 
+-      <p class="padding top"><span tooltip="padding-top"></span></p>
+-      <p class="padding right"><span tooltip="padding-right"></span></p>
+-      <p class="padding bottom"><span tooltip="padding-bottom"></span></p>
+-      <p class="padding left"><span tooltip="padding-left"></span></p>
++      <p class="padding top"><span tooltip="padding-top" region="padding"></span></p>
++      <p class="padding right"><span tooltip="padding-right" region="padding"></span></p>
++      <p class="padding bottom"><span tooltip="padding-bottom" region="padding"></span></p>
++      <p class="padding left"><span tooltip="padding-left" region="padding"></span></p>
+ 
+-      <p class="size"><span tooltip="&content.tooltip;"></span></p>
++      <p class="size"><span tooltip="&content.tooltip;" region="content"></span></p>
+ 
+       <span class="tooltip"></span>
+ 
+     </div>
+ 
+   </body>
+ </html>
+diff --git a/browser/devtools/shared/LayoutHelpers.jsm b/browser/devtools/shared/LayoutHelpers.jsm
+--- a/browser/devtools/shared/LayoutHelpers.jsm
++++ b/browser/devtools/shared/LayoutHelpers.jsm
+@@ -14,26 +14,24 @@ LayoutHelpers = {
+ 
+   /**
+    * Compute the position and the dimensions for the visible portion
+    * of a node, relativalely to the root window.
+    *
+    * @param nsIDOMNode aNode
+    *        a DOM element to be highlighted
+    */
+-  getDirtyRect: function LH_getDirectyRect(aNode) {
+-    let frameWin = aNode.ownerDocument.defaultView;
+-    let clientRect = aNode.getBoundingClientRect();
++  getDirtyRect: function LH_getDirectyRect(aWin, aRect) {
++    // Go up in the tree of frames to determine the correct rectangle.
+ 
+-    // Go up in the tree of frames to determine the correct rectangle.
+-    // clientRect is read-only, we need to be able to change properties.
+-    rect = {top: clientRect.top,
+-            left: clientRect.left,
+-            width: clientRect.width,
+-            height: clientRect.height};
++    let frameWin = aWin;
++    let rect = {top: aRect.top,
++                left: aRect.left,
++                width: aRect.width,
++                height: aRect.height};
+ 
+     // We iterate through all the parent windows.
+     while (true) {
+ 
+       // Does the selection overflow on the right of its window?
+       let diffx = frameWin.innerWidth - (rect.left + rect.width);
+       if (diffx < 0) {
+         rect.width += diffx;
+@@ -77,16 +75,30 @@ LayoutHelpers = {
+ 
+       frameWin = frameWin.parent;
+     }
+ 
+     return rect;
+   },
+ 
+   /**
++   * Same as getBoundingClientRect, but copy the properties of the rect into
++   * a object to make it writable.
++   */
++  getWritableBoundingClientRect: function LH_getWritableBoundingClientRect(aNode) {
++    let rect = aNode.getBoundingClientRect();
++    return {
++      top: rect.top,
++      left: rect.left,
++      width: rect.width,
++      height: rect.height
++    }
++  },
++
++  /**
+    * Compute the absolute position and the dimensions of a node, relativalely
+    * to the root window.
+    *
+    * @param nsIDOMNode aNode
+    *        a DOM element to get the bounds for
+    * @param nsIWindow aContentWindow
+    *        the content window holding the node
+    */
+diff --git a/browser/themes/pinstripe/browser.css b/browser/themes/pinstripe/browser.css
+--- a/browser/themes/pinstripe/browser.css
++++ b/browser/themes/pinstripe/browser.css
+@@ -2714,16 +2714,20 @@ toolbarbutton.chevron > .toolbarbutton-m
+   outline-offset: -1px;
+ }
+ 
+ #highlighter-outline[locked]  {
+   box-shadow: 0 0 0 1px rgba(0,0,0,0.3);
+   outline-color: rgba(255,255,255,0.7);
+ }
+ 
++.highlighter-layout-region {
++  border-color: rgba(255,0,102,0.7);
++}
++
+ /* Highlighter toolbar */
+ 
+ #inspector-inspect-toolbutton {
+   list-style-image: url("chrome://browser/skin/devtools/inspect-button.png");
+   -moz-image-region: rect(0px 16px 16px 0px);
+ }
+ 
+ #inspector-inspect-toolbutton[checked=true] {
