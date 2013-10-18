@@ -457,7 +457,7 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
        });
      } else {
        this.unmarkSelectedNode();
-@@ -383,20 +388,20 @@ MarkupView.prototype = {
+@@ -383,20 +388,22 @@ MarkupView.prototype = {
      return container;
    },
  
@@ -466,7 +466,9 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
     */
    _mutationObserver: function(aMutations) {
      let requiresLayoutChange = false;
-+    let reselectContainer;
++    let reselectParent;
++    let reselectChildIndex;
++
      for (let mutation of aMutations) {
        let type = mutation.type;
        let target = mutation.target;
@@ -479,7 +481,7 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
          if (!target) {
            continue;
          }
-@@ -411,30 +416,41 @@ MarkupView.prototype = {
+@@ -411,30 +418,53 @@ MarkupView.prototype = {
        if (type === "attributes" || type === "characterData") {
          container.update();
  
@@ -488,32 +490,45 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
            requiresLayoutChange = true;
          }
        } else if (type === "childList") {
-+        let flash = this._outerHTMLParent !== target;
-+        reselectContainer = this._containers.get(this._outerHTMLNode);
++        let isFromOuterHTML = this._outerHTMLParent === target;
 +
-+        delete this._outerHTMLNode;
-+        delete this._outerHTMLParent;
++        if (isFromOuterHTML) {
++          reselectParent = this._outerHTMLParent;
++          reselectChildIndex = this._outerHTMLChildIndex;
++
++          delete this._outerHTMLParent;
++          delete this._outerHTMLChildIndex;
++        }
 +
          container.childrenDirty = true;
          // Update the children to take care of changes in the DOM
          // Passing true as the last parameter asks for mutation flashing of the
          // new nodes
 -        this._updateChildren(container, {flash: true});
-+        this._updateChildren(container, {flash: flash});
++        this._updateChildren(container, {flash: !isFromOuterHTML});
        }
      }
  
      if (requiresLayoutChange) {
        this._inspector.immediateLayoutChange();
      }
-     this._waitForChildren().then(() => {
+-    this._waitForChildren().then(() => {
++    this._waitForChildren().then((nodes) => {
        this._flashMutatedNodes(aMutations);
        this._inspector.emit("markupmutation");
-+          if (reselectContainer) {
-+            // TODO: This reference to the node is not correct.
-+            // Should probably keep track of index of child and reselect based on that instead
-+            reselectContainer.selected = true;
++
++      // Reselect a node if it has had its outerHTML set.
++      this.walker.children(reselectParent).then((o) => {
++        let node = o.nodes[reselectChildIndex];
++        if (node) {
++          if (node.hasChildren) {
++            this.expandNode(node);
 +          }
++          this.markNodeAsSelected(node);
++          this._inspector.selection.setNodeFront(node, "outerhtml");
++          this.nodeChanged(node);
++        }
++      });
      });
    },
  
@@ -522,7 +537,7 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
     * corresponding containers to attract attention.
     */
    _flashMutatedNodes: function(aMutations) {
-@@ -544,16 +560,52 @@ MarkupView.prototype = {
+@@ -544,16 +574,70 @@ MarkupView.prototype = {
    /**
     * Collapse the node's children.
     */
@@ -531,14 +546,28 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
      container.expanded = false;
    },
  
-+  getNodeOuterHTML: function(aNode)
-+  {
++
++  getNodeOuterHTML: function(aNode) {
 +    let def = promise.defer();
 +    aNode.getOuterHTML().then(longstr => {
 +      longstr.string().then(oldValue => {
 +        longstr.release().then(null, console.error);
 +        def.resolve(oldValue);
 +      });
++    });
++    return def.promise;
++  },
++
++  getNodeChildIndex: function(aNode) {
++    let def = promise.defer();
++    this.walker.children(aNode.parentNode()).then((o) => {
++      let index = -1;
++      o.nodes.forEach((node, i) => {
++        if (node === aNode) {
++          index = i;
++        }
++      });
++      def.resolve(index);
 +    });
 +    return def.promise;
 +  },
@@ -553,14 +582,18 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
 +      this.htmlEditor.show(container.tagLine, oldValue);
 +      this.htmlEditor.once("popup-hidden", (e, aCommit, aValue) => {
 +        if (aCommit) {
-+          // Set the outer HTML with an undo modification
-+          container.undo.do(() => {
-+            aNode.setOuterHTML(aValue).then(() => {
-+              this._outerHTMLNode = aNode;
-+              this._outerHTMLParent = aNode.parentNode();
++          this.getNodeChildIndex(aNode).then((i) => {
++            this._outerHTMLParent = aNode.parentNode();
++            this._outerHTMLChildIndex = i;
++            this._outerHTMLNode = aNode;
++
++            // Set the outer HTML with an undo modification
++            container.undo.do(() => {
++              aNode.setOuterHTML(aValue).then(() => {
++              });
++            }, () => {
++              aNode.setOuterHTML(oldValue);
 +            });
-+          }, () => {
-+            aNode.setOuterHTML(oldValue);
 +          });
 +        }
 +      });
@@ -575,7 +608,7 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
      }
    },
  
-@@ -772,16 +824,19 @@ MarkupView.prototype = {
+@@ -772,16 +856,19 @@ MarkupView.prototype = {
    },
  
    /**
@@ -2603,7 +2636,28 @@ diff --git a/browser/themes/shared/devtools/light-theme.css b/browser/themes/sha
 diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
 --- a/toolkit/devtools/server/actors/inspector.js
 +++ b/toolkit/devtools/server/actors/inspector.js
-@@ -236,16 +236,38 @@ var NodeActor = protocol.ActorClass({
+@@ -71,16 +71,20 @@ const HIGHLIGHTED_PSEUDO_CLASS = ":-moz-
+ const HIGHLIGHTED_TIMEOUT = 2000;
+ 
+ let HELPER_SHEET = ".__fx-devtools-hide-shortcut__ { visibility: hidden !important } ";
+ HELPER_SHEET += ":-moz-devtools-highlighted { outline: 2px dashed #F06!important; outline-offset: -2px!important } ";
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/devtools/LayoutHelpers.jsm");
+ 
++loader.lazyGetter(this, "DOMParser", function() {
++ return Cc["@mozilla.org/xmlextras/domparser;1"].createInstance(Ci.nsIDOMParser);
++});
++
+ exports.register = function(handle) {
+   handle.addTabActor(InspectorActor, "inspectorActor");
+ };
+ 
+ exports.unregister = function(handle) {
+   handle.removeTabActor(InspectorActor);
+ };
+ 
+@@ -236,16 +240,64 @@ var NodeActor = protocol.ActorClass({
    setNodeValue: method(function(value) {
      this.rawNode.nodeValue = value;
    }, {
@@ -2612,7 +2666,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
    }),
  
    /**
-+   * Returns a LongStringActor with the node's value.
++   * Returns a LongStringActor with the node's outerHTML.
 +   */
 +  getOuterHTML: method(function() {
 +    return new LongStringActor(this.conn, this.rawNode.outerHTML || "");
@@ -2624,10 +2678,36 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
 +  }),
 +
 +  /**
-+   * Set the node's value to a given string.
++   * Set the node's outerHTML to a given string.
 +   */
 +  setOuterHTML: method(function(value) {
-+    this.rawNode.outerHTML = value;
++    let parsedDOM = DOMParser.parseFromString(value, "text/html");
++    let rawNode = this.rawNode;
++    let parentNode = rawNode.parentNode;
++
++    // Special case for head and body.  Setting document.body.outerHTML
++    // creates an extra <head> tag, and document.head.outerHTML creates
++    // an extra <body>.  So instead we will call replaceChild with the
++    // parsed DOM, assuming that they haven't set both head and body here.
++    if (rawNode.tagName === "body") {
++      if (parsedDOM.head.innerHTML === "") {
++        parentNode.replaceChild(parsedDOM.body, rawNode);
++      } else {
++        rawNode.outerHTML = value;
++      }
++    } else if (rawNode.tagName === "head") {
++      if (parsedDOM.body.innerHTML === "") {
++        parentNode.replaceChild(parsedDOM.head, rawNode);
++      } else {
++        rawNode.outerHTML = value;
++      }
++    } else {
++      // By using the parsedDOM here, we prevent warnings like:
++      // "mismatched tag. Expected: </body>." when setting to invalid
++      // markup, such as outerHTML = "</div>"
++        rawNode.outerHTML = value;
++      //rawNode.outerHTML = parsedDOM.body.innerHTML;
++    }
 +  }, {
 +    request: { value: Arg(0) },
 +    response: {}
