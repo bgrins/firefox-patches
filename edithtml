@@ -1,12 +1,12 @@
 # HG changeset patch
-# Parent f4d87794cfeb5043b994f8ec51cdeeff6b9595a2
+# Parent dd9a6a9181bdee7b9af5ef07fdf736e08a952f2b
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 895561 - "Edit As HTML" option in the markup view
 
 diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
 --- a/browser/devtools/inspector/inspector-panel.js
 +++ b/browser/devtools/inspector/inspector-panel.js
-@@ -588,26 +588,29 @@ InspectorPanel.prototype = {
+@@ -586,26 +586,29 @@ InspectorPanel.prototype = {
        deleteNode.setAttribute("disabled", "true");
      } else {
        deleteNode.removeAttribute("disabled");
@@ -36,7 +36,7 @@ diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/in
      while (this.lastNodemenuItem.nextSibling) {
        let toDelete = this.lastNodemenuItem.nextSibling;
        toDelete.parentNode.removeChild(toDelete);
-@@ -703,16 +706,29 @@ InspectorPanel.prototype = {
+@@ -701,16 +704,29 @@ InspectorPanel.prototype = {
        this.highlighter.hide();
      }
      else if (event.type == "mouseout") {
@@ -441,6 +441,27 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
        });
      } else {
        this.unmarkSelectedNode();
+@@ -331,18 +334,18 @@ MarkupView.prototype = {
+    *        If falsy, keyboard focus will be moved to the container too.
+    */
+   navigate: function(aContainer, aIgnoreFocus) {
+     if (!aContainer) {
+       return;
+     }
+ 
+     let node = aContainer.node;
+-    this.markNodeAsSelected(node);
+-    this._inspector.selection.setNodeFront(node, "treepanel");
++    this.markNodeAsSelected(node, "treepanel");
++
+     // This event won't be fired if the node is the same. But the highlighter
+     // need to lock the node if it wasn't.
+     this._inspector.selection.emit("new-node");
+     this._inspector.selection.emit("new-node-front");
+ 
+     if (!aIgnoreFocus) {
+       aContainer.focus();
+     }
 @@ -385,20 +388,22 @@ MarkupView.prototype = {
      return container;
    },
@@ -465,7 +486,7 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
          if (!target) {
            continue;
          }
-@@ -413,30 +418,54 @@ MarkupView.prototype = {
+@@ -413,30 +418,60 @@ MarkupView.prototype = {
        if (type === "attributes" || type === "characterData") {
          container.update();
  
@@ -474,13 +495,16 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
            requiresLayoutChange = true;
          }
        } else if (type === "childList") {
-+        let isFromOuterHTML = this._outerHTMLParent === target;
++        // If this is a request from setting outerHTML
++        let isFromOuterHTML = mutation.removed.some((n) => {
++          return n === this._outerHTMLNode;
++        });
 +
 +        if (isFromOuterHTML) {
-+          reselectParent = this._outerHTMLParent;
++          reselectParent = target;
 +          reselectChildIndex = this._outerHTMLChildIndex;
 +
-+          delete this._outerHTMLParent;
++          delete this._outerHTMLNode;
 +          delete this._outerHTMLChildIndex;
 +        }
 +
@@ -500,21 +524,24 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
 +    this._waitForChildren().then((nodes) => {
        this._flashMutatedNodes(aMutations);
 -      this._inspector.emit("markupmutation");
++      this.htmlEditor.refresh();
 +      this._inspector.emit("markupmutation", aMutations);
 +
 +      // If a node has had its outerHTML set, the parent node will be selected.
 +      // Reselect the original node immediately.
-+      this.walker.children(reselectParent).then((o) => {
-+        let node = o.nodes[reselectChildIndex];
-+        if (node) {
-+          if (node.hasChildren) {
-+            this.expandNode(node);
++      if (this._inspector.selection.nodeFront === reselectParent) {
++        this.walker.children(reselectParent).then((o) => {
++          let node = o.nodes[reselectChildIndex];
++          let container = this._containers.get(node);
++          if (node && container) {
++            this.markNodeAsSelected(node, "outerhtml");
++            if (container.hasChildren) {
++              this.expandNode(node);
++            }
 +          }
-+          this.markNodeAsSelected(node);
-+          this._inspector.selection.setNodeFront(node, "outerhtml");
-+          this.nodeChanged(node);
-+        }
-+      });
++        });
++
++      }
      });
    },
  
@@ -523,7 +550,7 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
     * corresponding containers to attract attention.
     */
    _flashMutatedNodes: function(aMutations) {
-@@ -546,16 +575,78 @@ MarkupView.prototype = {
+@@ -546,40 +581,138 @@ MarkupView.prototype = {
    /**
     * Collapse the node's children.
     */
@@ -532,7 +559,11 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
      container.expanded = false;
    },
  
-+
++  /**
++   * Retrieve the outerHTML for a remote node.
++   * @param aNode The NodeFront to get the outerHTML for.
++   * @returns A promise that will be resolved with the outerHTML.
++   */
 +  getNodeOuterHTML: function(aNode) {
 +    let def = promise.defer();
 +    aNode.getOuterHTML().then(longstr => {
@@ -544,40 +575,65 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
 +    return def.promise;
 +  },
 +
++  /**
++   * Retrieve the index of a child within its parent's children list.
++   * @param aNode The NodeFront to find the index of.
++   * @returns A promise that will be resolved with the integer index.
++   *          If the child cannot be found, returns -1
++   */
 +  getNodeChildIndex: function(aNode) {
 +    let def = promise.defer();
-+    this.walker.children(aNode.parentNode()).then((o) => {
-+      let index = -1;
-+      o.nodes.forEach((node, i) => {
-+        if (node === aNode) {
-+          index = i;
-+        }
++    let parentNode = aNode.parentNode();
++
++    // Node may have been removed from the DOM, instead of throwing an error,
++    // return -1 indicating that it isn't inside of its parent children list.
++    if (!parentNode) {
++      def.resolve(-1);
++    } else {
++      this.walker.children(parentNode).then((o) => {
++        let index = -1;
++        o.nodes.forEach((node, i) => {
++          if (node === aNode) {
++            index = i;
++          }
++        });
++        def.resolve(index);
 +      });
-+      def.resolve(index);
-+    });
++    }
++
 +    return def.promise;
 +  },
 +
-+  updateNodeOuterHTML: function(aNode, oldValue, newValue) {
++  /**
++   * Retrieve the index of a child within its parent's children collection.
++   * @param aNode The NodeFront to find the index of.
++   * @param newValue The new outerHTML to set on the node.
++   * @param oldValue The old outerHTML that will be reverted to find the index of.
++   * @returns A promise that will be resolved with the integer index.
++   *          If the child cannot be found, returns -1
++   */
++  updateNodeOuterHTML: function(aNode, newValue, oldValue) {
 +    let container = this._containers.get(aNode);
 +    if (!container) {
 +      return;
 +    }
 +
 +    this.getNodeChildIndex(aNode).then((i) => {
-+      this._outerHTMLParent = aNode.parentNode();
 +      this._outerHTMLChildIndex = i;
 +      this._outerHTMLNode = aNode;
-+      // Set the outer HTML with an undo modification
++
 +      container.undo.do(() => {
-+        aNode.setOuterHTML(newValue).then(() => {
-+        });
++        aNode.setOuterHTML(newValue);
 +      }, () => {
 +        aNode.setOuterHTML(oldValue);
 +      });
 +    });
 +  },
 +
++  /**
++   * Open an editor in the UI to allow editing of a node's outerHTML.
++   * @param aNode The NodeFront to edit.
++   */
 +  beginEditingOuterHTML: function(aNode) {
 +    this.getNodeOuterHTML(aNode).then((oldValue)=> {
 +      let container = this._containers.get(aNode);
@@ -588,12 +644,16 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
 +      this.htmlEditor.show(container.tagLine, oldValue);
 +      this.htmlEditor.once("popup-hidden", (e, aCommit, aValue) => {
 +        if (aCommit) {
-+          this.updateNodeOuterHTML(aNode, oldValue, aValue);
++          this.updateNodeOuterHTML(aNode, aValue, oldValue);
 +        }
 +      });
 +    });
 +  },
 +
++  /**
++   * Mark the given node expanded.
++   * @param aNode The NodeFront to mark as expanded.
++   */
    setNodeExpanded: function(aNode, aExpanded) {
      if (aExpanded) {
        this.expandNode(aNode);
@@ -602,7 +662,36 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
      }
    },
  
-@@ -774,16 +865,19 @@ MarkupView.prototype = {
+   /**
+-   * Mark the given node selected.
++   * Mark the given node selected, and update the inspector.selection
++   * object's NodeFront to keep consistent state between UI and selection.
++   * @param aNode The NodeFront to mark as selected.
+    */
+-  markNodeAsSelected: function(aNode) {
++  markNodeAsSelected: function(aNode, reason) {
+     let container = this._containers.get(aNode);
+     if (this._selectedContainer === container) {
+       return false;
+     }
+     if (this._selectedContainer) {
+       this._selectedContainer.selected = false;
+     }
+     this._selectedContainer = container;
+     if (aNode) {
+       this._selectedContainer.selected = true;
+     }
+ 
++    this._inspector.selection.setNodeFront(aNode, reason || "nodeselected");
+     return true;
+   },
+ 
+   /**
+    * Make sure that every ancestor of the selection are updated
+    * and included in the list of visible children.
+    */
+   _ensureVisible: function(node) {
+@@ -774,16 +907,19 @@ MarkupView.prototype = {
    },
  
    /**
