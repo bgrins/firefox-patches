@@ -1,0 +1,643 @@
+# HG changeset patch
+# User Gijs Kruitbosch <gijskruitbosch@gmail.com>
+# Date 1366226454 25200
+# Node ID cf000c8ae1f3ffa1228bea445abdf6685d8b10ef
+# Parent  f90420b412c0113e5d94fe28fdd40d6ecbd5591b
+Bug 777674 - Add support for anonymous content to devtools inspector
+
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -1038,16 +1038,17 @@ pref("devtools.toolbox.host", "bottom");
+ pref("devtools.toolbox.selectedTool", "webconsole");
+ pref("devtools.toolbox.toolbarSpec", '["paintflashing toggle","tilt toggle","scratchpad","resize toggle"]');
+ pref("devtools.toolbox.sideEnabled", true);
+ 
+ // Enable the Inspector
+ pref("devtools.inspector.enabled", true);
+ pref("devtools.inspector.activeSidebar", "ruleview");
+ pref("devtools.inspector.markupPreview", false);
++pref("devtools.inspector.showAnonContent", false);
+ 
+ // Enable the Layout View
+ pref("devtools.layoutview.enabled", true);
+ pref("devtools.layoutview.open", false);
+ 
+ // Enable the Responsive UI tool
+ pref("devtools.responsiveUI.enabled", true);
+ 
+diff --git a/browser/devtools/inspector/Selection.jsm b/browser/devtools/inspector/Selection.jsm
+--- a/browser/devtools/inspector/Selection.jsm
++++ b/browser/devtools/inspector/Selection.jsm
+@@ -166,21 +166,30 @@ Selection.prototype = {
+             this.node.ownerDocument &&
+             this.node.ownerDocument.defaultView &&
+             this.node instanceof this.node.ownerDocument.defaultView.Node);
+   },
+ 
+   isConnected: function SN_isConnected() {
+     try {
+       let doc = this.document;
+-      return doc && doc.defaultView && doc.documentElement.contains(this.node);
++      if (doc && doc.defaultView) {
++        let docEl = doc.documentElement;
++        if (docEl.contains(this.node)) return true;
++        let bindingParent = this.node;
++        while ((bindingParent = doc.getBindingParent(bindingParent))) {
++          if (docEl.contains(bindingParent)) {
++            return true;
++          }
++        }
++      }
+     } catch (e) {
+       // "can't access dead object" error
+-      return false;
+     }
++    return false;
+   },
+ 
+   isHTMLNode: function SN_isHTMLNode() {
+     let xhtml_ns = "http://www.w3.org/1999/xhtml";
+     return this.isNode() && this.node.namespaceURI == xhtml_ns;
+   },
+ 
+   // Node type
+diff --git a/browser/devtools/markupview/MarkupView.jsm b/browser/devtools/markupview/MarkupView.jsm
+--- a/browser/devtools/markupview/MarkupView.jsm
++++ b/browser/devtools/markupview/MarkupView.jsm
+@@ -44,21 +44,28 @@ Cu.import("resource://gre/modules/XPCOMU
+  */
+ this.MarkupView = function MarkupView(aInspector, aFrame, aControllerWindow)
+ {
+   this._inspector = aInspector;
+   this._frame = aFrame;
+   this.doc = this._frame.contentDocument;
+   this._elt = this.doc.querySelector("#root");
+ 
++  this._domUtils = Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils);
++
+   try {
+     this.maxChildren = Services.prefs.getIntPref("devtools.markup.pagesize");
+   } catch(ex) {
+     this.maxChildren = DEFAULT_MAX_CHILDREN;
+   }
++  try {
++    this.showAnonContent = Services.prefs.getBoolPref("devtools.inspector.showAnonContent");
++  } catch(ex) {
++    this.showAnonContent = false;
++  }
+ 
+   this.undo = new UndoStack();
+   this.undo.installController(aControllerWindow);
+ 
+   this._containers = new WeakMap();
+ 
+   this._observer = new this.doc.defaultView.MutationObserver(this._mutationObserver.bind(this));
+ 
+@@ -302,18 +309,17 @@ MarkupView.prototype = {
+     }
+ 
+     this._observer.observe(aNode, {
+       attributes: true,
+       childList: true,
+       characterData: true,
+     });
+ 
+-    let walker = documentWalker(aNode);
+-    let parent = walker.parentNode();
++    let parent = this._safeParentNode(aNode);
+     if (parent) {
+       var container = new MarkupContainer(this, aNode);
+     } else {
+       var container = new RootContainer(this, aNode);
+       this._elt.appendChild(container.elt);
+       this._rootNode = aNode;
+       aNode.addEventListener("load", function MP_watch_contentLoaded(aEvent) {
+         // Fake a childList mutation here.
+@@ -361,19 +367,18 @@ MarkupView.prototype = {
+   /**
+    * Make sure the given node's parents are expanded and the
+    * node is scrolled on to screen.
+    */
+   showNode: function MT_showNode(aNode, centered)
+   {
+     let container = this.importNode(aNode);
+     this._updateChildren(container);
+-    let walker = documentWalker(aNode);
+-    let parent;
+-    while (parent = walker.parentNode()) {
++    let parent = aNode;
++    while (parent = this._safeParentNode(parent)) {
+       this._updateChildren(this.getContainer(parent));
+       this.expandNode(parent);
+     }
+     LayoutHelpers.scrollIntoViewIfNeeded(this._containers.get(aNode).editor.elt, centered);
+   },
+ 
+   /**
+    * Expand the container's children.
+@@ -455,20 +460,19 @@ MarkupView.prototype = {
+ 
+   /**
+    * Make sure that every ancestor of the selection are updated
+    * and included in the list of visible children.
+    */
+   _ensureSelectionVisible: function MT_ensureSelectionVisible()
+   {
+     let node = this._selectedContainer.node;
+-    let walker = documentWalker(node);
+     while (node) {
+       let container = this._containers.get(node);
+-      let parent = walker.parentNode();
++      let parent = this._safeParentNode(node);
+       if (!container.elt.parentNode) {
+         let parentContainer = this._containers.get(parent);
+         parentContainer.childrenDirty = true;
+         this._updateChildren(parentContainer, node);
+       }
+ 
+       node = parent;
+     }
+@@ -503,31 +507,28 @@ MarkupView.prototype = {
+    *        in that list.
+    */
+   _updateChildren: function MT__updateChildren(aContainer, aCentered)
+   {
+     if (!aContainer.childrenDirty) {
+       return false;
+     }
+ 
+-    // Get a tree walker pointing at the first child of the node.
+-    let treeWalker = documentWalker(aContainer.node);
+-    let child = treeWalker.firstChild();
+-    aContainer.hasChildren = !!child;
++    aContainer.hasChildren = hasChildren(aContainer.node);
+ 
+     if (!aContainer.expanded) {
+       return;
+     }
+ 
+     aContainer.childrenDirty = false;
+ 
+     let children = this._getVisibleChildren(aContainer, aCentered);
+     let fragment = this.doc.createDocumentFragment();
+ 
+-    for (child of children.children) {
++    for (let child of children.children) {
+       let container = this.importNode(child, false);
+       fragment.appendChild(container.elt);
+     }
+ 
+     while (aContainer.children.firstChild) {
+       aContainer.children.removeChild(aContainer.children.firstChild);
+     }
+ 
+@@ -563,79 +564,72 @@ MarkupView.prototype = {
+    * Return a list of the children to display for this container.
+    */
+   _getVisibleChildren: function MV__getVisibleChildren(aContainer, aCentered)
+   {
+     let maxChildren = aContainer.maxChildren || this.maxChildren;
+     if (maxChildren == -1) {
+       maxChildren = Number.MAX_VALUE;
+     }
+-    let firstChild = documentWalker(aContainer.node).firstChild();
+-    let lastChild = documentWalker(aContainer.node).lastChild();
++
++    let walker = documentWalker(aContainer.node);
++    let firstChild = walker.firstChild();
+ 
+     if (!firstChild) {
+       // No children, we're done.
+       return { hasFirst: true, hasLast: true, children: [] };
+     }
+ 
+     // By default try to put the selected child in the middle of the list.
+     let start = aCentered || firstChild;
+ 
+-    // Start by reading backward from the starting point....
++    // Keep a running check of all nodes starting from the first node.
++    let currentNode = firstChild;
+     let nodes = [];
+-    let backwardWalker = documentWalker(start);
+-    if (backwardWalker.previousSibling()) {
+-      let backwardCount = Math.floor(maxChildren / 2);
+-      let backwardNodes = this._readBackward(backwardWalker, backwardCount);
+-      nodes = backwardNodes;
++    let currentIndex = 0, foundIndex = -1, foundBefore = 0, foundAfter = -1, toFindAfter = 1;
++    while (currentNode && toFindAfter != foundAfter) {
++      nodes[currentIndex] = currentNode;
++      if (currentNode == start) {
++        foundIndex = currentIndex;
++        toFindAfter = Math.max(maxChildren - foundBefore - 1, Math.floor(maxChildren / 2));
++      }
++      if (foundIndex != -1) {
++        foundAfter++;
++      } else {
++        foundBefore++;
++      }
++      // Get the next sibling
++      currentNode = walker.nextSibling();
++      currentIndex = (currentIndex + 1) % maxChildren;
+     }
+ 
+-    // Then read forward by any slack left in the max children...
+-    let forwardWalker = documentWalker(start);
+-    let forwardCount = maxChildren - nodes.length;
+-    nodes = nodes.concat(this._readForward(forwardWalker, forwardCount));
++    foundBefore = Math.min(foundBefore, maxChildren - foundAfter - 1);
+ 
+-    // If there's any room left, it means we've run all the way to the end.
+-    // In that case, there might still be more items at the front.
+-    let remaining = maxChildren - nodes.length;
+-    if (remaining > 0 && nodes[0] != firstChild) {
+-      let firstNodes = this._readBackward(backwardWalker, remaining);
++    let beforeWrappedNodes = nodes.splice(foundIndex + foundAfter + 1);
++    let after = nodes.splice(foundIndex);
++    let afterWrapped = nodes.splice(0, foundIndex - foundBefore);
++    nodes = beforeWrappedNodes.concat(nodes, after, afterWrapped);
+ 
+-      // Then put it all back together.
+-      nodes = firstNodes.concat(nodes);
+-    }
+-
++    let lastChild = documentWalker(aContainer.node).lastChild();
+     return {
+       hasFirst: nodes[0] == firstChild,
+       hasLast: nodes[nodes.length - 1] == lastChild,
+       children: nodes
+     };
+   },
+ 
+-  _readForward: function MV__readForward(aWalker, aCount)
++  _safeParentNode: function MV__safeParentNode(aNode)
+   {
+-    let ret = [];
+-    let node = aWalker.currentNode;
+-    do {
+-      ret.push(node);
+-      node = aWalker.nextSibling();
+-    } while (node && --aCount);
+-    return ret;
+-  },
+-
+-  _readBackward: function MV__readBackward(aWalker, aCount)
+-  {
+-    let ret = [];
+-    let node = aWalker.currentNode;
+-    do {
+-      ret.push(node);
+-      node = aWalker.previousSibling();
+-    } while(node && --aCount);
+-    ret.reverse();
+-    return ret;
++    // This check probably needs work
++    if (aNode && aNode.nodeType == Ci.nsIDOMNode.DOCUMENT_NODE &&
++        aNode.defaultView && !aNode.defaultView.frameElement) {
++      return null;
++    }
++    let aParent = this._domUtils.getParentForNode(aNode, this.showAnonContent);
++    return aParent;
+   },
+ 
+   /**
+    * Tear down the markup panel.
+    */
+   destroy: function MT_destroy()
+   {
+     this.undo.destroy();
+@@ -1333,98 +1327,135 @@ function nodeDocument(node) {
+ /**
+  * Similar to a TreeWalker, except will dig in to iframes and it doesn't
+  * implement the good methods like previousNode and nextNode.
+  *
+  * See TreeWalker documentation for explanations of the methods.
+  */
+ function DocumentWalker(aNode, aShow, aFilter)
+ {
+-  let doc = nodeDocument(aNode);
+-  this.walker = doc.createTreeWalker(nodeDocument(aNode), aShow, aFilter);
+-  this.walker.currentNode = aNode;
++  this.showAnonContent = Services.prefs.getBoolPref("devtools.inspector.showAnonContent");
++  this.walker = this._createWalker(aNode, aShow, aFilter);
+   this.filter = aFilter;
+ }
+ 
+ DocumentWalker.prototype = {
+   get node() this.walker.node,
+   get whatToShow() this.walker.whatToShow,
+   get expandEntityReferences() this.walker.expandEntityReferences,
+   get currentNode() this.walker.currentNode,
+   set currentNode(aVal) this.walker.currentNode = aVal,
+ 
++  _createWalker: function DW_createWalker(aNode, aShow, aFilter) {
++    let walker;
++    if (this.showAnonContent) {
++      walker = Cc["@mozilla.org/inspector/deep-tree-walker;1"].createInstance(Ci.inIDeepTreeWalker);
++      walker.showAnonymousContent = this.showAnonContent;
++      walker.showSubDocuments = true;
++      //XXXgijs currently the inIDeepTreeWalker ignores aShow and aFilter. :-(
++      walker.init(aNode, aShow, aFilter);
++    } else {
++      let doc = nodeDocument(aNode);
++      if (this.walker) {
++        walker = doc.createTreeWalker(nodeDocument(aNode), aShow, aFilter,
++                                      this.expandEntityReferences);
++      } else {
++        walker = doc.createTreeWalker(nodeDocument(aNode), aShow, aFilter);
++      }
++      walker.currentNode = aNode;
++    }
++    return walker;
++  },
++
+   /**
+    * Called when the new node is in a different document than
+    * the current node, creates a new treewalker for the document we've
+    * run in to.
+    */
+   _reparentWalker: function DW_reparentWalker(aNewNode) {
+     if (!aNewNode) {
+       return null;
+     }
+-    let doc = nodeDocument(aNewNode);
+-    let walker = doc.createTreeWalker(doc,
+-      this.whatToShow, this.filter, this.expandEntityReferences);
+-    walker.currentNode = aNewNode;
+-    this.walker = walker;
++    this.walker = this._createWalker(aNewNode, this.whatToShow, this.filter);
+     return aNewNode;
+   },
+ 
+-  parentNode: function DW_parentNode()
+-  {
+-    let currentNode = this.walker.currentNode;
+-    let parentNode = this.walker.parentNode();
+-
+-    if (!parentNode) {
+-      if (currentNode && currentNode.nodeType == Ci.nsIDOMNode.DOCUMENT_NODE
+-          && currentNode.defaultView) {
+-        let embeddingFrame = currentNode.defaultView.frameElement;
+-        if (embeddingFrame) {
+-          return this._reparentWalker(embeddingFrame);
+-        }
+-      }
+-      return null;
+-    }
+-
+-    return parentNode;
+-  },
+-
+   firstChild: function DW_firstChild()
+   {
+     let node = this.walker.currentNode;
+     if (!node)
+       return;
+     if (node.contentDocument) {
+       return this._reparentWalker(node.contentDocument);
+-    } else if (node instanceof nodeDocument(node).defaultView.GetSVGDocument) {
++    } else if (nodeDocument(node) && nodeDocument(node).defaultView && 
++               node instanceof nodeDocument(node).defaultView.GetSVGDocument) {
+       return this._reparentWalker(node.getSVGDocument());
+     }
+-    return this.walker.firstChild();
++    return this._walk(this.walker.firstChild());
+   },
+ 
+   lastChild: function DW_lastChild()
+   {
+     let node = this.walker.currentNode;
+     if (!node)
+       return;
+     if (node.contentDocument) {
+       return this._reparentWalker(node.contentDocument);
+-    } else if (node instanceof nodeDocument(node).defaultView.GetSVGDocument) {
++    } else if (nodeDocument(node) && nodeDocument(node).defaultView && 
++               node instanceof nodeDocument(node).defaultView.GetSVGDocument) {
+       return this._reparentWalker(node.getSVGDocument());
+     }
+-    return this.walker.lastChild();
++    return this._walk(this.walker.lastChild(), true);
+   },
+ 
+-  previousSibling: function DW_previousSibling() this.walker.previousSibling(),
+-  nextSibling: function DW_nextSibling() this.walker.nextSibling(),
++  previousSibling: function DW_previousSibling() {
++    return this._walk(this.walker.previousSibling(), true);
++  },
++  nextSibling: function DW_nextSibling() {
++    return this._walk(this.walker.nextSibling());
++  },
++
++  hasChildren: function DW_hasChildren() {
++    return !!this._walk(this.walker.firstChild());
++  },
++
++  _walk: function DW_walk(aNode, aReverse) {
++    while (this.showAnonContent && !this._testNode(aNode)) {
++      aNode = aReverse ? this.walker.previousSibling() : this.walker.nextSibling();
++    }
++    return aNode;
++  },
++
++  _testNode: function DW_testNode(aNode) {
++    if (!aNode) {
++      return true;
++    }
++    if (this.filter(aNode) !== Ci.nsIDOMNodeFilter.FILTER_ACCEPT) {
++      return false;
++    }
++    // XXX we only use SHOW_ALL, so no need to check whatToShow.
++    return true;
++  }
+ 
+   // XXX bug 785143: not doing previousNode or nextNode, which would sure be useful.
+ };
+ 
+ /**
++ * Check if a node has children which are interesting for the markup view given preferences etc.
++ * @param  {Element} node
++ *         The node to check for children
++ * @return {Boolean}
++ *         Whether the node has children (in which we're interested)
++ */
++function hasChildren(node) {
++  let walker = documentWalker(node);
++  return !!walker.firstChild();
++}
++
++/**
+  * Properly escape attribute values.
+  *
+  * @param  {String} attr
+  *         The attributes for which the values are to be escaped.
+  * @return {Array}
+  *         An array of attribute names and their escaped values.
+  */
+ function escapeAttributeValues(attr) {
+diff --git a/browser/devtools/markupview/test/browser_inspector_markup_subset.js b/browser/devtools/markupview/test/browser_inspector_markup_subset.js
+--- a/browser/devtools/markupview/test/browser_inspector_markup_subset.js
++++ b/browser/devtools/markupview/test/browser_inspector_markup_subset.js
+@@ -78,16 +78,66 @@ function test() {
+         forceReload();
+       },
+       after: function() {
+         // But now that we don't already have a loaded page, selecting
+         // w should center around w.
+         assertChildren("*more*uvwxy*more*");
+       },
+     },
++    {
++      desc: "Verify selecting the penultimate item",
++      selector: "#y",
++      before: function() {
++        forceReload();
++      },
++      after: function() {
++        assertChildren("*more*vwxyz");
++      }
++    },
++    {
++      desc: "Verify selecting the second item",
++      selector: "#b",
++      before: function() {
++      },
++      after: function() {
++        assertChildren("abcde*more*");
++      }
++    },
++    {
++      desc: "Verify selecting the third item for even numbers",
++      selector: "#c",
++      before: function() {
++        forceReload();
++        // hackety-hack, too lazy to reopen the markup view (which doesn't observe the pref,
++        // so twiddling that won't change anything)
++        markup.maxChildren = 6;
++      },
++      after: function() {
++        assertChildren("abcdef*more*");
++      }
++    },
++    {
++      desc: "Verify selecting the middle item for even numbers",
++      selector: "#k",
++      before: function() {
++      },
++      after: function() {
++        assertChildren("*more*ijklmn*more*");
++      }
++    },
++    {
++      desc: "Verify selecting the penultimate item for even numbers",
++      selector: "#y",
++      before: function() {
++      },
++      after: function() {
++        assertChildren("*more*uvwxyz");
++      }
++    }
+   ];
+ 
+   // Create the helper tab for parsing...
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function onload() {
+     gBrowser.selectedBrowser.removeEventListener("load", onload, true);
+     doc = content.document;
+     waitForFocus(setupTest, content);
+diff --git a/browser/devtools/styleinspector/CssRuleView.jsm b/browser/devtools/styleinspector/CssRuleView.jsm
+--- a/browser/devtools/styleinspector/CssRuleView.jsm
++++ b/browser/devtools/styleinspector/CssRuleView.jsm
+@@ -74,22 +74,39 @@ function ElementStyle(aElement, aStore)
+     this.store.userProperties = new UserProperties();
+   }
+ 
+   if (!("disabled" in this.store)) {
+     this.store.disabled = new WeakMap();
+   }
+ 
+   let doc = aElement.ownerDocument;
++  this.isAnonContent = !doc.documentElement.contains(aElement);
+ 
+   // To figure out how shorthand properties are interpreted by the
+   // engine, we will set properties on a dummy element and observe
+   // how their .style attribute reflects them as computed values.
+-  this.dummyElement = doc.createElementNS(this.element.namespaceURI,
+-                                          this.element.tagName);
++  try {
++    this.dummyElement = doc.createElementNS(this.element.namespaceURI,
++                                            this.element.tagName);
++  } catch (ex) {
++    // Sadly, creating XUL anon content from the content doc
++    // doesn't work. We also don't have our own document, so we
++    // use a privileged document to create this node:
++    let chromeWin;
++    if (doc.defaultView && (chromeWin = getChromeWindow(doc.defaultView))) {
++      try {
++        this.dummyElement = chromeWin.document.createElementNS(this.element.namespaceURI,
++                                                               this.element.tagName);
++        doc.importNode(this.dummyElement);
++      } catch (ex) {
++        dump(ex);
++      }
++    }
++  }
+   this.populate();
+ }
+ // We're exporting _ElementStyle for unit tests.
+ this._ElementStyle = ElementStyle;
+ 
+ ElementStyle.prototype = {
+ 
+   // The element we're looking at.
+@@ -151,17 +168,18 @@ ElementStyle.prototype = {
+ 
+     // getCSStyleRules returns ordered from least-specific to
+     // most-specific.
+     for (let i = domRules.Count() - 1; i >= 0; i--) {
+       let domRule = domRules.GetElementAt(i);
+ 
+       // XXX: Optionally provide access to system sheets.
+       let contentSheet = CssLogic.isContentStylesheet(domRule.parentStyleSheet);
+-      if (!contentSheet) {
++      // We do show system sheets if we're in anonymous content:
++      if (!contentSheet && !this.isAnonContent) {
+         continue;
+       }
+ 
+       if (domRule.type !== Ci.nsIDOMCSSRule.STYLE_RULE) {
+         continue;
+       }
+ 
+       this._maybeAddRule({
+@@ -1772,16 +1790,30 @@ function createMenuItem(aMenu, aAttribut
+   item.setAttribute("accesskey", _strings.GetStringFromName(aAttributes.accesskey));
+   item.addEventListener("command", aAttributes.command);
+ 
+   aMenu.appendChild(item);
+ 
+   return item;
+ }
+ 
++/*
++ * getChromeWindow
++ *
++ * Given a content DOM window, returns the chrome window it's in.
++ */
++function getChromeWindow(aWindow)
++{
++  var chromeWin = aWindow.QueryInterface(Ci.nsIInterfaceRequestor)
++                         .getInterface(Ci.nsIWebNavigation)
++                         .QueryInterface(Ci.nsIDocShell)
++                         .chromeEventHandler.ownerDocument.defaultView;
++  return chromeWin;
++}
++
+ /**
+  * Append a text node to an element.
+  */
+ function appendText(aParent, aText)
+ {
+   aParent.appendChild(aParent.ownerDocument.createTextNode(aText));
+ }
+ 
