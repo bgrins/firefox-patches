@@ -1,0 +1,260 @@
+# HG changeset patch
+# Parent 55622ba493103421fee9d7e20f59e1dc0937c75b
+# User Brian Grinstead <bgrinstead@mozilla.com>
+Bug 932880 - Developer tools leak many windows until shutdown in browser-chrome tests (2)
+
+diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
+--- a/browser/devtools/inspector/inspector-panel.js
++++ b/browser/devtools/inspector/inspector-panel.js
+@@ -670,16 +670,18 @@ InspectorPanel.prototype = {
+       this.markup.destroy();
+       delete this.markup;
+     }
+ 
+     if (this._markupFrame) {
+       this._markupFrame.parentNode.removeChild(this._markupFrame);
+       delete this._markupFrame;
+     }
++
++    delete this._markupBox;
+   },
+ 
+   /**
+    * Toggle a pseudo class.
+    */
+   togglePseudoClass: function InspectorPanel_togglePseudoClass(aPseudo) {
+     if (this.selection.isElementNode()) {
+       let node = this.selection.nodeFront;
+diff --git a/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js b/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js
+--- a/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js
++++ b/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js
+@@ -79,14 +79,15 @@ function test() {
+   function verifyNoNodeSelected() {
+     ok(doc.querySelectorAll(":-moz-devtools-highlighted").length === 0, "no node selected");
+     return promise.resolve();
+   }
+ 
+   function finishUp() {
+     let h = require("devtools/inspector/highlighter");
+     h._forceBasic.value = false;
++    inspector = doc = null;
+     gBrowser.removeCurrentTab();
+     finish();
+   }
+ }
+ 
+ 
+diff --git a/browser/devtools/inspector/test/browser_inspector_select_last_selected.js b/browser/devtools/inspector/test/browser_inspector_select_last_selected.js
+--- a/browser/devtools/inspector/test/browser_inspector_select_last_selected.js
++++ b/browser/devtools/inspector/test/browser_inspector_select_last_selected.js
+@@ -25,27 +25,26 @@ function test() {
+   }, true);
+   content.location = page1;
+ 
+   function startTests() {
+     testSameNodeSelectedOnPageReload();
+   }
+ 
+   function endTests() {
+-    executeSoon(() => {
+-      toolbox.destroy();
+-      toolbox = inspector = page1 = page2 = null;
+-      gBrowser.removeCurrentTab();
+-      finish();
+-    });
++    inspector.destroy();
++    toolbox.destroy();
++    toolbox = inspector = page1 = page2 = null;
++    gBrowser.removeCurrentTab();
++    finish();
+   }
+ 
+   function loadPageAnd(page, callback) {
+     inspector.once("markuploaded", () => {
+-      executeSoon(callback);
++      callback();
+     });
+ 
+     if (page) {
+       content.location = page;
+     } else {
+       content.location.reload();
+     }
+   }
+@@ -53,17 +52,17 @@ function test() {
+   function reloadAndReselect(id, callback) {
+     let div = content.document.getElementById(id);
+ 
+     inspector.once("inspector-updated", () => {
+       is(inspector.selection.node, div);
+ 
+       loadPageAnd(false, () => {
+         is(inspector.selection.node.id, id, "Node re-selected after reload");
+-        executeSoon(callback);
++        callback();
+       });
+     });
+ 
+     inspector.selection.setNode(div);
+   }
+ 
+   // Test that nodes selected on the test page remain selected after reload
+   function testSameNodeSelectedOnPageReload()
+@@ -80,47 +79,40 @@ function test() {
+   }
+ 
+   // Test that since the previously selected node doesn't exist on the new page
+   // the body is selected
+   function testBodySelectedOnNavigate() {
+     // Last node selected was id4, go to a different page and check body is
+     // selected
+     loadPageAnd(page2, () => {
+-      executeSoon(() => {
+-        is(
+-          inspector.selection.node.tagName.toLowerCase(),
+-          "body",
+-          "Node not found, body selected"
+-        );
+-        executeSoon(testSameNodeSelectedOnNavigateAwayAndBack);
+-      });
++      is(
++        inspector.selection.node.tagName.toLowerCase(),
++        "body",
++        "Node not found, body selected"
++      );
++      testSameNodeSelectedOnNavigateAwayAndBack();
+     });
+   }
+ 
+   // Test that the node selected on page 1 gets selected again after a navigation
+   // is made to another page and back again
+   function testSameNodeSelectedOnNavigateAwayAndBack() {
+     // On page2, select id5
+     let id = "id5";
+     let div = content.document.getElementById(id);
+ 
+     inspector.once("inspector-updated", () => {
+       is(inspector.selection.node.id, id);
+ 
+-      executeSoon(() => {
+-        // go to page1 but do not select anything
+-        loadPageAnd(page1, () => {
+-
+-          executeSoon(() => {
+-            // go back to page2 and check id5 is still the current selection
+-            loadPageAnd(page2, () => {
+-              is(inspector.selection.node.id, id, "Node re-selected after navigation");
+-              executeSoon(endTests);
+-            });
+-          });
++      // go to page1 but do not select anything
++      loadPageAnd(page1, () => {
++          // go back to page2 and check id5 is still the current selection
++        loadPageAnd(page2, () => {
++          is(inspector.selection.node.id, id, "Node re-selected after navigation");
++          endTests();
+         });
+       });
+     });
+ 
+     inspector.selection.setNode(div);
+   }
+ }
+diff --git a/browser/devtools/inspector/test/browser_inspector_sidebarstate.js b/browser/devtools/inspector/test/browser_inspector_sidebarstate.js
+--- a/browser/devtools/inspector/test/browser_inspector_sidebarstate.js
++++ b/browser/devtools/inspector/test/browser_inspector_sidebarstate.js
+@@ -20,20 +20,17 @@ function inspectorRuleViewOpened()
+ {
+   is(inspector.sidebar.getCurrentTabID(), "ruleview", "Rule View is selected by default");
+ 
+   // Select the computed view and turn off the inspector.
+   inspector.sidebar.select("computedview");
+ 
+   gDevTools.once("toolbox-destroyed", inspectorClosed);
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+-  let toolbox = gDevTools.getToolbox(target);
+-  executeSoon(function() {
+-    toolbox.destroy();
+-  });
++  gDevTools.getToolbox(target).destroy();
+ }
+ 
+ function inspectorClosed()
+ {
+   openInspector(function(panel) {
+     inspector = panel;
+     if (inspector.sidebar.getCurrentTabID()) {
+       // Default sidebar already selected.
+@@ -50,16 +47,17 @@ function testNewDefaultTab()
+   is(inspector.sidebar.getCurrentTabID(), "computedview", "Computed view is selected by default.");
+ 
+   finishTest();
+ }
+ 
+ 
+ function finishTest()
+ {
++  doc = inspector = null;
+   gBrowser.removeCurrentTab();
+   finish();
+ }
+ 
+ function test()
+ {
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+diff --git a/browser/devtools/inspector/test/head.js b/browser/devtools/inspector/test/head.js
+--- a/browser/devtools/inspector/test/head.js
++++ b/browser/devtools/inspector/test/head.js
+@@ -187,9 +187,12 @@ function getComputedPropertyValue(aName)
+       return value.textContent;
+     }
+   }
+ }
+ 
+ SimpleTest.registerCleanupFunction(function () {
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+   gDevTools.closeToolbox(target);
++  while (gBrowser.tabs.length > 1) {
++    gBrowser.removeCurrentTab();
++  }
+ });
+diff --git a/browser/devtools/markupview/test/browser_inspector_markup_subset.js b/browser/devtools/markupview/test/browser_inspector_markup_subset.js
+--- a/browser/devtools/markupview/test/browser_inspector_markup_subset.js
++++ b/browser/devtools/markupview/test/browser_inspector_markup_subset.js
+@@ -135,13 +135,13 @@ function test() {
+     button.click();
+     markup._waitForChildren().then(() => {
+       assertChildren("abcdefghijklmnopqrstuvwxyz");
+       finishUp();
+     });
+   }
+ 
+   function finishUp() {
+-    doc = inspector = null;
++    doc = inspector = markup = null;
+     gBrowser.removeCurrentTab();
+     finish();
+   }
+ }
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -70,16 +70,17 @@ function createDummyDocument() {
+   let eventTarget = docShell.chromeEventHandler;
+   docShell.createAboutBlankContentViewer(Cc["@mozilla.org/nullprincipal;1"].createInstance(Ci.nsIPrincipal));
+   let window = docShell.contentViewer.DOMDocument.defaultView;
+   window.location = "data:text/html,<html></html>";
+   let deferred = promise.defer();
+   eventTarget.addEventListener("DOMContentLoaded", function handler(event) {
+     eventTarget.removeEventListener("DOMContentLoaded", handler, false);
+     deferred.resolve(window.document);
++    frame.remove();
+   }, false);
+   gDummyPromise = deferred.promise;
+   return gDummyPromise;
+ }
+ 
+ /**
+  * Our model looks like this:
+  *

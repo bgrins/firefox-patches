@@ -1,0 +1,309 @@
+From 435c906cdb019e51003165e95cb444b207464abd Mon Sep 17 00:00:00 2001
+From: Tim Taubert <ttaubert@mozilla.com>
+Date: Thu, 31 Oct 2013 10:16:11 +0100
+Subject: Bug 932898 - Bring back the shutdown leak detector
+
+
+diff --git a/build/automationutils.py b/build/automationutils.py
+index abd3da8..1cd2a10 100644
+--- a/build/automationutils.py
++++ b/build/automationutils.py
+@@ -3,16 +3,17 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ from __future__ import with_statement
+ import glob, logging, os, platform, shutil, subprocess, sys, tempfile, urllib2, zipfile
+ import base64
+ import re
+ from urlparse import urlparse
++from operator import itemgetter
+ 
+ try:
+   import mozinfo
+ except ImportError:
+   # Stub out fake mozinfo since this is not importable on Android 4.0 Opt.
+   # This should be fixed; see
+   # https://bugzilla.mozilla.org/show_bug.cgi?id=650881
+   mozinfo = type('mozinfo', (), dict(info={}))()
+@@ -41,16 +42,17 @@ __all__ = [
+   "DEBUGGER_INFO",
+   "replaceBackSlashes",
+   "wrapCommand",
+   'KeyValueParseError',
+   'parseKeyValue',
+   'systemMemory',
+   'environment',
+   'dumpScreen',
++  "ShutdownLeaks"
+   ]
+ 
+ # Map of debugging programs to information about them, like default arguments
+ # and whether or not they are interactive.
+ DEBUGGER_INFO = {
+   # gdb requires that you supply the '--args' flag in order to pass arguments
+   # after the executable name to the executable.
+   "gdb": {
+@@ -529,8 +531,120 @@ def dumpScreen(utilityPath):
+         image = imgfile.read()
+   except IOError, err:
+     log.info("Failed to read image from %s", imgoutput)
+ 
+   encoded = base64.b64encode(image)
+   uri = "data:image/png;base64,%s" %  encoded
+   log.info("SCREENSHOT: %s", uri)
+   return uri
++
++class ShutdownLeaks(object):
++  """
++  Parses the mochitest run log when running a debug build, assigns all leaked
++  DOM windows (that are still around after test suite shutdown, despite running
++  the GC) to the tests that created them and prints leak statistics.
++  """
++  MAX_LEAK_COUNT = 0
++
++  def __init__(self, logger):
++    self.logger = logger
++    self.tests = []
++    self.leakedWindows = {}
++    self.leakedDocShells = set()
++    self.currentTest = None
++    self.seenShutdown = False
++
++  def log(self, line):
++    if line[2:11] == "DOMWINDOW":
++      self._logWindow(line)
++    elif line[2:10] == "DOCSHELL":
++      self._logDocShell(line)
++    elif line.startswith("TEST-START"):
++      fileName = line.split(" ")[-1].strip().replace("chrome://mochitests/content/browser/", "")
++      self.currentTest = {"fileName": fileName, "windows": set(), "docShells": set()}
++    elif line.startswith("INFO TEST-END"):
++      # don't track a test if no windows or docShells leaked
++      if self.currentTest and (self.currentTest["windows"] or self.currentTest["docShells"]):
++        self.tests.append(self.currentTest)
++      self.currentTest = None
++    elif line.startswith("INFO TEST-START | Shutdown"):
++      self.seenShutdown = True
++
++  def process(self):
++    leakingTests = self._parseLeakingTests()
++
++    if leakingTests:
++      totalWindows = sum(len(test["leakedWindows"]) for test in leakingTests)
++      totalDocShells = sum(len(test["leakedDocShells"]) for test in leakingTests)
++      msgType = "TEST-INFO" if totalWindows + totalDocShells <= self.MAX_LEAK_COUNT else "TEST-UNEXPECTED-FAIL"
++      self.logger("%s | ShutdownLeaks | leaked %d DOMWindow(s) and %d DocShell(s) until shutdown", msgType, totalWindows, totalDocShells)
++
++    for test in leakingTests:
++      for url, count in self._zipLeakedWindows(test["leakedWindows"]):
++        self.logger("%s | %s | leaked %d window(s) until shutdown [url = %s]", msgType, test["fileName"], count, url)
++
++      if test["leakedDocShells"]:
++        self.logger("%s | %s | leaked %d docShell(s) until shutdown", msgType, test["fileName"], len(test["leakedDocShells"]))
++
++  def _logWindow(self, line):
++    created = line[:2] == "++"
++    id = self._parseValue(line, "serial")
++
++    # log line has invalid format
++    if not id:
++      return
++
++    if self.currentTest:
++      windows = self.currentTest["windows"]
++      if created:
++        windows.add(id)
++      else:
++        windows.discard(id)
++    elif self.seenShutdown and not created:
++      self.leakedWindows[id] = self._parseValue(line, "url")
++
++  def _logDocShell(self, line):
++    created = line[:2] == "++"
++    id = self._parseValue(line, "id")
++
++    # log line has invalid format
++    if not id:
++      return
++
++    if self.currentTest:
++      docShells = self.currentTest["docShells"]
++      if created:
++        docShells.add(id)
++      else:
++        docShells.discard(id)
++    elif self.seenShutdown and not created:
++      self.leakedDocShells.add(id)
++
++  def _parseValue(self, line, name):
++    match = re.search("\[%s = (.+?)\]" % name, line)
++    if match:
++      return match.group(1)
++    return None
++
++  def _parseLeakingTests(self):
++    leakingTests = []
++
++    for test in self.tests:
++      test["leakedWindows"] = [self.leakedWindows[id] for id in test["windows"] if id in self.leakedWindows]
++      test["leakedDocShells"] = [id for id in test["docShells"] if id in self.leakedDocShells]
++      test["leakCount"] = len(test["leakedWindows"]) + len(test["leakedDocShells"])
++
++      if test["leakCount"]:
++        leakingTests.append(test)
++
++    return sorted(leakingTests, key=itemgetter("leakCount"), reverse=True)
++
++  def _zipLeakedWindows(self, leakedWindows):
++    counts = []
++    counted = set()
++
++    for url in leakedWindows:
++      if not url in counted:
++        counts.append((url, leakedWindows.count(url)))
++        counted.add(url)
++
++    return sorted(counts, key=itemgetter(1), reverse=True)
+diff --git a/testing/mochitest/runtests.py b/testing/mochitest/runtests.py
+index cfeb4fc..b8eab64 100644
+--- a/testing/mochitest/runtests.py
++++ b/testing/mochitest/runtests.py
+@@ -23,17 +23,17 @@ import re
+ import shutil
+ import signal
+ import subprocess
+ import tempfile
+ import time
+ import traceback
+ import urllib2
+ 
+-from automationutils import environment, getDebuggerInfo, isURL, KeyValueParseError, parseKeyValue, processLeakLog, systemMemory, dumpScreen
++from automationutils import environment, getDebuggerInfo, isURL, KeyValueParseError, parseKeyValue, processLeakLog, systemMemory, dumpScreen, ShutdownLeaks
+ from datetime import datetime
+ from manifestparser import TestManifest
+ from mochitest_options import MochitestOptions
+ from mozprofile import Profile, Preferences
+ from mozprofile.permissions import ServerLocations
+ from urllib import quote_plus as encodeURIComponent
+ 
+ # This should use the `which` module already in tree, but it is
+@@ -829,21 +829,27 @@ class Mochitest(MochitestUtilsMixin):
+     cmd = os.path.abspath(app)
+     args = list(extraArgs)
+     # TODO: mozrunner should use -foreground at least for mac
+     # https://bugzilla.mozilla.org/show_bug.cgi?id=916512
+     args.append('-foreground')
+     if testUrl:
+        args.append(testUrl)
+ 
++    #if debug build and not webapprtChrome
++    shutdownLeaks = ShutdownLeaks(log.info)
++    #else:
++      #shutdownLeaks = None
++
+     # create an instance to process the output
+     outputHandler = self.OutputHandler(harness=self,
+                                        utilityPath=utilityPath,
+                                        symbolsPath=symbolsPath,
+                                        dump_screen_on_timeout=not debuggerInfo,
++                                       shutdownLeaks=shutdownLeaks,
+       )
+ 
+     # if the output handler is a pipe, it will process output via the subprocess
+     kp_kwargs = {} if outputHandler.pipe else {'processOutputLine': [outputHandler]}
+ 
+     # create mozrunner instance and start the system under test process
+     self.lastTestSeen = self.test_name
+     startTime = datetime.now()
+@@ -1042,25 +1048,26 @@ class Mochitest(MochitestUtilsMixin):
+     log.info("TEST-UNEXPECTED-FAIL | %s | application timed out after %d seconds with no output", self.lastTestSeen, int(timeout))
+     browserProcessId = browserProcessId or proc.pid
+     self.killAndGetStack(browserProcessId, utilityPath, debuggerInfo, dump_screen=not debuggerInfo)
+ 
+   ### output processing
+ 
+   class OutputHandler(object):
+     """line output handler for mozrunner"""
+-    def __init__(self, harness, utilityPath, symbolsPath=None, dump_screen_on_timeout=True):
++    def __init__(self, harness, utilityPath, symbolsPath=None, dump_screen_on_timeout=True, shutdownLeaks = None):
+       """
+       harness -- harness instance
+       dump_screen_on_timeout -- whether to dump the screen on timeout
+       """
+       self.harness = harness
+       self.utilityPath = utilityPath
+       self.symbolsPath = symbolsPath
+       self.dump_screen_on_timeout = dump_screen_on_timeout
++      self.shutdownLeaks = shutdownLeaks
+ 
+       # perl binary to use
+       self.perl = which('perl')
+ 
+       # With metro browser runs this script launches the metro test harness which launches the browser.
+       # The metro test harness hands back the real browser process id via log output which we need to
+       # pick up on and parse out. This variable tracks the real browser process id if we find it.
+       self.browserProcessId = None
+@@ -1080,16 +1087,17 @@ class Mochitest(MochitestUtilsMixin):
+ 
+     def outputHandlers(self):
+       """returns ordered list of output handlers"""
+       return [self.fix_stack,
+               self.format,
+               self.record_last_test,
+               self.dumpScreenOnTimeout,
+               self.metro_subprocess_id,
++              self.trackShutdownLeaks,
+               self.log,
+               ]
+ 
+     def stackFixer(self):
+       """
+       return 2-tuple, (stackFixerFunction, StackFixerProcess),
+       if any, to use on the output lines
+       """
+@@ -1128,16 +1136,19 @@ class Mochitest(MochitestUtilsMixin):
+         self.stackFixerProcess.run(outputTimeout=outputTimeout)
+ 
+     def finish(self, didTimeout):
+       if self.stackFixerProcess:
+         status = self.stackFixerProcess.wait()
+         if status and not didTimeout:
+           log.info("TEST-UNEXPECTED-FAIL | runtests.py | Stack fixer process exited with code %d during test run", status)
+ 
++      if self.shutdownLeaks:
++        self.shutdownLeaks.process()
++
+ 
+     # output line handlers:
+     # these take a line and return a line
+ 
+     def fix_stack(self, line):
+       if self.stackFixerFunction:
+         return self.stackFixerFunction(line)
+       return line
+@@ -1161,16 +1172,21 @@ class Mochitest(MochitestUtilsMixin):
+       """look for metro browser subprocess id"""
+       if "METRO_BROWSER_PROCESS" in line:
+         index = line.find("=")
+         if index != -1:
+           self.browserProcessId = line[index+1:].rstrip()
+           log.info("INFO | runtests.py | metro browser sub process id detected: %s", self.browserProcessId)
+       return line
+ 
++    def trackShutdownLeaks(self, line):
++      if self.shutdownLeaks:
++        self.shutdownLeaks.log(line)
++      return line
++
+     def log(self, line):
+       log.info(line)
+       return line
+ 
+ 
+   def makeTestConfig(self, options):
+     "Creates a test configuration file for customizing test execution."
+     def jsonString(val):
+-- 
+1.8.4.1
+
