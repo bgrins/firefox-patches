@@ -1,0 +1,624 @@
+# HG changeset patch
+# Parent 962365beac97f48254ec5bf4effa67fda7d9537b
+
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -21,16 +21,17 @@ const {gDevTools} = Cu.import("resource:
+ const {HTMLEditor} = require("devtools/markupview/html-editor");
+ const {OutputParser} = require("devtools/output-parser");
+ const promise = require("sdk/core/promise");
+ const {Tooltip} = require("devtools/shared/widgets/Tooltip");
+ 
+ Cu.import("resource://gre/modules/devtools/LayoutHelpers.jsm");
+ Cu.import("resource://gre/modules/devtools/Templater.jsm");
+ Cu.import("resource://gre/modules/Services.jsm");
++Cu.import("resource://gre/modules/Task.jsm");
+ 
+ loader.lazyGetter(this, "DOMParser", function() {
+  return Cc["@mozilla.org/xmlextras/domparser;1"].createInstance(Ci.nsIDOMParser);
+ });
+ loader.lazyGetter(this, "AutocompletePopup", () => {
+   return require("devtools/shared/autocomplete-popup").AutocompletePopup
+ });
+ 
+@@ -1629,65 +1630,89 @@ ElementEditor.prototype = {
+    * @param string attrName The name of the attribute to get the element for
+    * @return DOMElement
+    */
+   getAttributeElement: function(attrName) {
+     return this.attrList.querySelector(
+       ".attreditor[data-attr=" + attrName + "] .attr-value");
+   },
+ 
++  _displayedEditValue: function(value) {
++    // Double quotes need to be handled specially to prevent DOMParser failing.
++    // name="v"a"l"u"e" when editing -> name='v"a"l"u"e"'
++    // name="v'a"l'u"e" when editing -> name="v'a&quot;l'u&quot;e"
++    let editValueDisplayed = value || "";
++    let hasDoubleQuote = editValueDisplayed.contains('"');
++    let hasSingleQuote = editValueDisplayed.contains("'");
++
++    // Can't just wrap value with ' since the value contains both " and '.
++    if (hasDoubleQuote && hasSingleQuote) {
++        editValueDisplayed = editValueDisplayed.replace(/\"/g, "&quot;");
++    }
++
++    // Wrap with ' since there are no single quotes in the attribute value.
++    if (hasDoubleQuote && !hasSingleQuote) {
++        return "'" + editValueDisplayed + "'";
++    }
++
++    return '"' + editValueDisplayed + '"';
++  },
++
+   _createAttribute: function(aAttr, aBefore = null) {
+     // Create the template editor, which will save some variables here.
+     let data = {
+       attrName: aAttr.name,
+     };
+     this.template("attribute", data);
+     var {attr, inner, name, val} = data;
+ 
+-    // Double quotes need to be handled specially to prevent DOMParser failing.
+-    // name="v"a"l"u"e" when editing -> name='v"a"l"u"e"'
+-    // name="v'a"l'u"e" when editing -> name="v'a&quot;l'u&quot;e"
+-    let editValueDisplayed = aAttr.value || "";
+-    let hasDoubleQuote = editValueDisplayed.contains('"');
+-    let hasSingleQuote = editValueDisplayed.contains("'");
+-    let initial = aAttr.name + '="' + editValueDisplayed + '"';
+-
+-    // Can't just wrap value with ' since the value contains both " and '.
+-    if (hasDoubleQuote && hasSingleQuote) {
+-        editValueDisplayed = editValueDisplayed.replace(/\"/g, "&quot;");
+-        initial = aAttr.name + '="' + editValueDisplayed + '"';
+-    }
+-
+-    // Wrap with ' since there are no single quotes in the attribute value.
+-    if (hasDoubleQuote && !hasSingleQuote) {
+-        initial = aAttr.name + "='" + editValueDisplayed + "'";
+-    }
++    let self = this;
++    let editValueDisplayed = this._displayedEditValue(aAttr.value);
++    let initial = aAttr.name + "=" + editValueDisplayed;
+ 
+     // Make the attribute editable.
+     editableField({
+       element: inner,
+       trigger: "dblclick",
+       stopOnReturn: true,
+       selectAll: false,
+       initial: initial,
+       contentType: InplaceEditor.CONTENT_TYPES.CSS_MIXED,
+       popup: this.markup.popup,
+       start: (aEditor, aEvent) => {
+-        // If the editing was started inside the name or value areas,
+-        // select accordingly.
+-        if (aEvent && aEvent.target === name) {
+-          aEditor.input.setSelectionRange(0, name.textContent.length);
+-        } else if (aEvent && aEvent.target === val) {
+-          let length = editValueDisplayed.length;
+-          let editorLength = aEditor.input.value.length;
+-          let start = editorLength - (length + 1);
+-          aEditor.input.setSelectionRange(start, start + length);
+-        } else {
+-          aEditor.input.select();
+-        }
++        aEditor.loading();
++        return Task.spawn(function() {
++          fullValue = yield this.node.getAttributeValue(aAttr.name);
++          let str = yield fullValue.string();
++          fullValue.release();
++
++          // Editor may have gone away while fetching the attribute
++          // value.  That's ok.
++          if (!aEditor.input) {
++            return;
++          }
++
++          editValueDisplayed = this._displayedEditValue(str);
++          initial = aAttr.name + "=" + editValueDisplayed;
++          aEditor.setValue(initial);
++          aEditor.doneLoading();
++
++          // If the editing was started inside the name or value areas,
++          // select accordingly.
++          if (aEvent && aEvent.target === name) {
++            aEditor.input.setSelectionRange(0, name.textContent.length);
++          } else if (aEvent && aEvent.target === val) {
++            let length = editValueDisplayed.length - 2;
++            let editorLength = aEditor.input.value.length;
++            let start = editorLength - (length + 1);
++            aEditor.input.setSelectionRange(start, start + length);
++          } else {
++            aEditor.input.select();
++          }
++        }.bind(this));
+       },
+       done: (aVal, aCommit) => {
+         if (!aCommit || aVal === initial) {
+           return;
+         }
+ 
+         let doMods = this._startModifyingAttributes();
+         let undoMods = this._startModifyingAttributes();
+diff --git a/browser/devtools/markupview/test/browser_bug896181_css_mixed_completion_new_attribute.js b/browser/devtools/markupview/test/browser_bug896181_css_mixed_completion_new_attribute.js
+--- a/browser/devtools/markupview/test/browser_bug896181_css_mixed_completion_new_attribute.js
++++ b/browser/devtools/markupview/test/browser_bug896181_css_mixed_completion_new_attribute.js
+@@ -8,17 +8,17 @@
+ // displayed when the cursor is like: ```style="display:n|"``` properly. No
+ // suggestions should ever appear when the attribute is not a style attribute.
+ // The correctness and cycling of the suggestions is covered in the ruleview
+ // tests.
+ 
+ function test() {
+   let inspector;
+   let {
+-    getInplaceEditorForSpan: inplaceEditor
++    getLoadedInplaceEditorForSpan: inplaceEditor
+   } = devtools.require("devtools/shared/inplace-editor");
+ 
+   waitForExplicitFinish();
+ 
+   // Will hold the doc we're viewing
+   let doc;
+ 
+   // Holds the MarkupTool object we're testing.
+@@ -73,18 +73,19 @@ function test() {
+ 
+   function startTests() {
+     markup = inspector.markup;
+     markup.expandAll().then(() => {
+       let node = getContainerForRawNode(markup, doc.querySelector("#node14")).editor;
+       let attr = node.newAttr;
+       attr.focus();
+       EventUtils.sendKey("return", inspector.panelWin);
+-      editor = inplaceEditor(attr);
+-      checkStateAndMoveOn(0);
++      inplaceEditor(attr).then(() => {
++        checkStateAndMoveOn(0);
++      });
+     });
+   }
+ 
+   function checkStateAndMoveOn(index) {
+     if (index == testData.length) {
+       finishUp();
+       return;
+     }
+diff --git a/browser/devtools/markupview/test/browser_inspector_markup_edit.js b/browser/devtools/markupview/test/browser_inspector_markup_edit.js
+--- a/browser/devtools/markupview/test/browser_inspector_markup_edit.js
++++ b/browser/devtools/markupview/test/browser_inspector_markup_edit.js
+@@ -14,17 +14,17 @@ http://creativecommons.org/publicdomain/
+  * This test mostly tries to verify that the editor makes changes to the
+  * underlying DOM, not that the UI updates - UI updates are based on
+  * underlying DOM changes, and the mutation tests should cover those cases.
+  */
+ 
+ function test() {
+   let inspector;
+   let {
+-    getInplaceEditorForSpan: inplaceEditor
++    getLoadedInplaceEditorForSpan: inplaceEditor
+   } = devtools.require("devtools/shared/inplace-editor");
+ 
+   // Prevent intermittent "test exceeded the timeout threshold" since this is
+   // a slow test: https://bugzilla.mozilla.org/show_bug.cgi?id=904953.
+   requestLongerTimeout(2);
+ 
+   waitForExplicitFinish();
+ 
+@@ -45,19 +45,21 @@ function test() {
+ 
+   /**
+    * Edit a given editableField
+    */
+   function editField(aField, aValue)
+   {
+     aField.focus();
+     EventUtils.sendKey("return", inspector.panelWin);
+-    let input = inplaceEditor(aField).input;
+-    input.value = aValue;
+-    EventUtils.sendKey("return", inspector.panelWin);
++    inplaceEditor(aField).then(editor => {
++      let input = editor.input;
++      input.value = aValue;
++      EventUtils.sendKey("return", inspector.panelWin);
++    });
+   }
+ 
+   /**
+    * Check that the appropriate attributes are assigned to a node.
+    *
+    * @param  {HTMLNode} aElement
+    *         The node to check.
+    * @param  {Object} aAttributes
+@@ -252,22 +254,24 @@ function test() {
+       },
+       execute: function(after) {
+         let editor = getContainerForRawNode(markup, doc.querySelector("#node24")).editor;
+         let attr = editor.attrs["data-long"].querySelector(".editable");
+ 
+         // Check to make sure it has expanded after focus
+         attr.focus();
+         EventUtils.sendKey("return", inspector.panelWin);
+-        let input = inplaceEditor(attr).input;
+-        is (input.value, 'data-long="'+LONG_ATTRIBUTE+'"');
+-        EventUtils.sendKey("escape", inspector.panelWin);
++        inplaceEditor(attr).then(inplace => {
++          let input = inplace.input;
++          is (input.value, 'data-long="'+LONG_ATTRIBUTE+'"');
++          EventUtils.sendKey("escape", inspector.panelWin);
+ 
+-        editField(attr, input.value  + ' data-short="ABC"');
+-        inspector.once("markupmutation", after);
++          editField(attr, input.value  + ' data-short="ABC"');
++          inspector.once("markupmutation", after);
++        });
+       },
+       after: function() {
+ 
+         let editor = getContainerForRawNode(markup, doc.querySelector("#node24")).editor;
+         let visibleAttrText = editor.attrs["data-long"].querySelector(".attr-value").textContent;
+         is (visibleAttrText, LONG_ATTRIBUTE_COLLAPSED)
+ 
+         assertAttributes(doc.querySelector("#node24"), {
+@@ -383,32 +387,33 @@ function test() {
+           style: 'background-image: url("moz-page-thumb://thumbnail?url=http%3A%2F%2Fwww.mozilla.org%2F");'
+         });
+       },
+       execute: function(after) {
+         inspector.once("markupmutation", after);
+         let editor = getContainerForRawNode(markup, doc.querySelector("#node26")).editor;
+         let attr = editor.attrs["style"].querySelector(".editable");
+ 
+-
+         attr.focus();
+         EventUtils.sendKey("return", inspector.panelWin);
+ 
+-        let input = inplaceEditor(attr).input;
+-        let value = input.value;
++        inplaceEditor(attr).then(inplace => {
++          let input = inplace.input;
++          let value = input.value;
+ 
+-        is (value,
+-          "style='background-image: url(\"moz-page-thumb://thumbnail?url=http%3A%2F%2Fwww.mozilla.org%2F\");'",
+-          "Value contains actual double quotes"
+-        );
++          is (value,
++            "style='background-image: url(\"moz-page-thumb://thumbnail?url=http%3A%2F%2Fwww.mozilla.org%2F\");'",
++            "Value contains actual double quotes"
++          );
+ 
+-        value = value.replace(/mozilla\.org/, "mozilla.com");
+-        input.value = value;
++          value = value.replace(/mozilla\.org/, "mozilla.com");
++          input.value = value;
+ 
+-        EventUtils.sendKey("return", inspector.panelWin);
++          EventUtils.sendKey("return", inspector.panelWin);
++        });
+       },
+       after: function() {
+         assertAttributes(doc.querySelector("#node26"), {
+           id: "node26",
+           style: 'background-image: url("moz-page-thumb://thumbnail?url=http%3A%2F%2Fwww.mozilla.com%2F");'
+         });
+       }
+     },
+@@ -424,25 +429,27 @@ function test() {
+       execute: function(after) {
+         inspector.once("markupmutation", after);
+         let editor = getContainerForRawNode(markup, doc.querySelector("#node27")).editor;
+         let attr = editor.attrs["class"].querySelector(".editable");
+ 
+         attr.focus();
+         EventUtils.sendKey("return", inspector.panelWin);
+ 
+-        let input = inplaceEditor(attr).input;
+-        let value = input.value;
++        inplaceEditor(attr).then(inplace => {
++          let input = inplace.input;
++          let value = input.value;
+ 
+-        is (value, "class=\"Double &quot; and single '\"", "Value contains &quot;");
++          is (value, "class=\"Double &quot; and single '\"", "Value contains &quot;");
+ 
+-        value = value.replace(/Double/, "&quot;").replace(/single/, "'");
+-        input.value = value;
++          value = value.replace(/Double/, "&quot;").replace(/single/, "'");
++          input.value = value;
+ 
+-        EventUtils.sendKey("return", inspector.panelWin);
++          EventUtils.sendKey("return", inspector.panelWin);
++        });
+       },
+       after: function() {
+         assertAttributes(doc.querySelector("#node27"), {
+           id: "node27",
+           class: '" " and \' \''
+         });
+       }
+     },
+diff --git a/browser/devtools/shared/inplace-editor.js b/browser/devtools/shared/inplace-editor.js
+--- a/browser/devtools/shared/inplace-editor.js
++++ b/browser/devtools/shared/inplace-editor.js
+@@ -35,16 +35,17 @@ const CONTENT_TYPES = {
+ };
+ const MAX_POPUP_ENTRIES = 10;
+ 
+ const FOCUS_FORWARD = Ci.nsIFocusManager.MOVEFOCUS_FORWARD;
+ const FOCUS_BACKWARD = Ci.nsIFocusManager.MOVEFOCUS_BACKWARD;
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
++Cu.import("resource://gre/modules/Promise.jsm");
+ Cu.import("resource:///modules/devtools/shared/event-emitter.js");
+ 
+ /**
+  * Mark a span editable.  |editableField| will listen for the span to
+  * be focused and create an InlineEditor to handle text input.
+  * Changes will be committed when the InlineEditor's input is blurred
+  * or dropped when the user presses escape.
+  *
+@@ -150,49 +151,58 @@ exports.editableItem = this.editableItem
+  */
+ 
+ function getInplaceEditorForSpan(aSpan)
+ {
+   return aSpan.inplaceEditor;
+ };
+ exports.getInplaceEditorForSpan = getInplaceEditorForSpan;
+ 
++function getLoadedInplaceEditorForSpan(aSpan)
++{
++  return aSpan.inplaceEditor.loaded.then(() => {
++    return aSpan.inplaceEditor;
++  });
++}
++exports.getLoadedInplaceEditorForSpan;
++
+ function InplaceEditor(aOptions, aEvent)
+ {
+   this.elt = aOptions.element;
+   let doc = this.elt.ownerDocument;
+   this.doc = doc;
+   this.elt.inplaceEditor = this;
+ 
+   this.change = aOptions.change;
+   this.done = aOptions.done;
+   this.destroy = aOptions.destroy;
+-  this.initial = aOptions.initial ? aOptions.initial : this.elt.textContent;
+   this.multiline = aOptions.multiline || false;
+   this.stopOnReturn = !!aOptions.stopOnReturn;
+   this.contentType = aOptions.contentType || CONTENT_TYPES.PLAIN_TEXT;
+   this.property = aOptions.property;
+   this.popup = aOptions.popup;
+ 
+   this._onBlur = this._onBlur.bind(this);
+   this._onKeyPress = this._onKeyPress.bind(this);
+   this._onInput = this._onInput.bind(this);
+   this._onKeyup = this._onKeyup.bind(this);
+ 
+-  this._createInput();
+-  this._autosize();
+-
+   // Pull out character codes for advanceChars, listing the
+   // characters that should trigger a blur.
+   this._advanceCharCodes = {};
+   let advanceChars = aOptions.advanceChars || '';
+   for (let i = 0; i < advanceChars.length; i++) {
+     this._advanceCharCodes[advanceChars.charCodeAt(i)] = true;
+   }
+ 
++  this.initial = aOptions.initial ? aOptions.initial : this.elt.textContent;
++
++  this._createInput();
++  this._autosize();
++
+   // Hide the provided element and add our editor.
+   this.originalDisplay = this.elt.style.display;
+   this.elt.style.display = "none";
+   this.elt.parentNode.insertBefore(this.input, this.elt);
+ 
+   if (typeof(aOptions.selectAll) == "undefined" || aOptions.selectAll) {
+     this.input.select();
+   }
+@@ -209,27 +219,58 @@ function InplaceEditor(aOptions, aEvent)
+ 
+   this.validate = aOptions.validate;
+ 
+   if (this.validate) {
+     this.input.addEventListener("keyup", this._onKeyup, false);
+   }
+ 
+   if (aOptions.start) {
++    this._inStart = true;
+     aOptions.start(this, aEvent);
++    this._inStart = false;
++  }
++  if (!this.loaded) {
++    this.loaded = Promise.resolve(undefined);
+   }
+ 
+   EventEmitter.decorate(this);
+ }
+ 
+ exports.InplaceEditor = InplaceEditor;
+ 
+ InplaceEditor.CONTENT_TYPES = CONTENT_TYPES;
+ 
+ InplaceEditor.prototype = {
++  loading: function InplaceEditor_loading()
++  {
++    if (!this._inStart) {
++      throw new Error("loading can only be called during the start method");
++    }
++    this._deferredLoad = Promise.defer();
++    this.loaded = this._deferredLoad.promise;
++    this.input.setAttribute("readonly", "");
++  },
++
++  doneLoading: function InplaceEditor_doneLoading()
++  {
++    if (!this._deferredLoad) {
++      throw new Error("doneLoading can only be called after loading");
++    }
++    this.input.removeAttribute("readonly");
++    this._deferredLoad.resolve(true);
++    this._deferredLoad = null;
++  },
++
++  setValue: function InplaceEditor_setValue(value)
++  {
++    this.input.value = value;
++    this._updateSize();
++  },
++
+   _createInput: function InplaceEditor_createEditor()
+   {
+     this.input =
+       this.doc.createElementNS(HTML_NS, this.multiline ? "textarea" : "input");
+     this.input.inplaceEditor = this;
+     this.input.classList.add("styleinspector-propertyeditor");
+     this.input.value = this.initial;
+ 
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -203,18 +203,36 @@ var NodeActor = protocol.ActorClass({
+ 
+     return form;
+   },
+ 
+   writeAttrs: function() {
+     if (!this.rawNode.attributes) {
+       return undefined;
+     }
+-    return [{namespace: attr.namespace, name: attr.name, value: attr.value }
+-            for (attr of this.rawNode.attributes)];
++    return [this.formatAttr(attr) for (attr of this.rawNode.attributes)];
++  },
++
++  formatAttr: function(attr) {
++    if (attr.name === "id" || attr.name === "class" ||
++        attr.value.length <= gValueSummaryLength) {
++      return {
++        name: attr.name,
++        namespace: attr.namespace,
++        value: attr.value
++      }
++    } else {
++      return {
++        name: attr.name,
++        namespace: attr.namespace,
++        value: attr.value.substring(0, gValueSummaryLength),
++        incomplete: true
++      }
++    }
++    return attr.substring(0, 50);
+   },
+ 
+   writePseudoClassLocks: function() {
+     if (this.rawNode.nodeType !== Ci.nsIDOMNode.ELEMENT_NODE) {
+       return undefined;
+     }
+     let ret = undefined;
+     for (let pseudo of PSEUDO_CLASSES) {
+@@ -222,16 +240,30 @@ var NodeActor = protocol.ActorClass({
+         ret = ret || [];
+         ret.push(pseudo);
+       }
+     }
+     return ret;
+   },
+ 
+   /**
++   * Returns a LongStringActor with a given attribute's value
++   */
++  getAttributeValue: method(function(attr) {
++    return new LongStringActor(this.conn, this.rawNode.getAttribute(attr));
++  }, {
++    request: {
++      name: Arg(0, "string")
++    },
++    response: {
++      value: RetVal("longstring")
++    }
++  }),
++
++  /**
+    * Returns a LongStringActor with the node's value.
+    */
+   getNodeValue: method(function() {
+     return new LongStringActor(this.conn, this.rawNode.nodeValue || "");
+   }, {
+     request: {},
+     response: {
+       value: RetVal("longstring")
+@@ -459,16 +491,42 @@ let NodeFront = protocol.FrontClass(Node
+   get name() this._form.name,
+   get publicId() this._form.publicId,
+   get systemId() this._form.systemId,
+ 
+   getAttribute: function(name) {
+     let attr = this._getAttribute(name);
+     return attr ? attr.value : null;
+   },
++
++  getAttributeValue: protocol.custom(function(name) {
++    let attr = this._getAttribute(name);
++    if (!attr.incomplete) {
++      return delayedResolve(new ShortLongString(attr.value));
++    } else {
++      let str = this._getAttributeValue(name);
++      return str.then(strFront => {
++        // For good measure, let's make sure that calling the string
++        // method updates the local attribute so that we don't need to
++        // call it again.
++        let stringMethod = strFront.string.bind(strFront);
++        strFront.string = () => {
++          return stringMethod().then(value => {
++            attr.value = value;
++            attr.incomplete = false;
++            return value;
++          });
++        };
++        return strFront;
++      });
++    }
++  }, {
++    impl: "_getAttributeValue"
++  }),
++
+   hasAttribute: function(name) {
+     this._cacheAttributes();
+     return (name in this._attrMap);
+   },
+ 
+   get hidden() {
+     let cls = this.getAttribute("class");
+     return cls && cls.indexOf(HIDDEN_CLASS) > -1;
+diff --git a/toolkit/devtools/server/main.js b/toolkit/devtools/server/main.js
+--- a/toolkit/devtools/server/main.js
++++ b/toolkit/devtools/server/main.js
+@@ -164,17 +164,17 @@ var DebuggerServer = {
+   _socketConnections: 0,
+   // Map of global actor names to actor constructors provided by extensions.
+   globalActorFactories: {},
+   // Map of tab actor names to actor constructors provided by extensions.
+   tabActorFactories: {},
+ 
+   LONG_STRING_LENGTH: 10000,
+   LONG_STRING_INITIAL_LENGTH: 1000,
+-  LONG_STRING_READ_LENGTH: 1000,
++  LONG_STRING_READ_LENGTH: 65 * 1024,
+ 
+   /**
+    * A handler function that prompts the user to accept or decline the incoming
+    * connection.
+    */
+   _allowConnection: null,
+ 
+   /**
