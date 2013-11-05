@@ -1,0 +1,170 @@
+# HG changeset patch
+# Parent 564283498a6f386a01fe776c9e73afb6d81b9bae
+# User Patrick Brosset <pbrosset@mozilla.com>
+Bug 931845 - Shows image tooltips immediately, and with no animation, r=bgrins
+
+diff --git a/browser/devtools/shared/widgets/Tooltip.js b/browser/devtools/shared/widgets/Tooltip.js
+--- a/browser/devtools/shared/widgets/Tooltip.js
++++ b/browser/devtools/shared/widgets/Tooltip.js
+@@ -11,16 +11,17 @@ const IOService = Cc["@mozilla.org/netwo
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource:///modules/devtools/ViewHelpers.jsm");
+ 
+ const GRADIENT_RE = /\b(repeating-)?(linear|radial)-gradient\(((rgb|hsl)a?\(.+?\)|[^\)])+\)/gi;
+ const BORDERCOLOR_RE = /^border-[-a-z]*color$/ig;
+ const BORDER_RE = /^border(-(top|bottom|left|right))?$/ig;
+ const BACKGROUND_IMAGE_RE = /url\([\'\"]?(.*?)[\'\"]?\)/;
++const SHOW_TIMEOUT = 50;
+ 
+ /**
+  * Tooltip widget.
+  *
+  * This widget is intended at any tool that may need to show rich content in the
+  * form of floating panels.
+  * A common use case is image previewing in the CSS rule view, but more complex
+  * use cases may include color pickers, object inspection, etc...
+@@ -169,27 +170,23 @@ Tooltip.prototype = {
+    * @param {Function} targetNodeCb
+    *        A function that accepts a node argument and returns true or false
+    *        to signify if the tooltip should be shown on that node or not.
+    *        Additionally, the function receives a second argument which is the
+    *        tooltip instance itself, to be used to add/modify the content of the
+    *        tooltip if needed. If omitted, the tooltip will be shown everytime.
+    * @param {Number} showDelay
+    *        An optional delay that will be observed before showing the tooltip.
+-   *        Defaults to 750ms
++   *        Defaults to SHOW_TIMEOUT
+    */
+-  startTogglingOnHover: function(baseNode, targetNodeCb, showDelay = 750) {
++  startTogglingOnHover: function(baseNode, targetNodeCb, showDelay = SHOW_TIMEOUT) {
+     if (this._basedNode) {
+       this.stopTogglingOnHover();
+     }
+ 
+-    // If no targetNodeCb callback is provided, then we need to hide the tooltip
+-    // on mouseleave since baseNode is the target node itself
+-    this._hideOnMouseLeave = !targetNodeCb;
+-
+     this._basedNode = baseNode;
+     this._showDelay = showDelay;
+     this._targetNodeCb = targetNodeCb || (() => true);
+ 
+     this._onBaseNodeMouseMove = this._onBaseNodeMouseMove.bind(this);
+     this._onBaseNodeMouseLeave = this._onBaseNodeMouseLeave.bind(this);
+ 
+     baseNode.addEventListener("mousemove", this._onBaseNodeMouseMove, false);
+@@ -212,36 +209,33 @@ Tooltip.prototype = {
+     this._basedNode = null;
+     this._targetNodeCb = null;
+     this._lastHovered = null;
+   },
+ 
+   _onBaseNodeMouseMove: function(event) {
+     if (event.target !== this._lastHovered) {
+       this.hide();
+-      this._lastHovered = null;
++      this._lastHovered = event.target;
+       setNamedTimeout(this.uid, this._showDelay, () => {
+         this._showOnHover(event.target);
+       });
+     }
+   },
+ 
+   _showOnHover: function(target) {
+     if (this._targetNodeCb(target, this)) {
+       this.show(target);
+-      this._lastHovered = target;
+     }
+   },
+ 
+   _onBaseNodeMouseLeave: function() {
+     clearNamedTimeout(this.uid);
+     this._lastHovered = null;
+-    if (this._hideOnMouseLeave) {
+-      this.hide();
+-    }
++    this.hide();
+   },
+ 
+   /**
+    * Set the content of this tooltip. Will first empty the tooltip and then
+    * append the new content element.
+    * Consider using one of the set<type>Content() functions instead.
+    * @param {node} content
+    *        A node that can be appended in the tooltip XUL element
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -1114,35 +1114,27 @@ CssRuleView.prototype = {
+     popupset.appendChild(this._contextmenu);
+   },
+ 
+   /**
+    * Verify that target is indeed a css value we want a tooltip on, and if yes
+    * prepare some content for the tooltip
+    */
+   _buildTooltipContent: function(target) {
+-    let isValueWithImage = target.classList.contains("ruleview-propertyvalue") &&
+-      target.querySelector(".theme-link");
+-
+     let isImageHref = target.classList.contains("theme-link") &&
+       target.parentNode.classList.contains("ruleview-propertyvalue");
+-    if (isImageHref) {
+-      target = target.parentNode;
+-    }
+-
+-    let isEditing = this.isEditing;
+ 
+     // If the inplace-editor is visible or if this is not a background image
+     // don't show the tooltip
+-    if (this.isEditing || (!isImageHref && !isValueWithImage)) {
++    if (this.isEditing || !isImageHref) {
+       return false;
+     }
+ 
+     // Retrieve the TextProperty for the hovered element
+-    let property = target.textProperty;
++    let property = target.parentNode.textProperty;
+     let href = property.rule.domRule.href;
+ 
+     // Fill some content
+     this.tooltip.setCssBackgroundImageContent(property.value, href);
+     return true;
+   },
+ 
+   /**
+diff --git a/browser/themes/shared/devtools/common.inc.css b/browser/themes/shared/devtools/common.inc.css
+--- a/browser/themes/shared/devtools/common.inc.css
++++ b/browser/themes/shared/devtools/common.inc.css
+@@ -116,20 +116,30 @@
+ 
+ .devtools-tooltip.devtools-tooltip-tooltip {
+   /* If the tooltip uses a <tooltip> XUL element */
+   -moz-appearance: none;
+   padding: 4px;
+   background: #eee;
+   border-radius: 3px;
+ }
++
+ .devtools-tooltip.devtools-tooltip-panel .panel-arrowcontent {
+   /* If the tooltip uses a <panel> XUL element instead */
+   padding: 4px;
+ }
+ 
++.devtools-tooltip .panel-arrowcontainer {
++  /* Reseting the transition used when panels are shown */
++  transition: none;
++  /* Panels slide up/down/left/right when they appear using a transform.
++  Since we want to remove the transition, we don't need to transform anymore
++  plus it can interfeer by causing mouseleave events on the underlying nodes */
++  transform: none;
++}
++
+ .devtools-tooltip-tiles {
+   background-color: #eee;
+   background-image: linear-gradient(45deg, #ccc 25%, transparent 25%, transparent 75%, #ccc 75%, #ccc),
+     linear-gradient(45deg, #ccc 25%, transparent 25%, transparent 75%, #ccc 75%, #ccc);
+   background-size: 20px 20px;
+   background-position: 0 0, 10px 10px;
+ }
