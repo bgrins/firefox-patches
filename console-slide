@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent a18a6e8344e7775836a2868053b983dc312c57ea
+# Parent 05b04015a884eaeff3093c893d2f59842b92751e
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 862558 - Web Console should always be available / visible
 
@@ -91,7 +91,7 @@ diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/
 +
 +    if (openedConsolePanel) {
 +      deck.setAttribute("collapsed", "true");
-+      splitter.removeAttribute("hidden");
++      splitter.setAttribute("hidden", "true");
 +      webconsolePanel.removeAttribute("collapsed");
 +    } else {
 +      deck.removeAttribute("collapsed");
@@ -99,8 +99,8 @@ diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/
 +        webconsolePanel.removeAttribute("collapsed");
 +        splitter.removeAttribute("hidden");
 +      } else {
-+        splitter.setAttribute("hidden", "true");
 +        webconsolePanel.setAttribute("collapsed", "true");
++        splitter.setAttribute("hidden", "true");
 +      }
 +    }
    },
@@ -170,7 +170,7 @@ diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/
        // focus the tool's frame to start receiving key events
        this.focusTool(id);
  
-@@ -669,16 +717,38 @@ Toolbox.prototype = {
+@@ -669,16 +717,39 @@ Toolbox.prototype = {
     *         The id of tool to focus
     */
    focusTool: function(id) {
@@ -188,6 +188,8 @@ diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/
 +    // Don't allow changes when console is open, since it could be confusing
 +    if (!openedConsolePanel) {
 +      this._splitConsole = !this._splitConsole;
++      this._refreshConsoleDisplay();
++      this.emit("split-console");
 +
 +      if (this._splitConsole) {
 +        this.loadTool("webconsole").then(() => {
@@ -196,7 +198,6 @@ diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/
 +          this.focusTool("webconsole");
 +        });
 +      }
-+      this._refreshConsoleDisplay();
 +    }
 +  },
 +
@@ -209,7 +210,46 @@ diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/
      let tool = next.getAttribute("toolid");
      return this.selectTool(tool);
    },
-@@ -874,16 +944,18 @@ Toolbox.prototype = {
+@@ -777,17 +848,17 @@ Toolbox.prototype = {
+ 
+     let newHost = this._createHost(hostType);
+     return newHost.create().then(iframe => {
+       // change toolbox document's parent to the new host
+       iframe.QueryInterface(Ci.nsIFrameLoaderOwner);
+       iframe.swapFrameLoaders(this.frame);
+ 
+       this._host.off("window-closed", this.destroy);
+-      this._host.destroy();
++      this.destroyHost();
+ 
+       this._host = newHost;
+ 
+       if (this.hostType != Toolbox.HostType.CUSTOM) {
+         Services.prefs.setCharPref(this._prefs.LAST_HOST, this._host.type);
+       }
+ 
+       this._buildDockButtons();
+@@ -865,16 +936,27 @@ Toolbox.prototype = {
+    *
+    * @return The notification box element.
+    */
+   getNotificationBox: function() {
+     return this.doc.getElementById("toolbox-notificationbox");
+   },
+ 
+   /**
++   * Destroy the current host, and remove event listeners from its frame.
++   *
++   * @return {promise} to be resolved when the host is destroyed.
++   */
++  destroyHost: function() {
++    this.doc.removeEventListener("keypress",
++      this._splitConsoleOnKeypress, false);
++    return this._host.destroy();
++  },
++
++  /**
+    * Remove all UI elements, detach from target and clear up
     */
    destroy: function() {
      // If several things call destroy then we give them all the same
@@ -217,17 +257,25 @@ diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/
      if (this._destroyer) {
        return this._destroyer;
      }
+@@ -905,17 +987,17 @@ Toolbox.prototype = {
+       }
+     }
  
-+    this.doc.removeEventListener("keypress",
-+      this._splitConsoleOnKeypress, false);
-     this._target.off("navigate", this._refreshHostTitle);
-     this.off("select", this._refreshHostTitle);
-     this.off("host-changed", this._refreshHostTitle);
+     let container = this.doc.getElementById("toolbox-buttons");
+     while (container.firstChild) {
+       container.removeChild(container.firstChild);
+     }
  
-     gDevTools.off("tool-registered", this._toolRegistered);
-     gDevTools.off("tool-unregistered", this._toolUnregistered);
+-    outstanding.push(this._host.destroy());
++    outstanding.push(this.destroyHost());
  
-     // Revert docShell.allowJavascript back to its original value if it was
+     this._telemetry.destroy();
+ 
+     return this._destroyer = promise.all(outstanding).then(() => {
+       // Targets need to be notified that the toolbox is being torn down.
+       // This is done after other destruction tasks since it may tear down
+       // fronts and the debugger transport which earlier destroy methods may
+       // require to complete.
 diff --git a/browser/devtools/framework/toolbox.xul b/browser/devtools/framework/toolbox.xul
 --- a/browser/devtools/framework/toolbox.xul
 +++ b/browser/devtools/framework/toolbox.xul
@@ -269,7 +317,7 @@ diff --git a/browser/devtools/webconsole/test/browser_webconsole_split.js b/brow
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/webconsole/test/browser_webconsole_split.js
-@@ -0,0 +1,69 @@
+@@ -0,0 +1,134 @@
 +/* vim:set ts=2 sw=2 sts=2 et: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -278,64 +326,150 @@ new file mode 100644
 +function test()
 +{
 +  addTab("data:text/html;charset=utf-8,Web Console test for splitting");
-+
-+
-+  function openInspector(callback)
-+  {
-+    let target = TargetFactory.forTab(gBrowser.selectedTab);
-+    gDevTools.showToolbox(target, "inspector").then(function(toolbox) {
-+      callback(toolbox.getCurrentPanel(), toolbox);
-+    }).then(null, console.error);
-+  }
-+
++  let {Task} = Cu.import("resource://gre/modules/Task.jsm");
++  let toolbox;
 +
 +  browser.addEventListener("load", function onLoad() {
 +    browser.removeEventListener("load", onLoad, true);
++    testConsoleLoadOnDifferentPanel()
++  }, true);
 +
-+    openInspector((inspector, toolbox) => {
-+      EventUtils.sendKey("ESCAPE", inspector.panelWin);
++  function testConsoleLoadOnDifferentPanel()
++  {
++    info("About to check console loads even when non-webconsole panel is open");
 +
-+      let win = toolbox.doc.defaultView;
-+      let deck = toolbox.doc.getElementById("toolbox-deck");
-+      let webconsolePanel = toolbox.doc.getElementById("toolbox-panel-webconsole");
-+      let splitter = toolbox.doc.getElementById("toolbox-console-splitter");
++    openPanel("inspector").then(() => {
++      toolbox.on("webconsole-ready", () => {
++        ok(true, "Webconsole has been triggered as loaded while another tool is active");
++        testKeyboardShortcuts();
++      });
 +
-+      let initialDeckHeight = parseInt(win.getComputedStyle(deck).getPropertyValue("height"));
-+      let initialWebconsoleHeight = parseInt(win.getComputedStyle(webconsolePanel).getPropertyValue("height"));
-+      let initialSplitterVisibility = !splitter.getAttribute("hidden");
-+      let openedConsolePanel = toolbox.currentToolId === "webconsole";
-+
-+      ok (!initialSplitterVisibility, "Splitter is hidden by default");
-+      ok (initialDeckHeight > 0, "Deck has a height > 0 by default");
-+      is (initialWebconsoleHeight, 0, "Web console is collapsed by default");
-+      ok (!openedConsolePanel, "The console panel is not the current tool.");
-+
++      // Opens split console.
 +      toolbox.toggleSplitConsole();
++    });
++  }
 +
-+      let splitDeckHeight = parseInt(win.getComputedStyle(deck).getPropertyValue("height"));
-+      let splitWebconsoleHeight = parseInt(win.getComputedStyle(webconsolePanel).getPropertyValue("height"));
-+      let splitSplitterVisibility = !splitter.getAttribute("hidden");
-+      let openedConsolePanel = toolbox.currentToolId === "webconsole";
++  function testKeyboardShortcuts()
++  {
++    info("About to check that panel responds to ESCAPE keyboard shortcut");
 +
-+      ok (splitSplitterVisibility, "Splitter is visible when console is split");
-+      ok (splitDeckHeight > 0, "Deck has a height > 0 when console is split");
-+      ok (splitWebconsoleHeight > 0, "Web console has a height > 0 when console is split");
-+      ok (!openedConsolePanel, "The console panel is not the current tool.");
-+
-+      toolbox.toggleSplitConsole();
-+
-+      let finalDeckHeight = parseInt(win.getComputedStyle(deck).getPropertyValue("height"));
-+      let finalWebconsoleHeight = parseInt(win.getComputedStyle(webconsolePanel).getPropertyValue("height"));
-+      let finalSplitterVisibility = !splitter.getAttribute("hidden");
-+      let openedConsolePanel = toolbox.currentToolId === "webconsole";
-+
-+      ok (!finalSplitterVisibility, "Splitter is hidden by default");
-+      ok (finalDeckHeight > 0, "Deck has a height > 0 by default");
-+      is (finalWebconsoleHeight, 0, "Web console is collapsed by default");
-+      ok (!openedConsolePanel, "The console panel is not the current tool.");
-+
-+      finishTest();
++    toolbox.once("split-console", () => {
++      ok(true, "Split console has been triggered via ESCAPE keypress");
++      checkAllTools();
 +    });
 +
-+  }, true);
++    // Closes split console.
++    EventUtils.sendKey("ESCAPE", toolbox.frame.contentWindow);
++  }
++
++  function checkAllTools()
++  {
++    info("About to check split console with each panel individually.");
++
++    Task.spawn(function() {
++      yield openAndCheckPanel("jsdebugger");
++      yield openAndCheckPanel("inspector");
++      yield openAndCheckPanel("styleeditor");
++      yield openAndCheckPanel("jsprofiler");
++      yield openAndCheckPanel("netmonitor");
++
++      checkWebconsolePanelOpened();
++    });
++  }
++
++  function checkWebconsolePanelOpened()
++  {
++    finish();
++  }
++
++  function openPanel(toolId, callback)
++  {
++    let deferred = promise.defer();
++    let target = TargetFactory.forTab(gBrowser.selectedTab);
++    gDevTools.showToolbox(target, toolId).then(function(box) {
++      toolbox = box;
++      deferred.resolve();
++    }).then(null, console.error);
++    return deferred.promise;
++  }
++
++  function openAndCheckPanel(toolId)
++  {
++    let deferred = promise.defer();
++    openPanel(toolId).then(() => {
++      info ("Checking toolbox for " + toolId);
++      checkToolboxUI(toolbox.getCurrentPanel());
++      deferred.resolve();
++    });
++    return deferred.promise;
++  }
++
++  function checkToolboxUI()
++  {
++    let win = toolbox.doc.defaultView;
++    let deck = toolbox.doc.getElementById("toolbox-deck");
++    let webconsolePanel = toolbox.doc.getElementById("toolbox-panel-webconsole");
++    let splitter = toolbox.doc.getElementById("toolbox-console-splitter");
++
++    let initialDeckHeight = parseInt(win.getComputedStyle(deck).getPropertyValue("height"));
++    let initialWebconsoleHeight = parseInt(win.getComputedStyle(webconsolePanel).getPropertyValue("height"));
++    let initialSplitterVisibility = !splitter.getAttribute("hidden");
++    let openedConsolePanel = toolbox.currentToolId === "webconsole";
++
++    ok (!initialSplitterVisibility, "Splitter is hidden by default");
++    ok (initialDeckHeight > 0, "Deck has a height > 0 by default");
++    is (initialWebconsoleHeight, 0, "Web console is collapsed by default");
++    ok (!openedConsolePanel, "The console panel is not the current tool");
++
++    toolbox.toggleSplitConsole()
++
++    let splitDeckHeight = parseInt(win.getComputedStyle(deck).getPropertyValue("height"));
++    let splitWebconsoleHeight = parseInt(win.getComputedStyle(webconsolePanel).getPropertyValue("height"));
++    let splitSplitterVisibility = !splitter.getAttribute("hidden");
++    let openedConsolePanel = toolbox.currentToolId === "webconsole";
++
++    ok (splitSplitterVisibility, "Splitter is visible when console is split");
++    ok (splitDeckHeight > 0, "Deck has a height > 0 when console is split");
++    ok (splitWebconsoleHeight > 0, "Web console has a height > 0 when console is split");
++    ok (!openedConsolePanel, "The console panel is not the current tool");
++
++    toolbox.toggleSplitConsole();
++
++    let finalDeckHeight = parseInt(win.getComputedStyle(deck).getPropertyValue("height"));
++    let finalWebconsoleHeight = parseInt(win.getComputedStyle(webconsolePanel).getPropertyValue("height"));
++    let finalSplitterVisibility = !splitter.getAttribute("hidden");
++    let openedConsolePanel = toolbox.currentToolId === "webconsole";
++
++    ok (!finalSplitterVisibility, "Splitter is hidden after toggling");
++    ok (finalDeckHeight > 0, "Deck has a height > 0 after toggling");
++    is (finalWebconsoleHeight, 0, "Web console is collapsed after toggling");
++    ok (!openedConsolePanel, "The console panel is not the current tool");
++  }
++
++  function finish()
++  {
++    toolbox = null;
++    finishTest();
++  }
 +}
+diff --git a/browser/devtools/webconsole/test/head.js b/browser/devtools/webconsole/test/head.js
+--- a/browser/devtools/webconsole/test/head.js
++++ b/browser/devtools/webconsole/test/head.js
+@@ -4,17 +4,16 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ let WebConsoleUtils, gDevTools, TargetFactory, console, promise, require;
+ 
+ (() => {
+   gDevTools = Cu.import("resource:///modules/devtools/gDevTools.jsm", {}).gDevTools;
+   console = Cu.import("resource://gre/modules/devtools/Console.jsm", {}).console;
+   promise = Cu.import("resource://gre/modules/commonjs/sdk/core/promise.js", {}).Promise;
+-
+   let tools = Cu.import("resource://gre/modules/devtools/Loader.jsm", {}).devtools;
+   let utils = tools.require("devtools/toolkit/webconsole/utils");
+   TargetFactory = tools.TargetFactory;
+   WebConsoleUtils = utils.Utils;
+   require = tools.require;
+ })();
+ // promise._reportErrors = true; // please never leave me.
+ 
