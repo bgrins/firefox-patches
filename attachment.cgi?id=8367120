@@ -1,0 +1,1344 @@
+Bug 939040 - Add eyedropper tool and include in the inspector colorpicker tooltip; r=pbrosset
+
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -1087,7 +1087,7 @@ pref("devtools.toolbox.footer.height", 2
+ pref("devtools.toolbox.sidebar.width", 500);
+ pref("devtools.toolbox.host", "bottom");
+ pref("devtools.toolbox.selectedTool", "webconsole");
+-pref("devtools.toolbox.toolbarSpec", '["splitconsole", "paintflashing toggle","tilt toggle","scratchpad","resize toggle"]');
++pref("devtools.toolbox.toolbarSpec", '["splitconsole", "paintflashing toggle","tilt toggle","scratchpad","eyedropper","resize toggle"]');
+ pref("devtools.toolbox.sideEnabled", true);
+ pref("devtools.toolbox.zoomValue", "1");
+ 
+@@ -1228,6 +1228,8 @@ pref("devtools.hud.loglimit.cssparser", 
+ pref("devtools.hud.loglimit.exception", 200);
+ pref("devtools.hud.loglimit.console", 200);
+ 
++pref("devtools.eyedropper.zoom", 6);
++
+ // The developer tools editor configuration:
+ // - tabsize: how many spaces to use when a Tab character is displayed.
+ // - expandtab: expand Tab characters to spaces.
+diff --git a/browser/base/content/browser-menubar.inc b/browser/base/content/browser-menubar.inc
+--- a/browser/base/content/browser-menubar.inc
++++ b/browser/base/content/browser-menubar.inc
+@@ -477,6 +477,9 @@
+                   <menuitem id="menu_responsiveUI"
+                             observes="devtoolsMenuBroadcaster_ResponsiveUI"
+                             accesskey="&responsiveDesignTool.accesskey;"/>
++                  <menuitem id="menu_eyedropper"
++                            observes="devtoolsMenuBroadcaster_Eyedropper"
++                            accesskey="&eyedropper.accesskey;"/>
+                   <menuitem id="menu_scratchpad"
+                             observes="devtoolsMenuBroadcaster_Scratchpad"
+                             accesskey="&scratchpad.accesskey;"/>
+diff --git a/browser/base/content/browser-sets.inc b/browser/base/content/browser-sets.inc
+--- a/browser/base/content/browser-sets.inc
++++ b/browser/base/content/browser-sets.inc
+@@ -99,6 +99,7 @@
+     <command id="Tools:BrowserConsole" oncommand="HUDService.toggleBrowserConsole();"/>
+     <command id="Tools:Scratchpad" oncommand="Scratchpad.openScratchpad();"/>
+     <command id="Tools:ResponsiveUI" oncommand="ResponsiveUI.toggle();"/>
++    <command id="Tools:Eyedropper" oncommand="openEyedropper();"/>
+     <command id="Tools:Addons" oncommand="BrowserOpenAddonsMgr();"/>
+     <command id="Tools:ErrorConsole" oncommand="toJavaScriptConsole()" disabled="true" hidden="true"/>
+     <command id="Tools:DevToolsConnect" oncommand="gDevToolsBrowser.openConnectScreen(gBrowser)" disabled="true" hidden="true"/>
+@@ -199,6 +200,11 @@
+                  type="checkbox" autocheck="false"
+                  command="Tools:ResponsiveUI"
+                  key="key_responsiveUI"/>
++    <broadcaster id="devtoolsMenuBroadcaster_Eyedropper"
++                 label="&eyedropper.label;"
++                 type="checkbox" autocheck="false"
++                 command="Tools:Eyedropper"
++                 key="key_eyedropper"/>
+     <broadcaster id="devtoolsMenuBroadcaster_PageSource"
+                  label="&pageSourceCmd.label;"
+                  key="key_viewSource"
+@@ -270,6 +276,14 @@
+ #endif
+     />
+ 
++    <key id="key_eyedropper" key="&eyedropper.commandkey;" command="Tools:Eyedropper"
++#ifdef XP_MACOSX
++        modifiers="accel,alt"
++#else
++        modifiers="accel,shift"
++#endif
++    />
++
+     <key id="key_devToolboxMenuItem" keytext="&devToolboxMenuItem.keytext;"
+          command="Tools:DevToolbox" key="&devToolboxMenuItem.keytext;"
+ #ifdef XP_MACOSX
+diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+--- a/browser/base/content/browser.js
++++ b/browser/base/content/browser.js
+@@ -7119,6 +7119,20 @@ XPCOMUtils.defineLazyGetter(ResponsiveUI
+   return tmp.ResponsiveUIManager;
+ });
+ 
++function openEyedropper() {
++  var eyedropper = new this.Eyedropper(this);
++  eyedropper.open();
++}
++
++Object.defineProperty(this, "Eyedropper", {
++  get: function() {
++    let devtools = Cu.import("resource://gre/modules/devtools/Loader.jsm", {}).devtools;
++    return devtools.require("devtools/eyedropper/eyedropper").Eyedropper;
++  },
++  configurable: true,
++  enumerable: true
++});
++
+ XPCOMUtils.defineLazyGetter(window, "gShowPageResizers", function () {
+ #ifdef XP_WIN
+   // Only show resizers on Windows 2000 and XP
+diff --git a/browser/devtools/commandline/Commands.jsm b/browser/devtools/commandline/Commands.jsm
+--- a/browser/devtools/commandline/Commands.jsm
++++ b/browser/devtools/commandline/Commands.jsm
+@@ -15,4 +15,5 @@ Cu.import("resource:///modules/devtools/
+ Cu.import("resource:///modules/devtools/CmdTilt.jsm");
+ Cu.import("resource:///modules/devtools/CmdScratchpad.jsm");
+ 
++require("devtools/eyedropper/commands.js");
+ require("devtools/profiler/commands.js");
+diff --git a/browser/devtools/eyedropper/commands.js b/browser/devtools/eyedropper/commands.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/eyedropper/commands.js
+@@ -0,0 +1,36 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++* License, v. 2.0. If a copy of the MPL was not distributed with this
++* file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++const { Cu } = require("chrome");
++module.exports = [];
++
++Cu.import("resource://gre/modules/devtools/gcli.jsm");
++
++// Fetch EyedropperManager using the current loader, but don't save a
++// reference to it, because it might change with a tool reload.
++// We can clean this up once the command line is loadered.
++Object.defineProperty(this, "Eyedropper", {
++  get: function() {
++    return require("devtools/eyedropper/eyedropper").Eyedropper;
++  },
++  enumerable: true
++});
++
++/**
++* 'eyedropper' command
++*/
++gcli.addCommand({
++  name: "eyedropper",
++  description: "Magnify areas of page to inspect pixels and colors",
++  buttonId: "command-button-eyedropper",
++  buttonClass: "command-button",
++  tooltipText: "Eyedropper",
++
++  exec: function(args, context) {
++    let chromeWindow = context.environment.chromeWindow;
++
++    let eyedropper = new Eyedropper(chromeWindow);
++    eyedropper.open();
++  }
++});
+\ No newline at end of file
+diff --git a/browser/devtools/eyedropper/eyedropper.js b/browser/devtools/eyedropper/eyedropper.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/eyedropper/eyedropper.js
+@@ -0,0 +1,398 @@
++const {Cc, Ci, Cu} = require("chrome");
++
++Cu.import("resource://gre/modules/Services.jsm");
++
++const {colorUtils} = require("devtools/css-color");
++const CssColor = colorUtils.CssColor;
++let EventEmitter = require("devtools/shared/event-emitter");
++
++loader.lazyGetter(this, "clipboardHelper", function() {
++  return Cc["@mozilla.org/widget/clipboardhelper;1"].
++    getService(Ci.nsIClipboardHelper);
++});
++
++loader.lazyGetter(this, "l10n", () => Services.strings
++  .createBundle("chrome://browser/locale/devtools/eyedropper.properties"));
++
++const MAGNIFIER_URL = "chrome://browser/content/devtools/eyedropper.xul";
++const ZOOM_PREF = "devtools.eyedropper.zoom";
++const FORMAT_PREF = "devtools.defaultColorUnit";
++
++const PANEL_STYLE = "width:140px;height:120px;" +
++                   "-moz-appearance:none;background-color:transparent";
++const CANVAS_WIDTH = 96;
++const CLOSE_DELAY = 750;
++
++/**
++ * Eyedropper widget. Once opened, shows zoomed area above current pixel and
++ * displays the color value of the center pixel.
++ *
++ * let eyedropper = new Eyedropper(window);
++ * maginifier.open();
++ */
++
++function Eyedropper(chromeWindow, opts = { copyOnSelect: true }) {
++  const { copyOnSelect } = opts;
++  this.onFirstMouseMove = this.onFirstMouseMove.bind(this);
++  this.onMouseMove = this.onMouseMove.bind(this);
++  this.onMouseDown = this.onMouseDown.bind(this);
++  this.onKeyDown = this.onKeyDown.bind(this);
++
++  this.chromeWindow = chromeWindow;
++  this.chromeDocument = chromeWindow.document;
++
++  this.dragging = true;
++  this.loaded = false;
++  this.popupSet = this.chromeDocument.querySelector("#mainPopupSet");
++
++  let zoom = 6; //Services.prefs.getIntPref(ZOOM_PREF);
++  this.zoomWindow = {
++    x: 0,          // the left coordinate of the center of the inspected region
++    y: 0,          // the top coordinate of the center of the inspected region
++    width: 1,      // width of canvas to draw zoomed area onto
++    height: 1,     // height of canvas
++    zoom: zoom     // zoom level - integer, minimum is 2
++  };
++
++  this.format = Services.prefs.getCharPref(FORMAT_PREF);
++  this.copyOnSelect = copyOnSelect;
++
++  EventEmitter.decorate(this);
++}
++
++exports.Eyedropper = Eyedropper;
++
++Eyedropper.prototype = {
++  /**
++   * The number of cells (blown-up pixels) per direction in the grid.
++   */
++  get cellsWide() {
++    let { width, zoom } = this.zoomWindow;
++
++    // Canvas will render whole "pixels" (cells) only, and an even
++    // number at that. Round up to the nearest even number of pixels.
++    let cellsWide = Math.ceil(width / zoom)
++    cellsWide += cellsWide % 2;
++
++    return cellsWide;
++  },
++
++  /**
++   * Size of each cell (blown-up pixel) in the grid.
++   */
++  get cellSize() {
++    return this.zoomWindow.width / this.cellsWide;
++  },
++
++  /**
++   * Get index of cell in the center of the grid.
++   */
++  get centerCell() {
++    return Math.floor(this.cellsWide / 2);
++  },
++
++  /**
++   * Get color of center cell in the grid.
++   */
++  get centerColor() {
++    let x = y = (this.centerCell * this.cellSize) + (this.cellSize / 2);
++    let rgb = this.ctx.getImageData(x, y, 1, 1).data;
++    return new CssColor("rgb(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + ")");
++  },
++
++  /**
++   * Show the eyedropper.
++   */
++  open: function() {
++    this.chromeDocument.addEventListener("mousemove", this.onFirstMouseMove);
++  },
++
++  onFirstMouseMove: function(event) {
++    this.chromeDocument.removeEventListener("mousemove", this.onFirstMouseMove);
++
++    this._panel = this.buildPanel();
++    this.popupSet.appendChild(this._panel);
++
++    this._panel.openPopupAtScreen(event.screenX, event.screenY);
++
++    this.addListeners();
++  },
++
++  buildPanel: function() {
++    let panel = this.chromeDocument.createElement("panel");
++    panel.id = "devtools-eyedropper-indication-panel";
++    panel.setAttribute("noautofocus", true);
++    panel.setAttribute("noautohide", true);
++    panel.setAttribute("backdrag", true);
++    panel.setAttribute("level", "floating");
++    panel.setAttribute("close", true);
++    panel.setAttribute("style", PANEL_STYLE);
++
++    panel.addEventListener("popuphidden", (e) => {
++      if (e.target === panel) {
++        this.destroy();
++      }
++    });
++
++    let iframe = this.iframe = this.chromeDocument.createElement("iframe");
++    iframe.addEventListener("load", this.frameLoaded.bind(this), true);
++    iframe.setAttribute("flex", "1");
++    iframe.setAttribute("transparent", "transparent");
++    iframe.setAttribute("allowTransparency", true);
++    iframe.setAttribute("class", "devtools-eyedropper-iframe");
++    iframe.setAttribute("src", MAGNIFIER_URL);
++    iframe.setAttribute("width", CANVAS_WIDTH);
++    iframe.setAttribute("height", CANVAS_WIDTH);
++
++    panel.appendChild(iframe);
++
++    return panel;
++  },
++
++  frameLoaded: function() {
++    this.iframeDocument = this.iframe.contentDocument;
++    this.canvas = this.iframeDocument.querySelector("#canvas");
++    this.ctx = this.canvas.getContext("2d");
++    this.canvasContainer = this.iframeDocument.querySelector("#canvas-container")
++    this.colorPreview = this.iframeDocument.querySelector("#color-preview");
++    this.colorValue = this.iframeDocument.querySelector("#color-value");
++
++    this.zoomWindow.width = this.canvas.width;
++    this.zoomWindow.height = this.canvas.height;
++
++    this.addPanelListeners();
++
++    this.drawWindow();
++
++    this.loaded = true;
++    this.emit("load");
++  },
++
++  addPanelListeners: function() {
++    this.iframeDocument.addEventListener("keydown", this.onKeyDown);
++
++    let closeCmd = this.iframeDocument.getElementById("eyedropper-cmd-close");
++    closeCmd.addEventListener("command", this.destroy.bind(this), true);
++
++    let copyCmd = this.iframeDocument.getElementById("eyedropper-cmd-copy");
++    copyCmd.addEventListener("command", this.selectColor.bind(this), true);
++  },
++
++  addListeners: function() {
++    this.chromeDocument.addEventListener("mousemove", this.onMouseMove);
++    this.chromeDocument.addEventListener("mousedown", this.onMouseDown);
++  },
++
++  removeListeners: function() {
++    this.chromeDocument.removeEventListener("mousemove", this.onMouseMove);
++    this.chromeDocument.removeEventListener("mousedown", this.onMouseDown);
++  },
++
++  onMouseMove: function(event) {
++    if (!this.dragging || !this._panel) {
++      return;
++    }
++
++    let { width } = this.zoomWindow;
++    let win = this.chromeWindow;
++
++    let windowX = win.screenX + (win.outerWidth - win.innerWidth);
++    let x = event.screenX - windowX;
++
++    let windowY = win.screenY + (win.outerHeight - win.innerHeight);
++    let y = event.screenY - windowY;
++
++    this.moveRegion(x, y);
++
++    let panelX = event.screenX - width / 2;
++    let panelY = event.screenY - width / 2;
++
++    this._panel.moveTo(panelX, panelY);
++  },
++
++  moveRegion: function(x, y) {
++    this.zoomWindow.x = x;
++    this.zoomWindow.y = y;
++
++    this.drawWindow();
++  },
++
++  onMouseDown: function(event) {
++    this.toggleDragging(false);
++
++    event.preventDefault();
++    event.stopPropagation();
++
++    this.selectColor();
++  },
++
++  selectColor: function() {
++    this.emit("select", this.colorValue.value);
++
++    if (this.copyOnSelect) {
++      this.copyColor(this.destroy.bind(this));
++    }
++    else {
++      this.destroy();
++    }
++  },
++
++  copyColor: function(callback) {
++    Services.appShell.hiddenDOMWindow.clearTimeout(this.copyTimeout);
++
++    let color = this.colorValue.value;
++    clipboardHelper.copyString(color);
++
++    this.colorValue.classList.add("highlight");
++    this.colorValue.value = "✓ " + l10n.GetStringFromName("colorValue.copied");
++
++    this.copyTimeout = Services.appShell.hiddenDOMWindow.setTimeout(() => {
++      this.colorValue.classList.remove("highlight");
++      this.colorValue.value = color;
++
++      if (callback) {
++        callback();
++      }
++    }, CLOSE_DELAY);
++  },
++
++  onKeyDown: function(event) {
++    if (event.metaKey && event.keyCode === event.DOM_VK_C) {
++      this.copyColor();
++      return;
++    }
++
++    let offsetX = 0;
++    let offsetY = 0;
++    let modifier = 1;
++
++    if (event.keyCode === event.DOM_VK_LEFT) {
++      offsetX = -1;
++    }
++    if (event.keyCode === event.DOM_VK_RIGHT) {
++      offsetX = 1;
++    }
++    if (event.keyCode === event.DOM_VK_UP) {
++      offsetY = -1;
++    }
++    if (event.keyCode === event.DOM_VK_DOWN) {
++      offsetY = 1;
++    }
++    if (event.shiftKey) {
++      modifier = 10;
++    }
++
++    offsetY *= modifier;
++    offsetX *= modifier;
++
++    if (offsetX !== 0 || offsetY !== 0) {
++      this.moveBy(offsetX, offsetY);
++      event.preventDefault();
++    }
++  },
++
++  moveBy: function(offsetX=0, offsetY=0) {
++    this.zoomWindow.x += offsetX;
++    this.zoomWindow.y += offsetY;
++
++    this.drawWindow();
++  },
++
++  toggleDragging: function(mode) {
++    if (mode === false) {
++      this.dragging = false;
++    }
++    else if (mode === true) {
++      this.dragging = true;
++    }
++    else {
++      this.dragging = !this.dragging;
++    }
++  },
++
++  drawWindow: function() {
++    let { width, height, x, y, zoom } = this.zoomWindow;
++
++    this.canvas.width = width;
++    this.canvas.height = height;
++
++    let drawY = y - (height / 2);
++    let drawX = x - (width / 2);
++
++    this.ctx.mozImageSmoothingEnabled = false;
++
++    this.ctx.drawWindow(this.chromeWindow, drawX, drawY, width, height, "white");
++
++    if (zoom > 1) {
++      let zoomedWidth = width / zoom;
++      let zoomedHeight = height / zoom;
++      let sx = (width - zoomedWidth) / 2;
++      let sy = (height - zoomedHeight) / 2;
++      let sw = zoomedWidth;
++      let sh = zoomedHeight;
++      let dx = 0;
++      let dy = 0;
++      let dw = width;
++      let dh = height;
++
++      this.ctx.drawImage(this.canvas, sx, sy, sw, sh, dx, dy, dw, dh);
++    }
++
++    this.iframe.focus();
++
++    this.colorPreview.style.backgroundColor = this.centerColor.hex;
++    this.populateColorValues();
++
++    if (this.zoomWindow.zoom > 2) {
++      // grid at 2x is too busy
++      this.drawGrid();
++    }
++    this.drawCrosshair();
++  },
++
++  drawGrid: function() {
++    let { width, height, zoom } = this.zoomWindow;
++
++    this.ctx.lineWidth = 1;
++    this.ctx.strokeStyle = "rgba(0, 0, 0, .05)";
++
++    for (let i = 0; i < width; i += this.cellSize) {
++      this.ctx.beginPath();
++      this.ctx.moveTo(i - .5, 0);
++      this.ctx.lineTo(i - .5, height);
++      this.ctx.stroke();
++
++      this.ctx.beginPath();
++      this.ctx.moveTo(0, i - .5);
++      this.ctx.lineTo(width, i - .5);
++      this.ctx.stroke();
++    }
++  },
++
++  drawCrosshair: function() {
++    let x = y = this.centerCell * this.cellSize;
++
++    this.ctx.lineWidth = 1;
++    this.ctx.lineJoin = 'miter';
++    this.ctx.strokeStyle = "rgba(0, 0, 0, 1)";
++    this.ctx.strokeRect(x - 1.5, y - 1.5, this.cellSize + 2, this.cellSize + 2);
++
++    this.ctx.strokeStyle = "rgba(255, 255, 255, 1)";
++    this.ctx.strokeRect(x - 0.5, y - 0.5, this.cellSize, this.cellSize);
++  },
++
++  populateColorValues: function() {
++    let color = this.centerColor;
++    this.colorValue.value = color[this.format];
++  },
++
++  destroy: function() {
++    if (this._panel) {
++      this.popupSet.removeChild(this._panel);
++      this._panel = null;
++    }
++    this.removeListeners();
++
++    this.emit("destroy");
++  }
++}
+\ No newline at end of file
+diff --git a/browser/devtools/eyedropper/eyedropper.xul b/browser/devtools/eyedropper/eyedropper.xul
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/eyedropper/eyedropper.xul
+@@ -0,0 +1,50 @@
++<?xml version="1.0" encoding="utf-8"?>
++
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++
++<!DOCTYPE window [
++<!ENTITY % eyedropperDTD SYSTEM "chrome://browser/locale/devtools/eyedropper.dtd" >
++ %eyedropperDTD;
++]>
++
++<?xml-stylesheet href="chrome://browser/skin/devtools/common.css"?>
++<?xml-stylesheet href="chrome://browser/skin/devtools/eyedropper.css" type="text/css"?>
++
++<window xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
++  <commandset id="eyedropper-commandset">
++    <command id="eyedropper-cmd-close"
++             oncommand="void(0);"/>
++    <command id="eyedropper-cmd-copy"
++             oncommand="void(0);"/>
++  </commandset>
++
++  <keyset id="eyedropper-keyset">
++    <key id="eyedropper-key-close"
++         key="&closeCmd.key;"
++         command="eyedropper-cmd-close"
++         modifiers="accel"/>
++    <key id="eyedropper-key-escape"
++         keycode="VK_ESCAPE"
++         command="eyedropper-cmd-close"/>
++    <key id="eyedropper-key-enter"
++         keycode="VK_RETURN"
++         command="eyedropper-cmd-copy"/>
++  </keyset>
++
++  <vbox id="eyedropper-container" flex="1">
++    <box id="canvas-overflow">
++      <box id="canvas-container">
++        <canvas id="canvas" xmlns="http://www.w3.org/1999/xhtml" width="96" height="96">
++        </canvas>
++      </box>
++    </box>
++    <hbox id="color-value-box">
++      <box id="color-preview">
++      </box>
++      <label id="color-value" class="devtools-monospace">
++      </label>
++    </hbox>
++  </vbox>
++</window>
+\ No newline at end of file
+diff --git a/browser/devtools/eyedropper/moz.build b/browser/devtools/eyedropper/moz.build
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/eyedropper/moz.build
+@@ -0,0 +1,14 @@
++# -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++TEST_DIRS += ['test']
++
++JS_MODULES_PATH = 'modules/devtools/eyedropper'
++
++EXTRA_JS_MODULES += [
++    'commands.js',
++    'eyedropper.js'
++]
+diff --git a/browser/devtools/eyedropper/test/browser.ini b/browser/devtools/eyedropper/test/browser.ini
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/eyedropper/test/browser.ini
+@@ -0,0 +1,6 @@
++[DEFAULT]
++support-files =
++  color-block.html
++  head.js
++
++[browser_eyedropper_basic.js]
+diff --git a/browser/devtools/eyedropper/test/browser_eyedropper_basic.js b/browser/devtools/eyedropper/test/browser_eyedropper_basic.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/eyedropper/test/browser_eyedropper_basic.js
+@@ -0,0 +1,54 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++const TESTCASE_URI = TEST_BASE + "color-block.html";
++
++const Cc = Components.classes;
++const Ci = Components.interfaces;
++
++const DIV_COLOR = "#00F";
++
++function test()
++{
++  waitForExplicitFinish();
++
++  addTab(TESTCASE_URI, runTests);
++}
++
++function runTests() {
++  let dropper = new Eyedropper(window);
++
++  dropper.once("select", (event, color) => {
++    is(color, DIV_COLOR, "correct color selected");
++  });
++
++  waitForClipboard(DIV_COLOR, () => {
++    inspectPage(dropper);
++  }, finish, finish);
++}
++
++function inspectPage(dropper) {
++  dropper.open();
++
++  let target = content.document.getElementById("test");
++  let win = content.window;
++
++  EventUtils.synthesizeMouse(target, 20, 20, { type: "mousemove" }, win);
++
++  dropperLoaded(dropper).then(() => {
++    EventUtils.synthesizeMouse(target, 30, 30, { type: "mousemove" }, win);
++    EventUtils.synthesizeMouse(target, 30, 30, {}, win);
++  });
++}
++
++function dropperLoaded(dropper) {
++  if (dropper.loaded) {
++    return promise.resolve();
++  }
++
++  let deferred = promise.defer();
++  dropper.once("load", deferred.resolve);
++
++  return deferred.promise;
++}
+diff --git a/browser/devtools/eyedropper/test/color-block.html b/browser/devtools/eyedropper/test/color-block.html
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/eyedropper/test/color-block.html
+@@ -0,0 +1,22 @@
++<!doctype html>
++<html>
++<head>
++  <title>basic eyedropper test case</title>
++  <style type="text/css">
++  body {
++    background: #f99;
++  }
++
++  #test {
++    margin: 100px;
++    background-color: blue;
++    width: 200px;
++    height: 200px;
++  }
++  </style>
++</head>
++<body>
++  <div id="test">
++  </div>
++</body>
++</html>
+diff --git a/browser/devtools/eyedropper/test/head.js b/browser/devtools/eyedropper/test/head.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/eyedropper/test/head.js
+@@ -0,0 +1,28 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++const TEST_BASE = "chrome://mochitests/content/browser/browser/devtools/eyedropper/test/";
++const TEST_HOST = 'mochi.test:8888';
++
++const promise = Cu.import("resource://gre/modules/commonjs/sdk/core/promise.js").Promise;
++const require = Cu.import("resource://gre/modules/devtools/Loader.jsm", {}).devtools.require;
++const { Eyedropper } = require("devtools/eyedropper/eyedropper");
++
++function cleanup()
++{
++  while (gBrowser.tabs.length > 1) {
++    gBrowser.removeCurrentTab();
++  }
++}
++
++registerCleanupFunction(cleanup);
++
++function addTab(uri, callback) {
++  gBrowser.selectedTab = gBrowser.addTab();
++  gBrowser.selectedBrowser.addEventListener("load", function onLoad() {
++    gBrowser.selectedBrowser.removeEventListener("load", onLoad, true);
++    callback();
++  }, true);
++
++  content.location = uri;
++}
+diff --git a/browser/devtools/eyedropper/test/moz.build b/browser/devtools/eyedropper/test/moz.build
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/eyedropper/test/moz.build
+@@ -0,0 +1,6 @@
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++BROWSER_CHROME_MANIFESTS += ['browser.ini']
+diff --git a/browser/devtools/jar.mn b/browser/devtools/jar.mn
+--- a/browser/devtools/jar.mn
++++ b/browser/devtools/jar.mn
+@@ -105,3 +105,5 @@ browser.jar:
+     content/browser/devtools/app-manager/manifest-editor.js            (app-manager/content/manifest-editor.js)
+     content/browser/devtools/spectrum-frame.xhtml                      (shared/widgets/spectrum-frame.xhtml)
+     content/browser/devtools/spectrum.css                              (shared/widgets/spectrum.css)
++    content/browser/devtools/eyedropper.xul                            (eyedropper/eyedropper.xul)
++
+diff --git a/browser/devtools/moz.build b/browser/devtools/moz.build
+--- a/browser/devtools/moz.build
++++ b/browser/devtools/moz.build
+@@ -12,6 +12,7 @@ DIRS += [
+     'framework',
+     'inspector',
+     'layoutview',
++    'eyedropper',
+     'markupview',
+     'netmonitor',
+     'profiler',
+@@ -23,7 +24,7 @@ DIRS += [
+     'styleeditor',
+     'styleinspector',
+     'tilt',
+-    'webconsole',
++    'webconsole'
+ ]
+ 
+ EXTRA_COMPONENTS += [
+diff --git a/browser/devtools/shared/widgets/Tooltip.js b/browser/devtools/shared/widgets/Tooltip.js
+--- a/browser/devtools/shared/widgets/Tooltip.js
++++ b/browser/devtools/shared/widgets/Tooltip.js
+@@ -13,6 +13,7 @@ const EventEmitter = require("devtools/s
+ const {colorUtils} = require("devtools/css-color");
+ const Heritage = require("sdk/core/heritage");
+ const {CSSTransformPreviewer} = require("devtools/shared/widgets/CSSTransformPreviewer");
++const {Eyedropper} = require("devtools/eyedropper/eyedropper");
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+@@ -175,6 +176,12 @@ function Tooltip(doc, options) {
+       this["_onPopup" + event], false);
+   }
+ 
++  this.panel.addEventListener("popuphiding", (event) => {
++    if (this.preventHiding) {
++      event.preventDefault();
++    }
++  });
++
+   // Listen to keypress events to close the tooltip if configured to do so
+   let win = this.doc.querySelector("window");
+   this._onKeyPress = event => {
+@@ -217,6 +224,10 @@ Tooltip.prototype = {
+     this.panel.openPopup(anchor, position, x, y);
+   },
+ 
++  set consumeOutsideClick(val) {
++    this.panel.setAttribute("consumeoutsideclicks", val);
++  },
++
+   /**
+    * Hide the tooltip
+    */
+@@ -585,7 +596,7 @@ Tooltip.prototype = {
+     let iframe = this.doc.createElementNS(XHTML_NS, "iframe");
+     iframe.setAttribute("transparent", true);
+     iframe.setAttribute("width", "210");
+-    iframe.setAttribute("height", "195");
++    iframe.setAttribute("height", "220");
+     iframe.setAttribute("flex", "1");
+     iframe.setAttribute("class", "devtools-tooltip-iframe");
+ 
+@@ -813,6 +824,7 @@ function SwatchColorPickerTooltip(doc) {
+   // resolves to the spectrum instance
+   this.spectrum = this.tooltip.setColorPickerContent([0, 0, 0, 1]);
+   this._onSpectrumColorChange = this._onSpectrumColorChange.bind(this);
++  this._openEyeDropper = this._openEyeDropper.bind(this);
+ }
+ 
+ module.exports.SwatchColorPickerTooltip = SwatchColorPickerTooltip;
+@@ -836,16 +848,49 @@ SwatchColorPickerTooltip.prototype = Her
+         spectrum.updateUI();
+       });
+     }
++
++    let tooltipDoc = this.tooltip.content.contentDocument;
++    let eyeButton = tooltipDoc.querySelector("#eyedropper-button");
++    eyeButton.addEventListener("click", this._openEyeDropper);
+   },
+ 
+   _onSpectrumColorChange: function(event, rgba, cssColor) {
++    this._selectColor(cssColor);
++  },
++
++  _selectColor: function(color) {
+     if (this.activeSwatch) {
+-      this.activeSwatch.style.backgroundColor = cssColor;
+-      this.activeSwatch.nextSibling.textContent = cssColor;
+-      this.preview(cssColor);
++      this.activeSwatch.style.backgroundColor = color;
++      this.activeSwatch.nextSibling.textContent = color;
++      this.preview(color);
+     }
+   },
+ 
++  _openEyeDropper: function() {
++    // we want the click to be handled by the eyedropper, not the tooltip
++    this.tooltip.consumeOutsideClick = false;
++    this.tooltip.preventHiding = true;
++
++    let chromeWindow = this.tooltip.doc.defaultView.top;
++    let dropper = new Eyedropper(chromeWindow, { copyOnSelect: false });
++
++    dropper.once("select", (event, color) => {
++      this._selectColor(color);
++
++      this.spectrum.then((spectrum) => {
++        spectrum.rgb = this._colorToRgba(color);
++        spectrum.updateUI();
++      });
++    });
++
++    dropper.once("destroy", () => {
++      this.tooltip.consumeOutsideClick = true;
++      this.tooltip.preventHiding = false;
++    })
++
++    dropper.open();
++  },
++
+   _colorToRgba: function(color) {
+     color = new colorUtils.CssColor(color);
+     let rgba = color._getRGBATuple();
+diff --git a/browser/devtools/shared/widgets/spectrum-frame.xhtml b/browser/devtools/shared/widgets/spectrum-frame.xhtml
+--- a/browser/devtools/shared/widgets/spectrum-frame.xhtml
++++ b/browser/devtools/shared/widgets/spectrum-frame.xhtml
+@@ -19,5 +19,6 @@
+ </head>
+ <body role="application">
+   <div id="spectrum"></div>
++  <button id="eyedropper-button"></button>
+ </body>
+ </html>
+\ No newline at end of file
+diff --git a/browser/devtools/shared/widgets/spectrum.css b/browser/devtools/shared/widgets/spectrum.css
+--- a/browser/devtools/shared/widgets/spectrum.css
++++ b/browser/devtools/shared/widgets/spectrum.css
+@@ -1,7 +1,17 @@
++
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
++#eyedropper-button {
++  background: url("chrome://browser/skin/devtools/eyedropper-black.png");
++  width: 18px;
++  height: 18px;
++  padding: 1px;
++  border: 1px solid grey;
++  border-radius: 2px;
++}
++
+ /* Mix-in classes */
+ 
+ .spectrum-checker {
+diff --git a/browser/locales/en-US/chrome/browser/browser.dtd b/browser/locales/en-US/chrome/browser/browser.dtd
+--- a/browser/locales/en-US/chrome/browser/browser.dtd
++++ b/browser/locales/en-US/chrome/browser/browser.dtd
+@@ -226,6 +226,10 @@ These should match what Safari and other
+ <!ENTITY responsiveDesignTool.accesskey "R">
+ <!ENTITY responsiveDesignTool.commandkey "M">
+ 
++<!ENTITY eyedropper.label   "Eyedropper">
++<!ENTITY eyedropper.accesskey "P">
++<!ENTITY eyedropper.commandkey "X">
++
+ <!-- LOCALIZATION NOTE (scratchpad.label): This menu item label appears
+   -  in the Tools menu. See bug 653093.
+   -  The Scratchpad is intended to provide a simple text editor for creating
+diff --git a/browser/locales/en-US/chrome/browser/devtools/eyedropper.dtd b/browser/locales/en-US/chrome/browser/devtools/eyedropper.dtd
+new file mode 100644
+--- /dev/null
++++ b/browser/locales/en-US/chrome/browser/devtools/eyedropper.dtd
+@@ -0,0 +1,8 @@
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++
++<!-- LOCALIZATION NOTE : FILE This file contains the Eyedropper strings -->
++<!-- LOCALIZATION NOTE : FILE Do not translate key -->
++
++<!ENTITY closeCmd.key  "W">
+\ No newline at end of file
+diff --git a/browser/locales/en-US/chrome/browser/devtools/eyedropper.properties b/browser/locales/en-US/chrome/browser/devtools/eyedropper.properties
+new file mode 100644
+--- /dev/null
++++ b/browser/locales/en-US/chrome/browser/devtools/eyedropper.properties
+@@ -0,0 +1,14 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++# LOCALIZATION NOTE These strings are used in the Eyedropper color tool.
++# LOCALIZATION NOTE The correct localization of this file might be to keep it
++# in English, or another language commonly spoken among web developers.
++# You want to make that choice consistent across the developer tools.
++# A good criteria is the language in which you'd find the best documentation
++# on web development on the web.
++
++# LOCALIZATION NOTE  (colorValue.copied): This text is displayed when the user selects a
++# color with the eyedropper and it's copied to the clipboard.
++colorValue.copied=copied
+diff --git a/browser/locales/jar.mn b/browser/locales/jar.mn
+--- a/browser/locales/jar.mn
++++ b/browser/locales/jar.mn
+@@ -52,6 +52,8 @@
+     locale/browser/devtools/toolbox.dtd            (%chrome/browser/devtools/toolbox.dtd)
+     locale/browser/devtools/toolbox.properties     (%chrome/browser/devtools/toolbox.properties)
+     locale/browser/devtools/inspector.dtd          (%chrome/browser/devtools/inspector.dtd)
++    locale/browser/devtools/eyedropper.dtd            (%chrome/browser/devtools/eyedropper.dtd)
++    locale/browser/devtools/eyedropper.properties     (%chrome/browser/devtools/eyedropper.properties)
+     locale/browser/devtools/connection-screen.dtd  (%chrome/browser/devtools/connection-screen.dtd)
+     locale/browser/devtools/connection-screen.properties (%chrome/browser/devtools/connection-screen.properties)
+     locale/browser/devtools/font-inspector.dtd     (%chrome/browser/devtools/font-inspector.dtd)
+diff --git a/browser/themes/linux/jar.mn b/browser/themes/linux/jar.mn
+--- a/browser/themes/linux/jar.mn
++++ b/browser/themes/linux/jar.mn
+@@ -168,6 +168,8 @@ browser.jar:
+   skin/classic/browser/devtools/command-pick@2x.png           (../shared/devtools/images/command-pick@2x.png)
+   skin/classic/browser/devtools/command-console.png           (../shared/devtools/images/command-console.png)
+   skin/classic/browser/devtools/command-console@2x.png        (../shared/devtools/images/command-console@2x.png)
++  skin/classic/browser/devtools/command-eyedropper.png        (../shared/devtools/images/command-eyedropper.png)
++  skin/classic/browser/devtools/command-eyedropper@2x.png     (../shared/devtools/images/command-eyedropper@2x.png)
+   skin/classic/browser/devtools/alerticon-warning.png (devtools/alerticon-warning.png)
+   skin/classic/browser/devtools/ruleview.css          (devtools/ruleview.css)
+ * skin/classic/browser/devtools/webconsole.css                  (devtools/webconsole.css)
+@@ -210,6 +212,7 @@ browser.jar:
+ * skin/classic/browser/devtools/profiler.css          (devtools/profiler.css)
+ * skin/classic/browser/devtools/netmonitor.css        (devtools/netmonitor.css)
+ * skin/classic/browser/devtools/scratchpad.css        (devtools/scratchpad.css)
++  skin/classic/browser/devtools/eyedropper.css        (../shared/devtools/eyedropper.css)
+   skin/classic/browser/devtools/magnifying-glass.png  (devtools/magnifying-glass.png)
+   skin/classic/browser/devtools/option-icon.png       (devtools/option-icon.png)
+   skin/classic/browser/devtools/itemToggle.png        (devtools/itemToggle.png)
+@@ -281,6 +284,7 @@ browser.jar:
+   skin/classic/browser/devtools/app-manager/rocket.svg                (../shared/devtools/app-manager/images/rocket.svg)
+   skin/classic/browser/devtools/app-manager/noise.png                 (../shared/devtools/app-manager/images/noise.png)
+   skin/classic/browser/devtools/app-manager/default-app-icon.png      (../shared/devtools/app-manager/images/default-app-icon.png)
++  skin/classic/browser/devtools/eyedropper-black.png        (../shared/devtools/images/eyedropper-black.png)
+ #ifdef MOZ_SERVICES_SYNC
+   skin/classic/browser/sync-16-throbber.png
+   skin/classic/browser/sync-16.png
+diff --git a/browser/themes/osx/jar.mn b/browser/themes/osx/jar.mn
+--- a/browser/themes/osx/jar.mn
++++ b/browser/themes/osx/jar.mn
+@@ -273,6 +273,8 @@ browser.jar:
+   skin/classic/browser/devtools/command-pick@2x.png           (../shared/devtools/images/command-pick@2x.png)
+   skin/classic/browser/devtools/command-console.png           (../shared/devtools/images/command-console.png)
+   skin/classic/browser/devtools/command-console@2x.png        (../shared/devtools/images/command-console@2x.png)
++  skin/classic/browser/devtools/command-eyedropper.png        (../shared/devtools/images/command-eyedropper.png)
++  skin/classic/browser/devtools/command-eyedropper@2x.png        (../shared/devtools/images/command-eyedropper@2x.png)
+   skin/classic/browser/devtools/alerticon-warning.png       (devtools/alerticon-warning.png)
+   skin/classic/browser/devtools/ruleview.css                (devtools/ruleview.css)
+   skin/classic/browser/devtools/commandline.css             (devtools/commandline.css)
+@@ -315,6 +317,7 @@ browser.jar:
+ * skin/classic/browser/devtools/profiler.css                (devtools/profiler.css)
+ * skin/classic/browser/devtools/netmonitor.css              (devtools/netmonitor.css)
+ * skin/classic/browser/devtools/scratchpad.css              (devtools/scratchpad.css)
++  skin/classic/browser/devtools/eyedropper.css              (../shared/devtools/eyedropper.css)
+   skin/classic/browser/devtools/magnifying-glass.png        (devtools/magnifying-glass.png)
+   skin/classic/browser/devtools/option-icon.png             (devtools/option-icon.png)
+   skin/classic/browser/devtools/itemToggle.png              (devtools/itemToggle.png)
+@@ -386,6 +389,7 @@ browser.jar:
+   skin/classic/browser/devtools/app-manager/rocket.svg                (../shared/devtools/app-manager/images/rocket.svg)
+   skin/classic/browser/devtools/app-manager/noise.png                 (../shared/devtools/app-manager/images/noise.png)
+   skin/classic/browser/devtools/app-manager/default-app-icon.png      (../shared/devtools/app-manager/images/default-app-icon.png)
++  skin/classic/browser/devtools/eyedropper-black.png        (../shared/devtools/images/eyedropper-black.png)
+ #ifdef MOZ_SERVICES_SYNC
+   skin/classic/browser/sync-throbber.png
+   skin/classic/browser/sync-16.png
+diff --git a/browser/themes/shared/devtools/eyedropper.css b/browser/themes/shared/devtools/eyedropper.css
+new file mode 100644
+--- /dev/null
++++ b/browser/themes/shared/devtools/eyedropper.css
+@@ -0,0 +1,41 @@
++#canvas {
++  image-rendering: -moz-crisp-edges;
++  cursor: none;
++  border: 3px solid #E0E0E0;
++  border-radius: 50%;
++}
++
++#canvas-overflow {
++  overflow: hidden;
++  width: 96px;
++  height: 96px;
++}
++
++#canvas-container {
++  display: block;
++  position: relative;
++  transform-origin: 50% 50%;
++}
++
++#color-preview {
++  width: 16px;
++  height: 16px;
++  box-shadow: 0px 0px 0px black;
++  border: solid 1px #fff;
++  margin: 3px;
++}
++
++#color-value-box {
++  background-color: #E0E0E0;
++  border-radius: 1px;
++}
++
++#color-value {
++  padding: 0.3em;
++  text-shadow: 1px 1px 1px #fff;
++}
++
++#color-value.highlight {
++  box-shadow: inset 0 0 1em white;
++  font-family: inherit;
++}
+diff --git a/browser/themes/shared/devtools/images/command-eyedropper.png b/browser/themes/shared/devtools/images/command-eyedropper.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..9bf16af5e1ddeb7360af938bb8177871f9cb52e4
+GIT binary patch
+literal 1770
+zc$@+11{L{<P)<h;3K|Lk000e1NJLTq000mG000mO1^@s6AM^iV000CeX+uL$Nkc;*
+zP;zf(X>4Tx05}naRo`#hR1`jmZ&IWdKOk5~hl<6oRa0BJ8yc;~21%2p?MfD<>DVeH
+z<T^KrsT&8|>9(p*dx19w`~g7O0}n_%Aq@s%d)fBDv`JHkDym6Hd+5XuAtvnwRpGmK
+zVkc9?T=n|PIo~<wJLg{8L_J?=wVD}Kh?c9aozEndlcyGxo=u9<v(!ri)T`-EEs@L3
+z5-!0N_s;9#9f}Cc?UC;OPWB_edW+oAi6T$HZWSGU8TbrQ%+zbPOBBBc`}k?M2Hf);
+z@Y6N~0;>X-eVh__(Z?q}P9Z-Dj?gOW6|D%o20XmjW-qs4UjrD(li^iv8@eK9k+ZFm
+zVRFymFOPAzG5-%Pn|1W;U4vNroTa&AxDScmEA~{ri9gr1^c?U@uwSpaNnw8l_>cP1
+zd;)kMQS_;jeRSUEM_*s96y65j1$)tOrwdK{YIQMt92l|D^(E_=$Rjw{b!QT@q!)ni
+zR`|5oW9X5n$Wv+HVc@|^eX5yXnsHX<gx$-tTA9oOBadXir_JPm2Y^4ct-PoO&C)tI
+zGolvqOIK@duBk!Vu9{g<3;i;gJ6?~-DQ&xz!jvD&4!U-s8Os(*#?k2}f30SEXA#=i
+z1-qUX+K`{!((H5w7<t$~ygD!D1{~X6)KX%$qrgY#L_{M_7A<1csY*MfP@XcB#Jxr~
+zJS8&7goVS)VKE|4(h_Xlc{z{c$ApZs7riZ_QKdV_uW-M~u~<J-*#Z0?VzcZp8)p-w
+zus7J7><CN2I>8PF3UX~a6)MwxDE0HaPjyrlI!;jX{6Kvuh*8ej?;85ekN$?5uuCiS
+zBTvvVG+XTxAO{m@bvM#Jr)z6J><&E22D|vq?Y?Vkbo_DijopiF$2PET#<s%v*srlI
+z{B2SKJ79W>mZ8e<cESmGBON_l0n;T7>u=y$(ArYkv7@Ex`GL?QCc!_*KFrd&;n1r7
+zqW-CFs9&fT)ZaU5gc&=gBz-D<EBz>aCw(vdOp0__x+47~U6sC(E(JNe@4cTT*n6*E
+zVH4eoU1-&7pEV~_PRe`a7v+@vy!^5}8?Y3)UmlaE<h}6h3HHql{T;m+bPBU-O|^S1
+z@dOw&4<!bj2G_<^#e}PL7FpY$lcrKO$i~?8Bd2y;oaL5^csibnCrF9!i%-PI;xhub
+zp1k;8_$IKX1NHus6EHeD;B72SCCD@4ojP$=Mf3`Eo6yZ&eg@wTqDiZE);7u&SJ|(s
+zuPF(9%D6IJ)klXF%`_Fy<tR3HxV^%Qqa?nAB97=m-uu2qcHInZ?ps8M|H3=#R%lzO
+z6MgLv^}ib0hVV{&<};#;2lcwW;^(7C<OY#bI<VjS9qCKr-E_Cnc!2j+&nHAXA2%BR
+zt~VMxUn2h&(Pi^LSpac(Y#S>R00009a7bBm000XU000XU0RWnu7ytkQY)M2xR5%fh
+zQcY+RQ4pSayIIq&NvcRy@ZiByQ81<lV;Z{_ij?Z9<mSPHAc!};diN@#2SGtRh~z4S
+zYD<2$ZPIp^N^ElS;zf~qFuR+YZg%sW2?VOP)d#!#-p=>UH}lOyDJA^JQV0_=&a_u%
+ziE$AHE@YGGGX5h0=9|q(ZfwlAZ9CGIo!7BMYz`422m)|j&k*~m=ks}1l}ui(ubv|E
+zW_%<u=eFFyX*t`fs)B+zy<Y{Kxc9DJ*Q4DZ835&#uIr=Q?Y2+lYZMD&@tEp4-nG3F
+z^vR|5mGeT#`C)x{bf>ceVHgHfx(X8fcp|Q~TCJCtQ<<ClwjfYGN{l2(b=&XJLI9Qg
+z3iQJ|k(~`DQzh_Mg2JalgaZ<#Lp&fN5K&O+Qc)C@jQfTV&N7C5`Yl1T+0<sv%<L4`
+z%}D?}<~mOMP&BF`pig*zXm|)vz@2O=`<1b|TrN~O6EFTTMvj-PB|}xj6KMC0UQ{{V
+z`Po?{!(u#c&-J<_Sz|n5yZr4}z%yoY*<QXP5FZPK>1;N;r3JW2J=9&-ec$#xo7%XV
+zNoKwbM$8GISS+$RP+nc0DqBk*E0%SV&!%Y}saQ)NN^9nIKJR+Ou08a}Sh1_;$fGxb
+zfSIY}rO)%#>d~P{Z&3*GVB$jhEw@Li0ac0IcVBt%;%pVmd`4=wcwcO+ouEoKD%SEW
+zpBs&awp;PfJucL0$0KU+LWb~=?&etpd6#(iC&x2|fw2Rzy}op%gWD9Cpz++JPPagc
+z8<XSd4K_BFO7Zv(Tx#fx=Ze;&i_?8-q>S&3E|p5EVHo`}9muBOFT4t0O9?JjIRF3v
+M07*qoM6N<$f=g*x8vp<R
+
+diff --git a/browser/themes/shared/devtools/images/command-eyedropper@2x.png b/browser/themes/shared/devtools/images/command-eyedropper@2x.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..855c32e2c54a0e485b58c6c9fbfbbc151f5533b1
+GIT binary patch
+literal 2617
+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
+bYTf%EJixWtV~rAM00000NkvXXu0mjftj_Xq
+
+diff --git a/browser/themes/shared/devtools/images/command-paintflashing.png b/browser/themes/shared/devtools/images/command-paintflashing.png
+index 244fb3cb98595bccc2fdd1f0c87aef01d9158aa4..367a73f04c11b29571458d0d72ac90d6556c5293
+GIT binary patch
+literal 1988
+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
+WEMDfqL!r+A0000<MNUMnLSTZAe8EWo
+
+diff --git a/browser/themes/shared/devtools/images/eyedropper-black.png b/browser/themes/shared/devtools/images/eyedropper-black.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..907a135e4d1f4580e893347478dc205d3aeaffde
+GIT binary patch
+literal 1698
+zc$@*E23`4yP)<h;3K|Lk000e1NJLTq000mG000mO1^@s6AM^iV000CeX+uL$Nkc;*
+zP;zf(X>4Tx05}naRo`#hR1`jmZ&IWdKOk5~hl<6oRa0BJ8yc;~21%2p?MfD<>DVeH
+z<T^KrsT&8|>9(p*dx19w`~g7O0}n_%Aq@s%d)fBDv`JHkDym6Hd+5XuAtvnwRpGmK
+zVkc9?T=n|PIo~<wJLg{8L_J?=wVD}Kh?c9aozEndlcyGxo=u9<v(!ri)T`-EEs@L3
+z5-!0N_s;9#9f}Cc?UC;OPWB_edW+oAi6T$HZWSGU8TbrQ%+zbPOBBBc`}k?M2Hf);
+z@Y6N~0;>X-eVh__(Z?q}P9Z-Dj?gOW6|D%o20XmjW-qs4UjrD(li^iv8@eK9k+ZFm
+zVRFymFOPAzG5-%Pn|1W;U4vNroTa&AxDScmEA~{ri9gr1^c?U@uwSpaNnw8l_>cP1
+zd;)kMQS_;jeRSUEM_*s96y65j1$)tOrwdK{YIQMt92l|D^(E_=$Rjw{b!QT@q!)ni
+zR`|5oW9X5n$Wv+HVc@|^eX5yXnsHX<gx$-tTA9oOBadXir_JPm2Y^4ct-PoO&C)tI
+zGolvqOIK@duBk!Vu9{g<3;i;gJ6?~-DQ&xz!jvD&4!U-s8Os(*#?k2}f30SEXA#=i
+z1-qUX+K`{!((H5w7<t$~ygD!D1{~X6)KX%$qrgY#L_{M_7A<1csY*MfP@XcB#Jxr~
+zJS8&7goVS)VKE|4(h_Xlc{z{c$ApZs7riZ_QKdV_uW-M~u~<J-*#Z0?VzcZp8)p-w
+zus7J7><CN2I>8PF3UX~a6)MwxDE0HaPjyrlI!;jX{6Kvuh*8ej?;85ekN$?5uuCiS
+zBTvvVG+XTxAO{m@bvM#Jr)z6J><&E22D|vq?Y?Vkbo_DijopiF$2PET#<s%v*srlI
+z{B2SKJ79W>mZ8e<cESmGBON_l0n;T7>u=y$(ArYkv7@Ex`GL?QCc!_*KFrd&;n1r7
+zqW-CFs9&fT)ZaU5gc&=gBz-D<EBz>aCw(vdOp0__x+47~U6sC(E(JNe@4cTT*n6*E
+zVH4eoU1-&7pEV~_PRe`a7v+@vy!^5}8?Y3)UmlaE<h}6h3HHql{T;m+bPBU-O|^S1
+z@dOw&4<!bj2G_<^#e}PL7FpY$lcrKO$i~?8Bd2y;oaL5^csibnCrF9!i%-PI;xhub
+zp1k;8_$IKX1NHus6EHeD;B72SCCD@4ojP$=Mf3`Eo6yZ&eg@wTqDiZE);7u&SJ|(s
+zuPF(9%D6IJ)klXF%`_Fy<tR3HxV^%Qqa?nAB97=m-uu2qcHInZ?ps8M|H3=#R%lzO
+z6MgLv^}ib0hVV{&<};#;2lcwW;^(7C<OY#bI<VjS9qCKr-E_Cnc!2j+&nHAXA2%BR
+zt~VMxUn2h&(Pi^LSpac(Y#S>R00009a7bBm000XU000XU0RWnu7ytkQBuPX;R5%fZ
+zlD~@+Q4q)9o83(jvG5R$xOqP|(IzKYq!1L0!d21A*1|#%ZN<j_LO~0`LM-ktun<gP
+zWf{>R96_@eIS<K!AS$@oopC0=JU!#RWnt&N`ONptcUBXT+HYyC1I{ZX&(&NTNu43m
+zFFp<iFZKTlFsK`iM%3%|vSzaxjlS%x0|Zy5f~4}CTH!MFU8-4pB923hIt-sgEOKTt
+z{w@aruKlwB!ys3#R4NBb<?`7;M^82ABZ!zOrAtc9+9vgCPYW{`z4xaH)N=ueo92g=
+zwFt60l(4`jn;!<(U|9<Y>YfgORViZ_r!eIJTHvn0!tN<huh*k#QTjT+DZ`w{zVi*Z
+z;Af50mK^cvj{>W!tEGOw|Fi1-c}_o!Me&`JxMwB3XWWj`if*N8x-Gfl)4~JUka02G
+z0-y&OM6C$Xfx?akI4H)k`k2Or8xDt`xUjG^nS#t%U{`k+0MvaN<J$JHKdM%%->4M4
+zA;ceCU`1<nXLAZKek^Gv<U-2U>_wB<x7ONY5*uR<*~Gmz-dvV={&K#I_;)NpoFu1=
+zx9`07b`r<&it(;%5_3sn{u{*y@k^8!uzXJfh96mPugivWu3{3`wTW%d;lH8XF(gTH
+zl&w9E3N}p5-$bAe+jBR4pFW!#%gRev$aA>CBRa?9xveyf*r=;%Kkd$qT}sXlLJafA
+skcTRdvWHt6TRXDP6B1*``@wSl3vuT`WAa@|EC2ui07*qoM6N<$g0<-|EC2ui
+
+diff --git a/browser/themes/shared/devtools/toolbars.inc.css b/browser/themes/shared/devtools/toolbars.inc.css
+--- a/browser/themes/shared/devtools/toolbars.inc.css
++++ b/browser/themes/shared/devtools/toolbars.inc.css
+@@ -472,6 +472,10 @@
+   }
+ }
+ 
++#command-button-eyedropper {
++  list-style-image: url("chrome://browser/skin/devtools/command-eyedropper.png");
++}
++
+ /* Tabs */
+ 
+ .devtools-tabbar {
+diff --git a/browser/themes/windows/jar.mn b/browser/themes/windows/jar.mn
+--- a/browser/themes/windows/jar.mn
++++ b/browser/themes/windows/jar.mn
+@@ -199,6 +199,8 @@ browser.jar:
+         skin/classic/browser/devtools/command-pick@2x.png           (../shared/devtools/images/command-pick@2x.png)
+         skin/classic/browser/devtools/command-console.png           (../shared/devtools/images/command-console.png)
+         skin/classic/browser/devtools/command-console@2x.png        (../shared/devtools/images/command-console@2x.png)
++        skin/classic/browser/devtools/command-eyedropper.png        (../shared/devtools/images/command-eyedropper.png)
++        skin/classic/browser/devtools/command-eyedropper@2x.png     (../shared/devtools/images/command-eyedropper@2x.png)
+         skin/classic/browser/devtools/markup-view.css               (../shared/devtools/markup-view.css)
+         skin/classic/browser/devtools/editor-error.png              (devtools/editor-error.png)
+         skin/classic/browser/devtools/editor-breakpoint.png         (devtools/editor-breakpoint.png)
+@@ -238,6 +240,7 @@ browser.jar:
+ *       skin/classic/browser/devtools/profiler.css                  (devtools/profiler.css)
+ *       skin/classic/browser/devtools/netmonitor.css                (devtools/netmonitor.css)
+ *       skin/classic/browser/devtools/scratchpad.css                (devtools/scratchpad.css)
++        skin/classic/browser/devtools/eyedropper.css                (../shared/devtools/eyedropper.css)
+         skin/classic/browser/devtools/magnifying-glass.png          (devtools/magnifying-glass.png)
+         skin/classic/browser/devtools/option-icon.png               (devtools/option-icon.png)
+         skin/classic/browser/devtools/itemToggle.png                (devtools/itemToggle.png)
+@@ -308,6 +311,7 @@ browser.jar:
+         skin/classic/browser/devtools/app-manager/rocket.svg                (../shared/devtools/app-manager/images/rocket.svg)
+         skin/classic/browser/devtools/app-manager/noise.png                 (../shared/devtools/app-manager/images/noise.png)
+         skin/classic/browser/devtools/app-manager/default-app-icon.png      (../shared/devtools/app-manager/images/default-app-icon.png)
++        skin/classic/browser/devtools/eyedropper-black.png                  (../shared/devtools/images/eyedropper-black.png)
+ #ifdef MOZ_SERVICES_SYNC
+         skin/classic/browser/sync-throbber.png
+         skin/classic/browser/sync-16.png
+@@ -521,6 +525,8 @@ browser.jar:
+         skin/classic/aero/browser/devtools/command-pick@2x.png       (../shared/devtools/images/command-pick@2x.png)
+         skin/classic/aero/browser/devtools/command-console.png       (../shared/devtools/images/command-console.png)
+         skin/classic/aero/browser/devtools/command-console@2x.png    (../shared/devtools/images/command-console@2x.png)
++        skin/classic/aero/browser/devtools/command-eyedropper.png        (../shared/devtools/images/command-eyedropper.png)
++        skin/classic/aero/browser/devtools/command-eyedropper@2x.png     (../shared/devtools/images/command-eyedropper@2x.png)
+         skin/classic/aero/browser/devtools/alerticon-warning.png     (devtools/alerticon-warning.png)
+         skin/classic/aero/browser/devtools/ruleview.css              (devtools/ruleview.css)
+         skin/classic/aero/browser/devtools/commandline.css           (devtools/commandline.css)
+@@ -563,6 +569,7 @@ browser.jar:
+ *       skin/classic/aero/browser/devtools/profiler.css              (devtools/profiler.css)
+ *       skin/classic/aero/browser/devtools/netmonitor.css            (devtools/netmonitor.css)
+ *       skin/classic/aero/browser/devtools/scratchpad.css            (devtools/scratchpad.css)
++        skin/classic/aero/browser/devtools/eyedropper.css            (../shared/devtools/eyedropper.css)
+         skin/classic/aero/browser/devtools/magnifying-glass.png      (devtools/magnifying-glass.png)
+         skin/classic/aero/browser/devtools/option-icon.png           (devtools/option-icon.png)
+         skin/classic/aero/browser/devtools/itemToggle.png            (devtools/itemToggle.png)
+@@ -633,6 +640,7 @@ browser.jar:
+         skin/classic/aero/browser/devtools/app-manager/rocket.svg                (../shared/devtools/app-manager/images/rocket.svg)
+         skin/classic/aero/browser/devtools/app-manager/noise.png                 (../shared/devtools/app-manager/images/noise.png)
+         skin/classic/aero/browser/devtools/app-manager/default-app-icon.png      (../shared/devtools/app-manager/images/default-app-icon.png)
++        skin/classic/aero/browser/devtools/eyedropper-black.png        (../shared/devtools/images/eyedropper-black.png)
+ 
+ #ifdef MOZ_SERVICES_SYNC
+         skin/classic/aero/browser/sync-throbber.png
