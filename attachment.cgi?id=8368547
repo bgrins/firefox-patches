@@ -1,0 +1,3102 @@
+# HG changeset patch
+# Parent af70f4108299bf955bc8ac156a5e2f9c13f94a83
+# User Patrick Brosset <pbrosset@mozilla.com>
+Bug 952277 - DOMNodes can be highlighted and selected from the debugger; r=past, vporof
+
+diff --git a/browser/devtools/debugger/debugger-panes.js b/browser/devtools/debugger/debugger-panes.js
+--- a/browser/devtools/debugger/debugger-panes.js
++++ b/browser/devtools/debugger/debugger-panes.js
+@@ -1725,49 +1725,54 @@ let SourceUtils = {
+ /**
+  * Functions handling the variables bubble UI.
+  */
+ function VariableBubbleView() {
+   dumpn("VariableBubbleView was instantiated");
+ 
+   this._onMouseMove = this._onMouseMove.bind(this);
+   this._onMouseLeave = this._onMouseLeave.bind(this);
+-  this._onMouseScroll = this._onMouseScroll.bind(this);
+   this._onPopupHiding = this._onPopupHiding.bind(this);
+ }
+ 
+ VariableBubbleView.prototype = {
+   /**
+    * Initialization function, called when the debugger is started.
+    */
+   initialize: function() {
+     dumpn("Initializing the VariableBubbleView");
+ 
+-    this._tooltip = new Tooltip(document);
+     this._editorContainer = document.getElementById("editor");
+-
++    this._editorContainer.addEventListener("mousemove", this._onMouseMove, false);
++    this._editorContainer.addEventListener("mouseleave", this._onMouseLeave, false);
++
++    this._tooltip = new Tooltip(document, {
++      closeOnEvents: [{
++        emitter: DebuggerController._toolbox,
++        event: "select"
++      }, {
++        emitter: this._editorContainer,
++        event: "scroll",
++        useCapture: true
++      }]
++    });
+     this._tooltip.defaultPosition = EDITOR_VARIABLE_POPUP_POSITION;
+     this._tooltip.defaultShowDelay = EDITOR_VARIABLE_HOVER_DELAY;
+-
+     this._tooltip.panel.addEventListener("popuphiding", this._onPopupHiding);
+-    this._editorContainer.addEventListener("mousemove", this._onMouseMove, false);
+-    this._editorContainer.addEventListener("mouseleave", this._onMouseLeave, false);
+-    this._editorContainer.addEventListener("scroll", this._onMouseScroll, true);
+   },
+ 
+   /**
+    * Destruction function, called when the debugger is closed.
+    */
+   destroy: function() {
+     dumpn("Destroying the VariableBubbleView");
+ 
+     this._tooltip.panel.removeEventListener("popuphiding", this._onPopupHiding);
+     this._editorContainer.removeEventListener("mousemove", this._onMouseMove, false);
+     this._editorContainer.removeEventListener("mouseleave", this._onMouseLeave, false);
+-    this._editorContainer.removeEventListener("scroll", this._onMouseScroll, true);
+   },
+ 
+   /**
+    * Searches for an identifier underneath the specified position in the
+    * source editor, and if found, opens a VariablesView inspection popup.
+    *
+    * @param number x, y
+    *        The left/top coordinates where to look for an identifier.
+@@ -1889,17 +1894,17 @@ VariableBubbleView.prototype = {
+         getterOrSetterEvalMacro: this._getGetterOrSetterEvalMacro(evalPrefix),
+         overrideValueEvalMacro: this._getOverrideValueEvalMacro(evalPrefix)
+       }, {
+         fetched: (aEvent, aType) => {
+           if (aType == "properties") {
+             window.emit(EVENTS.FETCHED_BUBBLE_PROPERTIES);
+           }
+         }
+-      });
++      }, DebuggerController._toolbox);
+     }
+ 
+     this._tooltip.show(this._markedText.anchor);
+   },
+ 
+   /**
+    * Hides the inspection popup.
+    */
+@@ -1956,23 +1961,16 @@ VariableBubbleView.prototype = {
+   /**
+    * The mouseleave listener for the source editor container node.
+    */
+   _onMouseLeave: function() {
+     clearNamedTimeout("editor-mouse-move");
+   },
+ 
+   /**
+-   * The mousescroll listener for the source editor container node.
+-   */
+-  _onMouseScroll: function() {
+-    this.hideContents();
+-  },
+-
+-  /**
+    * Listener handling the popup hiding event.
+    */
+   _onPopupHiding: function({ target }) {
+     if (this._tooltip.panel != target) {
+       return;
+     }
+     if (this._markedText) {
+       this._markedText.clear();
+diff --git a/browser/devtools/debugger/debugger-view.js b/browser/devtools/debugger/debugger-view.js
+--- a/browser/devtools/debugger/debugger-view.js
++++ b/browser/devtools/debugger/debugger-view.js
+@@ -164,16 +164,20 @@ let DebuggerView = {
+       searchEnabled: Prefs.variablesSearchboxVisible,
+       eval: (variable, value) => {
+         let string = variable.evaluationMacro(variable, value);
+         DebuggerController.StackFrames.evaluate(string);
+       },
+       lazyEmpty: true
+     });
+ 
++    // Attach the current toolbox to the VView so it can link DOMNodes to
++    // the inspector/highlighter
++    this.Variables.toolbox = DebuggerController._toolbox;
++
+     // Attach a controller that handles interfacing with the debugger protocol.
+     VariablesViewController.attach(this.Variables, {
+       getEnvironmentClient: aObject => gThreadClient.environment(aObject),
+       getObjectClient: aObject => {
+         return aObject instanceof DebuggerController.Tracer.WrappedObject
+           ? DebuggerController.Tracer.syncGripClient(aObject.object)
+           : gThreadClient.pauseGrip(aObject)
+       }
+diff --git a/browser/devtools/debugger/panel.js b/browser/devtools/debugger/panel.js
+--- a/browser/devtools/debugger/panel.js
++++ b/browser/devtools/debugger/panel.js
+@@ -15,16 +15,17 @@ function DebuggerPanel(iframeWindow, too
+   this.panelWin = iframeWindow;
+   this._toolbox = toolbox;
+   this._destroyer = null;
+ 
+   this._view = this.panelWin.DebuggerView;
+   this._controller = this.panelWin.DebuggerController;
+   this._view._hostType = this._toolbox.hostType;
+   this._controller._target = this.target;
++  this._controller._toolbox = this._toolbox;
+ 
+   this.handleHostChanged = this.handleHostChanged.bind(this);
+   this.highlightWhenPaused = this.highlightWhenPaused.bind(this);
+   this.unhighlightWhenResumed = this.unhighlightWhenResumed.bind(this);
+ 
+   EventEmitter.decorate(this);
+ };
+ 
+diff --git a/browser/devtools/debugger/test/browser_dbg_variables-view-frame-parameters-01.js b/browser/devtools/debugger/test/browser_dbg_variables-view-frame-parameters-01.js
+--- a/browser/devtools/debugger/test/browser_dbg_variables-view-frame-parameters-01.js
++++ b/browser/devtools/debugger/test/browser_dbg_variables-view-frame-parameters-01.js
+@@ -95,17 +95,17 @@ function testExpandVariables() {
+     ok(thisVar.get("window").target.querySelector(".value").className.contains("token-other"),
+       "Should have the right token class for 'window'.");
+ 
+     is(thisVar.get("document").target.querySelector(".name").getAttribute("value"), "document",
+       "Should have the right property name for 'document'.");
+     is(thisVar.get("document").target.querySelector(".value").getAttribute("value"),
+       "HTMLDocument \u2192 doc_frame-parameters.html",
+       "Should have the right property value for 'document'.");
+-    ok(thisVar.get("document").target.querySelector(".value").className.contains("token-other"),
++    ok(thisVar.get("document").target.querySelector(".value").className.contains("token-domnode"),
+       "Should have the right token class for 'document'.");
+ 
+     let argsProps = argsVar.target.querySelectorAll(".variables-view-property");
+     is(argsProps.length, 8,
+       "The 'arguments' variable should contain 5 enumerable and 3 non-enumerable properties");
+ 
+     is(argsProps[0].querySelector(".name").getAttribute("value"), "0",
+       "Should have the right property name for '0'.");
+diff --git a/browser/devtools/debugger/test/browser_dbg_variables-view-webidl.js b/browser/devtools/debugger/test/browser_dbg_variables-view-webidl.js
+--- a/browser/devtools/debugger/test/browser_dbg_variables-view-webidl.js
++++ b/browser/devtools/debugger/test/browser_dbg_variables-view-webidl.js
+@@ -59,32 +59,32 @@ function performTest() {
+   let buttonVar = globalScope.get("button");
+   let buttonAsProtoVar = globalScope.get("buttonAsProto");
+   let documentVar = globalScope.get("document");
+ 
+   is(buttonVar.target.querySelector(".name").getAttribute("value"), "button",
+     "Should have the right property name for 'button'.");
+   is(buttonVar.target.querySelector(".value").getAttribute("value"), "<button>",
+     "Should have the right property value for 'button'.");
+-  ok(buttonVar.target.querySelector(".value").className.contains("token-other"),
++  ok(buttonVar.target.querySelector(".value").className.contains("token-domnode"),
+     "Should have the right token class for 'button'.");
+ 
+   is(buttonAsProtoVar.target.querySelector(".name").getAttribute("value"), "buttonAsProto",
+     "Should have the right property name for 'buttonAsProto'.");
+   is(buttonAsProtoVar.target.querySelector(".value").getAttribute("value"), "Object",
+     "Should have the right property value for 'buttonAsProto'.");
+   ok(buttonAsProtoVar.target.querySelector(".value").className.contains("token-other"),
+     "Should have the right token class for 'buttonAsProto'.");
+ 
+   is(documentVar.target.querySelector(".name").getAttribute("value"), "document",
+     "Should have the right property name for 'document'.");
+   is(documentVar.target.querySelector(".value").getAttribute("value"),
+     "HTMLDocument \u2192 doc_frame-parameters.html",
+     "Should have the right property value for 'document'.");
+-  ok(documentVar.target.querySelector(".value").className.contains("token-other"),
++  ok(documentVar.target.querySelector(".value").className.contains("token-domnode"),
+     "Should have the right token class for 'document'.");
+ 
+   is(buttonVar.expanded, false,
+     "The buttonVar should not be expanded at this point.");
+   is(buttonAsProtoVar.expanded, false,
+     "The buttonAsProtoVar should not be expanded at this point.");
+   is(documentVar.expanded, false,
+     "The documentVar should not be expanded at this point.");
+@@ -142,17 +142,17 @@ function performTest() {
+       "Should have the right property value for '__proto__'.");
+     ok(buttonProtoVar.target.querySelector(".value").className.contains("token-other"),
+       "Should have the right token class for '__proto__'.");
+ 
+     is(buttonAsProtoProtoVar.target.querySelector(".name").getAttribute("value"), "__proto__",
+       "Should have the right property name for '__proto__'.");
+     is(buttonAsProtoProtoVar.target.querySelector(".value").getAttribute("value"), "<button>",
+       "Should have the right property value for '__proto__'.");
+-    ok(buttonAsProtoProtoVar.target.querySelector(".value").className.contains("token-other"),
++    ok(buttonAsProtoProtoVar.target.querySelector(".value").className.contains("token-domnode"),
+       "Should have the right token class for '__proto__'.");
+ 
+     is(documentProtoVar.target.querySelector(".name").getAttribute("value"), "__proto__",
+       "Should have the right property name for '__proto__'.");
+     is(documentProtoVar.target.querySelector(".value").getAttribute("value"), "HTMLDocumentPrototype",
+       "Should have the right property value for '__proto__'.");
+     ok(documentProtoVar.target.querySelector(".value").className.contains("token-other"),
+       "Should have the right token class for '__proto__'.");
+diff --git a/browser/devtools/framework/test/browser_keybindings.js b/browser/devtools/framework/test/browser_keybindings.js
+--- a/browser/devtools/framework/test/browser_keybindings.js
++++ b/browser/devtools/framework/test/browser_keybindings.js
+@@ -59,32 +59,16 @@ function test()
+ 
+     gDevTools.once("toolbox-ready", (e, toolbox) => {
+       inspectorShouldBeOpenAndHighlighting(toolbox.getCurrentPanel(), toolbox)
+     });
+ 
+     keysetMap.inspector.synthesizeKey();
+   }
+ 
+-  function moveMouseOver(aElement, aInspector, cb)
+-  {
+-    EventUtils.synthesizeMouse(aElement, 2, 2, {type: "mousemove"},
+-      aElement.ownerDocument.defaultView);
+-    aInspector.toolbox.once("picker-node-hovered", () => {
+-      executeSoon(cb);
+-    });
+-  }
+-
+-  function isHighlighting()
+-  {
+-    let outline = gBrowser.selectedBrowser.parentNode
+-      .querySelector(".highlighter-container .highlighter-outline");
+-    return outline && !outline.hasAttribute("hidden");
+-  }
+-
+   function inspectorShouldBeOpenAndHighlighting(aInspector, aToolbox)
+   {
+     is (aToolbox.currentToolId, "inspector", "Correct tool has been loaded");
+ 
+     aToolbox.once("picker-started", () => {
+       ok(true, "picker-started event received, highlighter started");
+       keysetMap.inspector.synthesizeKey();
+ 
+diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/toolbox.js
+--- a/browser/devtools/framework/toolbox.js
++++ b/browser/devtools/framework/toolbox.js
+@@ -68,17 +68,17 @@ function Toolbox(target, selectedTool, h
+   this._toolPanels = new Map();
+   this._telemetry = new Telemetry();
+ 
+   this._toolRegistered = this._toolRegistered.bind(this);
+   this._toolUnregistered = this._toolUnregistered.bind(this);
+   this._refreshHostTitle = this._refreshHostTitle.bind(this);
+   this._splitConsoleOnKeypress = this._splitConsoleOnKeypress.bind(this)
+   this.destroy = this.destroy.bind(this);
+-  this.stopPicker = this.stopPicker.bind(this);
++  this.highlighterUtils = new ToolboxHighlighterUtils(this);
+ 
+   this._target.on("close", this.destroy);
+ 
+   if (!hostType) {
+     hostType = Services.prefs.getCharPref(this._prefs.LAST_HOST);
+   }
+   if (!selectedTool) {
+     selectedTool = Services.prefs.getCharPref(this._prefs.LAST_TOOL);
+@@ -187,17 +187,17 @@ Toolbox.prototype = {
+     return parseFloat(Services.prefs.getCharPref(ZOOM_PREF));
+   },
+ 
+   /**
+    * Get the toolbox highlighter front. Note that it may not always have been
+    * initialized first. Use `initInspector()` if needed.
+    */
+   get highlighter() {
+-    if (this.isRemoteHighlightable) {
++    if (this.highlighterUtils.isRemoteHighlightable) {
+       return this._highlighter;
+     } else {
+       return null;
+     }
+   },
+ 
+   /**
+    * Get the toolbox's inspector front. Note that it may not always have been
+@@ -552,18 +552,18 @@ Toolbox.prototype = {
+     this._pickerButton = this.doc.createElement("toolbarbutton");
+     this._pickerButton.id = "command-button-pick";
+     this._pickerButton.className = "command-button";
+     this._pickerButton.setAttribute("tooltiptext", toolboxStrings("pickButton.tooltip"));
+ 
+     let container = this.doc.querySelector("#toolbox-buttons");
+     container.appendChild(this._pickerButton);
+ 
+-    this.togglePicker = this.togglePicker.bind(this);
+-    this._pickerButton.addEventListener("command", this.togglePicker, false);
++    this._togglePicker = this.highlighterUtils.togglePicker.bind(this.highlighterUtils);
++    this._pickerButton.addEventListener("command", this._togglePicker, false);
+   },
+ 
+   /**
+    * Build a tab for one tool definition and add to the toolbox
+    *
+    * @param {string} toolDefinition
+    *        Tool definition of the tool to build a tab for.
+    */
+@@ -1031,17 +1031,17 @@ Toolbox.prototype = {
+   initInspector: function() {
+     let deferred = promise.defer();
+ 
+     if (!this._inspector) {
+       this._inspector = InspectorFront(this._target.client, this._target.form);
+       this._inspector.getWalker().then(walker => {
+         this._walker = walker;
+         this._selection = new Selection(this._walker);
+-        if (this.isRemoteHighlightable) {
++        if (this.highlighterUtils.isRemoteHighlightable) {
+           this._inspector.getHighlighter().then(highlighter => {
+             this._highlighter = highlighter;
+             deferred.resolve();
+           });
+         } else {
+           deferred.resolve();
+         }
+       });
+@@ -1081,108 +1081,16 @@ Toolbox.prototype = {
+     } else {
+       deferred.resolve();
+     }
+ 
+     return deferred.promise;
+   },
+ 
+   /**
+-   * Start/stop the element picker on the debuggee target.
+-   */
+-  togglePicker: function() {
+-    if (this._isPicking) {
+-      return this.stopPicker();
+-    } else {
+-      return this.startPicker();
+-    }
+-  },
+-
+-  get isRemoteHighlightable() {
+-    return this._target.client.traits.highlightable;
+-  },
+-
+-  /**
+-   * Start the element picker on the debuggee target.
+-   * This will request the inspector actor to start listening for mouse/touch
+-   * events on the target to highlight the hovered/picked element.
+-   * Depending on the server-side capabilities, this may fire events when nodes
+-   * are hovered.
+-   * @return A promise that resolves when the picker has started
+-   */
+-  startPicker: function() {
+-    let deferred = promise.defer();
+-
+-    let done = () => {
+-      this.emit("picker-started");
+-      this.on("select", this.stopPicker);
+-      deferred.resolve();
+-    };
+-
+-    promise.all([
+-      this.initInspector(),
+-      this.selectTool("inspector")
+-    ]).then(() => {
+-      this._isPicking = true;
+-      this._pickerButton.setAttribute("checked", "true");
+-
+-      if (this.isRemoteHighlightable) {
+-        this.highlighter.pick().then(done);
+-
+-        this._onPickerNodeHovered = res => {
+-          this.emit("picker-node-hovered", res.node);
+-        };
+-        this.walker.on("picker-node-hovered", this._onPickerNodeHovered);
+-
+-        this._onPickerNodePicked = res => {
+-          this.selection.setNodeFront(res.node, "picker-node-picked");
+-          this.stopPicker();
+-        };
+-        this.walker.on("picker-node-picked", this._onPickerNodePicked);
+-      } else {
+-        this.walker.pick().then(node => {
+-          this.selection.setNodeFront(node, "picker-node-picked");
+-          this.stopPicker();
+-        });
+-        done();
+-      }
+-    });
+-
+-    return deferred.promise;
+-  },
+-
+-  /**
+-   * Stop the element picker
+-   * @return A promise that resolves when the picker has stopped
+-   */
+-  stopPicker: function() {
+-    let deferred = promise.defer();
+-
+-    let done = () => {
+-      this.emit("picker-stopped");
+-      this.off("select", this.stopPicker);
+-      deferred.resolve();
+-    };
+-
+-    this.initInspector().then(() => {
+-      this._isPicking = false;
+-      this._pickerButton.removeAttribute("checked");
+-      if (this.isRemoteHighlightable) {
+-        this.highlighter.cancelPick().then(done);
+-        this.walker.off("picker-node-hovered", this._onPickerNodeHovered);
+-        this.walker.off("picker-node-picked", this._onPickerNodePicked);
+-      } else {
+-        this.walker.cancelPick().then(done);
+-      }
+-    });
+-
+-    return deferred.promise;
+-  },
+-
+-  /**
+    * Get the toolbox's notification box
+    *
+    * @return The notification box element.
+    */
+   getNotificationBox: function() {
+     return this.doc.getElementById("toolbox-notificationbox");
+   },
+ 
+@@ -1223,17 +1131,17 @@ Toolbox.prototype = {
+         console.error("Panel " + id + ":", e);
+       }
+     }
+ 
+     // Destroying the walker and inspector fronts
+     outstanding.push(this.destroyInspector());
+ 
+     // Removing buttons
+-    this._pickerButton.removeEventListener("command", this.togglePicker, false);
++    this._pickerButton.removeEventListener("command", this._togglePicker, false);
+     this._pickerButton = null;
+     let container = this.doc.getElementById("toolbox-buttons");
+     while (container.firstChild) {
+       container.removeChild(container.firstChild);
+     }
+ 
+     outstanding.push(this.destroyHost());
+ 
+@@ -1255,8 +1163,189 @@ Toolbox.prototype = {
+       this.emit("destroyed");
+       // Free _host after the call to destroyed in order to let a chance
+       // to destroyed listeners to still query toolbox attributes
+       this._host = null;
+       this._toolPanels.clear();
+     }).then(null, console.error);
+   }
+ };
++
++/**
++ * The ToolboxHighlighterUtils is what you should use for anything related to
++ * node highlighting and picking.
++ * It encapsulates the logic to connecting to the HighlighterActor.
++ */
++function ToolboxHighlighterUtils(toolbox) {
++  this.toolbox = toolbox;
++  this._onPickerNodeHovered = this._onPickerNodeHovered.bind(this);
++  this._onPickerNodePicked = this._onPickerNodePicked.bind(this);
++  this.stopPicker = this.stopPicker.bind(this);
++}
++
++ToolboxHighlighterUtils.prototype = {
++  /**
++   * Indicates whether the highlighter actor exists on the server.
++   */
++  get isRemoteHighlightable() {
++    return this.toolbox._target.client.traits.highlightable;
++  },
++
++  /**
++   * Start/stop the element picker on the debuggee target.
++   */
++  togglePicker: function() {
++    if (this._isPicking) {
++      return this.stopPicker();
++    } else {
++      return this.startPicker();
++    }
++  },
++
++  _onPickerNodeHovered: function(res) {
++    this.toolbox.emit("picker-node-hovered", res.node);
++  },
++
++  _onPickerNodePicked: function(res) {
++    this.toolbox.selection.setNodeFront(res.node, "picker-node-picked");
++    this.stopPicker();
++  },
++
++  /**
++   * Start the element picker on the debuggee target.
++   * This will request the inspector actor to start listening for mouse/touch
++   * events on the target to highlight the hovered/picked element.
++   * Depending on the server-side capabilities, this may fire events when nodes
++   * are hovered.
++   * @return A promise that resolves when the picker has started
++   */
++  startPicker: function() {
++    let deferred = promise.defer();
++
++    let done = () => {
++      this.toolbox.emit("picker-started");
++      this.toolbox.on("select", this.stopPicker);
++      deferred.resolve();
++    };
++
++    promise.all([
++      this.toolbox.initInspector(),
++      this.toolbox.selectTool("inspector")
++    ]).then(() => {
++      this._isPicking = true;
++      this.toolbox._pickerButton.setAttribute("checked", "true");
++
++      if (this.isRemoteHighlightable) {
++        this.toolbox.highlighter.pick().then(done);
++
++        this.toolbox.walker.on("picker-node-hovered", this._onPickerNodeHovered);
++        this.toolbox.walker.on("picker-node-picked", this._onPickerNodePicked);
++      } else {
++        this.toolbox.walker.pick().then(node => {
++          this.toolbox.selection.setNodeFront(node, "picker-node-picked");
++          this.stopPicker();
++        });
++        done();
++      }
++    });
++
++    return deferred.promise;
++  },
++
++  /**
++   * Stop the element picker
++   * @return A promise that resolves when the picker has stopped
++   */
++  stopPicker: function() {
++    let deferred = promise.defer();
++
++    let done = () => {
++      this.toolbox.emit("picker-stopped");
++      this.toolbox.off("select", this.stopPicker);
++      deferred.resolve();
++    };
++
++    this.toolbox.initInspector().then(() => {
++      this._isPicking = false;
++      this.toolbox._pickerButton.removeAttribute("checked");
++      if (this.isRemoteHighlightable) {
++        this.toolbox.highlighter.cancelPick().then(done);
++        this.toolbox.walker.off("picker-node-hovered", this._onPickerNodeHovered);
++        this.toolbox.walker.off("picker-node-picked", this._onPickerNodePicked);
++      } else {
++        this.toolbox.walker.cancelPick().then(done);
++      }
++    });
++
++    return deferred.promise;
++  },
++
++  /**
++   * Show the box model highlighter on a node, given its NodeFront (this type
++   * of front is normally returned by the WalkerActor).
++   * @return a promise that resolves to the nodeFront when the node has been
++   * highlit
++   */
++  highlightNodeFront: function(nodeFront, options={}) {
++    let deferred = promise.defer();
++
++    // If the remote highlighter exists on the target, use it
++    if (this.isRemoteHighlightable) {
++      this.toolbox.initInspector().then(() => {
++        this.toolbox.highlighter.showBoxModel(nodeFront, options).then(() => {
++          this.toolbox.emit("node-highlight", nodeFront);
++          deferred.resolve(nodeFront);
++        });
++      });
++    }
++    // Else, revert to the "older" version of the highlighter in the walker
++    // actor
++    else {
++      this.toolbox.walker.highlight(nodeFront).then(() => {
++        this.toolbox.emit("node-highlight", nodeFront);
++        deferred.resolve(nodeFront);
++      });
++    }
++
++    return deferred.promise;
++  },
++
++  /**
++   * This is a convenience method in case you don't have a nodeFront but a
++   * valueGrip. This is often the case with VariablesView properties.
++   * This method will simply translate the grip into a nodeFront and call
++   * highlightNodeFront
++   * @return a promise that resolves to the nodeFront when the node has been
++   * highlit
++   */
++  highlightDomValueGrip: function(valueGrip, options={}) {
++    return this._translateGripToNodeFront(valueGrip).then(nodeFront => {
++      if (nodeFront) {
++        return this.highlightNodeFront(nodeFront, options);
++      } else {
++        return promise.reject();
++      }
++    });
++  },
++
++  _translateGripToNodeFront: function(grip) {
++    return this.toolbox.initInspector().then(() => {
++      return this.toolbox.walker.getNodeActorFromObjectActor(grip.actor);
++    });
++  },
++
++  /**
++   * Hide the highlighter.
++   * @return a promise that resolves when the highlighter is hidden
++   */
++  unhighlight: function() {
++    if (this.isRemoteHighlightable) {
++      // If the remote highlighter exists on the target, use it
++      return this.toolbox.initInspector().then(() => {
++        return this.toolbox.highlighter.hideBoxModel();
++      });
++    } else {
++      // If not, no need to unhighlight as the older highlight method uses a
++      // setTimeout to hide itself
++      return promise.resolve();
++    }
++  }
++};
+diff --git a/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js b/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js
+--- a/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js
++++ b/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js
+@@ -42,17 +42,17 @@ function test() {
+   }
+ 
+   function hoverH1InMarkupView() {
+     let deferred = promise.defer();
+ 
+     let container = getContainerForRawNode(inspector.markup, doc.querySelector("h1"));
+     EventUtils.synthesizeMouse(container.tagLine, 2, 2, {type: "mousemove"},
+       inspector.markup.doc.defaultView);
+-    inspector.markup.once("node-highlight", deferred.resolve);
++    inspector.toolbox.once("node-highlight", deferred.resolve);
+ 
+     return deferred.promise;
+   }
+ 
+   function assertH1Highlighted() {
+     ok(isHighlighting(), "The highlighter is shown on a markup container hover");
+     is(getHighlitNode(), doc.querySelector("h1"), "The highlighter highlights the right node");
+     return promise.resolve();
+diff --git a/browser/devtools/inspector/test/browser_inspector_bug_674871.js b/browser/devtools/inspector/test/browser_inspector_bug_674871.js
+--- a/browser/devtools/inspector/test/browser_inspector_bug_674871.js
++++ b/browser/devtools/inspector/test/browser_inspector_bug_674871.js
+@@ -53,17 +53,17 @@ function test()
+         getHighlighterOutline().setAttribute("disable-transitions", "true");
+         runTests();
+       });
+     });
+   }
+ 
+   function runTests()
+   {
+-    inspector.toolbox.startPicker().then(() => {
++    inspector.toolbox.highlighterUtils.startPicker().then(() => {
+       moveMouseOver(iframeNode, 1, 1, isTheIframeHighlighted);
+     });
+   }
+ 
+   function isTheIframeHighlighted()
+   {
+     let outlineRect = getHighlighterOutlineRect();
+     let iframeRect = iframeNode.getBoundingClientRect();
+@@ -81,17 +81,17 @@ function test()
+   function isTheIframeContentHighlighted()
+   {
+     is(getHighlitNode(), iframeBodyNode, "highlighter shows the right node");
+ 
+     // 184 == 200 + 11(border) + 13(padding) - 40(scroll)
+     let outlineRect = getHighlighterOutlineRect();
+     is(outlineRect.height, 184, "highlighter height");
+ 
+-    inspector.toolbox.stopPicker().then(() => {
++    inspector.toolbox.highlighterUtils.stopPicker().then(() => {
+       let target = TargetFactory.forTab(gBrowser.selectedTab);
+       gDevTools.closeToolbox(target);
+       finishUp();
+     });
+   }
+ 
+   function finishUp()
+   {
+diff --git a/browser/devtools/inspector/test/browser_inspector_bug_699308_iframe_navigation.js b/browser/devtools/inspector/test/browser_inspector_bug_699308_iframe_navigation.js
+--- a/browser/devtools/inspector/test/browser_inspector_bug_699308_iframe_navigation.js
++++ b/browser/devtools/inspector/test/browser_inspector_bug_699308_iframe_navigation.js
+@@ -10,17 +10,17 @@ function test() {
+   function startTest() {
+     openInspector(aInspector => {
+       inspector = aInspector;
+       runInspectorTests();
+     });
+   }
+ 
+   function showHighlighter(cb) {
+-    inspector.toolbox.startPicker().then(() => {
++    inspector.toolbox.highlighterUtils.startPicker().then(() => {
+       EventUtils.synthesizeMouse(content.document.body, 1, 1,
+         {type: "mousemove"}, content);
+       inspector.toolbox.once("picker-node-hovered", () => {
+         executeSoon(() => {
+           getHighlighterOutline().setAttribute("disable-transitions", "true");
+           cb();
+         });
+       });
+@@ -58,17 +58,17 @@ function test() {
+ 
+     finishTest();
+   }
+ 
+   function finishTest() {
+     is(iframeLoads, 2, "iframe loads");
+     ok(checksAfterLoads, "the Inspector tests got the chance to run after iframe reloads");
+ 
+-    inspector.toolbox.stopPicker().then(() => {
++    inspector.toolbox.highlighterUtils.stopPicker().then(() => {
+       iframe = null;
+       gBrowser.removeCurrentTab();
+       executeSoon(finish);
+     });
+   }
+ 
+   waitForExplicitFinish();
+ 
+diff --git a/browser/devtools/inspector/test/browser_inspector_bug_958169_switch_to_inspector_on_pick.js b/browser/devtools/inspector/test/browser_inspector_bug_958169_switch_to_inspector_on_pick.js
+--- a/browser/devtools/inspector/test/browser_inspector_bug_958169_switch_to_inspector_on_pick.js
++++ b/browser/devtools/inspector/test/browser_inspector_bug_958169_switch_to_inspector_on_pick.js
+@@ -19,17 +19,17 @@ function test() {
+ 
+   content.location = "data:text/html,<p>Switch to inspector on pick</p>";
+ }
+ 
+ function startTests() {
+   Task.spawn(function() {
+     yield openToolbox();
+     yield startPickerAndAssertSwitchToInspector();
+-    yield toolbox.stopPicker();
++    yield toolbox.highlighterUtils.stopPicker();
+ 
+     finishTests();
+   }).then(null, Cu.reportError);
+ }
+ 
+ function openToolbox() {
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+   return gDevTools.showToolbox(target, "webconsole").then(aToolbox => {
+diff --git a/browser/devtools/inspector/test/browser_inspector_bug_958456_highlight_comments.js b/browser/devtools/inspector/test/browser_inspector_bug_958456_highlight_comments.js
+--- a/browser/devtools/inspector/test/browser_inspector_bug_958456_highlight_comments.js
++++ b/browser/devtools/inspector/test/browser_inspector_bug_958456_highlight_comments.js
+@@ -82,17 +82,17 @@ function prepareHighlighter() {
+   });
+   return deferred.promise;
+ }
+ 
+ function hoverContainer(container) {
+   let deferred = promise.defer();
+   EventUtils.synthesizeMouse(container.tagLine, 2, 2, {type: "mousemove"},
+       markupView.doc.defaultView);
+-  inspector.markup.once("node-highlight", deferred.resolve);
++  inspector.toolbox.once("node-highlight", deferred.resolve);
+   return deferred.promise;
+ }
+ 
+ function hoverElement(selector) {
+   info("Hovering node " + selector + " in the markup view");
+   let container = getContainerForRawNode(markupView, doc.querySelector(selector));
+   return hoverContainer(container);
+ }
+diff --git a/browser/devtools/inspector/test/browser_inspector_bug_961771_picker_stops_on_tool_select.js b/browser/devtools/inspector/test/browser_inspector_bug_961771_picker_stops_on_tool_select.js
+--- a/browser/devtools/inspector/test/browser_inspector_bug_961771_picker_stops_on_tool_select.js
++++ b/browser/devtools/inspector/test/browser_inspector_bug_961771_picker_stops_on_tool_select.js
+@@ -28,17 +28,17 @@ function test() {
+       inspector = aInspector;
+ 
+       toolbox.once("picker-stopped", () => {
+         ok(true, "picker-stopped event fired after switch tools, so picker is closed");
+         finishUp();
+       });
+ 
+       Task.spawn(function() {
+-        yield toolbox.startPicker();
++        yield toolbox.highlighterUtils.startPicker();
+         yield toolbox.selectNextTool();
+       }).then(null, Cu.reportError);
+     });
+   }
+ 
+   function finishUp() {
+     inspector = doc = toolbox = null;
+     gBrowser.removeCurrentTab();
+diff --git a/browser/devtools/inspector/test/browser_inspector_highlighter.js b/browser/devtools/inspector/test/browser_inspector_highlighter.js
+--- a/browser/devtools/inspector/test/browser_inspector_highlighter.js
++++ b/browser/devtools/inspector/test/browser_inspector_highlighter.js
+@@ -47,17 +47,17 @@ function createDocument() {
+   doc.body.appendChild(div2);
+   doc.body.appendChild(div3);
+ 
+   openInspector(aInspector => {
+     inspector = aInspector;
+     inspector.selection.setNode(div, null);
+     inspector.once("inspector-updated", () => {
+       getHighlighterOutline().setAttribute("disable-transitions", "true");
+-      inspector.toolbox.startPicker().then(testMouseOverH1Highlights);
++      inspector.toolbox.highlighterUtils.startPicker().then(testMouseOverH1Highlights);
+     });
+   });
+ }
+ 
+ function testMouseOverH1Highlights() {
+   inspector.toolbox.once("picker-node-hovered", () => {
+     ok(isHighlighting(), "Highlighter is shown");
+     is(getHighlitNode(), h1, "Highlighter's outline correspond to the selected node");
+@@ -104,17 +104,17 @@ function testOutlineDimensions() {
+     is(outlineWidth, h1Width, "outline width matches dimensions of element (zoomed)");
+     is(outlineHeight, h1Height, "outline height matches dimensions of element (zoomed)");
+ 
+     executeSoon(finishUp);
+   }, 500);
+ }
+ 
+ function finishUp() {
+-  inspector.toolbox.stopPicker().then(() => {
++  inspector.toolbox.highlighterUtils.stopPicker().then(() => {
+     doc = h1 = inspector = null;
+     let target = TargetFactory.forTab(gBrowser.selectedTab);
+     gDevTools.closeToolbox(target);
+     gBrowser.removeCurrentTab();
+     finish();
+   });
+ }
+ 
+diff --git a/browser/devtools/inspector/test/browser_inspector_iframeTest.js b/browser/devtools/inspector/test/browser_inspector_iframeTest.js
+--- a/browser/devtools/inspector/test/browser_inspector_iframeTest.js
++++ b/browser/devtools/inspector/test/browser_inspector_iframeTest.js
+@@ -29,17 +29,17 @@ function createDocument() {
+       iframe2.removeEventListener("load", arguments.callee, false);
+ 
+       div2 = iframe2.contentDocument.createElement('div');
+       div2.textContent = 'nested div';
+       iframe2.contentDocument.body.appendChild(div2);
+       // Open the inspector, start the picker mode, and start the tests
+       openInspector(aInspector => {
+         inspector = aInspector;
+-        inspector.toolbox.startPicker().then(runTests);
++        inspector.toolbox.highlighterUtils.startPicker().then(runTests);
+       });
+     }, false);
+ 
+     iframe2.src = 'data:text/html,nested iframe';
+     iframe1.contentDocument.body.appendChild(iframe2);
+   }, false);
+ 
+   iframe1.src = 'data:text/html,little iframe';
+@@ -70,33 +70,33 @@ function testDiv2Highlighter() {
+   moveMouseOver(div2, () => {
+     is(getHighlitNode(), div2, "highlighter matches selection");
+     selectRoot();
+   });
+ }
+ 
+ function selectRoot() {
+   // Select the root document element to clear the breadcrumbs.
+-  inspector.selection.setNode(doc.documentElement);
++  inspector.selection.setNode(doc.documentElement, null);
+   inspector.once("inspector-updated", selectIframe);
+ }
+ 
+ function selectIframe() {
+   // Directly select an element in an iframe (without navigating to it
+   // with mousemoves).
+-  inspector.selection.setNode(div2);
++  inspector.selection.setNode(div2, null);
+   inspector.once("inspector-updated", () => {
+     let breadcrumbs = inspector.breadcrumbs;
+     is(breadcrumbs.nodeHierarchy.length, 9, "Should have 9 items");
+     finishUp();
+   });
+ }
+ 
+ function finishUp() {
+-  inspector.toolbox.stopPicker().then(() => {
++  inspector.toolbox.highlighterUtils.stopPicker().then(() => {
+     doc = div1 = div2 = iframe1 = iframe2 = inspector = null;
+     let target = TargetFactory.forTab(gBrowser.selectedTab);
+     gDevTools.closeToolbox(target);
+     gBrowser.removeCurrentTab();
+     finish();
+   });
+ }
+ 
+diff --git a/browser/devtools/main.js b/browser/devtools/main.js
+--- a/browser/devtools/main.js
++++ b/browser/devtools/main.js
+@@ -104,17 +104,17 @@ Tools.inspector = {
+   icon: "chrome://browser/skin/devtools/tool-inspector.svg",
+   url: "chrome://browser/content/devtools/inspector/inspector.xul",
+   label: l10n("inspector.label", inspectorStrings),
+   tooltip: l10n("inspector.tooltip", inspectorStrings),
+   inMenu: true,
+ 
+   preventClosingOnKey: true,
+   onkey: function(panel) {
+-    panel.toolbox.togglePicker();
++    panel.toolbox.highlighterUtils.togglePicker();
+   },
+ 
+   isTargetSupported: function(target) {
+     return true;
+   },
+ 
+   build: function(iframeWindow, toolbox) {
+     let panel = new InspectorPanel(iframeWindow, toolbox);
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -49,20 +49,16 @@ loader.lazyGetter(this, "AutocompletePop
+ /**
+  * The markup tree.  Manages the mapping of nodes to MarkupContainers,
+  * updating based on mutations, and the undo/redo bindings.
+  *
+  * @param Inspector aInspector
+  *        The inspector we're watching.
+  * @param iframe aFrame
+  *        An iframe in which the caller has kindly loaded markup-view.xhtml.
+- *
+- * Fires the following events:
+- * - node-highlight: When a node in the markup-view is hovered and the
+- *   corresponding node in the content gets highlighted
+  */
+ function MarkupView(aInspector, aFrame, aControllerWindow) {
+   this._inspector = aInspector;
+   this.walker = this._inspector.walker;
+   this._frame = aFrame;
+   this.doc = this._frame.contentDocument;
+   this._elt = this.doc.querySelector("#root");
+   this.htmlEditor = new HTMLEditor(this.doc);
+@@ -169,51 +165,21 @@ MarkupView.prototype = {
+     }
+   },
+ 
+   _onMouseLeave: function() {
+     this._hideBoxModel();
+   },
+ 
+   _showBoxModel: function(nodeFront, options={}) {
+-    let toolbox = this._inspector.toolbox;
+-
+-    // If the remote highlighter exists on the target, use it
+-    if (toolbox.isRemoteHighlightable) {
+-      toolbox.initInspector().then(() => {
+-        toolbox.highlighter.showBoxModel(nodeFront, options).then(() => {
+-          this.emit("node-highlight", nodeFront);
+-        });
+-      });
+-    }
+-    // Else, revert to the "older" version of the highlighter in the walker
+-    // actor
+-    else {
+-      this.walker.highlight(nodeFront).then(() => {
+-        this.emit("node-highlight", nodeFront);
+-      });
+-    }
++    this._inspector.toolbox.highlighterUtils.highlightNodeFront(nodeFront, options);
+   },
+ 
+   _hideBoxModel: function() {
+-    let deferred = promise.defer();
+-    let toolbox = this._inspector.toolbox;
+-
+-    // If the remote highlighter exists on the target, use it
+-    if (toolbox.isRemoteHighlightable) {
+-      toolbox.initInspector().then(() => {
+-        toolbox.highlighter.hideBoxModel().then(deferred.resolve);
+-      });
+-    } else {
+-      deferred.resolve();
+-    }
+-    // If not, no need to unhighlight as the older highlight method uses a
+-    // setTimeout to hide itself
+-
+-    return deferred.promise;
++    this._inspector.toolbox.highlighterUtils.unhighlight();
+   },
+ 
+   _briefBoxModelTimer: null,
+   _brieflyShowBoxModel: function(nodeFront, options) {
+     let win = this._frame.contentWindow;
+ 
+     if (this._briefBoxModelTimer) {
+       win.clearTimeout(this._briefBoxModelTimer);
+diff --git a/browser/devtools/shared/widgets/Tooltip.js b/browser/devtools/shared/widgets/Tooltip.js
+--- a/browser/devtools/shared/widgets/Tooltip.js
++++ b/browser/devtools/shared/widgets/Tooltip.js
+@@ -29,16 +29,17 @@ XPCOMUtils.defineLazyModuleGetter(this, 
+ const GRADIENT_RE = /\b(repeating-)?(linear|radial)-gradient\(((rgb|hsl)a?\(.+?\)|[^\)])+\)/gi;
+ const BORDERCOLOR_RE = /^border-[-a-z]*color$/ig;
+ const BORDER_RE = /^border(-(top|bottom|left|right))?$/ig;
+ const BACKGROUND_IMAGE_RE = /url\([\'\"]?(.*?)[\'\"]?\)/;
+ const XHTML_NS = "http://www.w3.org/1999/xhtml";
+ const SPECTRUM_FRAME = "chrome://browser/content/devtools/spectrum-frame.xhtml";
+ const ESCAPE_KEYCODE = Ci.nsIDOMKeyEvent.DOM_VK_ESCAPE;
+ const ENTER_KEYCODE = Ci.nsIDOMKeyEvent.DOM_VK_RETURN;
++const POPUP_EVENTS = ["shown", "hidden", "showing", "hiding"];
+ 
+ /**
+  * Tooltip widget.
+  *
+  * This widget is intended at any tool that may need to show rich content in the
+  * form of floating panels.
+  * A common use case is image previewing in the CSS rule view, but more complex
+  * use cases may include color pickers, object inspection, etc...
+@@ -131,48 +132,62 @@ let PanelFactory = {
+  *       return true;
+  *     }
+  *   });
+  *   t.destroy();
+  *
+  * @param {XULDocument} doc
+  *        The XUL document hosting this tooltip
+  * @param {Object} options
+- *        Optional options that give options to consumers
++ *        Optional options that give options to consumers:
+  *        - consumeOutsideClick {Boolean} Wether the first click outside of the
+  *        tooltip should close the tooltip and be consumed or not.
+- *        Defaults to false
++ *        Defaults to false.
+  *        - closeOnKeys {Array} An array of key codes that should close the
+- *        tooltip. Defaults to [27] (escape key)
++ *        tooltip. Defaults to [27] (escape key).
++ *        - closeOnEvents [{emitter: {Object}, event: {String}, useCapture: {Boolean}}]
++ *        Provide an optional list of emitter objects and event names here to
++ *        trigger the closing of the tooltip when these events are fired by the
++ *        emitters. The emitter objects should either implement on/off(event, cb)
++ *        or addEventListener/removeEventListener(event, cb). Defaults to [].
++ *        For instance, the following would close the tooltip whenever the
++ *        toolbox selects a new tool and when a DOM node gets scrolled:
++ *        new Tooltip(doc, {
++ *          closeOnEvents: [
++ *            {emitter: toolbox, event: "select"},
++ *            {emitter: myContainer, event: "scroll", useCapture: true}
++ *          ]
++ *        });
+  *        - noAutoFocus {Boolean} Should the focus automatically go to the panel
+- *        when it opens. Defaults to true
++ *        when it opens. Defaults to true.
+  *
+  * Fires these events:
+  * - showing : just before the tooltip shows
+  * - shown : when the tooltip is shown
+  * - hiding : just before the tooltip closes
+  * - hidden : when the tooltip gets hidden
+  * - keypress : when any key gets pressed, with keyCode
+  */
+ function Tooltip(doc, options) {
+   EventEmitter.decorate(this);
+ 
+   this.doc = doc;
+   this.options = new OptionsStore({
+     consumeOutsideClick: false,
+     closeOnKeys: [ESCAPE_KEYCODE],
+-    noAutoFocus: true
++    noAutoFocus: true,
++    closeOnEvents: []
+   }, options);
+   this.panel = PanelFactory.get(doc, this.options);
+ 
+   // Used for namedTimeouts in the mouseover handling
+   this.uid = "tooltip-" + Date.now();
+ 
+   // Emit show/hide events
+-  for (let event of ["shown", "hidden", "showing", "hiding"]) {
++  for (let event of POPUP_EVENTS) {
+     this["_onPopup" + event] = ((e) => {
+       return () => this.emit(e);
+     })(event);
+     this.panel.addEventListener("popup" + event,
+       this["_onPopup" + event], false);
+   }
+ 
+   // Listen to keypress events to close the tooltip if configured to do so
+@@ -182,16 +197,28 @@ function Tooltip(doc, options) {
+     if (this.options.get("closeOnKeys").indexOf(event.keyCode) !== -1) {
+       if (!this.panel.hidden) {
+         event.stopPropagation();
+       }
+       this.hide();
+     }
+   };
+   win.addEventListener("keypress", this._onKeyPress, false);
++
++  // Listen to custom emitters' events to close the tooltip
++  this.hide = this.hide.bind(this);
++  let closeOnEvents = this.options.get("closeOnEvents");
++  for (let {emitter, event, useCapture} of closeOnEvents) {
++    for (let add of ["addEventListener", "on"]) {
++      if (add in emitter) {
++        emitter[add](event, this.hide, useCapture);
++        break;
++      }
++    }
++  }
+ }
+ 
+ module.exports.Tooltip = Tooltip;
+ 
+ Tooltip.prototype = {
+   defaultPosition: "before_start",
+   defaultOffsetX: 0, // px
+   defaultOffsetY: 0, // px
+@@ -259,24 +286,34 @@ Tooltip.prototype = {
+   },
+ 
+   /**
+    * Get rid of references and event listeners
+    */
+   destroy: function () {
+     this.hide();
+ 
+-    for (let event of ["shown", "hidden", "showing", "hiding"]) {
++    for (let event of POPUP_EVENTS) {
+       this.panel.removeEventListener("popup" + event,
+         this["_onPopup" + event], false);
+     }
+ 
+     let win = this.doc.querySelector("window");
+     win.removeEventListener("keypress", this._onKeyPress, false);
+ 
++    let closeOnEvents = this.options.get("closeOnEvents");
++    for (let {emitter, event, useCapture} of closeOnEvents) {
++      for (let remove of ["removeEventListener", "off"]) {
++        if (remove in emitter) {
++          emitter[remove](event, this.hide, useCapture);
++          break;
++        }
++      }
++    }
++
+     this.content = null;
+ 
+     if (this._basedNode) {
+       this.stopTogglingOnHover();
+     }
+ 
+     this.doc = null;
+ 
+@@ -452,42 +489,51 @@ Tooltip.prototype = {
+    *        The value grip for the object actor.
+    * @param {object} viewOptions [optional]
+    *        Options for the variables view visualization.
+    * @param {object} controllerOptions [optional]
+    *        Options for the variables view controller.
+    * @param {object} relayEvents [optional]
+    *        A collection of events to listen on the variables view widget.
+    *        For example, { fetched: () => ... }
++   * @param {Toolbox} toolbox [optional]
++   *        Pass the instance of the current toolbox if you want the variables
++   *        view widget to allow highlighting and selection of DOM nodes
+    * @param {boolean} reuseCachedWidget [optional]
+    *        Pass false to instantiate a brand new widget for this variable.
+    *        Otherwise, if a variable was previously inspected, its widget
+    *        will be reused.
+    */
+   setVariableContent: function(
+     objectActor,
+     viewOptions = {},
+     controllerOptions = {},
+     relayEvents = {},
++    toolbox = null,
+     reuseCachedWidget = true) {
+ 
+     if (reuseCachedWidget && this._cachedVariablesView) {
+       var [vbox, widget] = this._cachedVariablesView;
+     } else {
+       var vbox = this.doc.createElement("vbox");
+       vbox.className = "devtools-tooltip-variables-view-box";
+       vbox.setAttribute("flex", "1");
+ 
+       let innerbox = this.doc.createElement("vbox");
+       innerbox.className = "devtools-tooltip-variables-view-innerbox";
+       innerbox.setAttribute("flex", "1");
+       vbox.appendChild(innerbox);
+ 
+       var widget = new VariablesView(innerbox, viewOptions);
+ 
++      // If a toolbox was provided, link it to the vview
++      if (toolbox) {
++        widget.toolbox = toolbox;
++      }
++
+       // Analyzing state history isn't useful with transient object inspectors.
+       widget.commitHierarchy = () => {};
+ 
+       for (let e in relayEvents) widget.on(e, relayEvents[e]);
+       VariablesViewController.attach(widget, controllerOptions);
+ 
+       this._cachedVariablesView = [vbox, widget];
+     }
+diff --git a/browser/devtools/shared/widgets/VariablesView.jsm b/browser/devtools/shared/widgets/VariablesView.jsm
+--- a/browser/devtools/shared/widgets/VariablesView.jsm
++++ b/browser/devtools/shared/widgets/VariablesView.jsm
+@@ -18,16 +18,18 @@ const PAGE_SIZE_MAX_JUMPS = 30;
+ const SEARCH_ACTION_MAX_DELAY = 300; // ms
+ const ITEM_FLASH_DURATION = 300 // ms
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ Cu.import("resource:///modules/devtools/ViewHelpers.jsm");
+ Cu.import("resource:///modules/devtools/shared/event-emitter.js");
+ Cu.import("resource://gre/modules/devtools/DevToolsUtils.jsm");
++Cu.import("resource://gre/modules/Task.jsm");
++let promise = Cu.import("resource://gre/modules/commonjs/sdk/core/promise.js").Promise;
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "devtools",
+   "resource://gre/modules/devtools/Loader.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "PluralForm",
+   "resource://gre/modules/PluralForm.jsm");
+ 
+ XPCOMUtils.defineLazyServiceGetter(this, "clipboardHelper",
+@@ -206,16 +208,22 @@ VariablesView.prototype = {
+       if (!this._store.length) {
+         this._appendEmptyNotice();
+         this._toggleSearchVisibility(false);
+       }
+     }, aTimeout);
+   },
+ 
+   /**
++   * Optional DevTools toolbox containing this VariablesView. Used to
++   * communicate with the inspector and highlighter.
++   */
++  toolbox: null,
++
++  /**
+    * The controller for this VariablesView, if it has one.
+    */
+   controller: null,
+ 
+   /**
+    * The amount of time (in milliseconds) it takes to empty this view lazily.
+    */
+   lazyEmptyDelay: LAZY_EMPTY_DELAY,
+@@ -320,16 +328,25 @@ VariablesView.prototype = {
+    * in order to change the variable or property to a plain value.
+    *
+    * This flag is applied recursively onto each scope in this view and
+    * affects only the child nodes when they're created.
+    */
+   editButtonTooltip: STR.GetStringFromName("variablesEditButtonTooltip"),
+ 
+   /**
++   * The tooltip text shown on a variable or property's value if that value is
++   * a DOMNode that can be highlighted and selected in the inspector.
++   *
++   * This flag is applied recursively onto each scope in this view and
++   * affects only the child nodes when they're created.
++   */
++  domNodeValueTooltip: STR.GetStringFromName("variablesDomNodeValueTooltip"),
++
++  /**
+    * The tooltip text shown on a variable or property's delete button if a
+    * |delete| function is provided, in order to delete the variable or property.
+    *
+    * This flag is applied recursively onto each scope in this view and
+    * affects only the child nodes when they're created.
+    */
+   deleteButtonTooltip: STR.GetStringFromName("variablesCloseButtonTooltip"),
+ 
+@@ -1204,16 +1221,17 @@ function Scope(aView, aName, aFlags = {}
+   this.delete = aView.delete;
+   this.new = aView.new;
+   this.preventDisableOnChange = aView.preventDisableOnChange;
+   this.preventDescriptorModifiers = aView.preventDescriptorModifiers;
+   this.editableNameTooltip = aView.editableNameTooltip;
+   this.editableValueTooltip = aView.editableValueTooltip;
+   this.editButtonTooltip = aView.editButtonTooltip;
+   this.deleteButtonTooltip = aView.deleteButtonTooltip;
++  this.domNodeValueTooltip = aView.domNodeValueTooltip;
+   this.contextMenuId = aView.contextMenuId;
+   this.separatorStr = aView.separatorStr;
+ 
+   this._init(aName.trim(), aFlags);
+ }
+ 
+ Scope.prototype = {
+   /**
+@@ -2064,16 +2082,17 @@ Scope.prototype = {
+   delete: null,
+   new: null,
+   preventDisableOnChange: false,
+   preventDescriptorModifiers: false,
+   editableNameTooltip: "",
+   editableValueTooltip: "",
+   editButtonTooltip: "",
+   deleteButtonTooltip: "",
++  domNodeValueTooltip: "",
+   contextMenuId: "",
+   separatorStr: "",
+ 
+   _store: null,
+   _enumItems: null,
+   _nonEnumItems: null,
+   _fetched: false,
+   _committed: false,
+@@ -2114,16 +2133,19 @@ XPCOMUtils.defineLazyGetter(Scope, "elli
+  *        The variable's name.
+  * @param object aDescriptor
+  *        The variable's descriptor.
+  */
+ function Variable(aScope, aName, aDescriptor) {
+   this._setTooltips = this._setTooltips.bind(this);
+   this._activateNameInput = this._activateNameInput.bind(this);
+   this._activateValueInput = this._activateValueInput.bind(this);
++  this.openNodeInInspector = this.openNodeInInspector.bind(this);
++  this.highlightDomNode = this.highlightDomNode.bind(this);
++  this.unhighlightDomNode = this.unhighlightDomNode.bind(this);
+ 
+   // Treat safe getter descriptors as descriptors with a value.
+   if ("getterValue" in aDescriptor) {
+     aDescriptor.value = aDescriptor.getterValue;
+     delete aDescriptor.get;
+     delete aDescriptor.set;
+   }
+ 
+@@ -2166,16 +2188,23 @@ Variable.prototype = Heritage.extend(Sco
+   _createChild: function(aName, aDescriptor) {
+     return new Property(this, aName, aDescriptor);
+   },
+ 
+   /**
+    * Remove this Variable from its parent and remove all children recursively.
+    */
+   remove: function() {
++    if (this._linkedToInspector) {
++      this.unhighlightDomNode();
++      this._valueLabel.removeEventListener("mouseover", this.highlightDomNode, false);
++      this._valueLabel.removeEventListener("mouseout", this.unhighlightDomNode, false);
++      this._openInspectorNode.removeEventListener("mousedown", this.openNodeInInspector, false);
++    }
++
+     this.ownerView._store.delete(this._nameString);
+     this._variablesView._itemsByElement.delete(this._target);
+     this._variablesView._currHierarchy.delete(this._absoluteName);
+ 
+     this._target.remove();
+ 
+     for (let property of this._store.values()) {
+       property.remove();
+@@ -2380,16 +2409,21 @@ Variable.prototype = Heritage.extend(Sco
+       concise: true,
+       noEllipsis: true,
+     });
+     this._valueClassName = VariablesView.getClass(aGrip);
+ 
+     this._valueLabel.classList.add(this._valueClassName);
+     this._valueLabel.setAttribute("value", this._valueString);
+     this._separatorLabel.hidden = false;
++
++    // DOMNodes get special treatment since they can be linked to the inspector
++    if (this._valueGrip.preview && this._valueGrip.preview.kind === "DOMNode") {
++      this._linkToInspector();
++    }
+   },
+ 
+   /**
+    * Marks this variable as overridden.
+    *
+    * @param boolean aFlag
+    *        Whether this variable is overridden or not.
+    */
+@@ -2550,17 +2584,17 @@ Variable.prototype = Heritage.extend(Sco
+     }
+ 
+     if (ownerView.preventDescriptorModifiers) {
+       return;
+     }
+ 
+     if (!descriptor.writable && !ownerView.getter && !ownerView.setter) {
+       let nonWritableIcon = this.document.createElement("hbox");
+-      nonWritableIcon.className = "variable-or-property-non-writable-icon";
++      nonWritableIcon.className = "plain variable-or-property-non-writable-icon";
+       nonWritableIcon.setAttribute("optional-visibility", "");
+       this._title.appendChild(nonWritableIcon);
+     }
+     if (descriptor.value && typeof descriptor.value == "object") {
+       if (descriptor.value.frozen) {
+         let frozenLabel = this.document.createElement("label");
+         frozenLabel.className = "plain variable-or-property-frozen-label";
+         frozenLabel.setAttribute("optional-visibility", "");
+@@ -2618,28 +2652,135 @@ Variable.prototype = Heritage.extend(Sco
+     }
+ 
+     this._target.appendChild(tooltip);
+     this._target.setAttribute("tooltip", tooltip.id);
+ 
+     if (this._editNode && ownerView.eval) {
+       this._editNode.setAttribute("tooltiptext", ownerView.editButtonTooltip);
+     }
++    if (this._openInspectorNode && this._linkedToInspector) {
++      this._openInspectorNode.setAttribute("tooltiptext", this.ownerView.domNodeValueTooltip);
++    }
+     if (this._valueLabel && ownerView.eval) {
+       this._valueLabel.setAttribute("tooltiptext", ownerView.editableValueTooltip);
+     }
+     if (this._name && ownerView.switch) {
+       this._name.setAttribute("tooltiptext", ownerView.editableNameTooltip);
+     }
+     if (this._deleteNode && ownerView.delete) {
+       this._deleteNode.setAttribute("tooltiptext", ownerView.deleteButtonTooltip);
+     }
+   },
+ 
+   /**
++   * Get the parent variablesview toolbox, if any.
++   */
++  get toolbox() {
++    return this._variablesView.toolbox;
++  },
++
++  /**
++   * Checks if this variable is a DOMNode and is part of a variablesview that
++   * has been linked to the toolbox, so that highlighting and jumping to the
++   * inspector can be done.
++   */
++  _isLinkableToInspector: function() {
++    let isDomNode = this._valueGrip && this._valueGrip.preview.kind === "DOMNode";
++    let hasBeenLinked = this._linkedToInspector;
++    let hasToolbox = !!this.toolbox;
++
++    return isDomNode && !hasBeenLinked && hasToolbox;
++  },
++
++  /**
++   * If the variable is a DOMNode, and if a toolbox is set, then link it to the
++   * inspector (highlight on hover, and jump to markup-view on click)
++   */
++  _linkToInspector: function() {
++    if (!this._isLinkableToInspector()) {
++      return;
++    }
++
++    // Listen to value mouseover/click events to highlight and jump
++    this._valueLabel.addEventListener("mouseover", this.highlightDomNode, false);
++    this._valueLabel.addEventListener("mouseout", this.unhighlightDomNode, false);
++
++    // Add a button to open the node in the inspector
++    this._openInspectorNode = this.document.createElement("toolbarbutton");
++    this._openInspectorNode.className = "plain variables-view-open-inspector";
++    this._openInspectorNode.addEventListener("mousedown", this.openNodeInInspector, false);
++    this._title.insertBefore(this._openInspectorNode, this._title.querySelector("toolbarbutton"));
++
++    this._linkedToInspector = true;
++  },
++
++  /**
++   * In case this variable is a DOMNode and part of a variablesview that has been
++   * linked to the toolbox's inspector, then select the corresponding node in
++   * the inspector, and switch the inspector tool in the toolbox
++   * @return a promise that resolves when the node is selected and the inspector
++   * has been switched to and is ready
++   */
++  openNodeInInspector: function(event) {
++    if (!this.toolbox) {
++      return promise.reject(new Error("Toolbox not available"));
++    }
++
++    event && event.stopPropagation();
++
++    return Task.spawn(function*() {
++      yield this.toolbox.initInspector();
++
++      let nodeFront = this._nodeFront;
++      if (!nodeFront) {
++        nodeFront = yield this.toolbox.walker.getNodeActorFromObjectActor(this._valueGrip.actor);
++      }
++
++      if (nodeFront) {
++        yield this.toolbox.selectTool("inspector");
++
++        let inspectorReady = promise.defer();
++        this.toolbox.getPanel("inspector").once("inspector-updated", inspectorReady.resolve);
++        yield this.toolbox.selection.setNodeFront(nodeFront, "variables-view");
++        yield inspectorReady.promise;
++      }
++    }.bind(this));
++  },
++
++  /**
++   * In case this variable is a DOMNode and part of a variablesview that has been
++   * linked to the toolbox's inspector, then highlight the corresponding node
++   */
++  highlightDomNode: function() {
++    if (this.toolbox) {
++      if (this._nodeFront) {
++        // If the nodeFront has been retrieved before, no need to ask the server
++        // again for it
++        this.toolbox.highlighterUtils.highlightNodeFront(this._nodeFront);
++        return;
++      }
++
++      this.toolbox.highlighterUtils.highlightDomValueGrip(this._valueGrip).then(front => {
++        this._nodeFront = front;
++      });
++    }
++  },
++
++  /**
++   * Unhighlight a previously highlit node
++   * @see highlightDomNode
++   */
++  unhighlightDomNode: function() {
++    if (this.toolbox) {
++      this.toolbox.highlighterUtils.unhighlight();
++    }
++  },
++
++  /**
+    * Sets a variable's configurable, enumerable and writable attributes,
+    * and specifies if it's a 'this', '<exception>', '<return>' or '__proto__'
+    * reference.
+    */
+   _setAttributes: function() {
+     let ownerView = this.ownerView;
+     if (ownerView.preventDescriptorModifiers) {
+       return;
+@@ -2735,16 +2876,19 @@ Variable.prototype = Heritage.extend(Sco
+   },
+ 
+   /**
+    * Makes this variable's value editable.
+    */
+   _activateValueInput: function(e) {
+     EditableValue.create(this, {
+       onSave: aString => {
++        if (this._linkedToInspector) {
++          this.unhighlightDomNode();
++        }
+         if (!this._variablesView.preventDisableOnChange) {
+           this._disable();
+         }
+         this.ownerView.eval(this, aString);
+       }
+     }, e);
+   },
+ 
+@@ -3568,16 +3712,23 @@ VariablesView.stringifiers._getNMoreStri
+  *
+  * @param any aGrip
+  *        @see Variable.setGrip
+  * @return string
+  *         The custom class style.
+  */
+ VariablesView.getClass = function(aGrip) {
+   if (aGrip && typeof aGrip == "object") {
++    if (aGrip.preview) {
++      switch (aGrip.preview.kind) {
++        case "DOMNode":
++          return "token-domnode";
++      }
++    }
++
+     switch (aGrip.type) {
+       case "undefined":
+         return "token-undefined";
+       case "null":
+         return "token-null";
+       case "Infinity":
+       case "-Infinity":
+       case "NaN":
+diff --git a/browser/devtools/shared/widgets/widgets.css b/browser/devtools/shared/widgets/widgets.css
+--- a/browser/devtools/shared/widgets/widgets.css
++++ b/browser/devtools/shared/widgets/widgets.css
+@@ -74,30 +74,33 @@
+ .variable-or-property:not([non-extensible]) > tooltip > label.extensible,
+ .variable-or-property:not([frozen]) > tooltip > label.frozen,
+ .variable-or-property:not([sealed]) > tooltip > label.sealed {
+   display: none;
+ }
+ 
+ .variable-or-property[pseudo-item] > tooltip,
+ .variable-or-property[pseudo-item] > .title > .variables-view-edit,
++.variable-or-property[pseudo-item] > .title > .variables-view-open-inspector,
+ .variable-or-property[pseudo-item] > .title > .variables-view-delete,
+ .variable-or-property[pseudo-item] > .title > .variables-view-add-property,
+ .variable-or-property[pseudo-item] > .title > .variable-or-property-frozen-label,
+ .variable-or-property[pseudo-item] > .title > .variable-or-property-sealed-label,
+ .variable-or-property[pseudo-item] > .title > .variable-or-property-non-extensible-label,
+ .variable-or-property[pseudo-item] > .title > .variable-or-property-non-writable-icon {
+   display: none;
+ }
+ 
+ *:not(:hover) .variables-view-delete,
++*:not(:hover) .variables-view-open-inspector,
+ *:not(:hover) .variables-view-add-property {
+   visibility: hidden;
+ }
+ 
+ .variables-view-delete > .toolbarbutton-text,
++.variables-view-open-inspector > .toolbarbutton-text,
+ .variables-view-add-property > .toolbarbutton-text {
+   display: none;
+ }
+ 
+ .variables-view-container[aligned-values] [optional-visibility] {
+   display: none;
+ }
+diff --git a/browser/devtools/webconsole/test/browser.ini b/browser/devtools/webconsole/test/browser.ini
+--- a/browser/devtools/webconsole/test/browser.ini
++++ b/browser/devtools/webconsole/test/browser.ini
+@@ -99,16 +99,17 @@ support-files =
+   test_bug_770099_violation.html
+   test_bug_770099_violation.html^headers^
+   test-autocomplete-in-stackframe.html
+   testscript.js
+   test-bug_923281_console_log_filter.html
+   test-bug_923281_test1.js
+   test-bug_923281_test2.js
+   test-bug_939783_console_trace_duplicates.html
++  test-bug-952277-highlight-nodes-in-vview.html
+ 
+ [browser_bug664688_sandbox_update_after_navigation.js]
+ [browser_bug_638949_copy_link_location.js]
+ [browser_bug_862916_console_dir_and_filter_off.js]
+ [browser_bug_865288_repeat_different_objects.js]
+ [browser_bug_865871_variables_view_close_on_esc_key.js]
+ [browser_bug_869003_inspect_cross_domain_object.js]
+ [browser_bug_871156_ctrlw_close_tab.js]
+@@ -253,9 +254,10 @@ run-if = os == "mac"
+ [browser_webconsole_expandable_timestamps.js]
+ [browser_webconsole_autocomplete_in_debugger_stackframe.js]
+ [browser_webconsole_autocomplete_popup_close_on_tab_switch.js]
+ [browser_webconsole_output_01.js]
+ [browser_webconsole_output_02.js]
+ [browser_webconsole_output_03.js]
+ [browser_webconsole_output_04.js]
+ [browser_webconsole_output_events.js]
++[browser_console_variables_view_highlighter.js]
+ [browser_webconsole_console_trace_duplicates.js]
+diff --git a/browser/devtools/webconsole/test/browser_console_variables_view_highlighter.js b/browser/devtools/webconsole/test/browser_console_variables_view_highlighter.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/webconsole/test/browser_console_variables_view_highlighter.js
+@@ -0,0 +1,91 @@
++/*
++ * Any copyright is dedicated to the Public Domain.
++ * http://creativecommons.org/publicdomain/zero/1.0/
++ */
++
++// Check that variables view is linked to the inspector for highlighting and
++// selecting DOM nodes
++
++const TEST_URI = "http://example.com/browser/browser/devtools/webconsole/test/test-bug-952277-highlight-nodes-in-vview.html";
++
++let gWebConsole, gJSTerm, gVariablesView, gToolbox;
++
++function test()
++{
++  addTab(TEST_URI);
++  browser.addEventListener("load", function onLoad() {
++    browser.removeEventListener("load", onLoad, true);
++    openConsole(null, consoleOpened);
++  }, true);
++}
++
++function consoleOpened(hud)
++{
++  gWebConsole = hud;
++  gJSTerm = hud.jsterm;
++  gToolbox = gDevTools.getToolbox(hud.target);
++  gJSTerm.execute("document.querySelectorAll('p')", onQSAexecuted);
++}
++
++function onQSAexecuted(msg)
++{
++  ok(msg, "output message found");
++  let anchor = msg.querySelector("a");
++  ok(anchor, "object link found");
++
++  gJSTerm.once("variablesview-fetched", onNodeListVviewFetched);
++
++  executeSoon(() =>
++    EventUtils.synthesizeMouse(anchor, 2, 2, {}, gWebConsole.iframeWindow)
++  );
++}
++
++function onNodeListVviewFetched(aEvent, aVar)
++{
++  gVariablesView = aVar._variablesView;
++  ok(gVariablesView, "variables view object");
++
++  // Transform the vview into an array we can filter properties from
++  let props = [[id, prop] for([id, prop] of aVar)];
++  // These properties are the DOM nodes ones
++  props = props.filter(v => v[0].match(/[0-9]+/));
++
++  function hoverOverDomNodeVariableAndAssertHighlighter(index) {
++    if (props[index]) {
++      let prop = props[index][1];
++      let valueEl = prop._valueLabel;
++
++      gToolbox.once("node-highlight", () => {
++        ok(true, "The highlighter was shown on hover of the DOMNode");
++        gToolbox.highlighterUtils.unhighlight().then(() => {
++          clickOnDomNodeVariableAndAssertInspectorSelected(index);
++        });
++      });
++
++      // Rather than trying to emulate a mouseenter event, let's call the
++      // variable's highlightDomNode and see if it has the desired effect
++      prop.highlightDomNode();
++    } else {
++      finishTest();
++    }
++  }
++
++  function clickOnDomNodeVariableAndAssertInspectorSelected(index) {
++    let prop = props[index][1];
++
++    // Make sure the inspector is initialized so we can listen to its events
++    gToolbox.initInspector().then(() => {
++      // Rather than trying to click on the value here, let's just call the
++      // variable's openNodeInInspector function and see if it has the
++      // desired effect
++      prop.openNodeInInspector().then(() => {
++        is(gToolbox.currentToolId, "inspector", "The toolbox switched over the inspector on DOMNode click");
++        gToolbox.selectTool("webconsole").then(() => {
++          hoverOverDomNodeVariableAndAssertHighlighter(index + 1);
++        });
++      });
++    });
++  }
++
++  hoverOverDomNodeVariableAndAssertHighlighter(0);
++}
+diff --git a/browser/devtools/webconsole/test/browser_webconsole_bug_653531_highlighter_console_helper.js b/browser/devtools/webconsole/test/browser_webconsole_bug_653531_highlighter_console_helper.js
+--- a/browser/devtools/webconsole/test/browser_webconsole_bug_653531_highlighter_console_helper.js
++++ b/browser/devtools/webconsole/test/browser_webconsole_bug_653531_highlighter_console_helper.js
+@@ -44,17 +44,17 @@ function createDocument() {
+ function setupHighlighterTests() {
+   ok(h1, "we have the header node");
+   openInspector(runSelectionTests);
+ }
+ 
+ function runSelectionTests(aInspector) {
+   inspector = aInspector;
+ 
+-  inspector.toolbox.startPicker();
++  inspector.toolbox.highlighterUtils.startPicker();
+   inspector.toolbox.once("picker-started", () => {
+     info("Picker mode started, now clicking on H1 to select that node");
+     executeSoon(() => {
+       EventUtils.synthesizeMouseAtCenter(h1, {}, content);
+       inspector.toolbox.once("picker-stopped", () => {
+         info("Picker mode stopped, H1 selected, now switching to the console");
+         openConsole(gBrowser.selectedTab).then(performWebConsoleTests);
+       });
+diff --git a/browser/devtools/webconsole/test/test-bug-952277-highlight-nodes-in-vview.html b/browser/devtools/webconsole/test/test-bug-952277-highlight-nodes-in-vview.html
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/webconsole/test/test-bug-952277-highlight-nodes-in-vview.html
+@@ -0,0 +1,15 @@
++<!DOCTYPE html>
++<html lang="en">
++  <head>
++    <meta charset="utf-8">
++    <title>Web Console test for bug 952277 - Highlighting and selecting nodes from the variablesview</title>
++<!-- Any copyright is dedicated to the Public Domain.
++     http://creativecommons.org/publicdomain/zero/1.0/ -->
++  </head>
++  <body>
++    <p>Web Console test for bug 952277 - Highlighting and selecting nodes from the variablesview</p>
++    <p>Web Console test for bug 952277 - Highlighting and selecting nodes from the variablesview</p>
++    <p>Web Console test for bug 952277 - Highlighting and selecting nodes from the variablesview</p>
++  </body>
++</html>
++
+diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webconsole/webconsole.js
+--- a/browser/devtools/webconsole/webconsole.js
++++ b/browser/devtools/webconsole/webconsole.js
+@@ -3415,16 +3415,17 @@ JSTerm.prototype = {
+    *        - hideFilterInput: boolean, if true the variables filter input is
+    *        hidden.
+    * @return object
+    *         The new Variables View instance.
+    */
+   _createVariablesView: function JST__createVariablesView(aOptions)
+   {
+     let view = new VariablesView(aOptions.container);
++    view.toolbox = gDevTools.getToolbox(this.hud.owner.target);
+     view.searchPlaceholder = l10n.getStr("propertiesFilterPlaceholder");
+     view.emptyText = l10n.getStr("emptyPropertiesList");
+     view.searchEnabled = !aOptions.hideFilterInput;
+     view.lazyEmpty = this._lazyVariablesView;
+ 
+     VariablesViewController.attach(view, {
+       getEnvironmentClient: aGrip => {
+         return new EnvironmentClient(this.hud.proxy.client, aGrip);
+diff --git a/browser/locales/en-US/chrome/browser/devtools/debugger.properties b/browser/locales/en-US/chrome/browser/devtools/debugger.properties
+--- a/browser/locales/en-US/chrome/browser/devtools/debugger.properties
++++ b/browser/locales/en-US/chrome/browser/devtools/debugger.properties
+@@ -257,16 +257,21 @@ variablesEditableValueTooltip=Click to c
+ # LOCALIZATION NOTE (variablesCloseButtonTooltip): The text that is displayed
+ # in the variables list on an item which can be removed.
+ variablesCloseButtonTooltip=Click to remove
+ 
+ # LOCALIZATION NOTE (variablesEditButtonTooltip): The text that is displayed
+ # in the variables list on a getter or setter which can be edited.
+ variablesEditButtonTooltip=Click to set value
+ 
++# LOCALIZATION NOTE (variablesEditableValueTooltip): The text that is displayed
++# in a tooltip on the "open in inspector" button in the the variables list for a
++# DOMNode item.
++variablesDomNodeValueTooltip=Click to select the node in the inspector
++
+ # LOCALIZATION NOTE (configurable|...|Tooltip): The text that is displayed
+ # in the variables list on certain variables or properties as tooltips.
+ # Expanations of what these represent can be found at the following links:
+ # https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object/defineProperty
+ # https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object/isExtensible
+ # https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object/isFrozen
+ # https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Object/isSealed
+ # It's probably best to keep these in English.
+diff --git a/browser/themes/linux/devtools/vview-delete.png b/browser/themes/linux/devtools/vview-delete.png
+index 0945af275e8860ed810900b6d1f36d1707622eae..72cb2443bc6544e0b6a95bb846dbe2ce64e8ba9f
+GIT binary patch
+literal 3608
+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
+
+diff --git a/browser/themes/linux/devtools/vview-edit.png b/browser/themes/linux/devtools/vview-edit.png
+index af42a28df9c4a32ecdc6cbe670abbe5c7f4fe316..2f5cb0030d693ab7bd256ec2186e660b2b25f0de
+GIT binary patch
+literal 3684
+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
+CdpL{$
+
+diff --git a/browser/themes/linux/devtools/vview-lock.png b/browser/themes/linux/devtools/vview-lock.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..d15a6230e71702c1f8336427c76afb0b9af736d5
+GIT binary patch
+literal 3541
+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
+P00000NkvXXu0mjf76RAE
+
+diff --git a/browser/themes/linux/devtools/vview-open-inspector.png b/browser/themes/linux/devtools/vview-open-inspector.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1fe0766dc60ca646f646c86ec061567828dd6fe
+GIT binary patch
+literal 3373
+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
+D*$s@N
+
+diff --git a/browser/themes/linux/jar.mn b/browser/themes/linux/jar.mn
+--- a/browser/themes/linux/jar.mn
++++ b/browser/themes/linux/jar.mn
+@@ -234,17 +234,19 @@ browser.jar:
+   skin/classic/browser/devtools/tool-inspector.svg          (../shared/devtools/images/tool-inspector.svg)
+   skin/classic/browser/devtools/tool-styleeditor.svg        (../shared/devtools/images/tool-styleeditor.svg)
+   skin/classic/browser/devtools/tool-profiler.svg           (../shared/devtools/images/tool-profiler.svg)
+   skin/classic/browser/devtools/tool-network.svg            (../shared/devtools/images/tool-network.svg)
+   skin/classic/browser/devtools/tool-scratchpad.svg         (../shared/devtools/images/tool-scratchpad.svg)
+   skin/classic/browser/devtools/close.png                     (../shared/devtools/images/close.png)
+   skin/classic/browser/devtools/close@2x.png                  (../shared/devtools/images/close@2x.png)
+   skin/classic/browser/devtools/vview-delete.png          (devtools/vview-delete.png)
++  skin/classic/browser/devtools/vview-lock.png            (devtools/vview-lock.png)
+   skin/classic/browser/devtools/vview-edit.png            (devtools/vview-edit.png)
++  skin/classic/browser/devtools/vview-open-inspector.png  (devtools/vview-open-inspector.png)
+   skin/classic/browser/devtools/undock@2x.png             (../shared/devtools/images/undock@2x.png)
+   skin/classic/browser/devtools/font-inspector.css        (devtools/font-inspector.css)
+   skin/classic/browser/devtools/computedview.css          (devtools/computedview.css)
+   skin/classic/browser/devtools/arrow-e.png               (devtools/arrow-e.png)
+   skin/classic/browser/devtools/responsiveui-rotate.png   (../shared/devtools/responsiveui-rotate.png)
+   skin/classic/browser/devtools/responsiveui-touch.png    (../shared/devtools/responsiveui-touch.png)
+   skin/classic/browser/devtools/responsiveui-screenshot.png (../shared/devtools/responsiveui-screenshot.png)
+   skin/classic/browser/devtools/app-manager/connection-footer.css     (../shared/devtools/app-manager/connection-footer.css)
+diff --git a/browser/themes/osx/devtools/vview-delete.png b/browser/themes/osx/devtools/vview-delete.png
+index 0945af275e8860ed810900b6d1f36d1707622eae..72cb2443bc6544e0b6a95bb846dbe2ce64e8ba9f
+GIT binary patch
+literal 3608
+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
+
+diff --git a/browser/themes/osx/devtools/vview-edit.png b/browser/themes/osx/devtools/vview-edit.png
+index af42a28df9c4a32ecdc6cbe670abbe5c7f4fe316..2f5cb0030d693ab7bd256ec2186e660b2b25f0de
+GIT binary patch
+literal 3684
+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
+CdpL{$
+
+diff --git a/browser/themes/osx/devtools/vview-lock.png b/browser/themes/osx/devtools/vview-lock.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..d15a6230e71702c1f8336427c76afb0b9af736d5
+GIT binary patch
+literal 3541
+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
+P00000NkvXXu0mjf76RAE
+
+diff --git a/browser/themes/osx/devtools/vview-open-inspector.png b/browser/themes/osx/devtools/vview-open-inspector.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1fe0766dc60ca646f646c86ec061567828dd6fe
+GIT binary patch
+literal 3373
+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
+D*$s@N
+
+diff --git a/browser/themes/osx/jar.mn b/browser/themes/osx/jar.mn
+--- a/browser/themes/osx/jar.mn
++++ b/browser/themes/osx/jar.mn
+@@ -341,17 +341,19 @@ browser.jar:
+   skin/classic/browser/devtools/tool-inspector.svg          (../shared/devtools/images/tool-inspector.svg)
+   skin/classic/browser/devtools/tool-styleeditor.svg        (../shared/devtools/images/tool-styleeditor.svg)
+   skin/classic/browser/devtools/tool-profiler.svg           (../shared/devtools/images/tool-profiler.svg)
+   skin/classic/browser/devtools/tool-network.svg            (../shared/devtools/images/tool-network.svg)
+   skin/classic/browser/devtools/tool-scratchpad.svg         (../shared/devtools/images/tool-scratchpad.svg)
+   skin/classic/browser/devtools/close.png                   (../shared/devtools/images/close.png)
+   skin/classic/browser/devtools/close@2x.png                (../shared/devtools/images/close@2x.png)
+   skin/classic/browser/devtools/vview-delete.png            (devtools/vview-delete.png)
++  skin/classic/browser/devtools/vview-lock.png              (devtools/vview-lock.png)
+   skin/classic/browser/devtools/vview-edit.png              (devtools/vview-edit.png)
++  skin/classic/browser/devtools/vview-open-inspector.png    (devtools/vview-open-inspector.png)
+   skin/classic/browser/devtools/undock@2x.png               (../shared/devtools/images/undock@2x.png)
+   skin/classic/browser/devtools/font-inspector.css          (devtools/font-inspector.css)
+   skin/classic/browser/devtools/computedview.css            (devtools/computedview.css)
+   skin/classic/browser/devtools/arrow-e.png                 (devtools/arrow-e.png)
+   skin/classic/browser/devtools/responsiveui-rotate.png     (../shared/devtools/responsiveui-rotate.png)
+   skin/classic/browser/devtools/responsiveui-touch.png      (../shared/devtools/responsiveui-touch.png)
+   skin/classic/browser/devtools/responsiveui-screenshot.png (../shared/devtools/responsiveui-screenshot.png)
+   skin/classic/browser/devtools/app-manager/connection-footer.css     (../shared/devtools/app-manager/connection-footer.css)
+diff --git a/browser/themes/shared/devtools/dark-theme.css b/browser/themes/shared/devtools/dark-theme.css
+--- a/browser/themes/shared/devtools/dark-theme.css
++++ b/browser/themes/shared/devtools/dark-theme.css
+@@ -143,20 +143,25 @@
+   color: #b26b47;
+ }
+ 
+ .theme-fg-color7,
+ .cm-s-mozilla .cm-atom,
+ .cm-s-mozilla .cm-quote,
+ .cm-s-mozilla .cm-error,
+ .variable-or-property .token-boolean,
++.variable-or-property .token-domnode,
+ .variable-or-property[exception] > .title > .name { /* Red */
+   color: #bf5656;
+ }
+ 
++.variable-or-property .token-domnode {
++  font-weight: bold;
++}
++
+ .theme-toolbar,
+ .devtools-toolbar,
+ .devtools-sidebar-tabs > tabs { /* General toolbar styling */
+   color: #b6babf;
+   background-color: #343c45;
+   border-color: hsla(210,8%,5%,.6);
+ }
+ 
+diff --git a/browser/themes/shared/devtools/light-theme.css b/browser/themes/shared/devtools/light-theme.css
+--- a/browser/themes/shared/devtools/light-theme.css
++++ b/browser/themes/shared/devtools/light-theme.css
+@@ -142,20 +142,25 @@
+   color: hsl(24,85%,39%);
+ }
+ 
+ .theme-fg-color7,
+ .cm-s-mozilla .cm-atom,
+ .cm-s-mozilla .cm-quote,
+ .cm-s-mozilla .cm-error,
+ .variable-or-property .token-boolean,
++.variable-or-property .token-domnode,
+ .variable-or-property[exception] > .title > .name { /* Red */
+   color: #bf5656;
+ }
+ 
++.variable-or-property .token-domnode {
++  font-weight: bold;
++}
++
+ .theme-fg-contrast { /* To be used for text on theme-bg-contrast */
+   color: black;
+ }
+ 
+ .theme-toolbar,
+ .devtools-toolbar,
+ .devtools-sidebar-tabs > tabs { /* General toolbar styling */
+   color: #585959;
+diff --git a/browser/themes/shared/devtools/widgets.inc.css b/browser/themes/shared/devtools/widgets.inc.css
+--- a/browser/themes/shared/devtools/widgets.inc.css
++++ b/browser/themes/shared/devtools/widgets.inc.css
+@@ -635,29 +635,28 @@
+   border-bottom: 1px dashed #f99;
+ }
+ 
+ .variable-or-property[safe-getter]:not([pseudo-item]) > .title > .name {
+   border-bottom: 1px dashed #8b0;
+ }
+ 
+ .variable-or-property-non-writable-icon {
+-  background: url("chrome://browser/skin/identity-icons-https.png") no-repeat;
++  background: url("chrome://browser/skin/devtools/vview-lock.png") no-repeat;
+   width: 16px;
+   height: 16px;
+-  opacity: 0.5;
+ }
+ 
+-@media (min-resolution: 2dppx) {
++/*@media (min-resolution: 2dppx) {
+   .variable-or-property-non-writable-icon {
+     background-image: url("chrome://browser/skin/identity-icons-https@2x.png");
+     background-size: 32px;
+   }
+ }
+-
++*/
+ .variable-or-property-frozen-label,
+ .variable-or-property-sealed-label,
+ .variable-or-property-non-extensible-label {
+   -moz-padding-end: 4px;
+ }
+ 
+ .variable-or-property:not(:focus) > .title > .variable-or-property-frozen-label,
+ .variable-or-property:not(:focus) > .title > .variable-or-property-sealed-label,
+@@ -678,16 +677,17 @@
+ 
+ .variables-view-container[aligned-values] .title > .element-value-input {
+   width: calc(70vw - 10px);
+ }
+ 
+ /* Actions first */
+ 
+ .variables-view-container[actions-first] .variables-view-delete,
++.variables-view-container[actions-first] .variables-view-open-inspector,
+ .variables-view-container[actions-first] .variables-view-add-property {
+   -moz-box-ordinal-group: 0;
+ }
+ 
+ .variables-view-container[actions-first] [invisible] {
+   visibility: hidden;
+ }
+ 
+@@ -719,30 +719,52 @@
+ /* Variables and properties editing */
+ 
+ .variables-view-delete {
+   list-style-image: url("chrome://browser/skin/devtools/vview-delete.png");
+   -moz-image-region: rect(0,16px,16px,0);
+ }
+ 
+ .variables-view-delete:hover {
++  -moz-image-region: rect(0,48px,16px,32px);
++}
++
++.variables-view-delete:active {
+   -moz-image-region: rect(0,32px,16px,16px);
+ }
+ 
+-.variables-view-delete:active {
++.variables-view-edit {
++  list-style-image: url("chrome://browser/skin/devtools/vview-edit.png");
++  -moz-image-region: rect(0,16px,16px,0);
++  cursor: pointer;
++  padding-left: 2px;
++}
++
++.variables-view-edit:hover {
+   -moz-image-region: rect(0,48px,16px,32px);
+ }
+ 
+-.variables-view-edit {
+-  background: url("chrome://browser/skin/devtools/vview-edit.png") center no-repeat;
+-  width: 20px;
+-  height: 16px;
++.variables-view-edit:active {
++  -moz-image-region: rect(0,32px,16px,16px);
++}
++
++.variables-view-open-inspector {
++  list-style-image: url("chrome://browser/skin/devtools/vview-open-inspector.png");
++  -moz-image-region: rect(0,16px,16px,0);
+   cursor: pointer;
+ }
+ 
++.variables-view-open-inspector:hover {
++  -moz-image-region: rect(0,48px,16px,32px);
++}
++
++.variables-view-open-inspector:active {
++  -moz-image-region: rect(0,32px,16px,16px);
++}
++
+ .variables-view-throbber {
+   background: url("chrome://global/skin/icons/loading_16.png") center no-repeat;
+   width: 16px;
+   height: 16px;
+ }
+ 
+ .element-value-input {
+   -moz-margin-start: -2px !important;
+diff --git a/browser/themes/windows/devtools/vview-delete.png b/browser/themes/windows/devtools/vview-delete.png
+index 9604653c0d4280d4bc4901b85786181f4f3d7929..72cb2443bc6544e0b6a95bb846dbe2ce64e8ba9f
+GIT binary patch
+literal 3608
+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
+
+diff --git a/browser/themes/windows/devtools/vview-edit.png b/browser/themes/windows/devtools/vview-edit.png
+index af42a28df9c4a32ecdc6cbe670abbe5c7f4fe316..2f5cb0030d693ab7bd256ec2186e660b2b25f0de
+GIT binary patch
+literal 3684
+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
+CdpL{$
+
+diff --git a/browser/themes/windows/devtools/vview-lock.png b/browser/themes/windows/devtools/vview-lock.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..d15a6230e71702c1f8336427c76afb0b9af736d5
+GIT binary patch
+literal 3541
+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
+P00000NkvXXu0mjf76RAE
+
+diff --git a/browser/themes/windows/devtools/vview-open-inspector.png b/browser/themes/windows/devtools/vview-open-inspector.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1fe0766dc60ca646f646c86ec061567828dd6fe
+GIT binary patch
+literal 3373
+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
+D*$s@N
+
+diff --git a/browser/themes/windows/jar.mn b/browser/themes/windows/jar.mn
+--- a/browser/themes/windows/jar.mn
++++ b/browser/themes/windows/jar.mn
+@@ -262,17 +262,19 @@ browser.jar:
+         skin/classic/browser/devtools/tool-inspector.svg            (../shared/devtools/images/tool-inspector.svg)
+         skin/classic/browser/devtools/tool-styleeditor.svg          (../shared/devtools/images/tool-styleeditor.svg)
+         skin/classic/browser/devtools/tool-profiler.svg             (../shared/devtools/images/tool-profiler.svg)
+         skin/classic/browser/devtools/tool-network.svg              (../shared/devtools/images/tool-network.svg)
+         skin/classic/browser/devtools/tool-scratchpad.svg           (../shared/devtools/images/tool-scratchpad.svg)
+         skin/classic/browser/devtools/close.png                     (../shared/devtools/images/close.png)
+         skin/classic/browser/devtools/close@2x.png                  (../shared/devtools/images/close@2x.png)
+         skin/classic/browser/devtools/vview-delete.png              (devtools/vview-delete.png)
++        skin/classic/browser/devtools/vview-lock.png                (devtools/vview-lock.png)
+         skin/classic/browser/devtools/vview-edit.png                (devtools/vview-edit.png)
++        skin/classic/browser/devtools/vview-open-inspector.png      (devtools/vview-open-inspector.png)
+         skin/classic/browser/devtools/undock@2x.png                 (../shared/devtools/images/undock@2x.png)
+         skin/classic/browser/devtools/font-inspector.css            (devtools/font-inspector.css)
+         skin/classic/browser/devtools/computedview.css              (devtools/computedview.css)
+         skin/classic/browser/devtools/arrow-e.png                   (devtools/arrow-e.png)
+         skin/classic/browser/devtools/responsiveui-rotate.png       (../shared/devtools/responsiveui-rotate.png)
+         skin/classic/browser/devtools/responsiveui-touch.png        (../shared/devtools/responsiveui-touch.png)
+         skin/classic/browser/devtools/responsiveui-screenshot.png   (../shared/devtools/responsiveui-screenshot.png)
+         skin/classic/browser/devtools/app-manager/connection-footer.css     (../shared/devtools/app-manager/connection-footer.css)
+@@ -568,17 +570,19 @@ browser.jar:
+         skin/classic/aero/browser/devtools/tool-inspector.svg        (../shared/devtools/images/tool-inspector.svg)
+         skin/classic/aero/browser/devtools/tool-styleeditor.svg      (../shared/devtools/images/tool-styleeditor.svg)
+         skin/classic/aero/browser/devtools/tool-profiler.svg         (../shared/devtools/images/tool-profiler.svg)
+         skin/classic/aero/browser/devtools/tool-network.svg          (../shared/devtools/images/tool-network.svg)
+         skin/classic/aero/browser/devtools/tool-scratchpad.svg       (../shared/devtools/images/tool-scratchpad.svg)
+         skin/classic/aero/browser/devtools/close.png                 (../shared/devtools/images/close.png)
+         skin/classic/aero/browser/devtools/close@2x.png              (../shared/devtools/images/close@2x.png)
+         skin/classic/aero/browser/devtools/vview-delete.png          (devtools/vview-delete.png)
++        skin/classic/aero/browser/devtools/vview-lock.png            (devtools/vview-lock.png)
+         skin/classic/aero/browser/devtools/vview-edit.png            (devtools/vview-edit.png)
++        skin/classic/aero/browser/devtools/vview-open-inspector.png  (devtools/vview-open-inspector.png)
+         skin/classic/aero/browser/devtools/undock@2x.png             (../shared/devtools/images/undock@2x.png)
+         skin/classic/aero/browser/devtools/font-inspector.css        (devtools/font-inspector.css)
+         skin/classic/aero/browser/devtools/computedview.css          (devtools/computedview.css)
+         skin/classic/aero/browser/devtools/arrow-e.png               (devtools/arrow-e.png)
+         skin/classic/aero/browser/devtools/responsiveui-rotate.png   (../shared/devtools/responsiveui-rotate.png)
+         skin/classic/aero/browser/devtools/responsiveui-touch.png    (../shared/devtools/responsiveui-touch.png)
+         skin/classic/aero/browser/devtools/responsiveui-screenshot.png (../shared/devtools/responsiveui-screenshot.png)
+         skin/classic/aero/browser/devtools/app-manager/connection-footer.css     (../shared/devtools/app-manager/connection-footer.css)
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -2081,17 +2081,41 @@ var WalkerActor = protocol.ActorClass({
+         added: [],
+         removed: []
+       });
+     }
+ 
+     // Need to force a release of this node, because those nodes can't
+     // be accessed anymore.
+     this.releaseNode(documentActor, { force: true });
+-  }
++  },
++
++  /**
++   * Given an ObjectActor (identified by its ID), commonly used in the debugger,
++   * webconsole and variablesView, return the corresponding inspector's NodeActor
++   */
++  getNodeActorFromObjectActor: method(function(objectActorID) {
++    let debuggerObject = this.conn.poolFor(objectActorID).get(objectActorID).obj;
++    let rawNode = debuggerObject.unsafeDereference();
++
++    // This is a special case for the document object whereby it is considered
++    // as document.documentElement (the <html> node)
++    if (rawNode.defaultView && rawNode === rawNode.defaultView.document) {
++      rawNode = rawNode.documentElement;
++    }
++
++    return this.attachElement(rawNode);
++  }, {
++    request: {
++      objectActorID: Arg(0, "string")
++    },
++    response: {
++      nodeFront: RetVal("disconnectedNode")
++    }
++  }),
+ });
+ 
+ /**
+  * Client side of the DOM walker.
+  */
+ var WalkerFront = exports.WalkerFront = protocol.FrontClass(WalkerActor, {
+   // Set to true if cleanup should be requested after every mutation list.
+   autoCleanup: true,
+@@ -2215,16 +2239,24 @@ var WalkerFront = exports.WalkerFront = 
+   querySelector: protocol.custom(function(queryNode, selector) {
+     return this._querySelector(queryNode, selector).then(response => {
+       return response.node;
+     });
+   }, {
+     impl: "_querySelector"
+   }),
+ 
++  getNodeActorFromObjectActor: protocol.custom(function(objectActorID) {
++    return this._getNodeActorFromObjectActor(objectActorID).then(response => {
++      return response.node;
++    });
++  }, {
++    impl: "_getNodeActorFromObjectActor"
++  }),
++
+   _releaseFront: function(node, force) {
+     if (node.retained && !force) {
+       node.reparent(null);
+       this._retainedOrphans.add(node);
+       return;
+     }
+ 
+     if (node.retained) {
