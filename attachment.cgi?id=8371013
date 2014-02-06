@@ -1,0 +1,213 @@
+# HG changeset patch
+# Parent 0f1bc0a9caa41b0caa9325a2edec59d951b445fb
+# User Patrick Brosset <pbrosset@mozilla.com>
+Bug 968316 - Keep the highlighter visible when selecting the currently hovered node in the markup-view, r=bgrins
+
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -252,21 +252,24 @@ MarkupView.prototype = {
+    * In a few cases, we don't want to highlight the node:
+    * - If the reason is null (used to reset the selection),
+    * - if it's "inspector-open" (when the inspector opens up, let's not highlight
+    * the default node)
+    * - if it's "navigateaway" (since the page is being navigated away from)
+    * - if it's "test" (this is a special case for mochitest. In tests, we often
+    * need to select elements but don't necessarily want the highlighter to come
+    * and go after a delay as this might break test scenarios)
++   * We also do not want to start a brief highlight timeout if the node is already
++   * being hovered over, since in that case it will already be highlighted.
+    */
+   _shouldNewSelectionBeHighlighted: function() {
+     let reason = this._inspector.selection.reason;
+     let unwantedReasons = ["inspector-open", "navigateaway", "test"];
+-    return reason && unwantedReasons.indexOf(reason) === -1;
++    let isHighlitNode = this._hoveredNode === this._inspector.selection.nodeFront;
++    return !isHighlitNode && reason && unwantedReasons.indexOf(reason) === -1;
+   },
+ 
+   /**
+    * Highlight the inspector selected node.
+    */
+   _onNewSelection: function() {
+     let selection = this._inspector.selection;
+ 
+diff --git a/browser/devtools/markupview/test/browser.ini b/browser/devtools/markupview/test/browser.ini
+--- a/browser/devtools/markupview/test/browser.ini
++++ b/browser/devtools/markupview/test/browser.ini
+@@ -19,8 +19,9 @@ skip-if = os == "linux"
+ [browser_inspector_markup_edit_outerhtml2.js]
+ [browser_inspector_markup_mutation.js]
+ [browser_inspector_markup_mutation_flashing.js]
+ [browser_inspector_markup_navigation.js]
+ [browser_inspector_markup_subset.js]
+ [browser_inspector_markup_765105_tooltip.js]
+ [browser_inspector_markup_950732.js]
+ [browser_inspector_markup_964014_copy_image_data.js]
++[browser_inspector_markup_968316_highlit_node_on_hover_then_select.js]
+diff --git a/browser/devtools/markupview/test/browser_inspector_markup_964014_copy_image_data.js b/browser/devtools/markupview/test/browser_inspector_markup_964014_copy_image_data.js
+--- a/browser/devtools/markupview/test/browser_inspector_markup_964014_copy_image_data.js
++++ b/browser/devtools/markupview/test/browser_inspector_markup_964014_copy_image_data.js
+@@ -37,17 +37,17 @@ function createDocument() {
+   context.lineTo(0, 600);
+   context.closePath();
+   context.fillStyle = "#ffc821";
+   context.fill();
+ 
+   openInspector().then(startTests);
+ }
+ 
+-function startTests(aInspector, aToolbox) {
++function startTests({inspector: aInspector, toolbox: aToolbox}) {
+   inspector = aInspector;
+   markup = inspector.markup;
+ 
+   Task.spawn(function() {
+     yield selectNode("div", inspector);
+     yield assertCopyImageDataNotAvailable();
+ 
+     yield selectNode("img", inspector);
+diff --git a/browser/devtools/markupview/test/browser_inspector_markup_968316_highlit_node_on_hover_then_select.js b/browser/devtools/markupview/test/browser_inspector_markup_968316_highlit_node_on_hover_then_select.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/markupview/test/browser_inspector_markup_968316_highlit_node_on_hover_then_select.js
+@@ -0,0 +1,54 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++// Test that when first hovering over a node and immediately after selecting it
++// by clicking on it leaves the highlighter visible for as long as the mouse is
++// over the node
++
++function test() {
++  waitForExplicitFinish();
++
++  gBrowser.selectedTab = gBrowser.addTab();
++  gBrowser.selectedBrowser.addEventListener("load", function onload(evt) {
++    gBrowser.selectedBrowser.removeEventListener("load", onload, true);
++    waitForFocus(startTests, content);
++  }, true);
++
++  content.location = "data:text/html,<p>It's going to be legen....</p>";
++}
++
++function startTests(aInspector, aToolbox) {
++  let p = content.document.querySelector("p");
++  Task.spawn(function() {
++    info("opening the inspector tool");
++    let {inspector, toolbox} = yield openInspector();
++
++    info("hovering over the <p> line in the markup-view");
++    yield hoverContainer(p, inspector);
++    ok(isHighlighterVisible(), "the highlighter is still visible");
++
++    info("selecting the <p> line by clicking in the markup-view");
++    yield clickContainer(p, inspector);
++
++    p.textContent = "wait for it ....";
++    info("wait and see if the highlighter stays visible even after the node was selected");
++    yield waitForTheBrieflyShowBoxModelTimeout();
++
++    p.textContent = "dary!!!!";
++    ok(isHighlighterVisible(), "the highlighter is still visible");
++  }).then(null, ok.bind(null, false)).then(endTests);
++}
++
++function endTests() {
++  gBrowser.removeCurrentTab();
++  finish();
++}
++
++function waitForTheBrieflyShowBoxModelTimeout() {
++  let deferred = promise.defer();
++  // Note that the current timeout is 1 sec and is neither configurable nor
++  // exported anywhere we can access, so hard-coding the timeout
++  content.setTimeout(deferred.resolve, 1500);
++  return deferred.promise;
++}
+diff --git a/browser/devtools/markupview/test/head.js b/browser/devtools/markupview/test/head.js
+--- a/browser/devtools/markupview/test/head.js
++++ b/browser/devtools/markupview/test/head.js
+@@ -35,31 +35,70 @@ function getContainerForRawNode(markupVi
+  */
+ function openInspector() {
+   let deferred = promise.defer();
+ 
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+   gDevTools.showToolbox(target, "inspector").then(function(toolbox) {
+     let inspector = toolbox.getCurrentPanel();
+     inspector.once("inspector-updated", () => {
+-      deferred.resolve(inspector, toolbox);
++      deferred.resolve({toolbox: toolbox, inspector: inspector});
+     });
+   }).then(null, console.error);
+ 
+   return deferred.promise;
+ }
+ 
++function getNode(nodeOrSelector) {
++  let node = nodeOrSelector;
++
++  if (typeof nodeOrSelector === "string") {
++    node = content.document.querySelector(nodeOrSelector);
++    ok(node, "A node was found for selector " + nodeOrSelector);
++  }
++
++  return node;
++}
++
+ /**
+- * Set the inspector's current selection to the first match of the given css
+- * selector
++ * Set the inspector's current selection to a node or to the first match of the
++ * given css selector
+  * @return a promise that resolves when the inspector is updated with the new
+  * node
+  */
+-function selectNode(selector, inspector) {
+-  let deferred = promise.defer();
+-  let node = content.document.querySelector(selector);
+-  ok(node, "A node was found for selector " + selector + ". Selecting it now");
++function selectNode(nodeOrSelector, inspector) {
++  let node = getNode(nodeOrSelector);
++  let updated = inspector.once("inspector-updated");
+   inspector.selection.setNode(node, "test");
+-  inspector.once("inspector-updated", () => {
+-    deferred.resolve(node);
+-  });
+-  return deferred.promise;
++  return updated;
+ }
++
++/**
++ * Simulate a mouse-over on the markup-container (a line in the markup-view)
++ * that corresponds to the node or selector passed.
++ * @return a promise that resolves when the container is hovered and the higlighter
++ * is shown on the corresponding node
++ */
++function hoverContainer(nodeOrSelector, inspector) {
++  let highlit = inspector.toolbox.once("node-highlight");
++  let container = getContainerForRawNode(inspector.markup, getNode(nodeOrSelector));
++  EventUtils.synthesizeMouse(container.tagLine, 2, 2, {type: "mousemove"},
++    inspector.markup.doc.defaultView);
++  return highlit;
++}
++
++/**
++ * Simulate a click on the markup-container (a line in the markup-view)
++ * that corresponds to the node or selector passed.
++ * @return a promise that resolves when the node has been selected.
++ */
++function clickContainer(nodeOrSelector, inspector) {
++  let updated = inspector.once("inspector-updated");
++  let container = getContainerForRawNode(inspector.markup, getNode(nodeOrSelector));
++  EventUtils.synthesizeMouseAtCenter(container.tagLine, {type: "mousedown"},
++    inspector.markup.doc.defaultView);
++  return updated;
++}
++
++function isHighlighterVisible() {
++  let outline = gBrowser.selectedBrowser.parentNode.querySelector(".highlighter-container .highlighter-outline");
++  return outline && !outline.hasAttribute("hidden");
++}
