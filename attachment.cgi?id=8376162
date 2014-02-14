@@ -1,0 +1,3135 @@
+# HG changeset patch
+# Parent e2c99a4026abfe6fd12bf4a0d649eee661c899c5
+# User Michael Ratcliffe <mratcliffe@mozilla.com>
+# Date 1392374182 0
+
+Bug 663778 - [layout] Draw layout information of the selected node r=pbrosset
+* * *
+Bug 663778 - Base devtools box model highlighter on getBoxQuads() polyfill r=pbrossett
+
+diff --git a/browser/base/content/browser.css b/browser/base/content/browser.css
+--- a/browser/base/content/browser.css
++++ b/browser/base/content/browser.css
+@@ -1,14 +1,15 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ @namespace url("http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul");
+ @namespace html url("http://www.w3.org/1999/xhtml");
++@namespace svg url("http://www.w3.org/2000/svg");
+ 
+ #main-window:not([chromehidden~="toolbar"]) {
+ %ifdef XP_MACOSX
+   min-width: 335px;
+ %else
+   min-width: 300px;
+ %endif
+ }
+diff --git a/browser/base/content/highlighter.css b/browser/base/content/highlighter.css
+--- a/browser/base/content/highlighter.css
++++ b/browser/base/content/highlighter.css
+@@ -1,35 +1,25 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ .highlighter-container {
+   pointer-events: none;
+ }
+ 
+-.highlighter-outline-container {
+-  overflow: hidden;
+-  position: relative;
+-}
+-
+-.highlighter-outline {
+-  position: absolute;
+-}
+-
+-.highlighter-outline[hidden] {
+-  opacity: 0;
+-  pointer-events: none;
+-  display: -moz-box;
+-}
+-
+-.highlighter-outline:not([disable-transitions]) {
+-  transition-property: opacity, top, left, width, height;
+-  transition-duration: 0.1s;
+-  transition-timing-function: linear;
++/*
++ * Box model highlighter
++ */
++svg|svg.box-model-root[hidden],
++svg|line.box-model-guide-top[hidden],
++svg|line.box-model-guide-right[hidden],
++svg|line.box-model-guide-left[hidden],
++svg|line.box-model-guide-bottom[hidden] {
++  display: none;
+ }
+ 
+ /*
+  * Node Infobar
+  */
+ .highlighter-nodeinfobar-container {
+   position: relative;
+ }
+@@ -40,23 +30,16 @@
+ }
+ 
+ .highlighter-nodeinfobar-positioner[hidden] {
+   opacity: 0;
+   pointer-events: none;
+   display: -moz-box;
+ }
+ 
+-.highlighter-nodeinfobar-positioner:not([disable-transitions]),
+-.highlighter-nodeinfobar-positioner[disable-transitions][force-transitions] {
+-  transition-property: transform, opacity, top, left;
+-  transition-duration: 0.1s;
+-  transition-timing-function: linear;
+-}
+-
+ .highlighter-nodeinfobar-text {
+   overflow: hidden;
+   white-space: nowrap;
+   text-overflow: ellipsis;
+   direction: ltr;
+ }
+ 
+ html|*.highlighter-nodeinfobar-id,
+diff --git a/browser/base/content/test/general/domplate_test.js b/browser/base/content/test/general/domplate_test.js
+--- a/browser/base/content/test/general/domplate_test.js
++++ b/browser/base/content/test/general/domplate_test.js
+@@ -41,11 +41,11 @@ function test()
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function() {
+     gBrowser.selectedBrowser.removeEventListener("load", arguments.callee, true);
+     doc = content.document;
+     waitForFocus(createDocument, content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic domplate tests";
++  content.location = "data:text/html;charset=utf-8,domplate_test.js";
+ }
+ 
+diff --git a/browser/devtools/framework/selection.js b/browser/devtools/framework/selection.js
+--- a/browser/devtools/framework/selection.js
++++ b/browser/devtools/framework/selection.js
+@@ -155,30 +155,32 @@ Selection.prototype = {
+     if (this.isNode()) {
+       return this.node.ownerDocument;
+     }
+     return null;
+   },
+ 
+   setNodeFront: function(value, reason="unknown") {
+     this.reason = reason;
+-    if (value !== this._nodeFront) {
+-      let rawValue = null;
+-      if (value && value.isLocal_toBeDeprecated()) {
+-        rawValue = value.rawNode();
+-      }
+-      this.emit("before-new-node", rawValue, reason);
+-      this.emit("before-new-node-front", value, reason);
+-      let previousNode = this._node;
+-      let previousFront = this._nodeFront;
+-      this._node = rawValue;
+-      this._nodeFront = value;
+-      this.emit("new-node", previousNode, this.reason);
+-      this.emit("new-node-front", value, this.reason);
++
++    // We used to return here if the node had not changed but we now need to
++    // set the node even if it is already set otherwise it is not possible to
++    // e.g. highlight the same node twice.
++    let rawValue = null;
++    if (value && value.isLocal_toBeDeprecated()) {
++      rawValue = value.rawNode();
+     }
++    this.emit("before-new-node", rawValue, reason);
++    this.emit("before-new-node-front", value, reason);
++    let previousNode = this._node;
++    let previousFront = this._nodeFront;
++    this._node = rawValue;
++    this._nodeFront = value;
++    this.emit("new-node", previousNode, this.reason);
++    this.emit("new-node-front", value, this.reason);
+   },
+ 
+   get documentFront() {
+     return this._walker.document(this._nodeFront);
+   },
+ 
+   get nodeFront() {
+     return this._nodeFront;
+diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/toolbox.js
+--- a/browser/devtools/framework/toolbox.js
++++ b/browser/devtools/framework/toolbox.js
+@@ -1038,17 +1038,22 @@ Toolbox.prototype = {
+     }
+   },
+ 
+   /**
+    * Initialize the inspector/walker/selection/highlighter fronts.
+    * Returns a promise that resolves when the fronts are initialized
+    */
+   initInspector: function() {
++    if (this._startup) {
++      return this._startup;
++    }
++
+     let deferred = promise.defer();
++    this._startup = deferred.promise;
+ 
+     if (!this._inspector) {
+       this._inspector = InspectorFront(this._target.client, this._target.form);
+       this._inspector.getWalker().then(walker => {
+         this._walker = walker;
+         this._selection = new Selection(this._walker);
+         if (this.highlighterUtils.isRemoteHighlightable) {
+           this._inspector.getHighlighter().then(highlighter => {
+@@ -1066,16 +1071,20 @@ Toolbox.prototype = {
+     return deferred.promise;
+   },
+ 
+   /**
+    * Destroy the inspector/walker/selection fronts
+    * Returns a promise that resolves when the fronts are destroyed
+    */
+   destroyInspector: function() {
++    if (this._destroying) {
++      return this._destroying;
++    }
++
+     if (!this._inspector) {
+       return promise.resolve();
+     }
+ 
+     let outstanding = () => {
+       return Task.spawn(function*() {
+         yield this.highlighterUtils.stopPicker();
+         yield this._inspector.destroy();
+@@ -1091,17 +1100,17 @@ Toolbox.prototype = {
+         this._selection = null;
+         this._walker = null;
+       }.bind(this));
+     };
+ 
+     // Releasing the walker (if it has been created)
+     // This can fail, but in any case, we want to continue destroying the
+     // inspector/highlighter/selection
+-    let walker = this._walker ? this._walker.release() : promise.resolve();
++    let walker = this._destroying = this._walker ? this._walker.release() : promise.resolve();
+     return walker.then(outstanding, outstanding);
+   },
+ 
+   /**
+    * Get the toolbox's notification box
+    *
+    * @return The notification box element.
+    */
+@@ -1250,20 +1259,20 @@ ToolboxHighlighterUtils.prototype = {
+     promise.all([
+       this.toolbox.initInspector(),
+       this.toolbox.selectTool("inspector")
+     ]).then(() => {
+       this._isPicking = true;
+       this.toolbox._pickerButton.setAttribute("checked", "true");
+ 
+       if (this.isRemoteHighlightable) {
+-        this.toolbox.highlighter.pick().then(done);
+-
+         this.toolbox.walker.on("picker-node-hovered", this._onPickerNodeHovered);
+         this.toolbox.walker.on("picker-node-picked", this._onPickerNodePicked);
++
++        this.toolbox.highlighter.pick().then(done);
+       } else {
+         this.toolbox.walker.pick().then(node => {
+           this.toolbox.selection.setNodeFront(node, "picker-node-picked");
+           this.stopPicker();
+         });
+         done();
+       }
+     });
+diff --git a/browser/devtools/inspector/breadcrumbs.js b/browser/devtools/inspector/breadcrumbs.js
+--- a/browser/devtools/inspector/breadcrumbs.js
++++ b/browser/devtools/inspector/breadcrumbs.js
+@@ -499,16 +499,20 @@ HTMLBreadcrumbs.prototype = {
+ 
+   /**
+    * Connecting the end of the breadcrumbs to a node.
+    *
+    * @param aNode The node to reach.
+    */
+   expand: function BC_expand(aNode)
+   {
++      if (!this.nodeHierarchy) {
++        return;
++      }
++
+       let fragment = this.chromeDoc.createDocumentFragment();
+       let toAppend = aNode;
+       let lastButtonInserted = null;
+       let originalLength = this.nodeHierarchy.length;
+       let stopNode = null;
+       if (originalLength > 0) {
+         stopNode = this.nodeHierarchy[originalLength - 1].node;
+       }
+@@ -606,30 +610,37 @@ HTMLBreadcrumbs.prototype = {
+   },
+ 
+   /**
+    * Ensure the selected node is visible.
+    */
+   scroll: function BC_scroll()
+   {
+     // FIXME bug 684352: make sure its immediate neighbors are visible too.
++    if (!this.nodeHierarchy) {
++      return;
++    }
+ 
+     let scrollbox = this.container;
+     let element = this.nodeHierarchy[this.currentIndex].button;
+ 
+     // Repeated calls to ensureElementIsVisible would interfere with each other
+     // and may sometimes result in incorrect scroll positions.
+     this.chromeWin.clearTimeout(this._ensureVisibleTimeout);
+     this._ensureVisibleTimeout = this.chromeWin.setTimeout(function() {
+       scrollbox.ensureElementIsVisible(element);
+     }, ENSURE_SELECTION_VISIBLE_DELAY);
+   },
+ 
+   updateSelectors: function BC_updateSelectors()
+   {
++    if (!this.nodeHierarchy) {
++      return;
++    }
++
+     for (let i = this.nodeHierarchy.length - 1; i >= 0; i--) {
+       let crumb = this.nodeHierarchy[i];
+       let button = crumb.button;
+ 
+       while(button.hasChildNodes()) {
+         button.removeChild(button.firstChild);
+       }
+       button.appendChild(this.prettyPrintNodeAsXUL(crumb.node));
+@@ -694,13 +705,13 @@ HTMLBreadcrumbs.prototype = {
+       this.scroll();
+       this.inspector.emit("breadcrumbs-updated", this.selection.nodeFront);
+       doneUpdating();
+     }).then(null, err => {
+       doneUpdating(this.selection.nodeFront);
+       this.selectionGuardEnd(err);
+     });
+   }
+-}
++};
+ 
+ XPCOMUtils.defineLazyGetter(this, "DOMUtils", function () {
+   return Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils);
+ });
+diff --git a/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js b/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js
+--- a/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js
++++ b/browser/devtools/inspector/test/browser_inspector_basic_highlighter.js
+@@ -13,64 +13,62 @@ function test() {
+ 
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function onload() {
+     gBrowser.selectedBrowser.removeEventListener("load", onload, true);
+     doc = content.document;
+     waitForFocus(setupTest, content);
+   }, true);
+ 
+-  content.location = "data:text/html,<h1>foo</h1><h2>bar</h2>";
++  content.location = "data:text/html;charset=utf-8,<h1>foo</h1><h2>bar</h2>";
+ 
+   function setupTest() {
+     openInspector((aInspector, aToolbox) => {
+       toolbox = aToolbox;
+       inspector = aInspector;
+-      inspector.selection.setNode(doc.querySelector("h2"), null);
+       inspector.once("inspector-updated", runTests);
++      inspector.selection.setNode(doc.querySelector("h2"), "test");
+     });
+   }
+ 
+-  function runTests(aInspector) {
+-    getHighlighterOutline().setAttribute("disable-transitions", "true");
++  function runTests() {
+     Task.spawn(function() {
+       yield hoverH1InMarkupView();
+       yield assertH1Highlighted();
+       yield mouseLeaveMarkupView();
+       yield assertNoNodeHighlighted();
+ 
+       finishUp();
+     }).then(null, Cu.reportError);
+   }
+ 
+   function hoverH1InMarkupView() {
+     let deferred = promise.defer();
++    let container = getContainerForRawNode(inspector.markup, doc.querySelector("h1"));
+ 
+-    let container = getContainerForRawNode(inspector.markup, doc.querySelector("h1"));
+-    EventUtils.synthesizeMouse(container.tagLine, 2, 2, {type: "mousemove"},
+-      inspector.markup.doc.defaultView);
+     inspector.toolbox.once("node-highlight", deferred.resolve);
++    EventUtils.synthesizeMouseAtCenter(container.tagLine, {type: "mousemove"},
++                                       inspector.markup.doc.defaultView);
+ 
+     return deferred.promise;
+   }
+ 
+   function assertH1Highlighted() {
+     ok(isHighlighting(), "The highlighter is shown on a markup container hover");
+     is(getHighlitNode(), doc.querySelector("h1"), "The highlighter highlights the right node");
+-    return promise.resolve();
+   }
+ 
+   function mouseLeaveMarkupView() {
+     let deferred = promise.defer();
+ 
+     // Find another element to mouseover over in order to leave the markup-view
+     let btn = toolbox.doc.querySelector(".toolbox-dock-button");
+ 
+-    EventUtils.synthesizeMouse(btn, 2, 2, {type: "mousemove"},
+-      toolbox.doc.defaultView);
++    EventUtils.synthesizeMouseAtCenter(btn, {type: "mousemove"},
++                                       toolbox.doc.defaultView);
+     executeSoon(deferred.resolve);
+ 
+     return deferred.promise;
+   }
+ 
+   function assertNoNodeHighlighted() {
+     ok(!isHighlighting(), "After the mouse left the markup view, the highlighter is hidden");
+     return promise.resolve();
+diff --git a/browser/devtools/inspector/test/browser_inspector_bug_674871.js b/browser/devtools/inspector/test/browser_inspector_bug_674871.js
+--- a/browser/devtools/inspector/test/browser_inspector_bug_674871.js
++++ b/browser/devtools/inspector/test/browser_inspector_bug_674871.js
+@@ -45,51 +45,54 @@ function test()
+     iframeNode = doc.querySelector("iframe");
+     iframeBodyNode = iframeNode.contentDocument.querySelector("body");
+     ok(iframeNode, "we have the iframe node");
+     ok(iframeBodyNode, "we have the body node");
+     openInspector(aInspector => {
+       inspector = aInspector;
+       // Make sure the highlighter is shown so we can disable transitions
+       inspector.toolbox.highlighter.showBoxModel(getNodeFront(doc.body)).then(() => {
+-        getHighlighterOutline().setAttribute("disable-transitions", "true");
+         runTests();
+       });
+     });
+   }
+ 
+   function runTests()
+   {
+     inspector.toolbox.highlighterUtils.startPicker().then(() => {
+       moveMouseOver(iframeNode, 1, 1, isTheIframeHighlighted);
+     });
+   }
+ 
+   function isTheIframeHighlighted()
+   {
+-    let outlineRect = getHighlighterOutlineRect();
+-    let iframeRect = iframeNode.getBoundingClientRect();
+-    for (let dim of ["width", "height", "top", "left"]) {
+-      is(Math.floor(outlineRect[dim]), Math.floor(iframeRect[dim]),
+-         "Outline dimension is correct " + outlineRect[dim]);
+-    }
++    let {p1, p2, p3, p4} = getBoxModelStatus().border.points;
++    let {top, right, bottom, left} = iframeNode.getBoundingClientRect();
++
++    is(top, p1.y, "iframeRect.top === boxModelStatus.p1.y");
++    is(top, p2.y, "iframeRect.top === boxModelStatus.p2.y");
++    is(right, p2.x, "iframeRect.right === boxModelStatus.p2.x");
++    is(right, p3.x, "iframeRect.right === boxModelStatus.p3.x");
++    is(bottom, p3.y, "iframeRect.bottom === boxModelStatus.p3.y");
++    is(bottom, p4.y, "iframeRect.bottom === boxModelStatus.p4.y");
++    is(left, p1.x, "iframeRect.left === boxModelStatus.p1.x");
++    is(left, p4.x, "iframeRect.left === boxModelStatus.p4.x");
+ 
+     iframeNode.style.marginBottom = doc.defaultView.innerHeight + "px";
+     doc.defaultView.scrollBy(0, 40);
+ 
+     moveMouseOver(iframeNode, 40, 40, isTheIframeContentHighlighted);
+   }
+ 
+   function isTheIframeContentHighlighted()
+   {
+     is(getHighlitNode(), iframeBodyNode, "highlighter shows the right node");
+ 
+-    // 184 == 200 + 11(border) + 13(padding) - 40(scroll)
+-    let outlineRect = getHighlighterOutlineRect();
+-    is(outlineRect.height, 184, "highlighter height");
++    let outlineRect = getSimpleBorderRect();
++    is(outlineRect.height, 200, "highlighter height");
+ 
+     inspector.toolbox.highlighterUtils.stopPicker().then(() => {
+       let target = TargetFactory.forTab(gBrowser.selectedTab);
+       gDevTools.closeToolbox(target);
+       finishUp();
+     });
+   }
+ 
+diff --git a/browser/devtools/inspector/test/browser_inspector_bug_699308_iframe_navigation.js b/browser/devtools/inspector/test/browser_inspector_bug_699308_iframe_navigation.js
+--- a/browser/devtools/inspector/test/browser_inspector_bug_699308_iframe_navigation.js
++++ b/browser/devtools/inspector/test/browser_inspector_bug_699308_iframe_navigation.js
+@@ -1,35 +1,26 @@
+ /* Any copyright is dedicated to the Public Domain.
+    http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ function test() {
+   let iframe;
+-  let iframeLoads = 0;
+   let checksAfterLoads = false;
+   let inspector;
+ 
+   function startTest() {
+     openInspector(aInspector => {
+       inspector = aInspector;
+       runInspectorTests();
+     });
+   }
+ 
+   function showHighlighter(cb) {
+-    inspector.toolbox.highlighterUtils.startPicker().then(() => {
+-      EventUtils.synthesizeMouse(content.document.body, 1, 1,
+-        {type: "mousemove"}, content);
+-      inspector.toolbox.once("picker-node-hovered", () => {
+-        executeSoon(() => {
+-          getHighlighterOutline().setAttribute("disable-transitions", "true");
+-          cb();
+-        });
+-      });
+-    });
++    inspector.selection.setNode(content.document.body, "test");
++    inspector.toolbox.once("node-highlight", cb);
+   }
+ 
+   function runInspectorTests() {
+     iframe = content.document.querySelector("iframe");
+     ok(iframe, "found the iframe element");
+ 
+     showHighlighter(() => {
+       ok(isHighlighting(), "Inspector is highlighting");
+@@ -38,35 +29,29 @@ function test() {
+ 
+       executeSoon(function() {
+         iframe.contentWindow.location = "javascript:location.reload()";
+       });
+     });
+   }
+ 
+   function onIframeLoad() {
+-    if (++iframeLoads != 2) {
+-      executeSoon(function() {
+-        iframe.contentWindow.location = "javascript:location.reload()";
+-      });
+-      return;
+-    }
++    iframe.removeEventListener("load", onIframeLoad, false);
+ 
+-    iframe.removeEventListener("load", onIframeLoad, false);
++    info("Finished reloading iframes");
+ 
+     ok(isHighlighting(), "Inspector is highlighting after iframe nav");
+ 
+     checksAfterLoads = true;
+ 
+     finishTest();
+   }
+ 
+   function finishTest() {
+-    is(iframeLoads, 2, "iframe loads");
+-    ok(checksAfterLoads, "the Inspector tests got the chance to run after iframe reloads");
++    ok(checksAfterLoads, "the Inspector tests got the chance to run after iframe reload");
+ 
+     inspector.toolbox.highlighterUtils.stopPicker().then(() => {
+       iframe = null;
+       gBrowser.removeCurrentTab();
+       executeSoon(finish);
+     });
+   }
+ 
+diff --git a/browser/devtools/inspector/test/browser_inspector_bug_958456_highlight_comments.js b/browser/devtools/inspector/test/browser_inspector_bug_958456_highlight_comments.js
+--- a/browser/devtools/inspector/test/browser_inspector_bug_958456_highlight_comments.js
++++ b/browser/devtools/inspector/test/browser_inspector_bug_958456_highlight_comments.js
+@@ -72,17 +72,16 @@ function finishTest() {
+   finish();
+ }
+ 
+ function prepareHighlighter() {
+   // Make sure the highlighter doesn't have transitions enabled
+   let deferred = promise.defer();
+   inspector.selection.setNode(doc.querySelector("p"), null);
+   inspector.once("inspector-updated", () => {
+-    getHighlighterOutline().setAttribute("disable-transitions", "true");
+     deferred.resolve();
+   });
+   return deferred.promise;
+ }
+ 
+ function hoverContainer(container) {
+   let deferred = promise.defer();
+   EventUtils.synthesizeMouse(container.tagLine, 2, 2, {type: "mousemove"},
+diff --git a/browser/devtools/inspector/test/browser_inspector_changes.js b/browser/devtools/inspector/test/browser_inspector_changes.js
+--- a/browser/devtools/inspector/test/browser_inspector_changes.js
++++ b/browser/devtools/inspector/test/browser_inspector_changes.js
+@@ -145,10 +145,10 @@ function test() {
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function() {
+     gBrowser.selectedBrowser.removeEventListener("load", arguments.callee, true);
+     doc = content.document;
+     waitForFocus(createDocument, content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic tests for inspector";
++  content.location = "data:text/html;charset=utf-8,browser_inspector_changes.js";
+ }
+diff --git a/browser/devtools/inspector/test/browser_inspector_highlighter.js b/browser/devtools/inspector/test/browser_inspector_highlighter.js
+--- a/browser/devtools/inspector/test/browser_inspector_highlighter.js
++++ b/browser/devtools/inspector/test/browser_inspector_highlighter.js
+@@ -46,40 +46,39 @@ function createDocument() {
+   doc.body.appendChild(div);
+   doc.body.appendChild(div2);
+   doc.body.appendChild(div3);
+ 
+   openInspector(aInspector => {
+     inspector = aInspector;
+     inspector.selection.setNode(div, null);
+     inspector.once("inspector-updated", () => {
+-      getHighlighterOutline().setAttribute("disable-transitions", "true");
+       inspector.toolbox.highlighterUtils.startPicker().then(testMouseOverH1Highlights);
+     });
+   });
+ }
+ 
+ function testMouseOverH1Highlights() {
+   inspector.toolbox.once("picker-node-hovered", () => {
+     ok(isHighlighting(), "Highlighter is shown");
+     is(getHighlitNode(), h1, "Highlighter's outline correspond to the selected node");
+-    testOutlineDimensions();
++    testBoxModelDimensions();
+   });
+ 
+   EventUtils.synthesizeMouse(h1, 2, 2, {type: "mousemove"}, content);
+ }
+ 
+-function testOutlineDimensions() {
++function testBoxModelDimensions() {
+   let h1Dims = h1.getBoundingClientRect();
+-  let h1Width = h1Dims.width;
+-  let h1Height = h1Dims.height;
++  let h1Width = Math.ceil(h1Dims.width);
++  let h1Height = Math.ceil(h1Dims.height);
+ 
+-  let outlineDims = getHighlighterOutlineRect();
+-  let outlineWidth = outlineDims.width;
+-  let outlineHeight = outlineDims.height;
++  let outlineDims = getSimpleBorderRect();
++  let outlineWidth = Math.ceil(outlineDims.width);
++  let outlineHeight = Math.ceil(outlineDims.height);
+ 
+   // Disabled due to bug 716245
+   is(outlineWidth, h1Width, "outline width matches dimensions of element (no zoom)");
+   is(outlineHeight, h1Height, "outline height matches dimensions of element (no zoom)");
+ 
+   // zoom the page by a factor of 2
+   let contentViewer = gBrowser.selectedBrowser.docShell.contentViewer
+                              .QueryInterface(Ci.nsIMarkupDocumentViewer);
+@@ -91,21 +90,20 @@ function testOutlineDimensions() {
+   window.setTimeout(function() {
+     // simulate the zoomed dimensions of the div element
+     let h1Dims = h1.getBoundingClientRect();
+     // There seems to be some very minor differences in the floats, so let's
+     // floor the values
+     let h1Width = Math.floor(h1Dims.width * contentViewer.fullZoom);
+     let h1Height = Math.floor(h1Dims.height * contentViewer.fullZoom);
+ 
+-    let outlineDims = getHighlighterOutlineRect();
++    let outlineDims = getSimpleBorderRect();
+     let outlineWidth = Math.floor(outlineDims.width);
+     let outlineHeight = Math.floor(outlineDims.height);
+ 
+-    // Disabled due to bug 716245
+     is(outlineWidth, h1Width, "outline width matches dimensions of element (zoomed)");
+     is(outlineHeight, h1Height, "outline height matches dimensions of element (zoomed)");
+ 
+     executeSoon(finishUp);
+   }, 500);
+ }
+ 
+ function finishUp() {
+@@ -122,10 +120,10 @@ function test() {
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function() {
+     gBrowser.selectedBrowser.removeEventListener("load", arguments.callee, true);
+     doc = content.document;
+     waitForFocus(createDocument, content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic tests for inspector";
++  content.location = "data:text/html,;charset=utf-8,browser_inspector_highlighter.js";
+ }
+diff --git a/browser/devtools/inspector/test/browser_inspector_iframeTest.js b/browser/devtools/inspector/test/browser_inspector_iframeTest.js
+--- a/browser/devtools/inspector/test/browser_inspector_iframeTest.js
++++ b/browser/devtools/inspector/test/browser_inspector_iframeTest.js
+@@ -26,46 +26,45 @@ function createDocument() {
+     iframe2 = iframe1.contentDocument.createElement('iframe');
+ 
+     iframe2.addEventListener('load', function () {
+       iframe2.removeEventListener("load", arguments.callee, false);
+ 
+       div2 = iframe2.contentDocument.createElement('div');
+       div2.textContent = 'nested div';
+       iframe2.contentDocument.body.appendChild(div2);
++
+       // Open the inspector, start the picker mode, and start the tests
+       openInspector(aInspector => {
+         inspector = aInspector;
+-        inspector.toolbox.highlighterUtils.startPicker().then(runTests);
++        inspector.toolbox.once("node-highlight", runTests);
++        inspector.toolbox.highlighterUtils.startPicker();
+       });
+     }, false);
+ 
+     iframe2.src = 'data:text/html,nested iframe';
+     iframe1.contentDocument.body.appendChild(iframe2);
+   }, false);
+ 
+   iframe1.src = 'data:text/html,little iframe';
+   doc.body.appendChild(iframe1);
+ }
+ 
+ function moveMouseOver(aElement, cb) {
+-  inspector.toolbox.once("picker-node-hovered", () => {
+-    executeSoon(cb);
+-  });
++  inspector.toolbox.once("picker-node-hovered", cb);
+   EventUtils.synthesizeMouseAtCenter(aElement, {type: "mousemove"},
+     aElement.ownerDocument.defaultView);
+ }
+ 
+ function runTests() {
+   testDiv1Highlighter();
+ }
+ 
+ function testDiv1Highlighter() {
+   moveMouseOver(div1, () => {
+-    getHighlighterOutline().setAttribute("disable-transitions", "true");
+     is(getHighlitNode(), div1, "highlighter matches selection");
+     testDiv2Highlighter();
+   });
+ }
+ 
+ function testDiv2Highlighter() {
+   moveMouseOver(div2, () => {
+     is(getHighlitNode(), div2, "highlighter matches selection");
+diff --git a/browser/devtools/inspector/test/browser_inspector_initialization.js b/browser/devtools/inspector/test/browser_inspector_initialization.js
+--- a/browser/devtools/inspector/test/browser_inspector_initialization.js
++++ b/browser/devtools/inspector/test/browser_inspector_initialization.js
+@@ -132,10 +132,10 @@ function test()
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function() {
+     gBrowser.selectedBrowser.removeEventListener("load", arguments.callee, true);
+     doc = content.document;
+     waitForFocus(createDocument, content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic tests for inspector";
++  content.location = "data:text/html;charset=utf-8,browser_inspector_initialization.js";
+ }
+diff --git a/browser/devtools/inspector/test/browser_inspector_invalidate.js b/browser/devtools/inspector/test/browser_inspector_invalidate.js
+--- a/browser/devtools/inspector/test/browser_inspector_invalidate.js
++++ b/browser/devtools/inspector/test/browser_inspector_invalidate.js
+@@ -8,34 +8,37 @@ function test() {
+ 
+   function createDocument() {
+     div = doc.createElement("div");
+     div.setAttribute("style", "width: 100px; height: 100px; background:yellow;");
+     doc.body.appendChild(div);
+ 
+     openInspector(aInspector => {
+       inspector = aInspector;
+-      inspector.toolbox.highlighter.showBoxModel(getNodeFront(div)).then(runTest);
++      inspector.selection.setNode(div);
++      inspector.once("inspector-updated", runTest);
+     });
+   }
+ 
+   function runTest() {
+-    let outline = getHighlighterOutline();
+-    is(outline.style.width, "100px", "outline has the right width");
++    let rect = getSimpleBorderRect();
++    is(rect.width, 100, "outline has the right width");
+ 
+     div.style.width = "200px";
+     function pollTest() {
+-      if (outline.style.width == "100px") {
++      rect = getSimpleBorderRect();
++
++      if (rect.width === 100) {
+         setTimeout(pollTest, 10);
+         return;
+       }
+-      is(outline.style.width, "200px", "outline updated");
++      is(rect.width, 200, "outline updated");
+       finishUp();
+     }
+-    setTimeout(pollTest, 10);
++    setTimeout(pollTest, 100);
+   }
+ 
+   function finishUp() {
+     inspector.toolbox.highlighter.hideBoxModel().then(() => {
+       doc = div = inspector = null;
+       gBrowser.removeCurrentTab();
+       finish();
+     });
+@@ -44,10 +47,10 @@ function test() {
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function() {
+     gBrowser.selectedBrowser.removeEventListener("load", arguments.callee, true);
+     doc = content.document;
+     waitForFocus(createDocument, content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic tests for inspector";
++  content.location = "data:text/html;charset=utf-8,browser_inspector_invalidate.js";
+ }
+diff --git a/browser/devtools/inspector/test/browser_inspector_scrolling.js b/browser/devtools/inspector/test/browser_inspector_scrolling.js
+--- a/browser/devtools/inspector/test/browser_inspector_scrolling.js
++++ b/browser/devtools/inspector/test/browser_inspector_scrolling.js
+@@ -27,45 +27,48 @@ function createDocument()
+ 
+   iframe.src = "data:text/html,foo bar";
+   doc.body.appendChild(iframe);
+ }
+ 
+ function inspectNode(aInspector)
+ {
+   inspector = aInspector;
++  let highlighter = inspector.toolbox.highlighter;
+ 
+-  inspector.once("inspector-updated", performScrollingTest);
+-  executeSoon(function() {
+-    inspector.selection.setNode(div, "");
+-  });
++  highlighter.showBoxModel(getNodeFront(div)).then(performScrollingTest);
+ }
+ 
+ function performScrollingTest()
+ {
++  gBrowser.selectedBrowser.addEventListener("scroll", function() {
++    gBrowser.selectedBrowser.removeEventListener("scroll", arguments.callee,
++      false);
++
++    is(iframe.contentDocument.body.scrollTop, 50, "inspected iframe scrolled");
++
++    finishUp();
++  }, false);
++
+   executeSoon(function() {
+     // FIXME: this will fail on retina displays. EventUtils will only scroll
+     // 25px down instead of 50.
+     EventUtils.synthesizeWheel(div, 10, 10,
+       { deltaY: 50.0, deltaMode: WheelEvent.DOM_DELTA_PIXEL },
+       iframe.contentWindow);
+   });
++}
+ 
+-  gBrowser.selectedBrowser.addEventListener("scroll", function() {
+-    gBrowser.selectedBrowser.removeEventListener("scroll", arguments.callee,
+-      false);
+-
+-    is(iframe.contentDocument.body.scrollTop, 50, "inspected iframe scrolled");
+-
+-    inspector = div = iframe = doc = null;
+-    let target = TargetFactory.forTab(gBrowser.selectedTab);
+-    gDevTools.closeToolbox(target);
+-    gBrowser.removeCurrentTab();
+-    finish();
+-  }, false);
++function finishUp()
++{
++  inspector = div = iframe = doc = null;
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++  gDevTools.closeToolbox(target);
++  gBrowser.removeCurrentTab();
++  finish();
+ }
+ 
+ function test()
+ {
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function() {
+     gBrowser.selectedBrowser.removeEventListener("load", arguments.callee, true);
+diff --git a/browser/devtools/inspector/test/browser_inspector_sidebarstate.js b/browser/devtools/inspector/test/browser_inspector_sidebarstate.js
+--- a/browser/devtools/inspector/test/browser_inspector_sidebarstate.js
++++ b/browser/devtools/inspector/test/browser_inspector_sidebarstate.js
+@@ -20,52 +20,53 @@ function inspectorRuleViewOpened()
+ {
+   is(inspector.sidebar.getCurrentTabID(), "ruleview", "Rule View is selected by default");
+ 
+   // Select the computed view and turn off the inspector.
+   inspector.sidebar.select("computedview");
+ 
+   gDevTools.once("toolbox-destroyed", inspectorClosed);
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+-  gDevTools.getToolbox(target).destroy();
++  gDevTools.closeToolbox(target);
+ }
+ 
+ function inspectorClosed()
+ {
+   openInspector(function(panel) {
+     inspector = panel;
++
+     if (inspector.sidebar.getCurrentTabID()) {
+-      // Default sidebar already selected.
++      info("Default sidebar already selected.")
+       testNewDefaultTab();
+     } else {
+-      // Default sidebar still to be selected.
++      info("Default sidebar still to be selected, adding select listener.");
+       inspector.sidebar.once("select", testNewDefaultTab);
+     }
+   });
+ }
+ 
+ function testNewDefaultTab()
+ {
+   is(inspector.sidebar.getCurrentTabID(), "computedview", "Computed view is selected by default.");
+ 
+   finishTest();
+ }
+ 
+ 
+ function finishTest()
+ {
++  gBrowser.removeCurrentTab();
+   doc = inspector = null;
+-  gBrowser.removeCurrentTab();
+   finish();
+ }
+ 
+ function test()
+ {
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function() {
+     gBrowser.selectedBrowser.removeEventListener("load", arguments.callee, true);
+     doc = content.document;
+     waitForFocus(createDocument, content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic tests for inspector";
++  content.location = "data:text/html;charset=utf-8,browser_inspector_sidebarstate.js";
+ }
+diff --git a/browser/devtools/inspector/test/browser_inspector_tree_height.js b/browser/devtools/inspector/test/browser_inspector_tree_height.js
+--- a/browser/devtools/inspector/test/browser_inspector_tree_height.js
++++ b/browser/devtools/inspector/test/browser_inspector_tree_height.js
+@@ -101,11 +101,11 @@ function test()
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function() {
+     gBrowser.selectedBrowser.removeEventListener("load", arguments.callee, true);
+     doc = content.document;
+     waitForFocus(createDocument, content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic tests for inspector";
++  content.location = "data:text/html;charset=utf-8,browser_inspector_tree_height.js";
+ }
+ 
+diff --git a/browser/devtools/inspector/test/head.js b/browser/devtools/inspector/test/head.js
+--- a/browser/devtools/inspector/test/head.js
++++ b/browser/devtools/inspector/test/head.js
+@@ -51,73 +51,128 @@ function getNodeFront(node)
+   return inspector.walker.frontForRawNode(node);
+ }
+ 
+ function getHighlighter()
+ {
+   return gBrowser.selectedBrowser.parentNode.querySelector(".highlighter-container");
+ }
+ 
+-function getHighlighterOutline()
+-{
+-  let h = getHighlighter();
+-  if (h) {
+-    return h.querySelector(".highlighter-outline");
+-  }
++function getSimpleBorderRect() {
++  let {p1, p2, p3, p4} = getBoxModelStatus().border.points;
++
++  return {
++    top: p1.y,
++    left: p1.x,
++    width: p2.x - p1.x,
++    height: p4.y - p1.y
++  };
+ }
+ 
+-function getHighlighterOutlineRect() {
+-  let helper = new LayoutHelpers(window.content);
+-  let outline = getHighlighterOutline();
++function getBoxModelRoot() {
++  let highlighter = getHighlighter();
++  return highlighter.querySelector(".box-model-root");
++}
+ 
+-  if (outline) {
+-    let browserOffsetRect = helper.getDirtyRect(gBrowser.selectedBrowser);
+-    let outlineRect = helper.getDirtyRect(outline);
+-    outlineRect.top -= browserOffsetRect.top;
+-    outlineRect.left -= browserOffsetRect.left;
++function getBoxModelStatus() {
++  let root = getBoxModelRoot();
++  let inspector = getActiveInspector();
+ 
+-    return outlineRect;
+-  }
++  return {
++    visible: !root.hasAttribute("hidden"),
++    currentNode: inspector.walker.currentNode,
++    margin: {
++      points: getPointsForRegion("margin"),
++      visible: isRegionHidden("margin")
++    },
++    border: {
++      points: getPointsForRegion("border"),
++      visible: isRegionHidden("border")
++    },
++    padding: {
++      points: getPointsForRegion("padding"),
++      visible: isRegionHidden("padding")
++    },
++    content: {
++      points: getPointsForRegion("content"),
++      visible: isRegionHidden("content")
++    },
++    guides: {
++      top: getGuideStatus("top"),
++      right: getGuideStatus("right"),
++      bottom: getGuideStatus("bottom"),
++      left: getGuideStatus("left")
++    }
++  };
++}
++
++function getGuideStatus(location) {
++  let root = getBoxModelRoot();
++  let guide = root.querySelector(".box-model-guide-" + location);
++
++  return {
++    visible: !guide.hasAttribute("hidden"),
++    x1: guide.getAttribute("x1"),
++    y1: guide.getAttribute("y1"),
++    x2: guide.getAttribute("x2"),
++    y2: guide.getAttribute("y2")
++  };
++}
++
++function getPointsForRegion(region) {
++  let root = getBoxModelRoot();
++  let box = root.querySelector(".box-model-" + region);
++  let points = box.getAttribute("points").split(/[, ]/);
++
++  // We multiply each value by 1 to cast it into a number
++  return {
++    p1: {
++      x: parseFloat(points[0]),
++      y: parseFloat(points[1])
++    },
++    p2: {
++      x: parseFloat(points[2]),
++      y: parseFloat(points[3])
++    },
++    p3: {
++      x: parseFloat(points[4]),
++      y: parseFloat(points[5])
++    },
++    p4: {
++      x: parseFloat(points[6]),
++      y: parseFloat(points[7])
++    }
++  };
++}
++
++function isRegionHidden(region) {
++  let root = getBoxModelRoot();
++  let box = root.querySelector(".box-model-" + region);
++
++  return !box.hasAttribute("hidden");
+ }
+ 
+ function isHighlighting()
+ {
+-  let outline = getHighlighterOutline();
+-  return outline && !outline.hasAttribute("hidden");
++  let root = getBoxModelRoot();
++  return !root.hasAttribute("hidden");
+ }
+ 
+ function getHighlitNode()
+ {
+   if (isHighlighting()) {
+     let helper = new LayoutHelpers(window.content);
+-    let outlineRect = getHighlighterOutlineRect();
++    let points = getBoxModelStatus().content.points;
++    let x = (points.p1.x + points.p2.x + points.p3.x + points.p4.x) / 4;
++    let y = (points.p1.y + points.p2.y + points.p3.y + points.p4.y) / 4;
+ 
+-    let a = {
+-      x: outlineRect.left,
+-      y: outlineRect.top
+-    };
+-
+-    let b = {
+-      x: a.x + outlineRect.width,
+-      y: a.y + outlineRect.height
+-    };
+-
+-    let {x, y} = getMidPoint(a, b);
+     return helper.getElementFromPoint(window.content.document, x, y);
+   }
+ }
+ 
+-function getMidPoint(aPointA, aPointB)
+-{
+-  let pointC = {};
+-  pointC.x = (aPointB.x - aPointA.x) / 2 + aPointA.x;
+-  pointC.y = (aPointB.y - aPointA.y) / 2 + aPointA.y;
+-  return pointC;
+-}
+-
+ function computedView()
+ {
+   let sidebar = getActiveInspector().sidebar;
+   let iframe = sidebar.tabbox.querySelector(".iframe-computedview");
+   return iframe.contentWindow.computedView;
+ }
+ 
+ function computedViewTree()
+diff --git a/browser/devtools/layoutview/view.css b/browser/devtools/layoutview/view.css
+--- a/browser/devtools/layoutview/view.css
++++ b/browser/devtools/layoutview/view.css
+@@ -49,33 +49,33 @@ body {
+   body {
+     position: absolute;
+     width: 320px;
+     left: -160px;
+     margin-left: 50%;
+   }
+ }
+ 
+-
+-#margins {
+-  padding: 28px;
++#content,
++#borders {
++  border-width: 1px;
+ }
+ 
+ #content {
+-  height: 20px;
+-  border-width: 1px;
++  height: 25px;
+ }
+ 
++#margins,
+ #padding {
++  border-style: solid;
+   border-width: 25px;
+ }
+ 
+ #borders {
+-  border-width: 2px;
+-  box-shadow: 0 0 16px black;
++  padding: 25px;
+ }
+ 
+ #main > p {
+   position: absolute;
+   pointer-events: none;
+ }
+ 
+ #main > p {
+@@ -84,98 +84,94 @@ body {
+ }
+ 
+ #main > p > span {
+   vertical-align: middle;
+   pointer-events: auto;
+   cursor: default;
+ }
+ 
+-.border.top {
+-  left: 0; top: 23px;
+-  width: 98px;
+-}
+-
+-.border.bottom {
+-  right: 0; bottom: 22px;
+-  width: 98px;
+-  top: auto;
+-}
+-
+-.border.left {
+-  top: 42px; left: 0;
+-  width: 56px;
+-}
+-
+-.border.right{
+-  bottom: 42px; right: 0;
+-  width: 56px;
+-  top: auto;
+-}
+-
+-.top, .bottom {
++.top,
++.bottom {
+   width: calc(100% - 2px);
+   text-align: center;
+ }
+ 
++.padding.top {
++  top: 55px;
++}
++
++.padding.bottom {
++  bottom: 57px;
++}
++
++.border.top {
++  top: 30px;
++}
++
++.border.bottom {
++  bottom: 31px;
++}
++
+ .margin.top {
+-  top: 8px;
++  top: 5px;
+ }
+ 
+ .margin.bottom {
+   bottom: 6px;
+ }
+ 
+-.padding.top {
+-  top: 35px;
+-}
+-
+-.padding.bottom {
+-  bottom: 35px;
+-}
+-
+ .size,
+ .margin.left,
+ .margin.right,
++.border.left,
++.border.right,
+ .padding.left,
+ .padding.right {
+-  top: 0;
++  top: 22px;
+   line-height: 132px;
+ }
+ 
+ .size {
+   width: calc(100% - 2px);
+ }
+ 
+ .margin.right,
+-.margin.left {
+-  width: 28px;
+-}
+-
++.margin.left,
++.border.left,
++.border.right,
+ .padding.right,
+ .padding.left {
+   width: 25px;
+ }
+ 
++.padding.left {
++  left: 52px;
++}
++
++.padding.right {
++  right: 51px;
++}
++
++.border.left {
++  left: 26px;
++}
++
++.border.right {
++  right: 26px;
++}
++
+ .margin.right {
+   right: 0;
+ }
+ 
+ .margin.left {
+   left: 0;
+ }
+ 
+-.padding.left {
+-  left: 30px;
+-}
+-
+-.padding.right {
+-  right: 30px;
+-}
+-
+ .tooltip {
+   position: absolute;
+   bottom: 0;
+   right: 2px;
+   pointer-events: none;
+ }
+ 
+ body.dim > #header > #element-position,
+diff --git a/browser/devtools/layoutview/view.js b/browser/devtools/layoutview/view.js
+--- a/browser/devtools/layoutview/view.js
++++ b/browser/devtools/layoutview/view.js
+@@ -166,16 +166,19 @@ LayoutView.prototype = {
+         !this.inspector.selection.isElementNode()) {
+       return promise.resolve(undefined);
+     }
+ 
+     let node = this.inspector.selection.nodeFront;
+     let lastRequest = this.inspector.pageStyle.getLayout(node, {
+       autoMargins: !this.dimmed
+     }).then(layout => {
++      if (layout.nodeRemoved) {
++        return;
++      }
+       // If a subsequent request has been made, wait for that one instead.
+       if (this._lastRequest != lastRequest) {
+         return this._lastRequest;
+       }
+       this._lastRequest = null;
+       let width = layout.width;
+       let height = layout.height;
+       let newLabel = width + "x" + height;
+@@ -234,22 +237,51 @@ LayoutView.prototype = {
+       }
+ 
+       this.inspector.emit("layoutview-updated");
+       return null;
+     });
+ 
+     this._lastRequest = lastRequest;
+     return this._lastRequest;
+-  }
+-}
++  },
++
++  showBoxModel: function(options={}) {
++    let toolbox = this.inspector.toolbox;
++    let nodeFront = this.inspector.selection.nodeFront;
++
++    toolbox.highlighterUtils.highlightNodeFront(nodeFront, options);
++  },
++
++  hideBoxModel: function() {
++    let toolbox = this.inspector.toolbox;
++
++    toolbox.highlighterUtils.unhighlight();
++  },
++};
+ 
+ let elts;
+ let tooltip;
+ 
++let onmouseover = function(e) {
++  let region = e.target.getAttribute("data-box");
++
++  tooltip.textContent = e.target.getAttribute("tooltip");
++  this.layoutview.showBoxModel({region: region});
++
++  return false;
++}.bind(window);
++
++let onmouseout = function(e) {
++  tooltip.textContent = "";
++  this.layoutview.hideBoxModel();
++
++  return false;
++}.bind(window);
++
+ window.setPanel = function(panel) {
+   this.layoutview = new LayoutView(panel, window);
+ 
+   // Tooltip mechanism
+   elts = document.querySelectorAll("*[tooltip]");
+   tooltip = document.querySelector(".tooltip");
+   for (let i = 0; i < elts.length; i++) {
+     let elt = elts[i];
+@@ -271,16 +303,8 @@ window.onunload = function() {
+   if (elts) {
+     for (let i = 0; i < elts.length; i++) {
+       let elt = elts[i];
+       elt.removeEventListener("mouseover", onmouseover, true);
+       elt.removeEventListener("mouseout", onmouseout, true);
+     }
+   }
+ };
+-
+-function onmouseover(e) {
+-  tooltip.textContent = e.target.getAttribute("tooltip");
+-}
+-
+-function onmouseout(e) {
+-  tooltip.textContent = "";
+-}
+\ No newline at end of file
+diff --git a/browser/devtools/layoutview/view.xhtml b/browser/devtools/layoutview/view.xhtml
+--- a/browser/devtools/layoutview/view.xhtml
++++ b/browser/devtools/layoutview/view.xhtml
+@@ -25,40 +25,40 @@
+   <body class="theme-body devtools-monospace">
+ 
+     <p id="header">
+       <span id="element-size"></span><span id="element-position"></span>
+     </p>
+ 
+     <div id="main">
+ 
+-      <div id="margins" tooltip="&margins.tooltip;">
+-        <div id="borders" tooltip="&borders.tooltip;">
+-          <div id="padding" tooltip="&padding.tooltip;">
+-            <div id="content" tooltip="&content.tooltip;">
++      <div id="margins" data-box="margin" tooltip="&margins.tooltip;">
++        <div id="borders" data-box="border" tooltip="&borders.tooltip;">
++          <div id="padding" data-box="padding" tooltip="&padding.tooltip;">
++            <div id="content" data-box="content" tooltip="&content.tooltip;">
+             </div>
+           </div>
+         </div>
+       </div>
+ 
+-      <p class="border top"><span tooltip="border-top"></span></p>
+-      <p class="border right"><span tooltip="border-right"></span></p>
+-      <p class="border bottom"><span tooltip="border-bottom"></span></p>
+-      <p class="border left"><span tooltip="border-left"></span></p>
++      <p class="border top"><span data-box="border" tooltip="border-top"></span></p>
++      <p class="border right"><span data-box="border" tooltip="border-right"></span></p>
++      <p class="border bottom"><span data-box="border" tooltip="border-bottom"></span></p>
++      <p class="border left"><span data-box="border" tooltip="border-left"></span></p>
+ 
+-      <p class="margin top"><span tooltip="margin-top"></span></p>
+-      <p class="margin right"><span tooltip="margin-right"></span></p>
+-      <p class="margin bottom"><span tooltip="margin-bottom"></span></p>
+-      <p class="margin left"><span tooltip="margin-left"></span></p>
++      <p class="margin top"><span data-box="margin" tooltip="margin-top"></span></p>
++      <p class="margin right"><span data-box="margin" tooltip="margin-right"></span></p>
++      <p class="margin bottom"><span data-box="margin" tooltip="margin-bottom"></span></p>
++      <p class="margin left"><span data-box="margin" tooltip="margin-left"></span></p>
+ 
+-      <p class="padding top"><span tooltip="padding-top"></span></p>
+-      <p class="padding right"><span tooltip="padding-right"></span></p>
+-      <p class="padding bottom"><span tooltip="padding-bottom"></span></p>
+-      <p class="padding left"><span tooltip="padding-left"></span></p>
++      <p class="padding top"><span data-box="padding" tooltip="padding-top"></span></p>
++      <p class="padding right"><span data-box="padding" tooltip="padding-right"></span></p>
++      <p class="padding bottom"><span data-box="padding" tooltip="padding-bottom"></span></p>
++      <p class="padding left"><span data-box="padding" tooltip="padding-left"></span></p>
+ 
+-      <p class="size"><span tooltip="&content.tooltip;"></span></p>
++      <p class="size"><span data-box="content" tooltip="&content.tooltip;"></span></p>
+ 
+       <span class="tooltip"></span>
+ 
+     </div>
+ 
+   </body>
+ </html>
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -549,27 +549,33 @@ MarkupView.prototype = {
+       if (type === "attributes" || type === "characterData") {
+         container.update();
+ 
+         // Auto refresh style properties on selected node when they change.
+         if (type === "attributes" && container.selected) {
+           requiresLayoutChange = true;
+         }
+       } else if (type === "childList") {
+-        let isFromOuterHTML = mutation.removed.some((n) => {
+-          return n === this._outerHTMLNode;
+-        });
++        let isFromOuterHTML;
+ 
+-        // Keep track of which node should be reselected after mutations.
+-        if (isFromOuterHTML) {
+-          reselectParent = target;
+-          reselectChildIndex = this._outerHTMLChildIndex;
++        if (typeof mutation.removed !== "undefined") {
++          isFromOuterHTML = mutation.removed.some((n) => {
++            return n === this._outerHTMLNode;
++          });
+ 
+-          delete this._outerHTMLNode;
+-          delete this._outerHTMLChildIndex;
++          // Keep track of which node should be reselected after mutations.
++          if (isFromOuterHTML) {
++            reselectParent = target;
++            reselectChildIndex = this._outerHTMLChildIndex;
++
++            delete this._outerHTMLNode;
++            delete this._outerHTMLChildIndex;
++          }
++        } else {
++          isFromOuterHTML = true;
+         }
+ 
+         container.childrenDirty = true;
+         // Update the children to take care of changes in the markup view DOM.
+         this._updateChildren(container, {flash: !isFromOuterHTML});
+       }
+     }
+ 
+diff --git a/browser/devtools/markupview/test/browser_inspector_markup_968316_highlit_node_on_hover_then_select.js b/browser/devtools/markupview/test/browser_inspector_markup_968316_highlit_node_on_hover_then_select.js
+--- a/browser/devtools/markupview/test/browser_inspector_markup_968316_highlit_node_on_hover_then_select.js
++++ b/browser/devtools/markupview/test/browser_inspector_markup_968316_highlit_node_on_hover_then_select.js
+@@ -26,29 +26,31 @@ function startTests(aInspector, aToolbox
+ 
+     info("hovering over the <p> line in the markup-view");
+     yield hoverContainer(p, inspector);
+     ok(isHighlighterVisible(), "the highlighter is still visible");
+ 
+     info("selecting the <p> line by clicking in the markup-view");
+     yield clickContainer(p, inspector);
+ 
++    ok(isHighlighterVisible(), "the highlighter is still visible");
++
+     p.textContent = "wait for it ....";
+-    info("wait and see if the highlighter stays visible even after the node was selected");
++    info("wait and see if the highlighter disapears soon after selection");
+     yield waitForTheBrieflyShowBoxModelTimeout();
+ 
+     p.textContent = "dary!!!!";
+-    ok(isHighlighterVisible(), "the highlighter is still visible");
++    ok(!isHighlighterVisible(), "the highlighter is no longer visible");
+   }).then(null, ok.bind(null, false)).then(endTests);
+ }
+ 
+ function endTests() {
+   gBrowser.removeCurrentTab();
+   finish();
+ }
+ 
+ function waitForTheBrieflyShowBoxModelTimeout() {
+   let deferred = promise.defer();
+   // Note that the current timeout is 1 sec and is neither configurable nor
+   // exported anywhere we can access, so hard-coding the timeout
+-  content.setTimeout(deferred.resolve, 1500);
++  content.setTimeout(deferred.resolve, 2000);
+   return deferred.promise;
+ }
+diff --git a/browser/devtools/markupview/test/browser_inspector_markup_navigation.js b/browser/devtools/markupview/test/browser_inspector_markup_navigation.js
+--- a/browser/devtools/markupview/test/browser_inspector_markup_navigation.js
++++ b/browser/devtools/markupview/test/browser_inspector_markup_navigation.js
+@@ -120,17 +120,17 @@ function test() {
+       case "pagedown":
+         EventUtils.synthesizeKey("VK_PAGE_DOWN", {});
+         break;
+       case "home":
+         EventUtils.synthesizeKey("VK_HOME", {});
+         break;
+     }
+ 
+-    inspector.markup._waitForChildren().then(() => executeSoon(function BIMNT_newNode() {
++    inspector.markup._waitForChildren().then(() => executeSoon(() => {
+       let node = inspector.selection.node;
+ 
+       if (className == "*comment*") {
+         is(node.nodeType, Node.COMMENT_NODE, "[" + cursor + "] should be a comment after moving " + key);
+       } else if (className == "*text*") {
+         is(node.nodeType, Node.TEXT_NODE, "[" + cursor + "] should be text after moving " + key);
+       } else if (className == "*doctype*") {
+         is(node.nodeType, Node.DOCUMENT_TYPE_NODE, "[" + cursor + "] should be doctype after moving " + key);
+diff --git a/browser/devtools/markupview/test/head.js b/browser/devtools/markupview/test/head.js
+--- a/browser/devtools/markupview/test/head.js
++++ b/browser/devtools/markupview/test/head.js
+@@ -141,18 +141,19 @@ function clickContainer(nodeOrSelector, 
+   return updated;
+ }
+ 
+ /**
+  * Checks if the highlighter is visible currently
+  * @return {Boolean}
+  */
+ function isHighlighterVisible() {
+-  let outline = gBrowser.selectedBrowser.parentNode.querySelector(".highlighter-container .highlighter-outline");
+-  return outline && !outline.hasAttribute("hidden");
++  let highlighter = gBrowser.selectedBrowser.parentNode
++                            .querySelector(".highlighter-container .box-model-root");
++  return highlighter && !highlighter.hasAttribute("hidden");
+ }
+ 
+ /**
+  * Simulate the mouse leaving the markup-view area
+  * @param {InspectorPanel} inspector The instance of InspectorPanel currently loaded in the toolbox
+  * @return a promise when done
+  */
+ function mouseLeaveMarkupView(inspector) {
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -1357,16 +1357,21 @@ CssRuleView.prototype = {
+ 
+     this._viewedElement = aElement;
+     if (!this._viewedElement) {
+       this._showEmpty();
+       return promise.resolve(undefined);
+     }
+ 
+     this._elementStyle = new ElementStyle(aElement, this.store, this.pageStyle);
++
++    if (!this._elementStyle) {
++      return promise.resolve(undefined);
++    }
++
+     return this._populate().then(() => {
+       this._elementStyle.onChanged = () => {
+         this._changed();
+       };
+     }).then(null, console.error);
+   },
+ 
+   /**
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_inherit.js b/browser/devtools/styleinspector/test/browser_ruleview_inherit.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_inherit.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_inherit.js
+@@ -107,10 +107,10 @@ function test()
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function(evt) {
+     gBrowser.selectedBrowser.removeEventListener(evt.type, arguments.callee, true);
+     doc = content.document;
+     waitForFocus(() => openRuleView(simpleInherit), content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic style inspector tests";
++  content.location = "data:text/html;charset=utf-8,browser_inspector_changes.js";
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_manipulation.js b/browser/devtools/styleinspector/test/browser_ruleview_manipulation.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_manipulation.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_manipulation.js
+@@ -78,10 +78,10 @@ function test()
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function(evt) {
+     gBrowser.selectedBrowser.removeEventListener(evt.type, arguments.callee, true);
+     doc = content.document;
+     waitForFocus(() => openRuleView(simpleOverride), content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic style inspector tests";
++  content.location = "data:text/html;charset=utf-8,browser_ruleview_manipulation.js";
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_override.js b/browser/devtools/styleinspector/test/browser_ruleview_override.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_override.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_override.js
+@@ -173,10 +173,10 @@ function test()
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function(evt) {
+     gBrowser.selectedBrowser.removeEventListener(evt.type, arguments.callee, true);
+     doc = content.document;
+     waitForFocus(() => openRuleView(simpleOverride), content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic style inspector tests";
++  content.location = "data:text/html;charset=utf-8,browser_ruleview_override.js";
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_ui.js b/browser/devtools/styleinspector/test/browser_ruleview_ui.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_ui.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_ui.js
+@@ -243,10 +243,10 @@ function test()
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function(evt) {
+     gBrowser.selectedBrowser.removeEventListener(evt.type, arguments.callee, true);
+     doc = content.document;
+     waitForFocus(() => openRuleView(startTest), content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic style inspector tests";
++  content.location = "data:text/html;charset=utf-8,browser_ruleview_ui.js";
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_update.js b/browser/devtools/styleinspector/test/browser_ruleview_update.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_update.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_update.js
+@@ -184,10 +184,10 @@ function test()
+   waitForExplicitFinish();
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function(evt) {
+     gBrowser.selectedBrowser.removeEventListener(evt.type, arguments.callee, true);
+     doc = content.document;
+     waitForFocus(() => openRuleView(startTest), content);
+   }, true);
+ 
+-  content.location = "data:text/html,basic style inspector tests";
++  content.location = "data:text/html;charset=utf-8,browser_ruleview_update.js";
+ }
+diff --git a/browser/themes/linux/browser.css b/browser/themes/linux/browser.css
+--- a/browser/themes/linux/browser.css
++++ b/browser/themes/linux/browser.css
+@@ -3,16 +3,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ %endif
+ 
+ @import url("chrome://global/skin/");
+ 
+ @namespace url("http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul");
+ @namespace html url("http://www.w3.org/1999/xhtml");
++@namespace svg url("http://www.w3.org/2000/svg");
+ 
+ %include ../shared/browser.inc
+ %include linuxShared.inc
+ %filter substitution
+ 
+ %define forwardTransitionLength 150ms
+ %define conditionalForwardWithUrlbar window:not([chromehidden~="toolbar"]) #urlbar-container
+ %define conditionalForwardWithUrlbarWidth 40
+diff --git a/browser/themes/linux/devtools/layoutview.css b/browser/themes/linux/devtools/layoutview.css
+--- a/browser/themes/linux/devtools/layoutview.css
++++ b/browser/themes/linux/devtools/layoutview.css
+@@ -6,41 +6,45 @@
+   background-image: url(layout-background-grid.png);
+ }
+ 
+ .theme-light .theme-body {
+   background-image: url(layout-background-grid.png), radial-gradient(circle at 50% 70%, hsl(210,53%,45%) 0%, hsl(210,54%,33%) 100%);
+ }
+ 
+ .theme-body {
+-  color: hsl(210,100%,85%) !important;
++  color: hsl(210,53%,45%) !important;
+   box-sizing: border-box;
+ }
+ 
+ #main {
++  background-color: white;
+   border-color: hsla(210,100%,85%,0.7);
+   border-style: dotted;
+ }
+ 
+-#main > .border {
+-  color: hsl(210,53%,45%);
++#content {
++  background-color: #80d4ff;
++  border-color: hsl(210,100%,85%);
++  border-style: dotted;
+ }
+ 
+-.border > span {
+-  background-color: hsl(210,100%,85%);
+-  border-radius: 2px;
+-  padding: 0 4px;
+-}
+-
+-#content {
+-  border-color: hsla(210,100%,85%,0.7);
+-  border-style: dotted 
++#padding,
++#margins {
++  border-color: hsla(210,100%,85%,0.2);
++  outline: dotted 1px hsl(210,100%,85%);
+ }
+ 
+ #padding {
+-  border-color: hsla(210,100%,85%,0.2);
+-  border-style: solid;
++  background-color: #66cc52;
+ }
+ 
+ #borders {
+-  border-style: solid;
++  background-color: #ffe431;
++  border-style: dotted;
+   border-color: hsl(210,100%,85%);
++  box-shadow: 0 0 8px #000;
+ }
++
++#margins {
++  background-color: #d89b28;
++  opacity: 0.6;
++}
+diff --git a/browser/themes/osx/browser.css b/browser/themes/osx/browser.css
+--- a/browser/themes/osx/browser.css
++++ b/browser/themes/osx/browser.css
+@@ -9,16 +9,17 @@
+ %define forwardTransitionLength 150ms
+ %define conditionalForwardWithUrlbar window:not([chromehidden~="toolbar"]) #urlbar-container
+ %define conditionalForwardWithUrlbarWidth 27
+ %define spaceAboveTabbar 9px
+ %define toolbarButtonPressed :hover:active:not([disabled="true"]):not([cui-areatype="menu-panel"])
+ 
+ @namespace url("http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul");
+ @namespace html url("http://www.w3.org/1999/xhtml");
++@namespace svg url("http://www.w3.org/2000/svg");
+ 
+ #urlbar:-moz-lwtheme:not([focused="true"]),
+ .searchbar-textbox:-moz-lwtheme:not([focused="true"]) {
+   opacity: .9;
+ }
+ 
+ #navigator-toolbox::after {
+   -moz-box-ordinal-group: 101; /* tabs toolbar is 100 */
+diff --git a/browser/themes/osx/devtools/layoutview.css b/browser/themes/osx/devtools/layoutview.css
+--- a/browser/themes/osx/devtools/layoutview.css
++++ b/browser/themes/osx/devtools/layoutview.css
+@@ -6,41 +6,45 @@
+   background-image: url(layout-background-grid.png);
+ }
+ 
+ .theme-light .theme-body {
+   background-image: url(layout-background-grid.png), radial-gradient(circle at 50% 70%, hsl(210,53%,45%) 0%, hsl(210,54%,33%) 100%);
+ }
+ 
+ .theme-body {
+-  color: hsl(210,100%,85%) !important;
++  color: hsl(210,53%,45%) !important;
+   box-sizing: border-box;
+ }
+ 
+ #main {
++  background-color: white;
+   border-color: hsla(210,100%,85%,0.7);
+   border-style: dotted;
+ }
+ 
+-#main > .border {
+-  color: hsl(210,53%,45%);
++#content {
++  background-color: #80d4ff;
++  border-color: hsl(210,100%,85%);
++  border-style: dotted;
+ }
+ 
+-.border > span {
+-  background-color: hsl(210,100%,85%);
+-  border-radius: 2px;
+-  padding: 0 4px;
+-}
+-
+-#content {
+-  border-color: hsla(210,100%,85%,0.7);
+-  border-style: dotted 
++#padding,
++#margins {
++  border-color: hsla(210,100%,85%,0.2);
++  outline: dotted 1px hsl(210,100%,85%);
+ }
+ 
+ #padding {
+-  border-color: hsla(210,100%,85%,0.2);
+-  border-style: solid;
++  background-color: #66cc52;
+ }
+ 
+ #borders {
+-  border-style: solid;
++  background-color: #ffe431;
++  border-style: dotted;
+   border-color: hsl(210,100%,85%);
++  box-shadow: 0 0 8px #000;
+ }
++
++#margins {
++  background-color: #d89b28;
++  opacity: 0.6;
++}
+diff --git a/browser/themes/shared/devtools/highlighter.inc.css b/browser/themes/shared/devtools/highlighter.inc.css
+--- a/browser/themes/shared/devtools/highlighter.inc.css
++++ b/browser/themes/shared/devtools/highlighter.inc.css
+@@ -1,20 +1,48 @@
+ %if 0
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ %endif
+ 
+-/* Highlighter */
++/* Box model highlighter */
++svg|g.box-model-container {
++  opacity: 0.4;
++}
+ 
+-.highlighter-outline {
+-  box-shadow: 0 0 0 1px black;
+-  outline: 1px dashed white;
+-  outline-offset: -1px;
++svg|polygon.box-model-content {
++  fill: #80d4ff;
++}
++
++svg|polygon.box-model-padding {
++  fill: #66cc52;
++}
++
++svg|polygon.box-model-border {
++  fill: #ffe431;
++}
++
++svg|polygon.box-model-margin {
++  fill: #d89b28;
++}
++
++svg|polygon.box-model-content,
++svg|polygon.box-model-padding,
++svg|polygon.box-model-border,
++svg|polygon.box-model-margin {
++  stroke: none;
++}
++
++svg|line.box-model-guide-top,
++svg|line.box-model-guide-right,
++svg|line.box-model-guide-bottom,
++svg|line.box-model-guide-left {
++  stroke: #08C;
++  stroke-dasharray: 5 3;
+ }
+ 
+ /* Highlighter - Node Infobar */
+ 
+ .highlighter-nodeinfobar {
+   color: hsl(216,33%,97%);
+   border-radius: 3px;
+   background: hsl(214,13%,24%) no-repeat padding-box;
+diff --git a/browser/themes/windows/browser.css b/browser/themes/windows/browser.css
+--- a/browser/themes/windows/browser.css
++++ b/browser/themes/windows/browser.css
+@@ -1,16 +1,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ @import url("chrome://global/skin/");
+ 
+ @namespace url("http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul");
+ @namespace html url("http://www.w3.org/1999/xhtml");
++@namespace svg url("http://www.w3.org/2000/svg");
+ 
+ %include ../shared/browser.inc
+ %include windowsShared.inc
+ %filter substitution
+ %define toolbarShadowColor hsla(209,67%,12%,0.35)
+ %define navbarTextboxCustomBorder border-color: rgba(0,0,0,.32);
+ %define forwardTransitionLength 150ms
+ %define conditionalForwardWithUrlbar window:not([chromehidden~="toolbar"]) #urlbar-container
+diff --git a/browser/themes/windows/devtools/layoutview.css b/browser/themes/windows/devtools/layoutview.css
+--- a/browser/themes/windows/devtools/layoutview.css
++++ b/browser/themes/windows/devtools/layoutview.css
+@@ -6,41 +6,45 @@
+   background-image: url(layout-background-grid.png);
+ }
+ 
+ .theme-light .theme-body {
+   background-image: url(layout-background-grid.png), radial-gradient(circle at 50% 70%, hsl(210,53%,45%) 0%, hsl(210,54%,33%) 100%);
+ }
+ 
+ .theme-body {
+-  color: hsl(210,100%,85%) !important;
++  color: hsl(210,53%,45%) !important;
+   box-sizing: border-box;
+ }
+ 
+ #main {
++  background-color: white;
+   border-color: hsla(210,100%,85%,0.7);
+   border-style: dotted;
+ }
+ 
+-#main > .border {
+-  color: hsl(210,53%,45%);
++#content {
++  background-color: #80d4ff;
++  border-color: hsl(210,100%,85%);
++  border-style: dotted;
+ }
+ 
+-.border > span {
+-  background-color: hsl(210,100%,85%);
+-  border-radius: 2px;
+-  padding: 0 4px;
+-}
+-
+-#content {
+-  border-color: hsla(210,100%,85%,0.7);
+-  border-style: dotted 
++#padding,
++#margins {
++  border-color: hsla(210,100%,85%,0.2);
++  outline: dotted 1px hsl(210,100%,85%);
+ }
+ 
+ #padding {
+-  border-color: hsla(210,100%,85%,0.2);
+-  border-style: solid;
++  background-color: #66cc52;
+ }
+ 
+ #borders {
+-  border-style: solid;
++  background-color: #ffe431;
++  border-style: dotted;
+   border-color: hsl(210,100%,85%);
++  box-shadow: 0 0 8px #000;
+ }
++
++#margins {
++  background-color: #d89b28;
++  opacity: 0.6;
++}
+diff --git a/toolkit/devtools/LayoutHelpers.jsm b/toolkit/devtools/LayoutHelpers.jsm
+--- a/toolkit/devtools/LayoutHelpers.jsm
++++ b/toolkit/devtools/LayoutHelpers.jsm
+@@ -11,95 +11,96 @@ const Cr = Components.results;
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "Services",
+   "resource://gre/modules/Services.jsm");
+ 
+ this.EXPORTED_SYMBOLS = ["LayoutHelpers"];
+ 
+ this.LayoutHelpers = LayoutHelpers = function(aTopLevelWindow) {
+-  this._topDocShell = aTopLevelWindow.QueryInterface(Ci.nsIInterfaceRequestor)
+-                                     .getInterface(Ci.nsIWebNavigation)
+-                                     .QueryInterface(Ci.nsIDocShell);
++  try {
++    // This throws when the tools are opened and closed quickly.
++    this._topDocShell = aTopLevelWindow.QueryInterface(Ci.nsIInterfaceRequestor)
++                                       .getInterface(Ci.nsIWebNavigation)
++                                       .QueryInterface(Ci.nsIDocShell);
++
++  } catch(e) {
++    // Do nothing
++  }
+ };
+ 
+ LayoutHelpers.prototype = {
+-
+   /**
+-   * Compute the position and the dimensions for the visible portion
+-   * of a node, relativalely to the root window.
++   * Get box quads adjusted for iframes and zoom level.
+    *
+-   * @param nsIDOMNode aNode
+-   *        a DOM element to be highlighted
++   * @param {DOMNode} node
++   *        The node for which we are to get the box model region quads
++   * @param  {String} region
++   *         The box model region to return:
++   *         "content", "padding", "border" or "margin"
+    */
+-  getDirtyRect: function LH_getDirectyRect(aNode) {
+-    let frameWin = aNode.ownerDocument.defaultView;
+-    let clientRect = aNode.getBoundingClientRect();
+-
+-    // Go up in the tree of frames to determine the correct rectangle.
+-    // clientRect is read-only, we need to be able to change properties.
+-    rect = {top: clientRect.top,
+-            left: clientRect.left,
+-            width: clientRect.width,
+-            height: clientRect.height};
+-
+-    // We iterate through all the parent windows.
+-    while (true) {
+-
+-      // Does the selection overflow on the right of its window?
+-      let diffx = frameWin.innerWidth - (rect.left + rect.width);
+-      if (diffx < 0) {
+-        rect.width += diffx;
+-      }
+-
+-      // Does the selection overflow on the bottom of its window?
+-      let diffy = frameWin.innerHeight - (rect.top + rect.height);
+-      if (diffy < 0) {
+-        rect.height += diffy;
+-      }
+-
+-      // Does the selection overflow on the left of its window?
+-      if (rect.left < 0) {
+-        rect.width += rect.left;
+-        rect.left = 0;
+-      }
+-
+-      // Does the selection overflow on the top of its window?
+-      if (rect.top < 0) {
+-        rect.height += rect.top;
+-        rect.top = 0;
+-      }
+-
+-      // Selection has been clipped to fit in its own window.
+-
+-      // Are we in the top-level window?
+-      if (this.isTopLevelWindow(frameWin)) {
+-        break;
+-      }
+-
+-      let frameElement = this.getFrameElement(frameWin);
+-      if (!frameElement) {
+-        break;
+-      }
+-
+-      // We are in an iframe.
+-      // We take into account the parent iframe position and its
+-      // offset (borders and padding).
+-      let frameRect = frameElement.getBoundingClientRect();
+-
+-      let [offsetTop, offsetLeft] =
+-        this.getIframeContentOffset(frameElement);
+-
+-      rect.top += frameRect.top + offsetTop;
+-      rect.left += frameRect.left + offsetLeft;
+-
+-      frameWin = this.getParentWindow(frameWin);
++  getAdjustedQuads: function(node, region) {
++    if (!node) {
++      return;
+     }
+ 
+-    return rect;
++    let [quads] = node.getBoxQuads({
++      box: region
++    });
++
++    if (!quads) {
++      return;
++    }
++
++    let [xOffset, yOffset] = this._getNodeOffsets(node);
++    let scale = this.calculateScale(node);
++
++    return {
++      p1: {
++        w: quads.p1.w * scale,
++        x: quads.p1.x * scale + xOffset,
++        y: quads.p1.y * scale + yOffset,
++        z: quads.p1.z * scale
++      },
++      p2: {
++        w: quads.p2.w * scale,
++        x: quads.p2.x * scale + xOffset,
++        y: quads.p2.y * scale + yOffset,
++        z: quads.p2.z * scale
++      },
++      p3: {
++        w: quads.p3.w * scale,
++        x: quads.p3.x * scale + xOffset,
++        y: quads.p3.y * scale + yOffset,
++        z: quads.p3.z * scale
++      },
++      p4: {
++        w: quads.p4.w * scale,
++        x: quads.p4.x * scale + xOffset,
++        y: quads.p4.y * scale + yOffset,
++        z: quads.p4.z * scale
++      },
++      bounds: {
++        bottom: quads.bounds.bottom * scale + yOffset,
++        height: quads.bounds.height * scale,
++        left: quads.bounds.left * scale + xOffset,
++        right: quads.bounds.right * scale + xOffset,
++        top: quads.bounds.top * scale + yOffset,
++        width: quads.bounds.width * scale,
++        x: quads.bounds.x * scale + xOffset,
++        y: quads.bounds.y * scale + yOffset
++      }
++    };
++  },
++
++  calculateScale: function(node) {
++    let win = node.ownerDocument.defaultView;
++    let winUtils = win.QueryInterface(Ci.nsIInterfaceRequestor)
++                      .getInterface(Ci.nsIDOMWindowUtils);
++    return winUtils.fullZoom;
+   },
+ 
+   /**
+    * Compute the absolute position and the dimensions of a node, relativalely
+    * to the root window.
+    *
+    * @param nsIDOMNode aNode
+    *        a DOM element to get the bounds for
+@@ -107,17 +108,17 @@ LayoutHelpers.prototype = {
+    *        the content window holding the node
+    */
+   getRect: function LH_getRect(aNode, aContentWindow) {
+     let frameWin = aNode.ownerDocument.defaultView;
+     let clientRect = aNode.getBoundingClientRect();
+ 
+     // Go up in the tree of frames to determine the correct rectangle.
+     // clientRect is read-only, we need to be able to change properties.
+-    rect = {top: clientRect.top + aContentWindow.pageYOffset,
++    let rect = {top: clientRect.top + aContentWindow.pageYOffset,
+             left: clientRect.left + aContentWindow.pageXOffset,
+             width: clientRect.width,
+             height: clientRect.height};
+ 
+     // We iterate through all the parent windows.
+     while (true) {
+ 
+       // Are we in the top-level window?
+@@ -174,36 +175,16 @@ LayoutHelpers.prototype = {
+ 
+     let borderTop = parseInt(style.getPropertyValue("border-top-width"));
+     let borderLeft = parseInt(style.getPropertyValue("border-left-width"));
+ 
+     return [borderTop + paddingTop, borderLeft + paddingLeft];
+   },
+ 
+   /**
+-   * Apply the page zoom factor.
+-   */
+-  getZoomedRect: function LH_getZoomedRect(aWin, aRect) {
+-    // get page zoom factor, if any
+-    let zoom =
+-      aWin.QueryInterface(Components.interfaces.nsIInterfaceRequestor)
+-        .getInterface(Components.interfaces.nsIDOMWindowUtils)
+-        .fullZoom;
+-
+-    // adjust rect for zoom scaling
+-    let aRectScaled = {};
+-    for (let prop in aRect) {
+-      aRectScaled[prop] = aRect[prop] * zoom;
+-    }
+-
+-    return aRectScaled;
+-  },
+-
+-
+-  /**
+    * Find an element from the given coordinates. This method descends through
+    * frames to find the element the user clicked inside frames.
+    *
+    * @param DOMDocument aDocument the document to look into.
+    * @param integer aX
+    * @param integer aY
+    * @returns Node|null the element node found at the given coordinates.
+    */
+@@ -238,18 +219,17 @@ LayoutHelpers.prototype = {
+   /**
+    * Scroll the document so that the element "elem" appears in the viewport.
+    *
+    * @param Element elem the element that needs to appear in the viewport.
+    * @param bool centered true if you want it centered, false if you want it to
+    * appear on the top of the viewport. It is true by default, and that is
+    * usually what you want.
+    */
+-  scrollIntoViewIfNeeded:
+-  function LH_scrollIntoViewIfNeeded(elem, centered) {
++  scrollIntoViewIfNeeded: function(elem, centered) {
+     // We want to default to centering the element in the page,
+     // so as to keep the context of the element.
+     centered = centered === undefined? true: !!centered;
+ 
+     let win = elem.ownerDocument.defaultView;
+     let clientRect = elem.getBoundingClientRect();
+ 
+     // The following are always from the {top, bottom, left, right}
+@@ -392,9 +372,143 @@ LayoutHelpers.prototype = {
+     }
+ 
+     let winUtils = win.
+       QueryInterface(Components.interfaces.nsIInterfaceRequestor).
+       getInterface(Components.interfaces.nsIDOMWindowUtils);
+ 
+     return winUtils.containerElement;
+   },
++
++  /**
++   * Get the x and y offsets for a node taking iframes into account.
++   *
++   * @param {DOMNode} node
++   *        The node for which we are to get the offset
++   */
++  _getNodeOffsets: function(node) {
++    let xOffset = 0;
++    let yOffset = 0;
++    let frameWin = node.ownerDocument.defaultView;
++    let scale = this.calculateScale(node);
++
++    while (true) {
++      // Are we in the top-level window?
++      if (this.isTopLevelWindow(frameWin)) {
++        break;
++      }
++
++      let frameElement = this.getFrameElement(frameWin);
++      if (!frameElement) {
++        break;
++      }
++
++      // We are in an iframe.
++      // We take into account the parent iframe position and its
++      // offset (borders and padding).
++      let frameRect = frameElement.getBoundingClientRect();
++
++      let [offsetTop, offsetLeft] =
++        this.getIframeContentOffset(frameElement);
++
++      xOffset += frameRect.left + offsetLeft;
++      yOffset += frameRect.top + offsetTop;
++
++      frameWin = this.getParentWindow(frameWin);
++    }
++
++    return [xOffset * scale, yOffset * scale];
++  },
++
++
++
++  /********************************************************************
++   * GetBoxQuads POLYFILL START
++   ********************************************************************/
++  _getBoxQuadsFromRect: function(rect, node) {
++    let scale = this.calculateScale(node);
++    let [xOffset, yOffset] = this._getNodeOffsets(node);
++
++    let out = {
++      p1: {
++        x: rect.left * scale + xOffset,
++        y: rect.top * scale + yOffset
++      },
++      p2: {
++        x: (rect.left + rect.width) * scale + xOffset,
++        y: rect.top * scale + yOffset
++      },
++      p3: {
++        x: (rect.left + rect.width) * scale + xOffset,
++        y: (rect.top + rect.height) * scale + yOffset
++      },
++      p4: {
++        x: rect.left * scale + xOffset,
++        y: (rect.top + rect.height) * scale + yOffset
++      }
++    };
++
++    out.bounds = {
++      bottom: out.p4.y,
++      height: out.p4.y - out.p1.y,
++      left: out.p1.x,
++      right: out.p2.x,
++      top: out.p1.y,
++      width: out.p2.x - out.p1.x,
++      x: out.p1.x,
++      y: out.p1.y
++    };
++
++    return out;
++  },
++
++  _parseNb: function(distance) {
++    let nb = parseFloat(distance, 10);
++    return isNaN(nb) ? 0 : nb;
++  },
++
++  getAdjustedQuadsPolyfill: function(node, region) {
++    // Get the border-box rect
++    // Note that this is relative to the node's viewport, so before we can use
++    // it, will need to go back up the frames like getRect
++    let borderRect = node.getBoundingClientRect();
++
++    // If the boxType is border, no need to go any further, we're done
++    if (region === "border") {
++      return this._getBoxQuadsFromRect(borderRect, node);
++    }
++
++    // Else, need to get margin/padding/border distances
++    let style = node.ownerDocument.defaultView.getComputedStyle(node);
++    let camel = s => s.substring(0, 1).toUpperCase() + s.substring(1);
++    let distances = {border:{}, padding:{}, margin: {}};
++
++    for (let side of ["top", "right", "bottom", "left"]) {
++      distances.border[side] = this._parseNb(style["border" + camel(side) + "Width"]);
++      distances.padding[side] = this._parseNb(style["padding" + camel(side)]);
++      distances.margin[side] = this._parseNb(style["margin" + camel(side)]);
++    }
++
++    // From the border-box rect, calculate the content-box, padding-box and
++    // margin-box rects
++    function offsetRect(rect, offsetType, dir=1) {
++      return {
++        top: rect.top + (dir * distances[offsetType].top),
++        left: rect.left + (dir * distances[offsetType].left),
++        width: rect.width - (dir * (distances[offsetType].left + distances[offsetType].right)),
++        height: rect.height - (dir * (distances[offsetType].top + distances[offsetType].bottom))
++      };
++    }
++
++    if (region === "margin") {
++      return this._getBoxQuadsFromRect(offsetRect(borderRect, "margin", -1), node);
++    } else if (region === "padding") {
++      return this._getBoxQuadsFromRect(offsetRect(borderRect, "border"), node);
++    } else if (region === "content") {
++      let paddingRect = offsetRect(borderRect, "border");
++      return this._getBoxQuadsFromRect(offsetRect(paddingRect, "padding"), node);
++    }
++  },
++
++  /********************************************************************
++   * GetBoxQuads POLYFILL END
++   ********************************************************************/
+ };
+diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/server/actors/highlighter.js
+--- a/toolkit/devtools/server/actors/highlighter.js
++++ b/toolkit/devtools/server/actors/highlighter.js
+@@ -3,30 +3,34 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const {Cu, Cc, Ci} = require("chrome");
+ const protocol = require("devtools/server/protocol");
+ const {Arg, Option, method} = protocol;
+ const events = require("sdk/event/core");
++const GUIDE_STROKE_WIDTH = 1;
++
+ // Make sure the domnode type is known here
+ require("devtools/server/actors/inspector");
+ 
+ Cu.import("resource://gre/modules/devtools/LayoutHelpers.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ Cu.import("resource://gre/modules/Services.jsm");
+ 
+ // FIXME: add ":visited" and ":link" after bug 713106 is fixed
+ const PSEUDO_CLASSES = [":hover", ":active", ":focus"];
+ const HIGHLIGHTED_PSEUDO_CLASS = ":-moz-devtools-highlighted";
+ let HELPER_SHEET = ".__fx-devtools-hide-shortcut__ { visibility: hidden !important } ";
+ HELPER_SHEET += ":-moz-devtools-highlighted { outline: 2px dashed #F06!important; outline-offset: -2px!important } ";
+ const XHTML_NS = "http://www.w3.org/1999/xhtml";
++const SVG_NS = "http://www.w3.org/2000/svg";
+ const HIGHLIGHTER_PICKED_TIMER = 1000;
++const INFO_BAR_OFFSET = 5;
+ 
+ /**
+  * The HighlighterActor is the server-side entry points for any tool that wishes
+  * to highlight elements in the content document.
+  *
+  * The highlighter can be retrieved via the inspector's getHighlighter method.
+  */
+ 
+@@ -74,29 +78,29 @@ let HighlighterActor = protocol.ActorCla
+   /**
+    * Display the box model highlighting on a given NodeActor.
+    * There is only one instance of the box model highlighter, so calling this
+    * method several times won't display several highlighters, it will just move
+    * the highlighter instance to these nodes.
+    *
+    * @param NodeActor The node to be highlighted
+    * @param Options See the request part for existing options. Note that not
+-   * all options may be supported by all types of highlighters. The simple
+-   * outline highlighter for instance does not scrollIntoView
++   * all options may be supported by all types of highlighters.
+    */
+   showBoxModel: method(function(node, options={}) {
+     if (this._isNodeValidForHighlighting(node.rawNode)) {
+       this._boxModelHighlighter.show(node.rawNode, options);
+     } else {
+       this._boxModelHighlighter.hide();
+     }
+   }, {
+     request: {
+       node: Arg(0, "domnode"),
+-      scrollIntoView: Option(1)
++      scrollIntoView: Option(1),
++      region: Option(1)
+     }
+   }),
+ 
+   _isNodeValidForHighlighting: function(node) {
+     // Is it null or dead?
+     let isNotDead = node && !Cu.isDeadWrapper(node);
+ 
+     // Is it connected to the document?
+@@ -242,69 +246,106 @@ let HighlighterFront = protocol.FrontCla
+  * Usage example:
+  *
+  * let h = new BoxModelHighlighter(browser);
+  * h.show(node);
+  * h.hide();
+  * h.destroy();
+  *
+  * Structure:
+- *  <stack class="highlighter-container">
+- *    <box class="highlighter-outline-container">
+- *      <box class="highlighter-outline" />
+- *    </box>
+- *    <box class="highlighter-nodeinfobar-container">
+- *      <box class="highlighter-nodeinfobar-positioner" position="top/bottom">
+- *        <box class="highlighter-nodeinfobar-arrow highlighter-nodeinfobar-arrow-top"/>
+- *        <hbox class="highlighter-nodeinfobar">
+- *          <hbox class="highlighter-nodeinfobar-text">tagname#id.class1.class2</hbox>
+- *        </hbox>
+- *        <box class="highlighter-nodeinfobar-arrow highlighter-nodeinfobar-arrow-bottom"/>
+- *      </box>
+- *    </box>
+- *  </stack>
++ * <stack class="highlighter-container">
++ *   <svg class="box-model-root" hidden="true">
++ *     <g class="box-model-container">
++ *       <polygon class="box-model-margin" points="317,122 747,36 747,181 317,267" />
++ *       <polygon class="box-model-border" points="317,128 747,42 747,161 317,247" />
++ *       <polygon class="box-model-padding" points="323,127 747,42 747,161 323,246" />
++ *       <polygon class="box-model-content" points="335,137 735,57 735,152 335,232" />
++ *     </g>
++ *     <line class="box-model-guide-top" x1="0" y1="592" x2="99999" y2="592" />
++ *     <line class="box-model-guide-right" x1="735" y1="0" x2="735" y2="99999" />
++ *     <line class="box-model-guide-bottom" x1="0" y1="612" x2="99999" y2="612" />
++ *     <line class="box-model-guide-left" x1="334" y1="0" x2="334" y2="99999" />
++ *   </svg>
++ *   <box class="highlighter-nodeinfobar-container">
++ *     <box class="highlighter-nodeinfobar-positioner" position="top" />
++ *       <box class="highlighter-nodeinfobar-arrow highlighter-nodeinfobar-arrow-top" />
++ *       <hbox class="highlighter-nodeinfobar">
++ *         <hbox class="highlighter-nodeinfobar-text" align="center" flex="1">
++ *           <span class="highlighter-nodeinfobar-tagname">Node name</span>
++ *           <span class="highlighter-nodeinfobar-id">Node id</span>
++ *           <span class="highlighter-nodeinfobar-classes">.someClass</span>
++ *           <span class="highlighter-nodeinfobar-pseudo-classes">:hover</span>
++ *         </hbox>
++ *       </hbox>
++ *       <box class="highlighter-nodeinfobar-arrow highlighter-nodeinfobar-arrow-bottom"/>
++ *     </box>
++ *   </box>
++ * </stack>
+  */
+ function BoxModelHighlighter(tabActor) {
+   this.browser = tabActor.browser;
+   this.win = tabActor.window;
+   this.chromeDoc = this.browser.ownerDocument;
+   this.chromeWin = this.chromeDoc.defaultView;
+ 
+   this.layoutHelpers = new LayoutHelpers(this.win);
+   this.chromeLayoutHelper = new LayoutHelpers(this.chromeWin);
+ 
+   this.transitionDisabler = null;
+   this.pageEventsMuter = null;
+   this._update = this._update.bind(this);
++  this.handleEvent = this.handleEvent.bind(this);
+   this.currentNode = null;
+ 
+   this._initMarkup();
+ }
+ 
+ BoxModelHighlighter.prototype = {
++  get zoom() {
++    return this.win.QueryInterface(Ci.nsIInterfaceRequestor)
++               .getInterface(Ci.nsIDOMWindowUtils).fullZoom;
++  },
++
+   _initMarkup: function() {
+     let stack = this.browser.parentNode;
+ 
+-    this.highlighterContainer = this.chromeDoc.createElement("stack");
+-    this.highlighterContainer.className = "highlighter-container";
++    this._highlighterContainer = this.chromeDoc.createElement("stack");
++    this._highlighterContainer.className = "highlighter-container";
+ 
+-    this.outline = this.chromeDoc.createElement("box");
+-    this.outline.className = "highlighter-outline";
++    this._svgRoot = this._createSVGNode("root", "svg", this._highlighterContainer);
+ 
+-    let outlineContainer = this.chromeDoc.createElement("box");
+-    outlineContainer.appendChild(this.outline);
+-    outlineContainer.className = "highlighter-outline-container";
+-    this.highlighterContainer.appendChild(outlineContainer);
++    this._boxModelContainer = this._createSVGNode("container", "g", this._svgRoot);
++
++    this._boxModelNodes = {
++      margin: this._createSVGNode("margin", "polygon", this._boxModelContainer),
++      border: this._createSVGNode("border", "polygon", this._boxModelContainer),
++      padding: this._createSVGNode("padding", "polygon", this._boxModelContainer),
++      content: this._createSVGNode("content", "polygon", this._boxModelContainer)
++    };
++
++    this._guideNodes = {
++      top: this._createSVGNode("guide-top", "line", this._svgRoot),
++      right: this._createSVGNode("guide-right", "line", this._svgRoot),
++      bottom: this._createSVGNode("guide-bottom", "line", this._svgRoot),
++      left: this._createSVGNode("guide-left", "line", this._svgRoot)
++    };
++
++    this._guideNodes.top.setAttribute("stroke-width", GUIDE_STROKE_WIDTH);
++    this._guideNodes.right.setAttribute("stroke-width", GUIDE_STROKE_WIDTH);
++    this._guideNodes.bottom.setAttribute("stroke-width", GUIDE_STROKE_WIDTH);
++    this._guideNodes.left.setAttribute("stroke-width", GUIDE_STROKE_WIDTH);
++
++    this._highlighterContainer.appendChild(this._svgRoot);
+ 
+     let infobarContainer = this.chromeDoc.createElement("box");
+     infobarContainer.className = "highlighter-nodeinfobar-container";
+-    this.highlighterContainer.appendChild(infobarContainer);
++    this._highlighterContainer.appendChild(infobarContainer);
+ 
+     // Insert the highlighter right after the browser
+-    stack.insertBefore(this.highlighterContainer, stack.childNodes[1]);
++    stack.insertBefore(this._highlighterContainer, stack.childNodes[1]);
+ 
+     // Building the infobar
+     let infobarPositioner = this.chromeDoc.createElement("box");
+     infobarPositioner.className = "highlighter-nodeinfobar-positioner";
+     infobarPositioner.setAttribute("position", "top");
+     infobarPositioner.setAttribute("disabled", "true");
+ 
+     let nodeInfobar = this.chromeDoc.createElement("hbox");
+@@ -357,66 +398,77 @@ BoxModelHighlighter.prototype = {
+       idLabel: idLabel,
+       classesBox: classesBox,
+       pseudoClassesBox: pseudoClassesBox,
+       positioner: infobarPositioner,
+       barHeight: barHeight,
+     };
+   },
+ 
++  _createSVGNode: function(classPostfix, nodeType, parent) {
++    let node = this.chromeDoc.createElementNS(SVG_NS, nodeType);
++    node.setAttribute("class", "box-model-" + classPostfix);
++
++    parent.appendChild(node);
++
++    return node;
++  },
++
+   /**
+    * Destroy the nodes. Remove listeners.
+    */
+   destroy: function() {
+     this.hide();
+ 
+     this.chromeWin.clearTimeout(this.transitionDisabler);
+     this.chromeWin.clearTimeout(this.pageEventsMuter);
+ 
+-    this._contentRect = null;
+-    this._highlightRect = null;
+-    this.outline = null;
+     this.nodeInfo = null;
+ 
+-    this.highlighterContainer.remove();
+-    this.highlighterContainer = null;
++    this._highlighterContainer.remove();
++    this._highlighterContainer = null;
+ 
+-    this.win = null
++    this.rect = null;
++
++    this.win = null;
+     this.browser = null;
+     this.chromeDoc = null;
+     this.chromeWin = null;
+     this.currentNode = null;
+   },
+ 
+   /**
+    * Show the highlighter on a given node
+    *
+    * @param {DOMNode} node
++   * @param {Object} options
++   *        Object used for passing options
+    */
+   show: function(node, options={}) {
+     if (!this.currentNode || node !== this.currentNode) {
+       this.currentNode = node;
+ 
+       this._showInfobar();
+-      this._computeZoomFactor();
+       this._detachPageListeners();
+       this._attachPageListeners();
+-      this._update();
++      this._update(options);
+       this._trackMutations();
+ 
+       if (options.scrollIntoView) {
+         this.chromeLayoutHelper.scrollIntoViewIfNeeded(node);
+       }
+     }
+   },
+ 
+   _trackMutations: function() {
+     if (this.currentNode) {
+       let win = this.currentNode.ownerDocument.defaultView;
+-      this.currentNodeObserver = win.MutationObserver(this._update);
++      this.currentNodeObserver = win.MutationObserver(() => {
++        this._update();
++      });
+       this.currentNodeObserver.observe(this.currentNode, {attributes: true});
+     }
+   },
+ 
+   _untrackMutations: function() {
+     if (this.currentNode) {
+       if (this.currentNodeObserver) {
+         // The following may fail with a "can't access dead object" exception
+@@ -428,136 +480,207 @@ BoxModelHighlighter.prototype = {
+       }
+     }
+   },
+ 
+   /**
+    * Update the highlighter on the current highlighted node (the one that was
+    * passed as an argument to show(node)).
+    * Should be called whenever node size or attributes change
+-   * @param {Boolean} brieflyDisableTransitions
+-   *        In case _update is called during scrolling or repaint, set this
+-   *        to true to avoid transitions
++   * @param {Object} options
++   *        Object used for passing options. Valid options are:
++   *          - box: "content", "padding", "border" or "margin." This specifies
++   *            the box that the guides should outline. Default is content.
+    */
+-  _update: function(brieflyDisableTransitions) {
++  _update: function(options={}) {
+     if (this.currentNode) {
+-      let rect = this.layoutHelpers.getDirtyRect(this.currentNode);
+-
+-      if (this._highlightRectangle(rect, brieflyDisableTransitions)) {
+-        this._moveInfobar();
+-        this._updateInfobar();
++      if (this._highlightBoxModel(options)) {
++        this._showInfobar();
+       } else {
+         // Nothing to highlight (0px rectangle like a <script> tag for instance)
+         this.hide();
+       }
+     }
+   },
+ 
+   /**
+    * Hide the highlighter, the outline and the infobar.
+    */
+   hide: function() {
+     if (this.currentNode) {
+       this._untrackMutations();
+       this.currentNode = null;
+-      this._hideOutline();
++      this._hideBoxModel();
+       this._hideInfobar();
+       this._detachPageListeners();
+     }
+   },
+ 
+   /**
+    * Hide the infobar
+    */
+   _hideInfobar: function() {
+-    this.nodeInfo.positioner.setAttribute("force-transitions", "true");
+     this.nodeInfo.positioner.setAttribute("hidden", "true");
+   },
+ 
+   /**
+    * Show the infobar
+    */
+   _showInfobar: function() {
+     this.nodeInfo.positioner.removeAttribute("hidden");
+-    this._moveInfobar();
+-    this.nodeInfo.positioner.removeAttribute("force-transitions");
++    this._updateInfobar();
+   },
+ 
+   /**
+-   * Hide the outline
++   * Hide the box model
+    */
+-  _hideOutline: function() {
+-    this.outline.setAttribute("hidden", "true");
++  _hideBoxModel: function() {
++    this._svgRoot.setAttribute("hidden", "true");
+   },
+ 
+   /**
+-   * Show the outline
++   * Show the box model
+    */
+-  _showOutline: function() {
+-    this.outline.removeAttribute("hidden");
++  _showBoxModel: function() {
++    this._svgRoot.removeAttribute("hidden");
+   },
+ 
+   /**
+-   * Highlight a rectangular region.
++   * Highlight the box model.
+    *
+-   * @param {object} aRect
+-   *        The rectangle region to highlight.
+-   * @param {boolean} brieflyDisableTransitions
+-   *        Set to true to avoid transitions during the highlighting
++   * @param {Object} options
++   *        Object used for passing options. Valid options are:
++   *          - region: "content", "padding", "border" or "margin." This specifies
++   *            the region that the guides should outline. Default is content.
+    * @return {boolean}
+    *         True if the rectangle was highlighted, false otherwise.
+    */
+-  _highlightRectangle: function(aRect, brieflyDisableTransitions) {
+-    if (!aRect) {
+-      return false;
++  _highlightBoxModel: function(options) {
++    let isShown = false;
++
++    options.region = options.region || "content";
++
++    // TODO: Remove this polyfill
++    this.rect =
++      this.layoutHelpers.getAdjustedQuadsPolyfill(this.currentNode, "margin");
++
++    if (!this.rect) {
++      return;
+     }
+ 
+-    let oldRect = this._contentRect;
++    if (this.rect.bounds.width > 0 && this.rect.bounds.height > 0) {
++      for (let boxType in this._boxModelNodes) {
++        // TODO: Remove this polyfill
++        let {p1, p2, p3, p4} = boxType === "margin" ? this.rect :
++          this.layoutHelpers.getAdjustedQuadsPolyfill(this.currentNode, boxType);
+ 
+-    if (oldRect && aRect.top == oldRect.top && aRect.left == oldRect.left &&
+-        aRect.width == oldRect.width && aRect.height == oldRect.height) {
+-      this._showOutline();
+-      return true; // same rectangle
+-    }
++        let boxNode = this._boxModelNodes[boxType];
++        boxNode.setAttribute("points",
++                             p1.x + "," + p1.y + " " +
++                             p2.x + "," + p2.y + " " +
++                             p3.x + "," + p3.y + " " +
++                             p4.x + "," + p4.y);
+ 
+-    let aRectScaled = this.layoutHelpers.getZoomedRect(this.win, aRect);
+-    let isShown = false;
+-
+-    if (aRectScaled.left >= 0 && aRectScaled.top >= 0 &&
+-        aRectScaled.width > 0 && aRectScaled.height > 0) {
+-
+-      // The bottom div and the right div are flexibles (flex=1).
+-      // We don't need to resize them.
+-      let top = "top:" + aRectScaled.top + "px;";
+-      let left = "left:" + aRectScaled.left + "px;";
+-      let width = "width:" + aRectScaled.width + "px;";
+-      let height = "height:" + aRectScaled.height + "px;";
+-
+-      if (brieflyDisableTransitions) {
+-        this._brieflyDisableTransitions();
++        if (boxType === options.region) {
++          this._showGuides(p1, p2, p3, p4);
++        }
+       }
+ 
+-      this.outline.setAttribute("style", top + left + width + height);
+-
+       isShown = true;
+-      this._showOutline();
++      this._showBoxModel();
+     } else {
+       // Only return false if the element really is invisible.
+       // A height of 0 and a non-0 width corresponds to a visible element that
+       // is below the fold for instance
+-      if (aRectScaled.width > 0 || aRectScaled.height > 0) {
++      if (this.rect.width > 0 || this.rect.height > 0) {
+         isShown = true;
+-        this._hideOutline();
++        this._hideBoxModel();
+       }
+     }
+ 
+-    this._contentRect = aRect; // save orig (non-scaled) rect
+-    this._highlightRect = aRectScaled; // and save the scaled rect.
++    return isShown;
++  },
+ 
+-    return isShown;
++  /**
++   * We only want to show guides for horizontal and vertical edges as this helps
++   * to line them up. This method finds these edges and displays a guide there.
++   *
++   * @param  {DOMPoint} p1
++   *                    Point 1
++   * @param  {DOMPoint} p2
++   *                    Point 2
++   * @param  {DOMPoint} p3 [description]
++   *                    Point 3
++   * @param  {DOMPoint} p4 [description]
++   *                    Point 4
++   */
++  _showGuides: function(p1, p2, p3, p4) {
++    let allX = [p1.x, p2.x, p3.x, p4.x].sort();
++    let allY = [p1.y, p2.y, p3.y, p4.y].sort();
++    let toShowX = [];
++    let toShowY = [];
++
++    for (let arr of [allX, allY]) {
++      for (let i = 0; i < arr.length; i++) {
++        let val = arr[i];
++
++        if (i !== arr.lastIndexOf(val)) {
++          if (arr === allX) {
++            toShowX.push(val);
++          } else {
++            toShowY.push(val);
++          }
++          arr.splice(arr.lastIndexOf(val), 1);
++        }
++      }
++    }
++
++    // Move guide into place or hide it if no valid co-ordinate was found.
++    this._updateGuide(this._guideNodes.top, toShowY[0]);
++    this._updateGuide(this._guideNodes.right, toShowX[1]);
++    this._updateGuide(this._guideNodes.bottom, toShowY[1]);
++    this._updateGuide(this._guideNodes.left, toShowX[0]);
++  },
++
++  /**
++   * Move a guide to the appropriate position and display it. If no point is
++   * passed then the guide is hidden.
++   *
++   * @param  {SVGLine} guide
++   *         The guide to update
++   * @param  {Integer} point
++   *         x or y co-ordinate. If this is undefined we hide the guide.
++   */
++  _updateGuide: function(guide, point=-1) {
++    if (point > 0) {
++      let offset = GUIDE_STROKE_WIDTH / 2;
++
++      if (guide === this._guideNodes.top || guide === this._guideNodes.left) {
++        point -= offset;
++      } else {
++        point += offset;
++      }
++
++      if (guide === this._guideNodes.top || guide === this._guideNodes.bottom) {
++        guide.setAttribute("x1", 0);
++        guide.setAttribute("y1", point);
++        guide.setAttribute("x2", "100%");
++        guide.setAttribute("y2", point);
++      } else {
++        guide.setAttribute("x1", point);
++        guide.setAttribute("y1", 0);
++        guide.setAttribute("x2", point);
++        guide.setAttribute("y2", "100%");
++      }
++      guide.removeAttribute("hidden");
++      return true;
++    } else {
++      guide.setAttribute("hidden", "true");
++      return false;
++    }
+   },
+ 
+   /**
+    * Update node information (tagName#id.class)
+    */
+   _updateInfobar: function() {
+     if (this.currentNode) {
+       // Tag name
+@@ -574,63 +697,52 @@ BoxModelHighlighter.prototype = {
+ 
+       // Pseudo-classes
+       let pseudos = PSEUDO_CLASSES.filter(pseudo => {
+         return DOMUtils.hasPseudoClassLock(this.currentNode, pseudo);
+       }, this);
+ 
+       let pseudoBox = this.nodeInfo.pseudoClassesBox;
+       pseudoBox.textContent = pseudos.join("");
++
++      this._moveInfobar();
+     }
+   },
+ 
+   /**
+    * Move the Infobar to the right place in the highlighter.
+    */
+   _moveInfobar: function() {
+-    if (this._highlightRect) {
++    if (this.rect) {
++      let bounds = this.rect.bounds;
+       let winHeight = this.win.innerHeight * this.zoom;
+       let winWidth = this.win.innerWidth * this.zoom;
+ 
+-      let rect = {top: this._highlightRect.top,
+-                  left: this._highlightRect.left,
+-                  width: this._highlightRect.width,
+-                  height: this._highlightRect.height};
+-
+-      rect.top = Math.max(rect.top, 0);
+-      rect.left = Math.max(rect.left, 0);
+-      rect.width = Math.max(rect.width, 0);
+-      rect.height = Math.max(rect.height, 0);
+-
+-      rect.top = Math.min(rect.top, winHeight);
+-      rect.left = Math.min(rect.left, winWidth);
+-
+       this.nodeInfo.positioner.removeAttribute("disabled");
+       // Can the bar be above the node?
+-      if (rect.top < this.nodeInfo.barHeight) {
++      if (bounds.top < this.nodeInfo.barHeight) {
+         // No. Can we move the toolbar under the node?
+-        if (rect.top + rect.height +
+-            this.nodeInfo.barHeight > winHeight) {
++        if (bounds.bottom + this.nodeInfo.barHeight > winHeight) {
+           // No. Let's move it inside.
+-          this.nodeInfo.positioner.style.top = rect.top + "px";
++          this.nodeInfo.positioner.style.top = bounds.top + "px";
+           this.nodeInfo.positioner.setAttribute("position", "overlap");
+         } else {
+           // Yes. Let's move it under the node.
+-          this.nodeInfo.positioner.style.top = rect.top + rect.height + "px";
++          this.nodeInfo.positioner.style.top = bounds.bottom - INFO_BAR_OFFSET + "px";
+           this.nodeInfo.positioner.setAttribute("position", "bottom");
+         }
+       } else {
+         // Yes. Let's move it on top of the node.
+         this.nodeInfo.positioner.style.top =
+-          rect.top - this.nodeInfo.barHeight + "px";
++          bounds.top + INFO_BAR_OFFSET - this.nodeInfo.barHeight + "px";
+         this.nodeInfo.positioner.setAttribute("position", "top");
+       }
+ 
+       let barWidth = this.nodeInfo.positioner.getBoundingClientRect().width;
+-      let left = rect.left + rect.width / 2 - barWidth / 2;
++      let left = bounds.right - bounds.width / 2 - barWidth / 2;
+ 
+       // Make sure the whole infobar is visible
+       if (left < 0) {
+         left = 0;
+         this.nodeInfo.positioner.setAttribute("hide-arrow", "true");
+       } else {
+         if (left + barWidth > winWidth) {
+           left = winWidth - barWidth;
+@@ -643,74 +755,48 @@ BoxModelHighlighter.prototype = {
+     } else {
+       this.nodeInfo.positioner.style.left = "0";
+       this.nodeInfo.positioner.style.top = "0";
+       this.nodeInfo.positioner.setAttribute("position", "top");
+       this.nodeInfo.positioner.setAttribute("hide-arrow", "true");
+     }
+   },
+ 
+-  /**
+-   * Store page zoom factor.
+-   */
+-  _computeZoomFactor: function() {
+-    this.zoom =
+-      this.win.QueryInterface(Ci.nsIInterfaceRequestor)
+-      .getInterface(Ci.nsIDOMWindowUtils)
+-      .fullZoom;
+-  },
++  _attachPageListeners: function() {
++    if (this.currentNode) {
++      let win = this.currentNode.ownerGlobal;
+ 
+-  _attachPageListeners: function() {
+-    this.browser.addEventListener("resize", this, true);
+-    this.browser.addEventListener("scroll", this, true);
+-    this.browser.addEventListener("MozAfterPaint", this, true);
++      win.addEventListener("scroll", this, true);
++      win.addEventListener("MozAfterPaint", this, true);
++    }
+   },
+ 
+   _detachPageListeners: function() {
+-    this.browser.removeEventListener("resize", this, true);
+-    this.browser.removeEventListener("scroll", this, true);
+-    this.browser.removeEventListener("MozAfterPaint", this, true);
++    if (this.currentNode) {
++      let win = this.currentNode.ownerGlobal;
++
++      win.removeEventListener("scroll", this, true);
++      win.removeEventListener("MozAfterPaint", this, true);
++    }
+   },
+ 
+   /**
+    * Generic event handler.
+    *
+    * @param nsIDOMEvent aEvent
+    *        The DOM event object.
+    */
+   handleEvent: function(event) {
+     switch (event.type) {
+-      case "resize":
+-        this._computeZoomFactor();
+-        break;
+       case "MozAfterPaint":
+       case "scroll":
+-        this._update(true);
++        this._update();
+         break;
+     }
+   },
+-
+-  /**
+-   * Disable the CSS transitions for a short time to avoid laggy animations
+-   * during scrolling or resizing.
+-   */
+-  _brieflyDisableTransitions: function() {
+-    if (this.transitionDisabler) {
+-      this.chromeWin.clearTimeout(this.transitionDisabler);
+-    } else {
+-      this.outline.setAttribute("disable-transitions", "true");
+-      this.nodeInfo.positioner.setAttribute("disable-transitions", "true");
+-    }
+-    this.transitionDisabler =
+-      this.chromeWin.setTimeout(() => {
+-        this.outline.removeAttribute("disable-transitions");
+-        this.nodeInfo.positioner.removeAttribute("disable-transitions");
+-        this.transitionDisabler = null;
+-      }, 500);
+-  }
+ };
+ 
+ /**
+  * The SimpleOutlineHighlighter is a class that has the same API than the
+  * BoxModelHighlighter, but adds a pseudo-class on the target element itself
+  * to draw a simple outline.
+  * It is used by the HighlighterActor too, but in case the more complex
+  * BoxModelHighlighter can't be attached (which is the case for FirefoxOS and
+diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/actors/styles.js
+--- a/toolkit/devtools/server/actors/styles.js
++++ b/toolkit/devtools/server/actors/styles.js
+@@ -439,16 +439,21 @@ var PageStyleActor = protocol.ActorClass
+         if (!sheetSet.has(parent)) {
+           sheetSet.add(parent);
+         }
+       }
+     }
+   },
+ 
+   getLayout: method(function(node, options) {
++    if (!node) {
++      return {
++        nodeRemoved: true
++      };
++    }
+     this.cssLogic.highlight(node.rawNode);
+ 
+     let layout = {};
+ 
+     // First, we update the first part of the layout view, with
+     // the size of the element.
+ 
+     let clientRect = node.rawNode.getBoundingClientRect();
