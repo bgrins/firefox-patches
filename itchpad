@@ -1,7 +1,9 @@
 # HG changeset patch
-# Parent 3277869ec1804e9395fef911437ea8e1b950d761
+# Parent d8c1b10c3a3dc57e9fa9ff47db13950a59befc64
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 987089 - Land Itchpad in browser/devtools;r=paul
+* * *
+Memory leak testing
 
 diff --git a/browser/devtools/itchpad/Makefile.in b/browser/devtools/itchpad/Makefile.in
 new file mode 100644
@@ -4182,7 +4184,7 @@ diff --git a/browser/devtools/itchpad/lib/stores/local.js b/browser/devtools/itc
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/itchpad/lib/stores/local.js
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,338 @@
 +/* -*- Mode: Javascript; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -4236,8 +4238,19 @@ new file mode 100644
 +
 +  destroy: function() {
 +    this.window.clearTimeout(this._refreshTimeout);
++    if (this._refreshDeferred) {
++      this._refreshDeferred.reject("destroy");
++    }
++    this.worker.terminate();
++
 +    this._refreshTimeout = null;
++    this._refreshDeferred = null;
 +    this.window = null;
++    this.worker = null;
++
++    if (this.root) {
++      this.root.destroy();
++    }
 +  },
 +
 +  toString: function() { return "[LocalStore:" + this.path + "]" },
@@ -4304,19 +4317,18 @@ new file mode 100644
 +  },
 +
 +  _refreshTimeout: null,
-+  _refreshPromise: null,
++  _refreshDeferred: null,
 +
 +  /**
 +   * Refresh the directory structure.
 +   */
 +  refresh: function(path=this.rootPath) {
-+    if (this._refreshPromise) {
-+      return this._refreshPromise.promise;
++    if (this._refreshDeferred) {
++      return this._refreshDeferred.promise;
 +    }
++    this._refreshDeferred = promise.defer();
 +
-+    this._refreshPromise = promise.defer();
-+
-+    let worker = new ChromeWorker("chrome://browser/content/devtools/readdir.js");
++    let worker = this.worker = new ChromeWorker("chrome://browser/content/devtools/readdir.js");
 +    let start = Date.now();
 +
 +    worker.onmessage = evt => {
@@ -4339,17 +4351,17 @@ new file mode 100644
 +      }
 +
 +      worker = null;
-+      this._refreshPromise.resolve();
-+      this._refreshPromise = null;
++      this._refreshDeferred.resolve();
++      this._refreshDeferred = null;
 +    };
 +    worker.onerror = ex => {
 +      console.error(ex);
 +      worker = null;
-+      this._refreshPromise.reject(ex);
-+      this._refreshPromise = null;
++      this._refreshDeferred.reject(ex);
++      this._refreshDeferred = null;
 +    }
 +    worker.postMessage({ path: this.rootPath, ignore: IGNORE_REGEX });
-+    return this._refreshPromise.promise;
++    return this._refreshDeferred.promise;
 +  },
 +
 +  /**
@@ -4401,13 +4413,28 @@ new file mode 100644
 +    return "[FileResource:" + this.path + "]";
 +  },
 +
++  destroy: function() {
++    if (this._refreshDeferred) {
++      this._refreshDeferred.reject();
++    }
++    this._refreshDeferred = null;
++  },
++
++  // Fetch and cache information about this particular file
++  // https://developer.mozilla.org/en-US/docs/JavaScript_OS.File/OS.File_for_the_main_thread#OS.File.stat
 +  refresh: function() {
-+    console.log("Starting refresh");
-+    return OS.File.stat(this.path).then(info => {
-+      console.log("refresh complete!");
++    if (this._refreshDeferred) {
++      return this._refreshDeferred.promise;
++    }
++    this._refreshDeferred = promise.defer();
++    OS.File.stat(this.path).then(info => {
 +      this.info = info;
-+      return this;
++      if (this._refreshDeferred) {
++        this._refreshDeferred.resolve(this);
++        this._refreshDeferred = null;
++      }
 +    });
++    return this._refreshDeferred.promise;
 +  },
 +
 +  get displayName() { return this.basename + (this.isDir ? "/" : "") },
@@ -4693,7 +4720,7 @@ diff --git a/browser/devtools/itchpad/lib/tree.js b/browser/devtools/itchpad/lib
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/itchpad/lib/tree.js
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,394 @@
 +/* -*- Mode: Javascript; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -4888,6 +4915,7 @@ new file mode 100644
 +
 +  destroy: function() {
 +    this._destroyed = true;
++    this.elt.remove();
 +  },
 +
 +  promptNew: function(initial, parent, sibling=null) {
@@ -4941,7 +4969,7 @@ new file mode 100644
 +    this.children.appendChild(placeholder);
 +    this.roots.add(model.root);
 +    model.root.refresh().then(root => {
-+      if (!this.models.has(model) || this._destroyed) {
++      if (this._destroyed || !this.models.has(model)) {
 +        // model may have been removed during the initial refresh.
 +        // In this case, do not import the node or add to DOM, just leave it be.
 +        return;
@@ -4959,6 +4987,7 @@ new file mode 100644
 +  removeModel: function(model) {
 +    this.models.delete(model);
 +    this.removeNode(model.root);
++    model.destroy();
 +  },
 +
 +  select: function(node) {
@@ -5898,7 +5927,7 @@ diff --git a/browser/themes/windows/jar.mn b/browser/themes/windows/jar.mn
 diff --git a/toolkit/devtools/Loader.jsm b/toolkit/devtools/Loader.jsm
 --- a/toolkit/devtools/Loader.jsm
 +++ b/toolkit/devtools/Loader.jsm
-@@ -44,16 +44,17 @@ let loaderGlobals = {
+@@ -45,16 +45,17 @@ let loaderGlobals = {
    }
  };
  
@@ -5916,7 +5945,7 @@ diff --git a/toolkit/devtools/Loader.jsm b/toolkit/devtools/Loader.jsm
        paths: {
          // When you add a line to this mapping, don't forget to make a
          // corresponding addition to the SrcdirProvider mapping below as well.
-@@ -68,16 +69,17 @@ BuiltinProvider.prototype = {
+@@ -69,16 +70,17 @@ BuiltinProvider.prototype = {
          "devtools/css-color": "resource://gre/modules/devtools/css-color",
          "devtools/output-parser": "resource://gre/modules/devtools/output-parser",
          "devtools/touch-events": "resource://gre/modules/devtools/touch-events",
@@ -5934,7 +5963,7 @@ diff --git a/toolkit/devtools/Loader.jsm b/toolkit/devtools/Loader.jsm
        },
        globals: loaderGlobals,
        invisibleToDebugger: this.invisibleToDebugger
-@@ -118,19 +120,21 @@ SrcdirProvider.prototype = {
+@@ -119,19 +121,21 @@ SrcdirProvider.prototype = {
      let cssColorURI = this.fileURI(OS.Path.join(toolkitDir, "css-color"));
      let outputParserURI = this.fileURI(OS.Path.join(toolkitDir, "output-parser"));
      let touchEventsURI = this.fileURI(OS.Path.join(toolkitDir, "touch-events"));
@@ -5956,7 +5985,7 @@ diff --git a/toolkit/devtools/Loader.jsm b/toolkit/devtools/Loader.jsm
        paths: {
          "": "resource://gre/modules/commonjs/",
          "main": mainURI,
-@@ -143,16 +147,17 @@ SrcdirProvider.prototype = {
+@@ -144,16 +148,17 @@ SrcdirProvider.prototype = {
          "devtools/css-color": cssColorURI,
          "devtools/output-parser": outputParserURI,
          "devtools/touch-events": touchEventsURI,
