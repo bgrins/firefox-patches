@@ -1,0 +1,173 @@
+# HG changeset patch
+# Parent 15c845afa6e9d1c589a1f6e098ffb98a11e0c9f0
+# User Brian Grinstead <bgrinstead@mozilla.com>
+Memory leak testing
+
+
+diff --git a/browser/devtools/itchpad/lib/stores/local.js b/browser/devtools/itchpad/lib/stores/local.js
+--- a/browser/devtools/itchpad/lib/stores/local.js
++++ b/browser/devtools/itchpad/lib/stores/local.js
+@@ -47,17 +47,27 @@ var LocalStore = Class({
+     this.setRoot(this._forPath(this.path));
+     this.refreshLoop = this.refreshLoop.bind(this);
+     this.refreshLoop();
+   },
+ 
+   destroy: function() {
+     this.window.clearTimeout(this._refreshTimeout);
+     this._refreshTimeout = null;
++    if (this._refreshPromise) {
++      this._refreshPromise.reject("destroy");
++    }
+     this.window = null;
++    console.log("WORKER DESTROY1!!!", this.root);
++    if (this.root) {
++      this.root.destroy();
++    }
++    this.worker.terminate();
++    this.worker = null;
++    console.log("WORKER DESTROY!!!");
+   },
+ 
+   toString: function() { return "[LocalStore:" + this.path + "]" },
+ 
+   /**
+    * Return a FileResource object for the given path.  If a FileInfo
+    * is provided, the resource will use it, otherwise the FileResource
+    * might not have full information until the next refresh.
+@@ -123,20 +133,20 @@ var LocalStore = Class({
+ 
+   /**
+    * Refresh the directory structure.
+    */
+   refresh: function(path=this.rootPath) {
+     if (this._refreshPromise) {
+       return this._refreshPromise.promise;
+     }
+-
++    console.log("REFRESH CALLEDW!!!");
+     this._refreshPromise = promise.defer();
+ 
+-    let worker = new ChromeWorker("chrome://browser/content/devtools/readdir.js");
++    let worker = this.worker = new ChromeWorker("chrome://browser/content/devtools/readdir.js");
+     let start = Date.now();
+ 
+     worker.onmessage = evt => {
+       // console.log("Directory read finished in " + ( Date.now() - start ) +"ms", evt);
+       for (path in evt.data) {
+         let info = evt.data[path];
+         info.path = path;
+ 
+@@ -211,23 +221,40 @@ var FileResource = Class({
+     this.info = info;
+     this.parent = null;
+   },
+ 
+   toString: function() {
+     return "[FileResource:" + this.path + "]";
+   },
+ 
++  destroy: function() {
++    this._destroyed = true;
++    if (this._refreshPromise) {
++      this._refreshPromise.reject();
++    }
++    this._refreshPromise = null;
++  },
++
+   refresh: function() {
+     console.log("Starting refresh");
+-    return OS.File.stat(this.path).then(info => {
++    if (this._refreshPromise) {
++      return this._refreshPromise.promise;
++    }
++    console.log("REFRESH CALLEDW!!!");
++    this._refreshPromise = promise.defer();
++    OS.File.stat(this.path).then(info => {
+       console.log("refresh complete!");
+       this.info = info;
+-      return this;
++      if (this._refreshPromise) {
++        this._refreshPromise.resolve(this);
++        this._refreshPromise = null;
++      }
+     });
++    return this._refreshPromise.promise;
+   },
+ 
+   get displayName() { return this.basename + (this.isDir ? "/" : "") },
+ 
+   get isDir() {
+     if (!this.info) { return false; }
+     return this.info.isDir && !this.info.isSymLink;
+   },
+diff --git a/browser/devtools/itchpad/lib/tree.js b/browser/devtools/itchpad/lib/tree.js
+--- a/browser/devtools/itchpad/lib/tree.js
++++ b/browser/devtools/itchpad/lib/tree.js
+@@ -187,16 +187,18 @@ var TreeView = Class({
+     this.elt.appendChild(this.children);
+ 
+     this.nodeChildrenChanged = this.nodeChildrenChanged.bind(this);
+     this.updateNode = this.updateNode.bind(this);
+   },
+ 
+   destroy: function() {
+     this._destroyed = true;
++    this.children.remove();
++    this.children = null;
+   },
+ 
+   promptNew: function(initial, parent, sibling=null) {
+     let deferred = promise.defer();
+ 
+     let parentContainer = this._containers.get(parent);
+     // Give child updates something to wait on...
+     parentContainer.prompting = deferred.promise;
+@@ -240,34 +242,46 @@ var TreeView = Class({
+       return;
+     }
+     this.models.add(model);
+     let placeholder = this.doc.createElementNS(HTML_NS, "li");
+     placeholder.style.display = "none";
+     this.children.appendChild(placeholder);
+     this.roots.add(model.root);
+     model.root.refresh().then(root => {
+-      if (!this.models.has(model) || this._destroyed) {
++      console.log("STOPPING REFRESH", this._destroyed);
++      if (this._destroyed) {
++        placeholder.remove();
++        placeholder = null;
++        console.log("DESTROYED!!!!!!!!");
++        return;
++      }
++      if (!this.models.has(model)) {
+         // model may have been removed during the initial refresh.
+         // In this case, do not import the node or add to DOM, just leave it be.
++        // placeholder = null;
+         return;
+       }
+       let container = this.importNode(root);
+       container.line.classList.add("side-menu-widget-group-title");
+       container.line.setAttribute("theme", "dark");
+       this.selectContainer(container);
+ 
+       this.children.insertBefore(container.elt, placeholder);
+       this.children.removeChild(placeholder);
++    }, () => {
++      console.log("ERROR RECEIEVED!!!!!!");
+     });
+   },
+ 
+   removeModel: function(model) {
+     this.models.delete(model);
+     this.removeNode(model.root);
++    console.log("ABOUT TO DESTROY", model, model.root);
++    model.destroy();
+   },
+ 
+   select: function(node) {
+     this.selectContainer(this._containers.get(node));
+   },
+ 
+   selectContainer: function(container) {
+     if (this.selectedContainer === container) {
