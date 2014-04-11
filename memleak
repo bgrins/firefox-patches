@@ -1,8 +1,7 @@
 # HG changeset patch
-# Parent 15c845afa6e9d1c589a1f6e098ffb98a11e0c9f0
+# Parent 72f3878bb7a73dcdbbae4bad7c0bcd06dab5724c
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Memory leak testing
-
 
 diff --git a/browser/devtools/itchpad/lib/stores/local.js b/browser/devtools/itchpad/lib/stores/local.js
 --- a/browser/devtools/itchpad/lib/stores/local.js
@@ -16,8 +15,8 @@ diff --git a/browser/devtools/itchpad/lib/stores/local.js b/browser/devtools/itc
    destroy: function() {
      this.window.clearTimeout(this._refreshTimeout);
      this._refreshTimeout = null;
-+    if (this._refreshPromise) {
-+      this._refreshPromise.reject("destroy");
++    if (this._refreshDeferred) {
++      this._refreshDeferred.reject("destroy");
 +    }
      this.window = null;
 +    console.log("WORKER DESTROY1!!!", this.root);
@@ -35,19 +34,31 @@ diff --git a/browser/devtools/itchpad/lib/stores/local.js b/browser/devtools/itc
     * Return a FileResource object for the given path.  If a FileInfo
     * is provided, the resource will use it, otherwise the FileResource
     * might not have full information until the next refresh.
-@@ -123,20 +133,20 @@ var LocalStore = Class({
+@@ -114,29 +124,28 @@ var LocalStore = Class({
+       if (SHOULD_LIVE_REFRESH) {
+         this._refreshTimeout = this.window.setTimeout(this.refreshLoop,
+           CHECK_LINKED_DIRECTORY_DELAY);
+       }
+     });
+   },
+ 
+   _refreshTimeout: null,
+-  _refreshPromise: null,
++  _refreshDeferred: null,
  
    /**
     * Refresh the directory structure.
     */
    refresh: function(path=this.rootPath) {
-     if (this._refreshPromise) {
-       return this._refreshPromise.promise;
+-    if (this._refreshPromise) {
+-      return this._refreshPromise.promise;
++    if (this._refreshDeferred) {
++      return this._refreshDeferred.promise;
      }
--
-+    console.log("REFRESH CALLEDW!!!");
-     this._refreshPromise = promise.defer();
++    this._refreshDeferred = promise.defer();
  
+-    this._refreshPromise = promise.defer();
+-
 -    let worker = new ChromeWorker("chrome://browser/content/devtools/readdir.js");
 +    let worker = this.worker = new ChromeWorker("chrome://browser/content/devtools/readdir.js");
      let start = Date.now();
@@ -58,7 +69,40 @@ diff --git a/browser/devtools/itchpad/lib/stores/local.js b/browser/devtools/itc
          let info = evt.data[path];
          info.path = path;
  
-@@ -211,23 +221,40 @@ var FileResource = Class({
+@@ -149,27 +158,27 @@ var LocalStore = Class({
+             newChildren.add(this._forPath(childPath, childInfo));
+           }
+           resource.setChildren(newChildren);
+         }
+         resource.info.children = null;
+       }
+ 
+       worker = null;
+-      this._refreshPromise.resolve();
+-      this._refreshPromise = null;
++      this._refreshDeferred.resolve();
++      this._refreshDeferred = null;
+     };
+     worker.onerror = ex => {
+       console.error(ex);
+       worker = null;
+-      this._refreshPromise.reject(ex);
+-      this._refreshPromise = null;
++      this._refreshDeferred.reject(ex);
++      this._refreshDeferred = null;
+     }
+     worker.postMessage({ path: this.rootPath, ignore: IGNORE_REGEX });
+-    return this._refreshPromise.promise;
++    return this._refreshDeferred.promise;
+   },
+ 
+   /**
+    * Returns true if the given path would be a child of the store's
+    * root directory.
+    */
+   contains: function(path) {
+     path = OS.Path.normalize(path);
+@@ -211,23 +220,38 @@ var FileResource = Class({
      this.info = info;
      this.parent = null;
    },
@@ -68,31 +112,31 @@ diff --git a/browser/devtools/itchpad/lib/stores/local.js b/browser/devtools/itc
    },
  
 +  destroy: function() {
-+    this._destroyed = true;
-+    if (this._refreshPromise) {
-+      this._refreshPromise.reject();
++    if (this._refreshDeferred) {
++      this._refreshDeferred.reject();
 +    }
-+    this._refreshPromise = null;
++    this._refreshDeferred = null;
 +  },
 +
++  // Fetch and cache information about this particular file
++  // https://developer.mozilla.org/en-US/docs/JavaScript_OS.File/OS.File_for_the_main_thread#OS.File.stat
    refresh: function() {
-     console.log("Starting refresh");
+-    console.log("Starting refresh");
 -    return OS.File.stat(this.path).then(info => {
-+    if (this._refreshPromise) {
-+      return this._refreshPromise.promise;
+-      console.log("refresh complete!");
++    if (this._refreshDeferred) {
++      return this._refreshDeferred.promise;
 +    }
-+    console.log("REFRESH CALLEDW!!!");
-+    this._refreshPromise = promise.defer();
++    this._refreshDeferred = promise.defer();
 +    OS.File.stat(this.path).then(info => {
-       console.log("refresh complete!");
        this.info = info;
 -      return this;
-+      if (this._refreshPromise) {
-+        this._refreshPromise.resolve(this);
-+        this._refreshPromise = null;
++      if (this._refreshDeferred) {
++        this._refreshDeferred.resolve(this);
++        this._refreshDeferred = null;
 +      }
      });
-+    return this._refreshPromise.promise;
++    return this._refreshDeferred.promise;
    },
  
    get displayName() { return this.basename + (this.isDir ? "/" : "") },
@@ -104,7 +148,7 @@ diff --git a/browser/devtools/itchpad/lib/stores/local.js b/browser/devtools/itc
 diff --git a/browser/devtools/itchpad/lib/tree.js b/browser/devtools/itchpad/lib/tree.js
 --- a/browser/devtools/itchpad/lib/tree.js
 +++ b/browser/devtools/itchpad/lib/tree.js
-@@ -187,16 +187,18 @@ var TreeView = Class({
+@@ -187,16 +187,17 @@ var TreeView = Class({
      this.elt.appendChild(this.children);
  
      this.nodeChildrenChanged = this.nodeChildrenChanged.bind(this);
@@ -113,8 +157,7 @@ diff --git a/browser/devtools/itchpad/lib/tree.js b/browser/devtools/itchpad/lib
  
    destroy: function() {
      this._destroyed = true;
-+    this.children.remove();
-+    this.children = null;
++    this.elt.remove();
    },
  
    promptNew: function(initial, parent, sibling=null) {
@@ -123,7 +166,7 @@ diff --git a/browser/devtools/itchpad/lib/tree.js b/browser/devtools/itchpad/lib
      let parentContainer = this._containers.get(parent);
      // Give child updates something to wait on...
      parentContainer.prompting = deferred.promise;
-@@ -240,34 +242,46 @@ var TreeView = Class({
+@@ -240,17 +241,17 @@ var TreeView = Class({
        return;
      }
      this.models.add(model);
@@ -133,35 +176,24 @@ diff --git a/browser/devtools/itchpad/lib/tree.js b/browser/devtools/itchpad/lib
      this.roots.add(model.root);
      model.root.refresh().then(root => {
 -      if (!this.models.has(model) || this._destroyed) {
-+      console.log("STOPPING REFRESH", this._destroyed);
-+      if (this._destroyed) {
-+        placeholder.remove();
-+        placeholder = null;
-+        console.log("DESTROYED!!!!!!!!");
-+        return;
-+      }
-+      if (!this.models.has(model)) {
++      if (this._destroyed || !this.models.has(model)) {
          // model may have been removed during the initial refresh.
          // In this case, do not import the node or add to DOM, just leave it be.
-+        // placeholder = null;
          return;
        }
        let container = this.importNode(root);
        container.line.classList.add("side-menu-widget-group-title");
        container.line.setAttribute("theme", "dark");
        this.selectContainer(container);
- 
+@@ -258,16 +259,17 @@ var TreeView = Class({
        this.children.insertBefore(container.elt, placeholder);
        this.children.removeChild(placeholder);
-+    }, () => {
-+      console.log("ERROR RECEIEVED!!!!!!");
      });
    },
  
    removeModel: function(model) {
      this.models.delete(model);
      this.removeNode(model.root);
-+    console.log("ABOUT TO DESTROY", model, model.root);
 +    model.destroy();
    },
  
