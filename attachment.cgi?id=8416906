@@ -1,0 +1,382 @@
+# HG changeset patch
+# Parent 9cb5b6743e80be95c878a1db4a9f9412a47eadba
+# User Manish Goregaokar <manishearth@gmail.com>
+Bug 994134 - Warn first time users on pasting code into the console; r=bgrins
+
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -1360,16 +1360,20 @@ pref("devtools.browserconsole.filter.war
+ pref("devtools.browserconsole.filter.info", true);
+ pref("devtools.browserconsole.filter.log", true);
+ pref("devtools.browserconsole.filter.secerror", true);
+ pref("devtools.browserconsole.filter.secwarn", true);
+ 
+ // Text size in the Web Console. Use 0 for the system default size.
+ pref("devtools.webconsole.fontSize", 0);
+ 
++// Number of usages of the web console or scratchpad.
++// If this is less than 10, then pasting code into the web console or scratchpad is disabled
++pref("devtools.selfxss.count", 0);
++
+ // Persistent logging: |true| if you want the Web Console to keep all of the
+ // logged messages after reloading the page, |false| if you want the output to
+ // be cleared each time page navigation happens.
+ pref("devtools.webconsole.persistlog", false);
+ 
+ // Web Console timestamp: |true| if you want the logs and instructions
+ // in the Web Console to display a timestamp, or |false| to not display
+ // any timestamps.
+diff --git a/browser/devtools/scratchpad/scratchpad.js b/browser/devtools/scratchpad/scratchpad.js
+--- a/browser/devtools/scratchpad/scratchpad.js
++++ b/browser/devtools/scratchpad/scratchpad.js
+@@ -63,19 +63,16 @@ XPCOMUtils.defineLazyModuleGetter(this, 
+   "resource:///modules/devtools/VariablesViewController.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "EnvironmentClient",
+   "resource://gre/modules/devtools/dbg-client.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "ObjectClient",
+   "resource://gre/modules/devtools/dbg-client.jsm");
+ 
+-XPCOMUtils.defineLazyModuleGetter(this, "WebConsoleUtils",
+-  "resource://gre/modules/devtools/WebConsoleUtils.jsm");
+-
+ XPCOMUtils.defineLazyModuleGetter(this, "DebuggerServer",
+   "resource://gre/modules/devtools/dbg-server.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "DebuggerClient",
+   "resource://gre/modules/devtools/dbg-client.jsm");
+ 
+ XPCOMUtils.defineLazyGetter(this, "REMOTE_TIMEOUT", () =>
+   Services.prefs.getIntPref("devtools.debugger.remote-timeout"));
+@@ -86,16 +83,18 @@ XPCOMUtils.defineLazyModuleGetter(this, 
+ XPCOMUtils.defineLazyModuleGetter(this, "Reflect",
+   "resource://gre/modules/reflect.jsm");
+ 
+ // Because we have no constructor / destructor where we can log metrics we need
+ // to do so here.
+ let telemetry = new Telemetry();
+ telemetry.toolOpened("scratchpad");
+ 
++let WebConsoleUtils = require("devtools/toolkit/webconsole/utils").Utils;
++
+ /**
+  * The scratchpad object handles the Scratchpad window functionality.
+  */
+ var Scratchpad = {
+   _instanceId: null,
+   _initialWindowTitle: document.title,
+   _dirty: false,
+ 
+@@ -488,16 +487,17 @@ var Scratchpad = {
+    * Execute the selected text (if any) or the entire editor content in the
+    * current context.
+    *
+    * @return Promise
+    *         The promise for the script evaluation result.
+    */
+   execute: function SP_execute()
+   {
++    WebConsoleUtils.usageCount++;
+     let selection = this.editor.getSelection() || this.getText();
+     return this.evaluate(selection);
+   },
+ 
+   /**
+    * Execute the selected text (if any) or the entire editor content in the
+    * current context.
+    *
+@@ -1606,20 +1606,25 @@ var Scratchpad = {
+       value: initialText,
+       lineNumbers: true,
+       showTrailingSpace: Services.prefs.getBoolPref(SHOW_TRAILING_SPACE),
+       enableCodeFolding: Services.prefs.getBoolPref(ENABLE_CODE_FOLDING),
+       contextMenu: "scratchpad-text-popup"
+     };
+ 
+     this.editor = new Editor(config);
+-    this.editor.appendTo(document.querySelector("#scratchpad-editor")).then(() => {
++    let editorElement = document.querySelector("#scratchpad-editor");
++    this.editor.appendTo(editorElement).then(() => {
+       var lines = initialText.split("\n");
+ 
+       this.editor.on("change", this._onChanged);
++      this._onPaste = WebConsoleUtils.pasteHandlerGen(this.editor.container.contentDocument.body,
++                                                      document.querySelector('#scratchpad-notificationbox'));
++      editorElement.addEventListener("paste", this._onPaste);
++      editorElement.addEventListener("drop", this._onPaste);
+       this.editor.on("save", () => this.saveFile());
+       this.editor.focus();
+       this.editor.setCursor({ line: lines.length, ch: lines.pop().length });
+ 
+       if (state)
+         this.dirty = !state.saved;
+ 
+       this.initialized = true;
+@@ -1681,17 +1686,22 @@ var Scratchpad = {
+     // This event is created only after user uses 'reload and run' feature.
+     if (this._reloadAndRunEvent && this.gBrowser) {
+       this.gBrowser.selectedBrowser.removeEventListener("load",
+           this._reloadAndRunEvent, true);
+     }
+ 
+     PreferenceObserver.uninit();
+     CloseObserver.uninit();
+-
++    if (this._onPaste) {
++      let ed = document.querySelector("#scratchpad-editor");
++      ed.removeEventListener("paste", this._onPaste);
++      ed.removeEventListener("drop", this._onPaste);
++      this._onPaste = null;
++    }
+     this.editor.off("change", this._onChanged);
+     this.editor.destroy();
+     this.editor = null;
+ 
+     if (this._sidebar) {
+       this._sidebar.destroy();
+       this._sidebar = null;
+     }
+diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webconsole/webconsole.js
+--- a/browser/devtools/webconsole/webconsole.js
++++ b/browser/devtools/webconsole/webconsole.js
+@@ -3127,17 +3127,20 @@ JSTerm.prototype = {
+     this.completeNode = doc.querySelector(".jsterm-complete-node");
+     this.inputNode = doc.querySelector(".jsterm-input-node");
+ 
+     if (this.hud.owner._browserConsole &&
+         !Services.prefs.getBoolPref("devtools.chrome.enabled")) {
+       inputContainer.style.display = "none";
+     }
+     else {
++      this._onPaste = WebConsoleUtils.pasteHandlerGen(this.inputNode, doc.getElementById("webconsole-notificationbox"));
+       this.inputNode.addEventListener("keypress", this._keyPress, false);
++      this.inputNode.addEventListener("paste", this._onPaste);
++      this.inputNode.addEventListener("drop", this._onPaste);
+       this.inputNode.addEventListener("input", this._inputEventHandler, false);
+       this.inputNode.addEventListener("keyup", this._inputEventHandler, false);
+       this.inputNode.addEventListener("focus", this._focusEventHandler, false);
+     }
+ 
+     this.hud.window.addEventListener("blur", this._blurEventHandler, false);
+     this.lastInputValue && this.setInputValue(this.lastInputValue);
+   },
+@@ -3266,16 +3269,17 @@ JSTerm.prototype = {
+     let options = { frame: this.SELECTED_FRAME };
+     this.requestEvaluation(aExecuteString, options).then(onResult, onResult);
+ 
+     // Append a new value in the history of executed code, or overwrite the most
+     // recent entry. The most recent entry may contain the last edited input
+     // value that was not evaluated yet.
+     this.history[this.historyIndex++] = aExecuteString;
+     this.historyPlaceHolder = this.history.length;
++    WebConsoleUtils.usageCount++;
+     this.setInputValue("");
+     this.clearCompletion();
+   },
+ 
+   /**
+    * Request a JavaScript string evaluation from the server.
+    *
+    * @param string aString
+@@ -4518,16 +4522,22 @@ JSTerm.prototype = {
+     this.autocompletePopup = null;
+ 
+     let popup = this.hud.owner.chromeWindow.document
+                 .getElementById("webConsole_autocompletePopup");
+     if (popup) {
+       popup.parentNode.removeChild(popup);
+     }
+ 
++    if (this._onPaste) {
++      this.inputNode.removeEventListener("paste", this._onPaste, false);
++      this.inputNode.removeEventListener("drop", this._onPaste, false);
++      this._onPaste = null;
++    }
++
+     this.inputNode.removeEventListener("keypress", this._keyPress, false);
+     this.inputNode.removeEventListener("input", this._inputEventHandler, false);
+     this.inputNode.removeEventListener("keyup", this._inputEventHandler, false);
+     this.inputNode.removeEventListener("focus", this._focusEventHandler, false);
+     this.hud.window.removeEventListener("blur", this._blurEventHandler, false);
+ 
+     this.hud = null;
+   },
+diff --git a/browser/devtools/webconsole/webconsole.xul b/browser/devtools/webconsole/webconsole.xul
+--- a/browser/devtools/webconsole/webconsole.xul
++++ b/browser/devtools/webconsole/webconsole.xul
+@@ -168,25 +168,26 @@ function goUpdateConsoleCommands() {
+ 
+         <textbox class="compact hud-filter-box devtools-searchinput" type="search"
+                  placeholder="&filterOutput.placeholder;" tabindex="2"/>
+       </toolbar>
+ 
+       <hbox id="output-wrapper" flex="1" context="output-contextmenu" tooltip="aHTMLTooltip">
+         <div xmlns="http://www.w3.org/1999/xhtml" id="output-container" tabindex="1" />
+       </hbox>
+-
+-      <hbox class="jsterm-input-container" style="direction:ltr">
+-        <stack class="jsterm-stack-node" flex="1">
+-          <textbox class="jsterm-complete-node devtools-monospace"
+-                   multiline="true" rows="1" tabindex="-1"/>
+-          <textbox class="jsterm-input-node devtools-monospace"
+-                   multiline="true" rows="1" tabindex="0"/>
+-        </stack>
+-      </hbox>
++      <notificationbox id="webconsole-notificationbox">
++        <hbox class="jsterm-input-container" style="direction:ltr">
++          <stack class="jsterm-stack-node" flex="1">
++            <textbox class="jsterm-complete-node devtools-monospace"
++                     multiline="true" rows="1" tabindex="-1"/>
++            <textbox class="jsterm-input-node devtools-monospace"
++                     multiline="true" rows="1" tabindex="0"/>
++          </stack>
++        </hbox>
++      </notificationbox>
+     </vbox>
+ 
+     <splitter class="devtools-side-splitter"/>
+ 
+     <tabbox id="webconsole-sidebar" class="devtools-sidebar-tabs" hidden="true" width="300">
+       <tabs/>
+       <tabpanels flex="1"/>
+     </tabbox>
+diff --git a/browser/locales/en-US/chrome/browser/devtools/webconsole.properties b/browser/locales/en-US/chrome/browser/devtools/webconsole.properties
+--- a/browser/locales/en-US/chrome/browser/devtools/webconsole.properties
++++ b/browser/locales/en-US/chrome/browser/devtools/webconsole.properties
+@@ -218,12 +218,22 @@ messageRepeats.tooltip2=#1 repeat;#1 rep
+ # tooltip when hovering over the inspector icon next to a DOM Node in the console
+ # output
+ openNodeInInspector=Click to select the node in the inspector
+ 
+ # LOCALIZATION NOTE (cdFunctionInvalidArgument): the text that is displayed when
+ # cd() is invoked with an invalid argument.
+ cdFunctionInvalidArgument=Cannot cd() to the given window. Invalid argument.
+ 
++# LOCALIZATION NOTE (selfxss.msg): the text that is displayed when
++# a new user of the developer tools pastes code into the console
++# %1 is the text of selfxss.okstring
++selfxss.msg=Scam Warning: Take care when pasting things you don't understand. This could allow attackers to steal your identity or take control of your computer. Please type '%S' below to allow pasting.
++
++# LOCALIZATION NOTE (selfxss.msg): the string to be typed
++# in by a new user of the developer tools when they receive the sefxss.msg prompt.
++# Please avoid using non-keyboard characters here
++selfxss.okstring=allow pasting
++
+ # LOCALIZATION NOTE (messageToggleDetails): the text that is displayed when
+ # you hover the arrow for expanding/collapsing the message details. For
+ # console.error() and other messages we show the stacktrace.
+ messageToggleDetails=Show/hide message details.
+diff --git a/toolkit/devtools/webconsole/utils.js b/toolkit/devtools/webconsole/utils.js
+--- a/toolkit/devtools/webconsole/utils.js
++++ b/toolkit/devtools/webconsole/utils.js
+@@ -26,16 +26,18 @@ loader.lazyImporter(this, "DevToolsUtils
+ // (function foobar(a, b) { ...
+ // function foobar2(a) { ...
+ // function() { ...
+ const REGEX_MATCH_FUNCTION_NAME = /^\(?function\s+([^(\s]+)\s*\(/;
+ 
+ // Match the function arguments from the result of toString() or toSource().
+ const REGEX_MATCH_FUNCTION_ARGS = /^\(?function\s*[^\s(]*\s*\((.+?)\)/;
+ 
++// Number of terminal entries for the self-xss prevention to go away
++const CONSOLE_ENTRY_THRESHOLD = 10
+ let WebConsoleUtils = {
+   /**
+    * Convenience function to unwrap a wrapped object.
+    *
+    * @param aObject the object to unwrap.
+    * @return aObject unwrapped.
+    */
+   unwrap: function WCU_unwrap(aObject)
+@@ -525,17 +527,89 @@ let WebConsoleUtils = {
+    *        Value you want to check if it is a grip with an actor.
+    * @return boolean
+    *         True if the given value is a grip with an actor.
+    */
+   isActorGrip: function WCU_isActorGrip(aGrip)
+   {
+     return aGrip && typeof(aGrip) == "object" && aGrip.actor;
+   },
++  /**
++   * Value of devtools.selfxss.count preference
++   *
++   * @type number
++   * @private
++   */
++  _usageCount: 0,
++  get usageCount() {
++    // Cache the value, for efficiency
++    if (WebConsoleUtils._usageCount < CONSOLE_ENTRY_THRESHOLD) {
++      WebConsoleUtils._usageCount = Services.prefs.getIntPref("devtools.selfxss.count")
++      return WebConsoleUtils._usageCount;
++    }
++    return CONSOLE_ENTRY_THRESHOLD;
++  },
++  set usageCount(newUC) {
++    if (WebConsoleUtils._usageCount < CONSOLE_ENTRY_THRESHOLD) {
++      WebConsoleUtils._usageCount = newUC;
++      Services.prefs.setIntPref("devtools.selfxss.count", newUC);
++    }
++  },
++  /**
++   * The inputNode "paste" event handler generator. Helps prevent self-xss attacks
++   *
++   * @param nsIDOMElement inputField
++   * @param nsIDOMElement notificationBox
++   * @returns A function to be added as a handler to 'paste' and 'drop' events on the input field
++   */
++  pasteHandlerGen: function WCU_pasteHandlerGen(inputField, notificationBox){
++    let handler = function WCU_pasteHandler(aEvent) {
++      if (WebConsoleUtils.usageCount >= CONSOLE_ENTRY_THRESHOLD) {
++        inputField.removeEventListener("paste", handler);
++        inputField.removeEventListener("drop", handler);
++        return true;
++      }
++      if (notificationBox.getNotificationWithValue("selfxss-notification")) {
++        aEvent.preventDefault();
++        aEvent.stopPropagation();
++        return false;
++      }
++      let l10n = new WebConsoleUtils.l10n("chrome://browser/locale/devtools/webconsole.properties");
++      let okstring = l10n.getStr("selfxss.okstring");
++      let msg = l10n.getFormatStr("selfxss.msg", [okstring]);
++
++      let notification = notificationBox.appendNotification(msg,
++        "selfxss-notification", null, notificationBox.PRIORITY_WARNING_HIGH, null,
++        function(eventType) {
++          // Cleanup function if notification is dismissed
++          if (eventType == "removed") {
++            inputField.removeEventListener("keyup", pasteKeyUpHandler);
++          }
++        });
++
++      function pasteKeyUpHandler(aEvent2) {
++        let value = inputField.value || inputField.textContent;
++        if (value.contains(okstring)) {
++          notificationBox.removeNotification(notification);
++          inputField.removeEventListener("keyup", pasteKeyUpHandler);
++          WebConsoleUtils.usageCount = CONSOLE_ENTRY_THRESHOLD;
++        }
++      }
++      inputField.addEventListener("keyup", pasteKeyUpHandler);
++
++      aEvent.preventDefault();
++      aEvent.stopPropagation();
++      return false;
++    }
++    return handler;
++  },
++
++
+ };
++
+ exports.Utils = WebConsoleUtils;
+ 
+ //////////////////////////////////////////////////////////////////////////
+ // Localization
+ //////////////////////////////////////////////////////////////////////////
+ 
+ WebConsoleUtils.l10n = function WCU_l10n(aBundleURI)
+ {
