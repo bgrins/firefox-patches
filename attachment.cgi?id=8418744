@@ -1,0 +1,3530 @@
+# HG changeset patch
+# User Paul Rouget <paul@mozilla.com>
+v1
+
+
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+index a371e9b..8af0a31 100644
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -1210,16 +1210,23 @@ pref("devtools.toolbar.enabled", true);
+ pref("devtools.toolbar.visible", false);
+ pref("devtools.commands.dir", "");
+ 
+ // Enable the app manager
+ pref("devtools.appmanager.enabled", true);
+ pref("devtools.appmanager.lastTab", "help");
+ pref("devtools.appmanager.manifestEditor.enabled", true);
+ 
++// Enable fxide
++#ifdef MOZ_FXIDE
++pref("devtools.fxide.enabled", true);
++#else
++pref("devtools.fxide.enabled", false);
++#endif
++
+ // Toolbox preferences
+ pref("devtools.toolbox.footer.height", 250);
+ pref("devtools.toolbox.sidebar.width", 500);
+ pref("devtools.toolbox.host", "bottom");
+ pref("devtools.toolbox.selectedTool", "webconsole");
+ pref("devtools.toolbox.toolbarSpec", '["splitconsole", "paintflashing toggle","tilt toggle","scratchpad","resize toggle","eyedropper"]');
+ pref("devtools.toolbox.sideEnabled", true);
+ pref("devtools.toolbox.zoomValue", "1");
+diff --git a/browser/devtools/app-manager/app-projects.js b/browser/devtools/app-manager/app-projects.js
+index d09f72f..23c1a3c 100644
+--- a/browser/devtools/app-manager/app-projects.js
++++ b/browser/devtools/app-manager/app-projects.js
+@@ -1,14 +1,15 @@
+-const {Cc,Ci,Cu} = require("chrome");
++const {Cc,Ci,Cu,Cr} = require("chrome");
+ const ObservableObject = require("devtools/shared/observable-object");
+ const promise = require("devtools/toolkit/deprecated-sync-thenables");
+ 
+ const {EventEmitter} = Cu.import("resource://gre/modules/devtools/event-emitter.js");
+ const {generateUUID} = Cc['@mozilla.org/uuid-generator;1'].getService(Ci.nsIUUIDGenerator);
++const {FileUtils} = Cu.import("resource://gre/modules/FileUtils.jsm");
+ 
+ /**
+  * IndexedDB wrapper that just save project objects
+  *
+  * The only constraint is that project objects have to have
+  * a unique `location` object.
+  */
+ 
+@@ -32,30 +33,55 @@ const IDB = {
+       let db = event.target.result;
+       db.createObjectStore("projects", { keyPath: "location" });
+     };
+ 
+     request.onsuccess = function() {
+       let db = IDB._db = request.result;
+       let objectStore = db.transaction("projects").objectStore("projects");
+       let projects = []
++      let toRemove = [];
+       objectStore.openCursor().onsuccess = function(event) {
+         let cursor = event.target.result;
+         if (cursor) {
+           if (cursor.value.location) {
++
+             // We need to make sure this object has a `.location` property.
+             // The UI depends on this property.
+             // This should not be needed as we make sure to register valid
+             // projects, but in the past (before bug 924568), we might have
+             // registered invalid objects.
+-            projects.push(cursor.value);
++
++
++            // We also want to make sure the location is valid.
++            // If the location doesn't exist, we remove the project.
++
++            try {
++              let file = FileUtils.File(cursor.value.location);
++              if (file.exists()) {
++                projects.push(cursor.value);
++              } else {
++                toRemove.push(cursor.value.location);
++              }
++            } catch (e) {
++              if (e.result == Cr.NS_ERROR_FILE_UNRECOGNIZED_PATH) {
++                // A URL
++                projects.push(cursor.value);
++              }
++            }
+           }
+           cursor.continue();
+         } else {
+-          deferred.resolve(projects);
++          let removePromises = [];
++          for (let location of toRemove) {
++            removePromises.push(IDB.remove(location));
++          }
++          promise.all(removePromises).then(() => {
++            deferred.resolve(projects);
++          });
+         }
+       };
+     };
+ 
+     return deferred.promise;
+   },
+ 
+   add: function(project) {
+@@ -78,16 +104,22 @@ const IDB = {
+     }
+ 
+     return deferred.promise;
+   },
+ 
+   update: function(project) {
+     let deferred = promise.defer();
+ 
++    // Clone object to make it storable by IndexedDB.
++    // Projects are proxified objects (for the template
++    // mechanismn in the first version of the App Manager).
++    // This will change in the future.
++    project = JSON.parse(JSON.stringify(project));
++
+     var transaction = IDB._db.transaction(["projects"], "readwrite");
+     var objectStore = transaction.objectStore("projects");
+     var request = objectStore.put(project);
+     request.onerror = function(event) {
+       deferred.reject("Unable to update project to the AppProjects indexedDB: " +
+                       this.error.name + " - " + this.error.message );
+     };
+     request.onsuccess = function() {
+@@ -126,16 +158,24 @@ IDB.open().then(function (projects) {
+ });
+ 
+ const AppProjects = {
+   load: function() {
+     return loadDeferred.promise;
+   },
+ 
+   addPackaged: function(folder) {
++    let file = FileUtils.File(folder.path);
++    if (!file.exists()) {
++      return promise.reject("path doesn't exist");
++    }
++    let existingProject = this.get(folder.path);
++    if (existingProject) {
++      return promise.reject("Already added");
++    }
+     let project = {
+       type: "packaged",
+       location: folder.path,
+       // We need a unique id, that is the app origin,
+       // in order to identify the app when being installed on the device.
+       // The packaged app local path is a valid id, but only on the client.
+       // This origin will be used to generate the true id of an app:
+       // its manifest URL.
+@@ -146,33 +186,33 @@ const AppProjects = {
+     return IDB.add(project).then(function () {
+       store.object.projects.push(project);
+       // return the added objects (proxified)
+       return store.object.projects[store.object.projects.length - 1];
+     });
+   },
+ 
+   addHosted: function(manifestURL) {
++    let existingProject = this.get(manifestURL);
++    if (existingProject) {
++      return promise.reject("Already added");
++    }
+     let project = {
+       type: "hosted",
+       location: manifestURL
+     };
+     return IDB.add(project).then(function () {
+       store.object.projects.push(project);
+       // return the added objects (proxified)
+       return store.object.projects[store.object.projects.length - 1];
+     });
+   },
+ 
+   update: function (project) {
+-    return IDB.update({
+-      type: project.type,
+-      location: project.location,
+-      packagedAppOrigin: project.packagedAppOrigin
+-    }).then(() => project);
++    return IDB.update(project);
+   },
+ 
+   remove: function(location) {
+     return IDB.remove(location).then(function () {
+       let projects = store.object.projects;
+       for (let i = 0; i < projects.length; i++) {
+         if (projects[i].location == location) {
+           projects.splice(i, 1);
+diff --git a/browser/devtools/app-manager/app-validator.js b/browser/devtools/app-manager/app-validator.js
+index f0120cf..df4da3e 100644
+--- a/browser/devtools/app-manager/app-validator.js
++++ b/browser/devtools/app-manager/app-validator.js
+@@ -51,16 +51,17 @@ AppValidator.prototype._getPackagedManifestURL = function () {
+   return Services.io.newFileURI(manifestFile).spec;
+ };
+ 
+ AppValidator.prototype._fetchManifest = function (manifestURL) {
+   let deferred = promise.defer();
+   this.manifestURL = manifestURL;
+ 
+   let req = new XMLHttpRequest();
++  req.overrideMimeType('text/plain');
+   try {
+     req.open("GET", manifestURL, true);
+   } catch(e) {
+     this.error(strings.formatStringFromName("validator.invalidManifestURL", [manifestURL], 1));
+     deferred.resolve(null);
+     return deferred.promise;
+   }
+   req.channel.loadFlags |= Ci.nsIRequest.LOAD_BYPASS_CACHE | Ci.nsIRequest.INHIBIT_CACHING;
+@@ -150,16 +151,17 @@ AppValidator.prototype.validateLaunchPath = function (manifest) {
+     indexURL = Services.io.newURI(path, null, Services.io.newURI(origin, null, null)).spec;
+   } catch(e) {
+     this.error(strings.formatStringFromName("validator.accessFailedLaunchPath", [origin + path], 1));
+     deferred.resolve();
+     return deferred.promise;
+   }
+ 
+   let req = new XMLHttpRequest();
++  req.overrideMimeType('text/plain');
+   try {
+     req.open("HEAD", indexURL, true);
+   } catch(e) {
+     this.error(strings.formatStringFromName("validator.accessFailedLaunchPath", [indexURL], 1));
+     deferred.resolve();
+     return deferred.promise;
+   }
+   req.channel.loadFlags |= Ci.nsIRequest.LOAD_BYPASS_CACHE | Ci.nsIRequest.INHIBIT_CACHING;
+diff --git a/browser/devtools/framework/gDevTools.jsm b/browser/devtools/framework/gDevTools.jsm
+index c662b7d..da96ed4 100644
+--- a/browser/devtools/framework/gDevTools.jsm
++++ b/browser/devtools/framework/gDevTools.jsm
+@@ -517,17 +517,27 @@ let gDevToolsBrowser = {
+   openConnectScreen: function(gBrowser) {
+     gBrowser.selectedTab = gBrowser.addTab("chrome://browser/content/devtools/connect.xhtml");
+   },
+ 
+   /**
+    * Open the App Manager
+    */
+   openAppManager: function(gBrowser) {
+-    gBrowser.selectedTab = gBrowser.addTab("about:app-manager");
++    if (Services.prefs.getBoolPref("devtools.fxide.enabled")) {
++      let win = Services.wm.getMostRecentWindow("devtools:fxide");
++      if (win) {
++        win.focus();
++      } else {
++        let ww = Cc["@mozilla.org/embedcomp/window-watcher;1"].getService(Ci.nsIWindowWatcher);
++        ww.openWindow(null, "chrome://fxide/content/", "fxide", "chrome,centerscreen,resizable", null);
++      }
++    } else {
++      gBrowser.selectedTab = gBrowser.addTab("about:app-manager");
++    }
+   },
+ 
+   /**
+    * Add this DevTools's presence to a browser window's document
+    *
+    * @param {XULDocument} doc
+    *        The document to which menuitems and handlers are to be added
+    */
+diff --git a/browser/devtools/fxide/Makefile.in b/browser/devtools/fxide/Makefile.in
+new file mode 100644
+index 0000000..722362c
+--- /dev/null
++++ b/browser/devtools/fxide/Makefile.in
+@@ -0,0 +1,10 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++PREF_JS_EXPORTS = $(srcdir)/fxide-prefs.js
++
++include $(topsrcdir)/config/rules.mk
++
++libs::
++	$(NSINSTALL) $(srcdir)/modules/*.js $(FINAL_TARGET)/modules/devtools
+diff --git a/browser/devtools/fxide/content/details.js b/browser/devtools/fxide/content/details.js
+new file mode 100644
+index 0000000..9fff912
+--- /dev/null
++++ b/browser/devtools/fxide/content/details.js
+@@ -0,0 +1,122 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++const Cu = Components.utils;
++Cu.import("resource:///modules/devtools/gDevTools.jsm");
++const {Services} = Cu.import("resource://gre/modules/Services.jsm");
++const {require} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {}).devtools;
++const {AppProjects} = require("devtools/app-manager/app-projects");
++const {AppValidator} = require("devtools/app-manager/app-validator");
++const {AppManager} = require("devtools/app-manager");
++
++window.addEventListener("load", function onLoad() {
++  window.removeEventListener("load", onLoad);
++  document.addEventListener("visibilitychange", updateUI, true);
++  AppManager.on("app-manager-update", onAppManagerUpdate);
++  updateUI();
++}, true);
++
++window.addEventListener("unload", function onUnload() {
++  window.removeEventListener("unload", onUnload);
++  AppManager.off("app-manager-update", onAppManagerUpdate);
++}, true);
++
++function onAppManagerUpdate(event, what, details) {
++  if (what == "project" ||
++      what == "project-validated") {
++    updateUI();
++  }
++}
++
++function resetUI() {
++  document.querySelector("#toolbar").classList.add("hidden");
++  document.querySelector("#type").classList.add("hidden");
++  document.querySelector("#descriptionHeader").classList.add("hidden");
++  document.querySelector("#manifestURLHeader").classList.add("hidden");
++  document.querySelector("#locationHeader").classList.add("hidden");
++
++  document.body.className = "";
++  document.querySelector("#icon").src = "";
++  document.querySelector("h1").textContent = "";
++  document.querySelector("#description").textContent = "";
++  document.querySelector("#type").textContent = "";
++  document.querySelector("#manifestURL").textContent = "";
++  document.querySelector("#location").textContent = "";
++
++  document.querySelector("#errorslist").innerHTML = "";
++  document.querySelector("#warningslist").innerHTML = "";
++
++}
++
++function updateUI() {
++  resetUI();
++
++  let project = AppManager.selectedProject;
++  if (!project) {
++    return;
++  }
++
++  if (project.type != "runtimeApp") {
++    document.querySelector("#toolbar").classList.remove("hidden");
++    document.querySelector("#locationHeader").classList.remove("hidden");
++    document.querySelector("#location").textContent = project.location;
++  }
++
++  document.body.className = project.validationStatus;
++  document.querySelector("#icon").src = project.icon;
++  document.querySelector("h1").textContent = project.name;
++
++  let manifest;
++  if (project.type == "runtimeApp") {
++    manifest = project.app.manifest;
++  } else {
++    manifest = project.manifest;
++  }
++
++  if (manifest) {
++    if (manifest.description) {
++      document.querySelector("#descriptionHeader").classList.remove("hidden");
++      document.querySelector("#description").textContent = manifest.description;
++    }
++
++    document.querySelector("#type").classList.remove("hidden");
++
++    if (project.type == "runtimeApp") {
++      document.querySelector("#type").textContent = manifest.type || "web";
++    } else {
++      document.querySelector("#type").textContent = project.type + " " + (manifest.type || "web");
++    }
++
++    if (project.type == "packaged") {
++      let manifest = AppManager.getProjectManifestURL(project);
++      if (manifest) {
++        document.querySelector("#manifestURLHeader").classList.remove("hidden");
++        document.querySelector("#manifestURL").textContent = manifest;
++      }
++    }
++  }
++
++  let errorsNode = document.querySelector("#errorslist");
++  let warningsNode = document.querySelector("#warningslist");
++
++  if (project.errors) {
++    for (let e of project.errors) {
++      let li = document.createElement("li");
++      li.textContent = e;
++      errorsNode.appendChild(li);
++    }
++  }
++
++  if (project.warnings) {
++    for (let w of project.warnings) {
++      let li = document.createElement("li");
++      li.textContent = w;
++      warningsNode.appendChild(li);
++    }
++  }
++}
++
++function removeProject() {
++  AppManager.removeSelectedProject();
++}
+diff --git a/browser/devtools/fxide/content/details.xhtml b/browser/devtools/fxide/content/details.xhtml
+new file mode 100644
+index 0000000..f87ae32
+--- /dev/null
++++ b/browser/devtools/fxide/content/details.xhtml
+@@ -0,0 +1,52 @@
++<?xml version="1.0" encoding="UTF-8"?>
++
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++
++<!DOCTYPE html [
++  <!ENTITY % fxideDTD SYSTEM "chrome://fxide/locale/fxide.dtd" >
++  %fxideDTD;
++]>
++
++<html xmlns="http://www.w3.org/1999/xhtml">
++  <head>
++    <meta charset="utf8"/>
++    <link rel="stylesheet" href="chrome://fxide/skin/details.css" type="text/css"/>
++    <script type="application/javascript;version=1.8" src="chrome://fxide/content/details.js"></script>
++  </head>
++  <body>
++
++    <div id="toolbar">
++      <button onclick="removeProject()">&details_removeProject_button;</button>
++      <p id="validation_status">
++        <span class="valid">&details_valid_header;</span>
++        <span class="warning">&details_warning_header;</span>
++        <span class="error">&details_error_header;</span>
++      </p>
++    </div>
++
++    <header>
++      <img id="icon"></img>
++      <div>
++        <h1></h1>
++        <p id="type"></p>
++      </div>
++    </header>
++
++    <main>
++      <h3 id="descriptionHeader">&details_description;</h3>
++      <p id="description"></p>
++
++      <h3 id="locationHeader">&details_location;</h3>
++      <p id="location"></p>
++
++      <h3 id="manifestURLHeader">&details_manifestURL;</h3>
++      <p id="manifestURL"></p>
++    </main>
++
++    <ul class="validation_messages" id="errorslist"></ul>
++    <ul class="validation_messages" id="warningslist"></ul>
++
++  </body>
++</html>
+diff --git a/browser/devtools/fxide/content/fxide.js b/browser/devtools/fxide/content/fxide.js
+new file mode 100644
+index 0000000..35ac691
+--- /dev/null
++++ b/browser/devtools/fxide/content/fxide.js
+@@ -0,0 +1,725 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++const Cc = Components.classes;
++const Cu = Components.utils;
++const Ci = Components.interfaces;
++
++Cu.import("resource:///modules/devtools/gDevTools.jsm");
++Cu.import("resource://gre/modules/Promise.jsm");
++
++const {devtools} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
++const {require} = devtools;
++const {Services} = Cu.import("resource://gre/modules/Services.jsm");
++const {AppProjects} = require("devtools/app-manager/app-projects");
++const {Connection} = require("devtools/client/connection-manager");
++const {AppManager} = require("devtools/app-manager");
++
++const Strings = Services.strings.createBundle("chrome://fxide/locale/fxide.properties");
++
++const HTML = "http://www.w3.org/1999/xhtml";
++
++window.addEventListener("load", function onLoad() {
++  window.removeEventListener("load", onLoad);
++  UI.init();
++});
++
++window.addEventListener("unload", function onUnload() {
++  window.removeEventListener("unload", onUnload);
++  UI.uninit();
++});
++
++let UI = {
++  init: function() {
++    AppManager.init();
++
++    this.onMessage = this.onMessage.bind(this);
++    window.addEventListener("message", this.onMessage);
++
++    this.appManagerUpdate = this.appManagerUpdate.bind(this);
++    AppManager.on("app-manager-update", this.appManagerUpdate);
++
++    this.logNode = document.querySelector("#logs");
++
++    this.updateCommands();
++    this.updateRuntimeList();
++
++    this.onfocus = this.onfocus.bind(this);
++    window.addEventListener("focus", this.onfocus, true);
++
++    try {
++      let lastProjectLocation = Services.prefs.getCharPref("devtools.fxide.lastprojectlocation");
++      AppProjects.load().then(() => {
++        let lastProject = AppProjects.get(lastProjectLocation);
++        if (lastProject) {
++          AppManager.selectedProject = lastProject;
++        } else {
++          AppManager.selectedProject = null;
++        }
++      });
++    } catch(e) {
++      AppManager.selectedProject = null;
++    }
++
++    document.querySelector("#toggle-logs").addEventListener("click", function() {
++      document.querySelector("#logs").classList.toggle("expand");
++      UI.logNode.scrollTop = UI.logNode.scrollTopMax;
++    });
++  },
++
++  uninit: function() {
++    window.removeEventListener("focus", this.onfocus, true);
++    AppManager.off("app-manager-update", this.appManagerUpdate);
++    AppManager.uninit();
++    window.removeEventListener("message", this.onMessage);
++  },
++
++  onfocus: function() {
++    // Because we can't track the activity in the folder project,
++    // we need to validate the project regularly. Let's assume that
++    // if a modification happened, it happened when the window was
++    // not focused.
++    if (AppManager.selectedProject &&
++        AppManager.selectedProject.type != "runtimeApp") {
++      AppManager.validateProject(AppManager.selectedProject);
++    }
++  },
++
++  appManagerUpdate: function(event, what, details) {
++    // Got a message from app-manager.js
++    switch (what) {
++      case "console":
++        if (details.level == "log")     this.console.log(details.message);
++        if (details.level == "warning") this.console.warning(details.message);
++        if (details.level == "error")   this.console.error(details.message);
++        if (details.level == "success") this.console.success(details.message);
++        break;
++      case "runtimelist":
++        this.updateRuntimeList();
++        break;
++      case "connection":
++        this.updateRuntimeButton();
++        this.updateCommands();
++        break;
++      case "project":
++        this.updateTitle();
++        this.closeToolbox();
++        this.updateCommands();
++        this.updateProjectButton();
++        this.openProject();
++        break;
++      case "project-is-not-running":
++      case "project-is-running":
++        this.updateCommands();
++        break;
++      case "runtime":
++        this.updateRuntimeButton();
++        break;
++      case "project-validated":
++        this.updateTitle();
++        this.updateCommands();
++        this.updateProjectButton();
++        break;
++    };
++  },
++
++  openInBrowser: function(url) {
++    // Open a URL in a Firefox window
++    let browserWin = Services.wm.getMostRecentWindow("navigator:browser");
++    if (browserWin) {
++      let gBrowser = browserWin.gBrowser;
++      gBrowser.selectedTab = gBrowser.addTab(url);
++      browserWin.focus();
++    } else {
++      window.open(url);
++    }
++  },
++
++  updateTitle: function() {
++    let project = AppManager.selectedProject;
++    if (project) {
++      window.document.title = Strings.formatStringFromName("title_app", [project.name], 1);
++    } else {
++      window.document.title = Strings.GetStringFromName("title_noApp");
++    }
++  },
++
++  hidePanels: function() {
++    let panels = document.querySelectorAll("panel");
++    for (let p of panels) {
++      p.hidePopup();
++    }
++  },
++
++  busy: function() {
++    document.querySelector("window").classList.add("busy")
++    this.updateCommands();
++  },
++
++  unbusy: function() {
++    document.querySelector("window").classList.remove("busy")
++    this.updateCommands();
++  },
++
++  busyUntil: function(promise, operationDescription) {
++    // Freeze the UI until the promise is resolved. A 30s timeout
++    // will unfreeze the UI, just in case the promise never gets
++    // resolved.
++    let timeout = setTimeout(() => {
++      this.unbusy();
++      this.console.error("Operation timeout: " + operationDescription);
++    }, 30000);
++    this.busy();
++    promise.then(() => {
++      clearTimeout(timeout);
++      this.unbusy();
++    }, () => {
++      clearTimeout(timeout);
++      this.unbusy();
++    });
++  },
++
++  /********** RUNTIME **********/
++
++  updateRuntimeList: function() {
++    let USBListNode = document.querySelector("#runtime-panel-usbruntime");
++    let simulatorListNode = document.querySelector("#runtime-panel-simulators");
++    while (USBListNode.hasChildNodes()) {
++      USBListNode.firstChild.remove();
++    }
++    while (simulatorListNode.hasChildNodes()) {
++      simulatorListNode.firstChild.remove();
++    }
++
++    this.console.log("Found " + AppManager.runtimeList.usb.length + " USB devices.");
++    this.console.log("Found " + AppManager.runtimeList.simulators.length + " simulators.");
++    for (let runtime of AppManager.runtimeList.usb) {
++      let panelItemNode = document.createElement("toolbarbutton");
++      panelItemNode.className = "panel-item runtime-panel-item-usbruntime";
++      panelItemNode.setAttribute("label", runtime.getName());
++      USBListNode.appendChild(panelItemNode);
++      let r = runtime;
++      panelItemNode.addEventListener("click", () => {
++        this.hidePanels();
++        this.connectToRuntime(r);
++      }, true);
++    }
++
++    for (let runtime of AppManager.runtimeList.simulators) {
++      let panelItemNode = document.createElement("toolbarbutton");
++      panelItemNode.className = "panel-item runtime-panel-item-simulator";
++      panelItemNode.setAttribute("label", runtime.getName());
++      simulatorListNode.appendChild(panelItemNode);
++      let r = runtime;
++      panelItemNode.addEventListener("click", () => {
++        this.hidePanels();
++        this.connectToRuntime(r);
++      }, true);
++    }
++
++  },
++
++  connectToRuntime: function(runtime) {
++    let name = runtime.getName();
++    let promise = AppManager.connectToRuntime(runtime);
++    this.busyUntil(promise, "connecting to runtime");
++    promise.then(
++      () => {this.console.success("Connected to " + name)},
++      () => {this.console.error("Can't connect to " + name)});
++  },
++
++  updateRuntimeButton: function() {
++    let buttonNode = document.querySelector("#runtime-panel-button");
++    let labelNode = buttonNode.querySelector(".panel-button-label");
++    if (!AppManager.selectedRuntime) {
++      labelNode.setAttribute("value", Strings.GetStringFromName("runtimeButton_label"));
++    } else {
++      let name = AppManager.selectedRuntime.getName();
++      labelNode.setAttribute("value", name);
++    }
++  },
++
++  /********** PROJECTS **********/
++
++  // Panel & button
++
++  updateProjectButton: function() {
++    let buttonNode = document.querySelector("#project-panel-button");
++    let labelNode = buttonNode.querySelector(".panel-button-label");
++    let imageNode = buttonNode.querySelector(".panel-button-image");
++
++    let project = AppManager.selectedProject;
++
++    if (!project) {
++      buttonNode.classList.add("no-project");
++      labelNode.setAttribute("value", Strings.GetStringFromName("projectButton_label"));
++      imageNode.removeAttribute("src");
++    } else {
++      buttonNode.classList.remove("no-project");
++      labelNode.setAttribute("value", project.name);
++      imageNode.setAttribute("src", project.icon);
++    }
++  },
++
++  // details.xhtml
++
++  openProject: function() {
++    let details = document.querySelector("#details");
++    let project = AppManager.selectedProject;
++
++    if (!project) {
++      details.setAttribute("hidden", "true");
++      return;
++    }
++
++    if (project.location) {
++      Services.prefs.setCharPref("devtools.fxide.lastprojectlocation", project.location);
++    }
++
++    details.removeAttribute("hidden");
++  },
++
++  /********** COMMANDS **********/
++
++  updateCommands: function() {
++
++    if (document.querySelector("window").classList.contains("busy")) {
++      document.querySelector("#cmd_newApp").setAttribute("disabled", "true");
++      document.querySelector("#cmd_importPackagedApp").setAttribute("disabled", "true");
++      document.querySelector("#cmd_importHostedApp").setAttribute("disabled", "true");
++      document.querySelector("#cmd_showProjectPanel").setAttribute("disabled", "true");
++      document.querySelector("#cmd_showRuntimePanel").setAttribute("disabled", "true");
++      document.querySelector("#cmd_removeProject").setAttribute("disabled", "true");
++      document.querySelector("#cmd_disconnectRuntime").setAttribute("disabled", "true");
++      document.querySelector("#cmd_showPermissionsTable").setAttribute("disabled", "true");
++      document.querySelector("#cmd_takeScreenshot").setAttribute("disabled", "true");
++      document.querySelector("#cmd_showRuntimeDetails").setAttribute("disabled", "true");
++      document.querySelector("#cmd_play").setAttribute("disabled", "true");
++      document.querySelector("#cmd_stop").setAttribute("disabled", "true");
++      document.querySelector("#cmd_toggleToolbox").setAttribute("disabled", "true");
++      return;
++    }
++
++    document.querySelector("#cmd_newApp").removeAttribute("disabled");
++    document.querySelector("#cmd_importPackagedApp").removeAttribute("disabled");
++    document.querySelector("#cmd_importHostedApp").removeAttribute("disabled");
++    document.querySelector("#cmd_showProjectPanel").removeAttribute("disabled");
++    document.querySelector("#cmd_showRuntimePanel").removeAttribute("disabled");
++
++    // Action commands
++    let playCmd = document.querySelector("#cmd_play");
++    let stopCmd = document.querySelector("#cmd_stop");
++    let debugCmd = document.querySelector("#cmd_toggleToolbox");
++
++    if (!AppManager.selectedProject || AppManager.connection.status != Connection.Status.CONNECTED) {
++      playCmd.setAttribute("disabled", "true");
++      stopCmd.setAttribute("disabled", "true");
++      debugCmd.setAttribute("disabled", "true");
++    } else {
++      let isProjectRunning = AppManager.isProjectRunning();
++      if (isProjectRunning) {
++        stopCmd.removeAttribute("disabled");
++        debugCmd.removeAttribute("disabled");
++      } else {
++        stopCmd.setAttribute("disabled", "true");
++        debugCmd.setAttribute("disabled", "true");
++      }
++
++      // If connected and a project is selected
++      if (AppManager.selectedProject.type == "runtimeApp") {
++        if (isProjectRunning) {
++          playCmd.setAttribute("disabled", "true");
++        } else {
++          playCmd.removeAttribute("disabled");
++        }
++      } else {
++        if (AppManager.selectedProject.errorsCount == 0) {
++          playCmd.removeAttribute("disabled");
++        } else {
++          playCmd.setAttribute("disabled", "true");
++        }
++      }
++    }
++
++    // Remove command
++    let removeCmdNode = document.querySelector("#cmd_removeProject");
++    if (AppManager.selectedProject) {
++      removeCmdNode.removeAttribute("disabled");
++    } else {
++      removeCmdNode.setAttribute("disabled", "true");
++    }
++
++    // Runtime commands
++    let screenshotCmd = document.querySelector("#cmd_takeScreenshot");
++    let permissionsCmd = document.querySelector("#cmd_showPermissionsTable");
++    let detailsCmd = document.querySelector("#cmd_showRuntimeDetails");
++    let disconnectCmd = document.querySelector("#cmd_disconnectRuntime");
++
++    let box = document.querySelector("#runtime-actions");
++
++    if (AppManager.connection.status == Connection.Status.CONNECTED) {
++      screenshotCmd.removeAttribute("disabled");
++      permissionsCmd.removeAttribute("disabled");
++      disconnectCmd.removeAttribute("disabled");
++      detailsCmd.removeAttribute("disabled");
++      box.removeAttribute("hidden");
++    } else {
++      screenshotCmd.setAttribute("disabled", "true");
++      permissionsCmd.setAttribute("disabled", "true");
++      disconnectCmd.setAttribute("disabled", "true");
++      detailsCmd.setAttribute("disabled", "true");
++      box.setAttribute("hidden", "true");
++    }
++
++  },
++
++  /********** TOOLBOX **********/
++
++  onMessage: function(event) {
++    // The custom toolbox sends a message to its parent
++    // window.
++    try {
++      let json = JSON.parse(event.data);
++      switch (json.name) {
++        case "toolbox-close":
++          this.closeToolboxUI();
++          break;
++      }
++    } catch(e) { Cu.reportError(e); }
++  },
++
++  closeToolbox: function() {
++    if (this.toolboxPromise) {
++      this.toolboxPromise.then(toolbox => {
++        toolbox.destroy();
++        this.toolboxPromise = null;
++      }, this.console.error);
++    }
++  },
++
++  showToolbox: function(target) {
++    if (this.toolboxIframe) {
++      return;
++    }
++
++    let splitter = document.querySelector(".devtools-horizontal-splitter");
++    splitter.removeAttribute("hidden");
++
++    let iframe = document.createElement("iframe");
++    document.querySelector("window").insertBefore(iframe, splitter.nextSibling);
++    let host = devtools.Toolbox.HostType.CUSTOM;
++    let options = { customIframe: iframe };
++    this.toolboxIframe = iframe;
++
++    let height = Services.prefs.getIntPref("devtools.toolbox.footer.height");
++    iframe.height = height;
++
++    return gDevTools.showToolbox(target, null, host, options);
++  },
++
++  closeToolboxUI: function() {
++    let body = document.querySelector("#body");
++    body.removeAttribute("hidden");
++
++    Services.prefs.setIntPref("devtools.toolbox.footer.height", this.toolboxIframe.height);
++
++    // We have to destroy the iframe, otherwise, the keybindings of fxide don't work
++    // properly anymore.
++    this.toolboxIframe.remove();
++    this.toolboxIframe = null;
++
++    let splitter = document.querySelector(".devtools-horizontal-splitter");
++    splitter.setAttribute("hidden", "true");
++  },
++
++  console: {
++    _log: function(msg, classname) {
++      let li = document.createElementNS(HTML, "p");
++      li.textContent = msg;
++      li.className = classname;
++      UI.logNode.appendChild(li);
++      UI.logNode.scrollTop = UI.logNode.scrollTopMax;
++    },
++    log: function(msg) {
++      UI.console._log(msg, "log");
++      console.log(msg);
++    },
++    warning: function(msg) {
++      UI.console._log(msg, "warning");
++      console.warning(msg);
++    },
++    error: function(msg) {
++      UI.console._log(msg, "error");
++      console.error(msg);
++    },
++    success: function(msg) {
++      UI.console._log(msg, "success");
++      console.log(msg);
++    },
++  },
++}
++
++
++let Cmds = {
++  quit: function() {
++    window.close();
++  },
++
++  newApp: function() {
++    UI.hidePanels();
++    let ret = {location:null};
++    window.openDialog("chrome://fxide/content/newapp.xul", "newapp", "chrome,modal", ret);
++    if (!ret.location)
++      return;
++    let project = AppProjects.get(ret.location);
++    UI.busyUntil(AppManager.validateProject(project).then(() => {
++      UI.console.success("New project created at " + ret.location);
++      AppManager.selectedProject = project;
++    }, (e) => UI.console.error("Error while create new app: " + e)), "creating new app");;
++  },
++
++  importPackagedApp: function() {
++    UI.hidePanels();
++    let fp = Cc["@mozilla.org/filepicker;1"].createInstance(Ci.nsIFilePicker);
++    fp.init(window, Strings.GetStringFromName("importPackagedApp_title"), Ci.nsIFilePicker.modeGetFolder);
++    let res = fp.show();
++    if (res == Ci.nsIFilePicker.returnCancel)
++      return;
++    UI.busyUntil(AppProjects.addPackaged(fp.file)
++                            .then(project => AppManager.validateProject(project))
++                            .then(project => AppManager.selectedProject = project)
++                            .then(( ) => { UI.console.log("New project successfuly added") },
++                                  (e) => { UI.console.error("Error while importing project: " + e) }),
++                            "importing packaged app");
++  },
++
++
++  importHostedApp: function() {
++    UI.hidePanels();
++    let promptService = Cc["@mozilla.org/embedcomp/prompt-service;1"].getService(Ci.nsIPromptService);
++    let ret = {value:null};
++    promptService.prompt(window,
++                         Strings.GetStringFromName("importHostedApp_title"),
++                         Strings.GetStringFromName("importHostedApp_header"),
++                         ret, null, {});
++    let url = ret.value;
++    if (!url)
++      return;
++    UI.busyUntil(AppProjects.addHosted(url)
++                            .then(project => AppManager.validateProject(project))
++                            .then(project => AppManager.selectedProject = project)
++                            .then(( ) => { UI.console.log("New project successfuly added") },
++                                  (e) => { UI.console.error("Error while importing project: " + e) }),
++                            "importing hosted app");
++  },
++
++
++  showProjectPanel: function() {
++    let panelNode = document.querySelector("#project-panel");
++    let panelVboxNode = document.querySelector("#project-panel > vbox");
++    let anchorNode = document.querySelector("#project-panel-button > .panel-button-anchor");
++    let projectsNode = document.querySelector("#project-panel-projects");
++
++    while (projectsNode.hasChildNodes()) {
++      projectsNode.firstChild.remove();
++    }
++
++    panelNode.openPopup(anchorNode);
++    panelVboxNode.scrollTop = 0;
++
++    AppProjects.load().then(() => {
++      let projects = AppProjects.store.object.projects;
++      for (let i = 0; i < projects.length; i++) {
++        let project = projects[i];
++        let panelItemNode = document.createElement("toolbarbutton");
++        panelItemNode.className = "panel-item";
++        projectsNode.appendChild(panelItemNode);
++        panelItemNode.setAttribute("label", project.name || AppManager.DEFAULT_PROJECT_NAME);
++        panelItemNode.setAttribute("image", project.icon || AppManager.DEFAULT_PROJECT_ICON);
++        if (!project.validationStatus) {
++          // The result of the validation process (storing names, icons, …) has never been
++          // stored in the IndexedDB database. This happens when the project has been created
++          // from the old app manager. We need to run the validation again and update the name
++          // and icon of the app
++          AppManager.validateProject(project).then(() => {
++            panelItemNode.setAttribute("label", project.name);
++            panelItemNode.setAttribute("image", project.icon);
++          });
++        }
++        panelItemNode.addEventListener("click", () => {
++          UI.hidePanels();
++          AppManager.selectedProject = project;
++        }, true);
++      }
++    }, UI.console.error);
++
++
++    let runtimeappsHeaderNode = document.querySelector("#panel-header-runtimeapps");
++    if (AppManager.connection.status == Connection.Status.CONNECTED) {
++      runtimeappsHeaderNode.removeAttribute("hidden");
++    } else {
++      runtimeappsHeaderNode.setAttribute("hidden", "true");
++    }
++
++    let runtimeAppsNode = document.querySelector("#project-panel-runtimeapps");
++    while (runtimeAppsNode.hasChildNodes()) {
++      runtimeAppsNode.firstChild.remove();
++    }
++
++    UI.console.log("Found " + AppManager.webAppsStore.object.all.length + " apps");
++
++    for (let i = 0; i < AppManager.webAppsStore.object.all.length; i++) {
++      let app = AppManager.webAppsStore.object.all[i];
++      let panelItemNode = document.createElement("toolbarbutton");
++      panelItemNode.className = "panel-item";
++      panelItemNode.setAttribute("label", app.name);
++      panelItemNode.setAttribute("image", app.iconURL);
++      runtimeAppsNode.appendChild(panelItemNode);
++      panelItemNode.addEventListener("click", () => {
++        UI.hidePanels();
++        AppManager.selectedProject = {
++          type: "runtimeApp",
++          app: app,
++          icon: app.iconURL,
++          name: app.name
++        };
++      }, true);
++    }
++  },
++
++  showRuntimePanel: function() {
++    let panel = document.querySelector("#runtime-panel");
++    let anchor = document.querySelector("#runtime-panel-button > .panel-button-anchor");
++    panel.openPopup(anchor);
++  },
++
++  disconnectRuntime: function() {
++    UI.busyUntil(AppManager.disconnectRuntime());
++  },
++
++  takeScreenshot: function() {
++    UI.hidePanels();
++    UI.busyUntil(AppManager.deviceFront.screenshotToDataURL().then(longstr => {
++       return longstr.string().then(dataURL => {
++         longstr.release().then(null, UI.console.error);
++         UI.openInBrowser(dataURL);
++       });
++    }));
++  },
++
++  showPermissionsTable: function() {
++    UI.hidePanels();
++    UI.busyUntil(AppManager.deviceFront.getRawPermissionsTable().then(json => {
++      let styleContent = "";
++      styleContent += "body {background:white; font-family: monospace}";
++      styleContent += "table {border-collapse: collapse}";
++      styleContent += "th, td {padding: 5px; border: 1px solid #EEE}";
++      styleContent += "th {min-width: 130px}";
++      styleContent += "td {text-align: center}";
++      styleContent += "th:first-of-type, td:first-of-type {text-align:left}";
++      styleContent += ".permallow  {color:rgb(152, 207, 57)}";
++      styleContent += ".permprompt {color:rgb(0,158,237)}";
++      styleContent += ".permdeny   {color:rgb(204,73,8)}";
++      let style = document.createElementNS(HTML, "style");
++      style.textContent = styleContent;
++      let table = document.createElementNS(HTML, "table");
++      table.innerHTML = "<tr><th>Name</th><th>type:web</th><th>type:privileged</th><th>type:certified</th></tr>";
++      let permissionsTable = json.rawPermissionsTable;
++      for (let name in permissionsTable) {
++        let tr = document.createElementNS(HTML, "tr");
++        let td = document.createElementNS(HTML, "td");
++        td.textContent = name;
++        tr.appendChild(td);
++        for (let type of ["app","privileged","certified"]) {
++          let td = document.createElementNS(HTML, "td");
++          if (permissionsTable[name][type] == json.ALLOW_ACTION) {
++            td.textContent = "✓";
++            td.className = "permallow";
++          }
++          if (permissionsTable[name][type] == json.PROMPT_ACTION) {
++            td.textContent = "!";
++            td.className = "permprompt";
++          }
++          if (permissionsTable[name][type] == json.DENY_ACTION) {
++            td.textContent = "✕";
++            td.className = "permdeny"
++          }
++          tr.appendChild(td);
++        }
++        table.appendChild(tr);
++      }
++      let body = document.createElementNS(HTML, "body");
++      body.appendChild(style);
++      body.appendChild(table);
++      let url = "data:text/html;charset=utf-8,";
++      url += encodeURIComponent(body.outerHTML);
++      UI.openInBrowser(url);
++    }), "showing permission table");
++  },
++
++  showRuntimeDetails: function() {
++    UI.hidePanels();
++    UI.busyUntil(AppManager.deviceFront.getDescription().then(json => {
++      let styleContent = "";
++      styleContent += "body {background:white; font-family: monospace}";
++      styleContent += "table {border-collapse: collapse}";
++      styleContent += "th, td {padding: 5px; border: 1px solid #EEE}";
++      let style = document.createElementNS(HTML, "style");
++      style.textContent = styleContent;
++      let table = document.createElementNS(HTML, "table");
++      for (let name in json) {
++        let tr = document.createElementNS(HTML, "tr");
++        let td = document.createElementNS(HTML, "td");
++        td.textContent = name;
++        tr.appendChild(td);
++        td = document.createElementNS(HTML, "td");
++        td.textContent = json[name];
++        tr.appendChild(td);
++        table.appendChild(tr);
++      }
++      let body = document.createElementNS(HTML, "body");
++      body.appendChild(style);
++      body.appendChild(table);
++      let url = "data:text/html;charset=utf-8,";
++      url += encodeURIComponent(body.outerHTML);
++      UI.openInBrowser(url);
++    }), "showing runtime details");
++
++  },
++
++  play: function() {
++    switch(AppManager.selectedProject.type) {
++      case "packaged":
++      case "hosted":
++        UI.busyUntil(AppManager.installAndRunProject(), "installing and running app");
++        break;
++      case "runtimeApp":
++        UI.busyUntil(AppManager.runRuntimeApp(), "running app");
++        break;
++    }
++  },
++
++  stop: function() {
++    UI.busyUntil(AppManager.stopRunningApp(), "stopping app");
++  },
++
++  toggleToolbox: function() {
++    if (UI.toolboxIframe) {
++      UI.closeToolbox();
++    } else {
++      UI.toolboxPromise = AppManager.getTarget().then((target) => {
++        return UI.showToolbox(target);
++      }, UI.console.error);
++      UI.busyUntil(UI.toolboxPromise, "opening toolbox");
++    }
++  },
++
++  removeProject: function() {
++    AppManager.removeSelectedProject();
++  },
++
++  toggleEditors: function() {
++    // Toggle Itchpad
++  },
++}
+diff --git a/browser/devtools/fxide/content/fxide.xul b/browser/devtools/fxide/content/fxide.xul
+new file mode 100644
+index 0000000..2b0649d
+--- /dev/null
++++ b/browser/devtools/fxide/content/fxide.xul
+@@ -0,0 +1,165 @@
++<?xml version="1.0"?>
++
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++
++<!DOCTYPE window [
++  <!ENTITY % fxideDTD SYSTEM "chrome://fxide/locale/fxide.dtd" >
++  %fxideDTD;
++]>
++
++<?xml-stylesheet href="chrome://global/skin/global.css"?>
++<?xml-stylesheet href="chrome://fxide/skin/fxide.css"?>
++
++<window id="fxide"
++        xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
++        xmlns:html="http://www.w3.org/1999/xhtml"
++        title="&windowTitle;"
++        windowtype="devtools:fxide"
++        macanimationtype="document"
++        fullscreenbutton="true"
++        screenX="4" screenY="4"
++        width="640" height="480"
++        drawtitle="true"
++        persist="screenX screenY width height">
++
++  <script type="application/javascript" src="fxide.js"></script>
++
++  <commandset id="mainCommandSet">
++    <commandset id="editMenuCommands"/>
++    <commandset id="fxideCommands">
++      <command id="cmd_quit" oncommand="Cmds.quit()"/>
++      <command id="cmd_newApp" oncommand="Cmds.newApp()" label="&projectMenu_newApp_label;"/>
++      <command id="cmd_importPackagedApp" oncommand="Cmds.importPackagedApp()" label="&projectMenu_importPackagedApp_label;"/>
++      <command id="cmd_importHostedApp" oncommand="Cmds.importHostedApp()" label="&projectMenu_importHostedApp_label;"/>
++      <command id="cmd_removeProject" oncommand="Cmds.removeProject()" label="&projectMenu_remove_label;"/>
++      <command id="cmd_showProjectPanel" oncommand="Cmds.showProjectPanel()"/>
++      <command id="cmd_showRuntimePanel" oncommand="Cmds.showRuntimePanel()"/>
++      <command id="cmd_disconnectRuntime" oncommand="Cmds.disconnectRuntime()" label="&runtimeMenu_disconnect_label;"/>
++      <command id="cmd_showPermissionsTable" oncommand="Cmds.showPermissionsTable()" label="&runtimeMenu_showPermissionTable_label;"/>
++      <command id="cmd_showRuntimeDetails" oncommand="Cmds.showRuntimeDetails()" label="&runtimeMenu_showDetails_label;"/>
++      <command id="cmd_takeScreenshot" oncommand="Cmds.takeScreenshot()" label="&runtimeMenu_takeScreenshot_label;"/>
++      <command id="cmd_toggleEditor" oncommand="Cmds.toggleEditors()" label="&viewMenu_toggleEditor_label;"/>
++      <command id="cmd_play" oncommand="Cmds.play()"/>
++      <command id="cmd_stop" oncommand="Cmds.stop()"/>
++      <command id="cmd_toggleToolbox" oncommand="Cmds.toggleToolbox()"/>
++    </commandset>
++  </commandset>
++
++  <menubar id="main-menubar">
++    <menu id="menu-project" label="&projectMenu_label;" accesskey="&projectMenu_accesskey;">
++      <menupopup id="menu-project-popup">
++        <menuitem command="cmd_newApp" accesskey="&projectMenu_newApp_accesskey;"/>
++        <menuitem command="cmd_importPackagedApp" accesskey="&projectMenu_importPackagedApp_accesskey;"/>
++        <menuitem command="cmd_importHostedApp" accesskey="&projectMenu_importHostedApp_accesskey;"/>
++        <menuitem command="cmd_showProjectPanel" key="key_showProjectPanel" label="&projectMenu_selectApp_label;" accesskey="&projectMenu_selectApp_accessley;"/>
++        <menuseparator/>
++        <menuitem command="cmd_play" key="key_play" label="&projectMenu_play_label;" accesskey="&projectMenu_play_accesskey;"/>
++        <menuitem command="cmd_stop" key="key_stop" label="&projectMenu_stop_label;" accesskey="&projectMenu_stop_accesskey;"/>
++        <menuitem command="cmd_toggleToolbox" key="key_toggleToolbox" label="&projectMenu_debug_label;" accesskey="&projectMenu_debug_accesskey;"/>
++        <menuseparator/>
++        <menuitem command="cmd_removeProject" accesskey="&projectMenu_remove_accesskey;"/>
++      </menupopup>
++    </menu>
++
++    <menu id="menu-runtime" label="&runtimeMenu_label;" accesskey="&runtimeMenu_accesskey;">
++      <menupopup id="menu-runtime-popup">
++        <menuitem command="cmd_takeScreenshot" accesskey="&runtimeMenu_takeScreenshot_accesskey;"/>
++        <menuitem command="cmd_showPermissionsTable" accesskey="&runtimeMenu_showPermissionTable_accesskey;"/>
++        <menuitem command="cmd_showRuntimeDetails" accesskey="&runtimeMenu_showDetails_accesskey;"/>
++        <menuseparator/>
++        <menuitem command="cmd_disconnectRuntime" accesskey="&runtimeMenu_disconnect_accesskey;"/>
++      </menupopup>
++    </menu>
++
++    <menu id="menu-view" label="&viewMenu_label;" accesskey="&viewMenu_accesskey;">
++      <menupopup id="menu-ViewPopup">
++        <menuitem command="cmd_toggleEditor" key="key_toggleEditor" accesskey="&viewMenu_toggleEditor_accesskey;"/>
++      </menupopup>
++    </menu>
++
++  </menubar>
++
++  <keyset id="mainKeyset">
++    <key key="&key_quit;" id="key_quit" command="cmd_quit" modifiers="accel"/>
++    <key key="&key_showProjectPanel;" id="key_showProjectPanel" command="cmd_showProjectPanel" modifiers="accel"/>
++    <key key="&key_play;" id="key_play" command="cmd_play" modifiers="accel"/>
++    <key key="&key_stop;" id="key_stop" command="cmd_stop" modifiers="accel"/>
++    <key key="&key_toggleEditor;" id="key_toggleEditor" command="cmd_toggleEditor" modifiers="accel"/>
++    <key keycode="&key_toggleToolbox;" id="key_toggleToolbox" command="cmd_toggleToolbox"/>
++  </keyset>
++
++  <toolbar id="main-toolbar">
++
++    <vbox flex="1">
++      <hbox id="action-buttons-container" class="busy">
++        <toolbarbutton id="action-button-play"  class="action-button" command="cmd_play" tooltiptext="&projectMenu_play_label;"/>
++        <toolbarbutton id="action-button-stop"  class="action-button" command="cmd_stop" tooltiptext="&projectMenu_stop_label;"/>
++        <toolbarbutton id="action-button-debug" class="action-button" command="cmd_toggleToolbox" tooltiptext="&projectMenu_debug_label;"/>
++        <html:img id="action-busy" src="chrome://fxide/skin/throbber.svg"/>
++      </hbox>
++
++      <hbox id="panel-buttons-container">
++        <toolbarbutton id="project-panel-button" class="panel-button no-project" command="cmd_showProjectPanel">
++          <image class="panel-button-image"/>
++          <label class="panel-button-label" value="&projectButton_label;"/>
++          <image class="panel-button-anchor"/>
++        </toolbarbutton>
++        <spacer flex="1"/>
++        <toolbarbutton id="runtime-panel-button" class="panel-button" command="cmd_showRuntimePanel">
++          <image class="panel-button-image"/>
++          <label class="panel-button-label" value="&runtimeButton_label;"/>
++          <image class="panel-button-anchor"/>
++        </toolbarbutton>
++      </hbox>
++
++    </vbox>
++  </toolbar>
++
++  <popupset>
++
++    <!-- App panel -->
++    <panel id="project-panel" type="arrow" position="bottomcenter topleft" consumeoutsideclicks="true">
++      <vbox flex="1">
++        <toolbarbutton class="panel-item project-panel-item-newapp" command="cmd_newApp"/>
++        <toolbarbutton class="panel-item project-panel-item-openpackaged" command="cmd_importPackagedApp"/>
++        <toolbarbutton class="panel-item project-panel-item-openhosted" command="cmd_importHostedApp"/>
++        <label class="panel-header">&projectPanel_myProjects;</label>
++        <vbox id="project-panel-projects"></vbox>
++        <label class="panel-header" id="panel-header-runtimeapps" hidden="true">&projectPanel_runtimeApps;</label>
++        <vbox flex="1" id="project-panel-runtimeapps"/>
++      </vbox>
++    </panel>
++
++    <!-- Runtime panel -->
++    <panel id="runtime-panel" type="arrow" position="bottomcenter topright" consumeoutsideclicks="true">
++      <vbox flex="1">
++        <label class="panel-header">&runtimePanel_USBDevices;</label>
++        <vbox id="runtime-panel-usbruntime"></vbox>
++        <label class="panel-header">&runtimePanel_simulators;</label>
++        <vbox id="runtime-panel-simulators"></vbox>
++        <vbox flex="1" id="runtime-actions" hidden="true">
++          <toolbarbutton class="panel-item" id="runtime-details" command="cmd_showRuntimeDetails"/>
++          <toolbarbutton class="panel-item" id="runtime-permissions" command="cmd_showPermissionsTable"/>
++          <toolbarbutton class="panel-item" id="runtime-screenshot"  command="cmd_takeScreenshot"/>
++        </vbox>
++      </vbox>
++    </panel>
++
++  </popupset>
++
++  <vbox flex="1" id="body">
++    <iframe id="details" flex="1" hidden="true" src="details.xhtml"/>
++  </vbox>
++
++  <splitter hidden="true" class="devtools-horizontal-splitter" orient="vertical"/>
++
++  <!-- toolbox iframe will be inserted here -->
++
++  <html:div id="logs-container">
++    <html:pre id="logs"></html:pre>
++    <html:button id="toggle-logs">&logs;</html:button>
++  </html:div>
++
++</window>
+diff --git a/browser/devtools/fxide/content/jar.mn b/browser/devtools/fxide/content/jar.mn
+new file mode 100644
+index 0000000..8dd0c07
+--- /dev/null
++++ b/browser/devtools/fxide/content/jar.mn
+@@ -0,0 +1,12 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++fxide.jar:
++%  content fxide %content/
++    content/fxide.xul                 (fxide.xul)
++    content/fxide.js                  (fxide.js)
++    content/newapp.xul                (newapp.xul)
++    content/newapp.js                 (newapp.js)
++    content/details.xhtml             (details.xhtml)
++    content/details.js                (details.js)
+diff --git a/browser/devtools/fxide/content/moz.build b/browser/devtools/fxide/content/moz.build
+new file mode 100644
+index 0000000..3bbe672
+--- /dev/null
++++ b/browser/devtools/fxide/content/moz.build
+@@ -0,0 +1,7 @@
++# -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++JAR_MANIFESTS += ['jar.mn']
+diff --git a/browser/devtools/fxide/content/newapp.js b/browser/devtools/fxide/content/newapp.js
+new file mode 100644
+index 0000000..6ecee41
+--- /dev/null
++++ b/browser/devtools/fxide/content/newapp.js
+@@ -0,0 +1,161 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++const Cc = Components.classes;
++const Cu = Components.utils;
++const Ci = Components.interfaces;
++Cu.import("resource://gre/modules/Services.jsm");
++
++Cu.import("resource://gre/modules/XPCOMUtils.jsm");
++
++XPCOMUtils.defineLazyModuleGetter(this, "ZipUtils", "resource://gre/modules/ZipUtils.jsm");
++XPCOMUtils.defineLazyModuleGetter(this, "Downloads", "resource://gre/modules/Downloads.jsm");
++
++const {require} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {}).devtools;
++const {FileUtils} = Cu.import("resource://gre/modules/FileUtils.jsm");
++const {AppProjects} = require("devtools/app-manager/app-projects");
++const APP_CREATOR_LIST = "devtools.fxide.templatesURL";
++const {AppManager} = require("devtools/app-manager");
++
++let gTemplateList = null;
++
++window.addEventListener("load", function onLoad() {
++  window.removeEventListener("load", onLoad);
++  let projectNameNode = document.querySelector("#project-name");
++  projectNameNode.addEventListener("input", canValidate, true);
++  getJSON();
++}, true);
++
++function getJSON() {
++  let xhr = new XMLHttpRequest();
++  xhr.overrideMimeType('text/plain');
++  xhr.onload = function() {
++    let list;
++    try {
++      list = JSON.parse(this.responseText);
++      if (!Array.isArray(list)) {
++        throw new Error("JSON response not an array");
++      }
++      if (list.length == 0) {
++        throw new Error("JSON response is an empty array");
++      }
++    } catch(e) {
++      return failAndBail("Invalid response from server");
++    }
++    gTemplateList = list;
++    let templatelistNode = document.querySelector("#templatelist");
++    templatelistNode.innerHTML = "";
++    for (let template of list) {
++      let richlistitemNode = document.createElement("richlistitem");
++      let imageNode = document.createElement("image");
++      imageNode.setAttribute("src", template.icon);
++      let labelNode = document.createElement("label");
++      labelNode.setAttribute("value", template.name);
++      let descriptionNode = document.createElement("description");
++      descriptionNode.textContent = template.description;
++      let vboxNode = document.createElement("vbox");
++      vboxNode.setAttribute("flex", "1");
++      richlistitemNode.appendChild(imageNode);
++      vboxNode.appendChild(labelNode);
++      vboxNode.appendChild(descriptionNode);
++      richlistitemNode.appendChild(vboxNode);
++      templatelistNode.appendChild(richlistitemNode);
++    }
++    templatelistNode.selectedIndex = 0;
++  };
++  xhr.onerror = function() {
++    failAndBail("Can't download app templates");
++  };
++  let url = Services.prefs.getCharPref(APP_CREATOR_LIST);
++  xhr.open("get", url);
++  xhr.send();
++}
++
++function failAndBail(msg) {
++  let promptService = Cc["@mozilla.org/embedcomp/prompt-service;1"].getService(Ci.nsIPromptService);
++  promptService.alert(window, "error", msg);
++  window.close();
++}
++
++function canValidate() {
++  let projectNameNode = document.querySelector("#project-name");
++  let dialogNode = document.querySelector("dialog");
++  if (projectNameNode.value.length > 0) {
++    dialogNode.removeAttribute("buttondisabledaccept");
++  } else {
++    dialogNode.setAttribute("buttondisabledaccept", "true");
++  }
++}
++
++function doOK() {
++  let projectName = document.querySelector("#project-name").value;
++
++  if (!projectName) {
++    AppManager.console.error("No project name");
++    return false;
++  }
++
++  if (!gTemplateList) {
++    AppManager.console.error("No template index");
++    return false;
++  }
++
++  let templatelistNode = document.querySelector("#templatelist");
++  if (templatelistNode.selectedIndex < 0) {
++    AppManager.console.error("No template selected");
++    return false;
++  }
++
++  let fp = Cc["@mozilla.org/filepicker;1"].createInstance(Ci.nsIFilePicker);
++  fp.init(window, "Select directory where to create app directory", Ci.nsIFilePicker.modeGetFolder);
++  let res = fp.show();
++  if (res == Ci.nsIFilePicker.returnCancel) {
++    AppManager.console.error("No directory selected");
++    return false;
++  }
++  let folder = fp.file;
++
++  // Create subfolder with fs-friendly name of project
++  let subfolder = projectName.replace(/\W/g, '').toLowerCase();
++  folder.append(subfolder);
++
++  try {
++    folder.create(Ci.nsIFile.DIRECTORY_TYPE, FileUtils.PERMS_DIRECTORY);
++  } catch(e) {
++    AppManager.console.error(e);
++    return false;
++  }
++
++  // Download boilerplate zip
++  let template = gTemplateList[templatelistNode.selectedIndex];
++  let source = template.file;
++  let target = folder.clone();
++  target.append(subfolder + ".zip");
++
++  let bail = (e) => {
++    AppManager.console.error(e);
++    window.close();
++  };
++
++  Downloads.fetch(source, target).then(() => {
++    ZipUtils.extractFiles(target, folder);
++    target.remove(false);
++    AppProjects.addPackaged(folder).then((project) => {
++      window.arguments[0].location = project.location;
++      AppManager.validateProject(project).then(() => {
++        if (project.manifest) {
++          project.manifest.name = projectName;
++          AppManager.writeManifest(project).then(() => {
++            AppManager.validateProject(project).then(
++              () => {window.close()}, bail)
++          }, bail)
++        } else {
++          bail("Manifest not found");
++        }
++      }, bail)
++    }, bail)
++  }, bail);
++
++  return false;
++}
+diff --git a/browser/devtools/fxide/content/newapp.xul b/browser/devtools/fxide/content/newapp.xul
+new file mode 100644
+index 0000000..6deff03
+--- /dev/null
++++ b/browser/devtools/fxide/content/newapp.xul
+@@ -0,0 +1,33 @@
++<?xml version="1.0"?>
++
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++
++<!DOCTYPE window [
++  <!ENTITY % fxideDTD SYSTEM "chrome://fxide/locale/fxide.dtd" >
++  %fxideDTD;
++]>
++
++<?xml-stylesheet href="chrome://global/skin/global.css"?>
++<?xml-stylesheet href="chrome://fxide/skin/newapp.css"?>
++
++<dialog id="fxide:newapp" title="&newAppWindowTitle;"
++  width="600" height="400"
++  buttons="accept,cancel"
++  ondialogaccept="return doOK();"
++  buttondisabledaccept="true"
++  xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
++
++  <script type="application/javascript" src="newapp.js"></script>
++  <label class="header-name" value="&newAppHeader;"/>
++
++  <richlistbox id="templatelist" flex="1">
++    <description>&newAppLoadingTemplate;</description>
++  </richlistbox>
++  <vbox>
++    <label class="header-name" control="project-name" value="&newAppProjectName;"/>
++    <textbox id="project-name"/>
++  </vbox>
++
++</dialog>
+diff --git a/browser/devtools/fxide/fxide-prefs.js b/browser/devtools/fxide/fxide-prefs.js
+new file mode 100644
+index 0000000..03275f7
+--- /dev/null
++++ b/browser/devtools/fxide/fxide-prefs.js
+@@ -0,0 +1,6 @@
++# -*- Mode: JavaScript; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 2 -*-
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++pref("devtools.fxide.templatesURL", "http://fixme/");
+diff --git a/browser/devtools/fxide/locales/Makefile.in b/browser/devtools/fxide/locales/Makefile.in
+new file mode 100644
+index 0000000..82f614e
+--- /dev/null
++++ b/browser/devtools/fxide/locales/Makefile.in
+@@ -0,0 +1,5 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++DEFINES += -DAB_CD=$(AB_CD)
+diff --git a/browser/devtools/fxide/locales/en-US/fxide.dtd b/browser/devtools/fxide/locales/en-US/fxide.dtd
+new file mode 100644
+index 0000000..bab418b
+--- /dev/null
++++ b/browser/devtools/fxide/locales/en-US/fxide.dtd
+@@ -0,0 +1,80 @@
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++
++<!ENTITY windowTitle "Firefox App Manager">
++
++<!ENTITY projectMenu_label "Project">
++<!ENTITY projectMenu_accesskey "P">
++<!ENTITY projectMenu_newApp_label "New App…">
++<!ENTITY projectMenu_newApp_accesskey "N">
++<!ENTITY projectMenu_importPackagedApp_label "Open Packaged App…">
++<!ENTITY projectMenu_importPackagedApp_accesskey "P">
++<!ENTITY projectMenu_importHostedApp_label "Open Hosted App…">
++<!ENTITY projectMenu_importHostedApp_accesskey "H">
++<!ENTITY projectMenu_selectApp_label "Open App…">
++<!ENTITY projectMenu_selectApp_accessley "S">
++<!ENTITY projectMenu_play_label "Install and run">
++<!ENTITY projectMenu_play_accesskey "I">
++<!ENTITY projectMenu_stop_label "Stop App">
++<!ENTITY projectMenu_stop_accesskey "S">
++<!ENTITY projectMenu_debug_label "Debug App">
++<!ENTITY projectMenu_debug_accesskey "D">
++<!ENTITY projectMenu_remove_label "Remove Project">
++<!ENTITY projectMenu_remove_accesskey "R">
++
++<!ENTITY runtimeMenu_label "Runtime">
++<!ENTITY runtimeMenu_accesskey "R">
++<!ENTITY runtimeMenu_disconnect_label "Disconnect">
++<!ENTITY runtimeMenu_disconnect_accesskey "D">
++<!ENTITY runtimeMenu_showPermissionTable_label "Permissions Table">
++<!ENTITY runtimeMenu_showPermissionTable_accesskey "P">
++<!ENTITY runtimeMenu_takeScreenshot_label "Screenshot">
++<!ENTITY runtimeMenu_takeScreenshot_accesskey "S">
++<!ENTITY runtimeMenu_showDetails_label "Runtime Info">
++<!ENTITY runtimeMenu_showDetails_accesskey "E">
++
++<!ENTITY viewMenu_label "View">
++<!ENTITY viewMenu_accesskey "V">
++<!ENTITY viewMenu_toggleEditor_label "Toggle Editor">
++<!ENTITY viewMenu_toggleEditor_accesskey "E">
++
++<!ENTITY projectButton_label "Open App">
++<!ENTITY runtimeButton_label "Select Runtime">
++
++<!-- We try to repicate Firefox' bindings: -->
++<!-- quit app -->
++<!ENTITY key_quit "Q">
++<!-- open menu -->
++<!ENTITY key_showProjectPanel "O">
++<!-- reload app -->
++<!ENTITY key_play "R">
++<!-- close app -->
++<!ENTITY key_stop "W">
++<!-- show toolbox -->
++<!ENTITY key_toggleToolbox "VK_F12">
++<!-- toggle sidebar -->
++<!ENTITY key_toggleEditor "B">
++
++<!ENTITY projectPanel_myProjects "My Projects">
++<!ENTITY projectPanel_runtimeApps "Runtime Apps">
++<!ENTITY runtimePanel_USBDevices "USB Devices">
++<!ENTITY runtimePanel_simulators "Simulators">
++
++<!ENTITY logs "Logs">
++
++
++<!-- Lense -->
++<!ENTITY details_valid_header "valid">
++<!ENTITY details_warning_header "warnings">
++<!ENTITY details_error_header "errors">
++<!ENTITY details_description "Description">
++<!ENTITY details_location "Location">
++<!ENTITY details_manifestURL "App ID">
++<!ENTITY details_removeProject_button "Remove Project">
++
++<!-- New App -->
++<!ENTITY newAppWindowTitle "New App">
++<!ENTITY newAppHeader "Select template">
++<!ENTITY newAppLoadingTemplate "Loading templates…">
++<!ENTITY newAppProjectName "Project Name:">
+diff --git a/browser/devtools/fxide/locales/en-US/fxide.properties b/browser/devtools/fxide/locales/en-US/fxide.properties
+new file mode 100644
+index 0000000..47986ba0
+--- /dev/null
++++ b/browser/devtools/fxide/locales/en-US/fxide.properties
+@@ -0,0 +1,13 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++title_noApp=Firefox App Manager
++title_app=Firefox App Manager: %S
++
++runtimeButton_label=Select Runtime
++projectButton_label=Open App
++
++importPackagedApp_title=Select directory
++importHostedApp_title=Open Hosted Ap
++importHostedApp_header=Enter Manifest URL
+diff --git a/browser/devtools/fxide/locales/jar.mn b/browser/devtools/fxide/locales/jar.mn
+new file mode 100644
+index 0000000..2848f8e
+--- /dev/null
++++ b/browser/devtools/fxide/locales/jar.mn
+@@ -0,0 +1,10 @@
++#filter substitution
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++
++fxide.jar:
++% locale fxide @AB_CD@ %locale/
++  locale/fxide.dtd           (%fxide.dtd)
++  locale/fxide.properties    (%fxide.properties)
+diff --git a/browser/devtools/fxide/locales/moz.build b/browser/devtools/fxide/locales/moz.build
+new file mode 100644
+index 0000000..c97072b
+--- /dev/null
++++ b/browser/devtools/fxide/locales/moz.build
+@@ -0,0 +1,7 @@
++# -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++JAR_MANIFESTS += ['jar.mn']
+\ No newline at end of file
+diff --git a/browser/devtools/fxide/modules/app-manager.js b/browser/devtools/fxide/modules/app-manager.js
+new file mode 100644
+index 0000000..3d0d7c0
+--- /dev/null
++++ b/browser/devtools/fxide/modules/app-manager.js
+@@ -0,0 +1,540 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++const {Cu} = require("chrome");
++
++Cu.import("resource://gre/modules/Promise.jsm");
++
++const {Devices} = Cu.import("resource://gre/modules/devtools/Devices.jsm");
++const {Services} = Cu.import("resource://gre/modules/Services.jsm");
++const {FileUtils} = Cu.import("resource://gre/modules/FileUtils.jsm");
++const {Simulator} = Cu.import("resource://gre/modules/devtools/Simulator.jsm");
++const {EventEmitter} = Cu.import("resource://gre/modules/devtools/event-emitter.js");
++const {TextEncoder, OS}  = Cu.import("resource://gre/modules/osfile.jsm", {});
++const {AppProjects} = require("devtools/app-manager/app-projects");
++const WebappsStore = require("devtools/app-manager/webapps-store");
++const {AppValidator} = require("devtools/app-manager/app-validator");
++const {ConnectionManager, Connection} = require("devtools/client/connection-manager");
++const AppActorFront = require("devtools/app-actor-front");
++const {getDeviceFront} = require("devtools/server/actors/device");
++
++exports.AppManager = AppManager = {
++
++  // FIXME: will break when devtools/app-manager will be removed:
++  DEFAULT_PROJECT_ICON: "chrome://browser/skin/devtools/app-manager/default-app-icon.png",
++  DEFAULT_PROJECT_NAME: "--",
++
++  init: function() {
++    let host = Services.prefs.getCharPref("devtools.debugger.remote-host");
++    let port = Services.prefs.getIntPref("devtools.debugger.remote-port");
++
++    this.connection = ConnectionManager.createConnection("localhost", port);
++    this.onConnectionChanged = this.onConnectionChanged.bind(this);
++    this.connection.on(Connection.Events.STATUS_CHANGED, this.onConnectionChanged);
++    this.webAppsStore = new WebappsStore(this.connection);
++
++    this.runtimeList = {usb:[], simulators:[]};
++    this.trackUSBRuntimes();
++    this.trackSimulatorRuntimes();
++  },
++
++  uninit: function() {
++    this._unlistenToApps();
++    this.selectedProject = null;
++    this.selectedRuntime = null;
++    this.untrackUSBRuntimes();
++    this.untrackSimulatorRuntimes();
++    this._runningApps.clear();
++    this.runtimeList = null;
++    this.connection.off(Connection.Events.STATUS_CHANGED, this.onConnectionChanged);
++    this.webAppsStore.destroy();
++    this._listTabsResponse = null;
++    this.connection.disconnect();
++    this.connection = null;
++  },
++
++  console: {
++    // Forward console.* calls to the UI
++    log: function(msg)      { AppManager.update("console", {level: "log", message: msg}); },
++    warning: function(msg)  { AppManager.update("console", {level: "warning", message: msg}); },
++    error: function(msg)    { AppManager.update("console", {level: "error", message: msg}); },
++    success: function(msg)  { AppManager.update("console", {level: "success", message: msg}); },
++  },
++
++  update: function(what, details) {
++    // Anything we want to forward to the UI
++    this.emit("app-manager-update", what, details);
++  },
++
++  onConnectionChanged: function() {
++    if (this.connection.status == Connection.Status.DISCONNECTED) {
++      this.selectedRuntime = null;
++    }
++
++    if (this.connection.status != Connection.Status.CONNECTED) {
++      AppManager.console.log("Connection status changed: " + this.connection.status);
++      this._runningApps.clear();
++      this._unlistenToApps();
++      this._listTabsResponse = null;
++    } else {
++      this.connection.client.listTabs((response) => {
++        this._listenToApps();
++        this._listTabsResponse = response;
++        this._getRunningApps();
++      });
++    }
++
++    this.update("connection");
++  },
++
++  _runningApps: new Set(),
++  _getRunningApps: function() {
++    let client = this.connection.client;
++    let request = {
++      to: this._listTabsResponse.webappsActor,
++      type: "listRunningApps"
++    };
++    client.request(request, (res) => {
++      if (res.error) {
++        AppManager.console.error("listRunningApps error: " + res.error);
++      }
++      for (let m of res.apps) {
++        this._runningApps.add(m);
++      }
++    });
++    this.checkIfProjectIsRunning();
++  },
++  _listenToApps: function() {
++    let client = this.connection.client;
++    client.addListener("appOpen", (type, { manifestURL }) => {
++      AppManager.console.log("App open: " + manifestURL);
++      this._runningApps.add(manifestURL);
++      this.checkIfProjectIsRunning();
++    });
++
++    client.addListener("appClose", (type, { manifestURL }) => {
++      AppManager.console.log("App close: " + manifestURL);
++      this._runningApps.delete(manifestURL);
++      this.checkIfProjectIsRunning();
++    });
++  },
++  _unlistenToApps: function() {
++    // Is that even possible?
++    // connection.client is null now.
++  },
++
++  isProjectRunning: function() {
++    let manifest = this.getProjectManifestURL(this.selectedProject);
++    return manifest && this._runningApps.has(manifest);
++  },
++
++  checkIfProjectIsRunning: function() {
++    if (this.selectedProject) {
++      if (this.isProjectRunning()) {
++        AppManager.console.log("Project is running on " + this.selectedRuntime.getName());
++        this.update("project-is-running");
++          this._notRunningLogged = false;
++      } else {
++        this.update("project-is-not-running");
++        if (!this._notRunningLogged) {
++          this._notRunningLogged = true;
++          AppManager.console.log("Project is not running");
++        }
++      }
++    }
++  },
++
++  getTarget: function() {
++    let manifest = this.getProjectManifestURL(this.selectedProject);
++    let name = this.selectedProject.name;
++    if (manifest) {
++      let client = this.connection.client;
++      let actor = this._listTabsResponse.webappsActor;
++
++      let promise = AppActorFront.getTargetForApp(client, actor, manifest);
++      promise.then(( ) => { AppManager.console.log("Connected to app: " + name) },
++                   (e) => { AppManager.console.error("Can't connect to app: " + e) });
++      return promise;
++
++    }
++    AppManager.console.error("Can't find manifestURL for selected project");
++    return Promise.reject();
++  },
++
++
++  getProjectManifestURL: function(project) {
++    let manifest = null;
++    if (project.type == "runtimeApp") {
++      manifest = project.app.manifestURL;
++    }
++
++    if (project.type == "hosted") {
++      manifest = project.location;
++    }
++
++    if (project.type == "packaged" && project.packagedAppOrigin) {
++      manifest = "app://" + project.packagedAppOrigin + "/manifest.webapp";
++    }
++
++    return manifest;
++  },
++
++  _selectedProject: null,
++  set selectedProject(value) {
++    if (value != this.selectedProject) {
++      this._selectedProject = value;
++
++      if (this.selectedProject) {
++        AppManager.console.log("New project selected: " + this.selectedProject.name);
++        if (this.selectedProject.type == "runtimeApp") {
++          this.runRuntimeApp();
++        } else {
++          this.validateProject(this.selectedProject);
++        }
++      } else {
++        AppManager.console.log("No project selected");
++      }
++
++      this.update("project");
++
++      this.checkIfProjectIsRunning();
++    }
++  },
++  get selectedProject() {
++    return this._selectedProject;
++  },
++
++  removeSelectedProject: function() {
++    let location = this.selectedProject.location;
++    AppManager.selectedProject = null;
++    AppProjects.remove(location);
++  },
++
++  _selectedRuntime: null,
++  set selectedRuntime(value) {
++    this._selectedRuntime = value;
++    if (!value &&
++      this.selectedProject &&
++      this.selectedProject.type == "runtimeApp") {
++      this.selectedProject = null;
++    }
++    this.update("runtime");
++  },
++
++  get selectedRuntime() {
++    return this._selectedRuntime;
++  },
++
++  connectToRuntime: function(runtime) {
++    if (this.connection.status == Connection.Status.CONNECTED) {
++      return Promise.reject("Already connected");
++    }
++    this.selectedRuntime = runtime;
++    let deferred = Promise.defer();
++
++    AppManager.console.log("Connecting to " + runtime.getName());
++    let onConnectedOrDisconnected = () => {
++      this.connection.off(Connection.Events.CONNECTED, onConnectedOrDisconnected);
++      this.connection.off(Connection.Events.DISCONNECTED, onConnectedOrDisconnected);
++      if (this.connection.status == Connection.Status.CONNECTED) {
++        deferred.resolve();
++      } else {
++        deferred.reject();
++      }
++    }
++    this.connection.on(Connection.Events.CONNECTED, onConnectedOrDisconnected);
++    this.connection.on(Connection.Events.DISCONNECTED, onConnectedOrDisconnected);
++    this.selectedRuntime.connect(this.connection).then(
++      () => {},
++      () => {deferred.reject()});
++
++    return deferred.promise;
++  },
++
++  get deviceFront() {
++    if (!this._listTabsResponse) {
++      return null;
++    }
++    return getDeviceFront(this.connection.client, this._listTabsResponse);
++  },
++
++  disconnectRuntime: function() {
++    if (this.connection.status != Connection.Status.CONNECTED) {
++      return Promise.reject("Already disconnected");
++    }
++    let deferred = Promise.defer();
++    this.connection.once(Connection.Events.DISCONNECTED, () => deferred.resolve());
++    this.connection.disconnect();
++    return deferred.promise;
++  },
++
++  runRuntimeApp: function() {
++    if (this.selectedProject && this.selectedProject.type != "runtimeApp") {
++      return Promise.reject("attempting to run a non-runtime app");
++    }
++    let client = this.connection.client;
++    let actor = this._listTabsResponse.webappsActor;
++    let manifest = this.getProjectManifestURL(this.selectedProject);
++    return AppActorFront.launchApp(client, actor, manifest);
++  },
++
++  installAndRunProject: function() {
++    let project = this.selectedProject;
++
++    if (!project ||
++        !this._listTabsResponse ||
++        (project.type != "packaged" && project.type != "hosted")) {
++      AppManager.console.error("Can't install project. Unknown type of project.");
++      return Promise.reject("Can't install");
++    }
++
++    return this.validateProject(project).then(() => {
++
++      if (project.errorsCount > 0) {
++        AppManager.console.error("Can't install project. Validation errors.");
++        return;
++      }
++
++      let client = this.connection.client;
++      let actor = this._listTabsResponse.webappsActor;
++      let installPromise;
++
++      if (project.type == "packaged") {
++        installPromise = AppActorFront.installPackaged(client, actor, project.location, project.packagedAppOrigin)
++              .then(({ appId }) => {
++                // If the packaged app specified a custom origin override,
++                // we need to update the local project origin
++                project.packagedAppOrigin = appId;
++                // And ensure the indexed db on disk is also updated
++                AppProjects.update(project);
++              });
++      }
++
++      if (project.type == "hosted") {
++        let manifestURLObject = Services.io.newURI(project.location, null, null);
++        let origin = Services.io.newURI(manifestURLObject.prePath, null, null);
++        let appId = origin.host;
++        let metadata = {
++          origin: origin.spec,
++          manifestURL: project.location
++        };
++        installPromise = AppActorFront.installHosted(client, actor, appId, metadata, project.manifest);
++      }
++
++      if (!installPromise) {
++        return Promise.reject("Can't install");
++      }
++
++      return installPromise.then(() => {
++        let manifest = this.getProjectManifestURL(project);
++        if (!this._runningApps.has(manifest)) {
++          AppManager.console.log("Launching app: " + project.name);
++          AppActorFront.launchApp(client, actor, manifest);
++        } else {
++          AppManager.console.log("Reloading app: " + project.name);
++          AppActorFront.reloadApp(client, actor, manifest);
++        }
++      });
++
++    }, AppManager.console.error);
++  },
++
++  stopRunningApp: function() {
++    let client = this.connection.client;
++    let actor = this._listTabsResponse.webappsActor;
++    let manifest = this.getProjectManifestURL(this.selectedProject);
++    return AppActorFront.closeApp(client, actor, manifest);
++  },
++
++  /* PROJECT VALIDATION */
++
++  validateProject: function(project) {
++    if (!project) {
++      return Promise.reject();
++    }
++
++    let validation = new AppValidator(project);
++    return validation.validate()
++      .then(() => {
++        if (validation.manifest) {
++          let manifest = validation.manifest;
++          let iconPath;
++          if (manifest.icons) {
++            let size = Object.keys(manifest.icons).sort(function(a, b) b - a)[0];
++            if (size) {
++              iconPath = manifest.icons[size];
++            }
++          }
++          if (!iconPath) {
++            project.icon = AppManager.DEFAULT_PROJECT_ICON;
++          } else {
++            if (project.type == "hosted") {
++              let manifestURL = Services.io.newURI(project.location, null, null);
++              let origin = Services.io.newURI(manifestURL.prePath, null, null);
++              project.icon = Services.io.newURI(iconPath, null, origin).spec;
++            } else if (project.type == "packaged") {
++              let projectFolder = FileUtils.File(project.location);
++              let folderURI = Services.io.newFileURI(projectFolder).spec;
++              project.icon = folderURI + iconPath.replace(/^\/|\\/, "");
++            }
++          }
++          project.manifest = validation.manifest;
++
++          if ("name" in project.manifest) {
++            project.name = project.manifest.name;
++          } else {
++            project.name = AppManager.DEFAULT_PROJECT_NAME;
++          }
++        } else {
++          project.manifest = null;
++          project.icon = AppManager.DEFAULT_PROJECT_ICON;
++          project.name = AppManager.DEFAULT_PROJECT_NAME;
++        }
++
++        project.validationStatus = "valid";
++
++        if (validation.warnings.length > 0) {
++          project.warningsCount = validation.warnings.length;
++          project.warnings = validation.warnings;
++          project.validationStatus = "warning";
++          AppManager.console.warning("Validation (" + project.name + "): found " + validation.warnings.length + " warnings.");
++        } else {
++          project.warnings = "";
++          project.warningsCount = 0;
++          AppManager.console.log("Validation (" + project.name + "): no warnings found.");
++        }
++
++        if (validation.errors.length > 0) {
++          project.errorsCount = validation.errors.length;
++          project.errors = validation.errors;
++          project.validationStatus = "error";
++          AppManager.console.error("Validation (" + project.name + "): found " + validation.errors.length + " errors.");
++        } else {
++          project.errors = "";
++          project.errorsCount = 0;
++          AppManager.console.log("Validation (" + project.name + "): no errors found.");
++        }
++
++        if (project.warningsCount && project.errorsCount) {
++          project.validationStatus = "error warning";
++        }
++
++        if (this.selectedProject === project) {
++          this.update("project-validated");
++        }
++
++        if (AppProjects.get(project.location)) {
++          AppProjects.update(project);
++        }
++
++        return project;
++      }, AppManager.console.error);
++  },
++
++  /* RUNTIME LIST */
++
++  trackUSBRuntimes: function() {
++    this._updateUSBRuntimes = this._updateUSBRuntimes.bind(this);
++    Devices.on("register", this._updateUSBRuntimes);
++    Devices.on("unregister", this._updateUSBRuntimes);
++    Devices.on("addon-status-updated", this._updateUSBRuntimes);
++    this._updateUSBRuntimes();
++  },
++  untrackUSBRuntimes: function() {
++    Devices.off("register", this._updateUSBRuntimes);
++    Devices.off("unregister", this._updateUSBRuntimes);
++    Devices.off("addon-status-updated", this._updateUSBRuntimes);
++  },
++  _updateUSBRuntimes: function() {
++    this.runtimeList.usb = [];
++    for (let id of Devices.available()) {
++      this.runtimeList.usb.push(new USBRuntime(id));
++    }
++    this.update("runtimelist");
++  },
++
++  trackSimulatorRuntimes: function() {
++    this._updateSimulatorRuntimes = this._updateSimulatorRuntimes.bind(this);
++    Simulator.on("register", this._updateSimulatorRuntimes);
++    Simulator.on("unregister", this._updateSimulatorRuntimes);
++    this._updateSimulatorRuntimes();
++  },
++  untrackSimulatorRuntimes: function() {
++    Simulator.off("register", this._updateSimulatorRuntimes);
++    Simulator.off("unregister", this._updateSimulatorRuntimes);
++  },
++  _updateSimulatorRuntimes: function() {
++    this.runtimeList.simulators = [];
++    for (let version of Simulator.availableVersions()) {
++      this.runtimeList.simulators.push(new SimulatorRuntime(version));
++    }
++    this.update("runtimelist");
++  },
++
++  writeManifest: function(project) {
++    if (project.type != "packaged") {
++      return Promise.reject("Not a packaged app");
++    }
++
++    if (!project.manifest) {
++      project.manifest = {};
++    }
++
++    let folder = project.location;
++    let manifestPath = OS.Path.join(folder, "manifest.webapp");
++    let text = JSON.stringify(project.manifest, null, 2);
++    let encoder = new TextEncoder();
++    let array = encoder.encode(text);
++    return OS.File.writeAtomic(manifestPath, array, {tmpPath: manifestPath + ".tmp"});
++  },
++}
++
++EventEmitter.decorate(AppManager);
++
++/* RUNTIMES */
++
++function USBRuntime(id) {
++  this.id = id;
++}
++
++USBRuntime.prototype = {
++  connect: function(connection) {
++    let device = Devices.getByName(this.id);
++    if (!device) {
++      AppManager.console.error("Can't find device: " + id);
++      return Promise.reject();
++    }
++    return device.connect().then((port) => {
++      connection.host = "localhost";
++      connection.port = port;
++      connection.connect();
++    });
++  },
++  getName: function() {
++    return this.id;
++  },
++}
++
++function SimulatorRuntime(version) {
++  this.version = version;
++}
++
++SimulatorRuntime.prototype = {
++  connect: function(connection) {
++    let port = ConnectionManager.getFreeTCPPort();
++    let simulator = Simulator.getByVersion(this.version);
++    if (!simulator || !simulator.launch) {
++      AppManager.console.error("Can't find simulator: " + this.version);
++      return Promise.reject();
++    }
++    return simulator.launch({port: port}).then(() => {
++      connection.port = port;
++      connection.keepConnecting = true;
++      connection.connect();
++    });
++  },
++  getName: function() {
++    return this.version;
++  },
++}
+diff --git a/browser/devtools/fxide/moz.build b/browser/devtools/fxide/moz.build
+new file mode 100644
+index 0000000..89146c92
+--- /dev/null
++++ b/browser/devtools/fxide/moz.build
+@@ -0,0 +1,12 @@
++# -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++PARALLEL_DIRS += [
++    'content',
++    'locales',
++    'themes',
++]
++
+diff --git a/browser/devtools/fxide/themes/linux/jar.mn b/browser/devtools/fxide/themes/linux/jar.mn
+new file mode 100644
+index 0000000..4a0dd45
+--- /dev/null
++++ b/browser/devtools/fxide/themes/linux/jar.mn
+@@ -0,0 +1,11 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++fxide.jar:
++% skin fxide classic/1.0 %skin/
++  skin/fxide.css            (../shared/fxide.css)
++  skin/icons.png            (../shared/icons.png)
++  skin/details.css          (../shared/details.css)
++  skin/newapp.css           (../shared/newapp.css)
++  skin/throbber.svg         (../shared/throbber.svg)
+diff --git a/browser/devtools/fxide/themes/linux/moz.build b/browser/devtools/fxide/themes/linux/moz.build
+new file mode 100644
+index 0000000..3bbe672
+--- /dev/null
++++ b/browser/devtools/fxide/themes/linux/moz.build
+@@ -0,0 +1,7 @@
++# -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++JAR_MANIFESTS += ['jar.mn']
+diff --git a/browser/devtools/fxide/themes/moz.build b/browser/devtools/fxide/themes/moz.build
+new file mode 100644
+index 0000000..5040c10
+--- /dev/null
++++ b/browser/devtools/fxide/themes/moz.build
+@@ -0,0 +1,14 @@
++# -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++toolkit = CONFIG['MOZ_WIDGET_TOOLKIT']
++
++if toolkit == 'cocoa':
++    DIRS += ['osx']
++elif toolkit in ('gtk2', 'gtk3', 'qt'):
++    DIRS += ['linux']
++else:
++    DIRS += ['windows']
+diff --git a/browser/devtools/fxide/themes/osx/jar.mn b/browser/devtools/fxide/themes/osx/jar.mn
+new file mode 100644
+index 0000000..4a0dd45
+--- /dev/null
++++ b/browser/devtools/fxide/themes/osx/jar.mn
+@@ -0,0 +1,11 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++fxide.jar:
++% skin fxide classic/1.0 %skin/
++  skin/fxide.css            (../shared/fxide.css)
++  skin/icons.png            (../shared/icons.png)
++  skin/details.css          (../shared/details.css)
++  skin/newapp.css           (../shared/newapp.css)
++  skin/throbber.svg         (../shared/throbber.svg)
+diff --git a/browser/devtools/fxide/themes/osx/moz.build b/browser/devtools/fxide/themes/osx/moz.build
+new file mode 100644
+index 0000000..3bbe672
+--- /dev/null
++++ b/browser/devtools/fxide/themes/osx/moz.build
+@@ -0,0 +1,7 @@
++# -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++JAR_MANIFESTS += ['jar.mn']
+diff --git a/browser/devtools/fxide/themes/shared/details.css b/browser/devtools/fxide/themes/shared/details.css
+new file mode 100644
+index 0000000..387ec03
+--- /dev/null
++++ b/browser/devtools/fxide/themes/shared/details.css
+@@ -0,0 +1,135 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++body {
++  margin: 0;
++  background-color: white;
++  font-family: Lucida Grande, Helvetica, Helvetica Neue, sans-serif;
++  font-size: 12px;
++}
++
++.hidden {
++  display: none;
++}
++
++h1, h3, p {
++  margin: 0;
++}
++
++#toolbar {
++  background-color: #D8D8D8;
++  border-bottom: 1px solid #AAA;
++}
++
++#toolbar > button {
++  -moz-appearance: none;
++  background-color: transparent;
++  border-width: 0 1px 0 0;
++  border-color: #AAA;
++  border-style: solid;
++  margin: 0;
++  padding: 0 12px;
++  font-weight: bold;
++  height: 24px;
++}
++
++#toolbar > button:hover {
++  background-color: #CCC;
++  cursor: pointer;
++}
++
++#validation_status {
++  float: right;
++  text-transform: uppercase;
++  font-size: 10px;
++  line-height: 24px;
++  padding: 0 12px;
++  color: white;
++}
++
++
++header {
++  padding: 20px 0;
++}
++
++header > div {
++  vertical-align: top;
++  display: inline-block;
++}
++
++#icon {
++  height: 48px;
++  width: 48px;
++  text-align:top;
++  float: left;
++  margin: 0 20px;
++}
++
++h1, #type {
++  line-height: 24px;
++  height: 24px; /* avoid collapsing if empty */
++  display: block;
++}
++
++h1 {
++  font-size: 20px;
++}
++
++#type {
++  font-size: 10px;
++  text-transform: uppercase;
++  color: #777;
++}
++
++main {
++  padding-left: 88px;
++}
++
++h3 {
++  color: #999;
++  font-size: 10px;
++  font-weight: normal;
++}
++
++main > p {
++  margin-bottom: 20px;
++}
++
++.validation_messages {
++  margin-left: 74px;
++  list-style: none;
++  border-left: 4px solid transparent;
++  padding: 0 10px;;
++}
++
++
++body.valid #validation_status {
++  background-color: #81D135;
++}
++
++body.warning #validation_status {
++  background-color: #FFAC00;
++}
++
++body.error #validation_status {
++  background-color: #ED4C62;
++}
++
++#warningslist {
++  border-color: #FFAC00
++}
++
++#errorslist {
++  border-color: #ED4C62;
++}
++
++#validation_status > span {
++  display: none;
++}
++
++body.valid #validation_status > .valid,
++body.warning #validation_status > .warning,
++body.error #validation_status > .error {
++  display: inline;
++}
+diff --git a/browser/devtools/fxide/themes/shared/fxide.css b/browser/devtools/fxide/themes/shared/fxide.css
+new file mode 100644
+index 0000000..f068cb8
+--- /dev/null
++++ b/browser/devtools/fxide/themes/shared/fxide.css
+@@ -0,0 +1,272 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#main-toolbar {
++  padding: 0 12px;
++  margin-top: -2px;
++}
++
++#action-buttons-container {
++  -moz-box-pack: center;
++  height: 50px;
++}
++
++#panel-buttons-container {
++  height: 50px;
++  margin-top: -50px;
++  pointer-events: none;
++}
++
++#panel-buttons-container > .panel-button {
++  pointer-events: auto;
++}
++
++#action-busy {
++  height: 24px;
++  width: 24px;
++}
++
++window.busy .action-button,
++window:not(.busy) #action-busy {
++  display: none;
++}
++
++/* Panel buttons */
++
++.panel-button {
++  -moz-box-align: center;
++}
++
++.panel-button-anchor {
++  list-style-image: url('icons.png');
++  -moz-image-region: rect(43px, 563px, 61px, 535px);
++  width: 12;
++  height: 7px;
++  margin-bottom: -5px;
++}
++
++.panel-button:hover > .panel-button-anchor {
++  -moz-image-region: rect(243px, 563px, 261px, 535px);
++}
++
++/* Panel buttons - projects */
++
++#project-panel-button > .panel-button-image {
++  width: 18px;
++  height: 18px;
++}
++
++#project-panel-button.no-project > .panel-button-image {
++  list-style-image: url("icons.png");
++  -moz-image-region: rect(0px, 740px, 40px, 700px);
++}
++
++/* Panel buttons - runtime */
++
++#runtime-panel-button > .panel-button-image {
++  list-style-image: url('icons.png');
++  -moz-image-region: rect(25px, 475px, 75px, 425px);
++  width: 1.2em;
++  height: 1.2em;
++}
++
++/* Action buttons */
++
++.action-button {
++  -moz-appearance: none;
++  border-width: 0;
++  margin: 0;
++  padding: 0;
++  list-style-image: url('icons.png');
++}
++
++.action-button[disabled="true"] {
++  opacity: 0.5;
++  pointer-events: none;
++}
++
++.action-button > .toolbarbutton-icon {
++  width: 40px;
++  height: 40px;
++}
++
++.action-button > .toolbarbutton-text {
++  display: none;
++}
++
++#action-button-play {         -moz-image-region: rect(0,100px,100px,0) }
++#action-button-play:hover {   -moz-image-region: rect(200px,100px,300px,0) }
++#action-button-stop {         -moz-image-region: rect(0,200px,100px,100px) }
++#action-button-stop:hover {   -moz-image-region: rect(200px,200px,300px,100px) }
++#action-button-debug {        -moz-image-region: rect(0,400px,100px,300px) }
++#action-button-debug:hover {  -moz-image-region: rect(200px,400px,300px,300px) }
++
++/* Panels */
++
++panel > vbox {
++  overflow-y: scroll;
++  overflow-x: hidden;
++}
++
++panel > .panel-arrowcontainer > .panel-arrowcontent {
++  padding: 12px 0;
++  width: 180px;
++}
++
++.panel-item {
++  padding: 3px 12px;
++  margin: 0;
++  -moz-appearance: none;
++}
++
++.panel-item:hover {
++  background: #CBF0FE;
++}
++
++.panel-header {
++  /* We can't use borders or vertical padding here because
++   * panels don't take these into account when calculated the
++   * height of the panel.
++   */
++  background-color: #EEE;
++  outline-width: 1px;
++  outline-color: #D5D5D5;
++  outline-style: solid;
++  color: #ACACAC;
++  text-transform: uppercase;
++  padding: 0 16px;
++  line-height: 200%;
++  margin: 5px 0;
++  font-size: 90%;
++  font-weight: bold;
++}
++
++.panel-item > .toolbarbutton-icon {
++  width: 18px;
++  height: 18px;
++}
++
++.panel-item > .toolbarbutton-text {
++  text-align: start;
++}
++
++/* project panel */
++
++.project-panel-item-newapp,
++.project-panel-item-openpackaged,
++.project-panel-item-openhosted {
++  list-style-image: url("icons.png");
++}
++
++.project-panel-item-newapp       { -moz-image-region: rect(0px, 640px, 40px, 600px) }
++.project-panel-item-openpackaged { -moz-image-region: rect(0px, 740px, 40px, 700px) }
++.project-panel-item-openhosted   { -moz-image-region: rect(0px, 840px, 40px, 800px) }
++
++/* runtime panel */
++
++#runtime-panel .panel-arrowcontent {
++  padding: 12px 0 0;
++}
++
++#runtime-panel-simulators {
++  margin-bottom: 12px;
++}
++
++#runtime-permissions,
++#runtime-screenshot,
++.runtime-panel-item-usbruntime,
++.runtime-panel-item-simulator {
++  list-style-image: url("icons.png");
++}
++
++#runtime-screenshot             { -moz-image-region: rect(200px, 640px, 240px, 600px) }
++#runtime-permissions            { -moz-image-region: rect(100px, 840px, 140px, 800px) }
++.runtime-panel-item-usbruntime { -moz-image-region: rect(100px, 640px, 140px, 600px) }
++.runtime-panel-item-simulator  { -moz-image-region: rect(100px, 740px, 140px, 700px) }
++
++#runtime-actions {
++  border-top: 1px solid rgba(221,221,221,1);
++}
++
++
++#runtime-actions > toolbarbutton {
++  border-top: 1px solid rgba(221,221,221,1);
++  background-color: rgba(233,233,233,1);
++  color: rgba(87,87,87,1);
++  padding-top: 8px;
++  padding-bottom: 8px;
++}
++
++#runtime-actions > toolbarbutton:hover {
++  background-color: rgba(221,221,221,1);
++}
++
++#runtime-actions > toolbarbutton:last-child {
++  border-radius: 0 0 3px 3px;
++}
++
++/* Main view */
++
++#body {
++  background-color: rgb(225, 225, 225);
++  background-image: url('chrome://browser/skin/devtools/app-manager/rocket.svg'), url('chrome://browser/skin/devtools/app-manager/noise.png');
++  background-repeat: no-repeat, repeat;
++  background-size: 35%, auto;
++  background-position: center center, top left;
++}
++
++.devtools-horizontal-splitter {
++  -moz-appearance: none;
++  background-image: none;
++  background-color: transparent;
++  border: 0;
++  border-bottom: 1px solid rgba(118, 121, 125, .5);
++  min-height: 3px;
++  height: 3px;
++  margin-top: -3px;
++  position: relative;
++  border-bottom: 1px solid #aaa;
++}
++
++/* Logs */
++
++#logs-container {
++  position: relative;
++}
++
++#logs {
++  overflow: auto;
++  padding: 0 6px;
++  margin: 0;
++  line-height: 12px;
++  font-size: 8px;
++  background-color: #1F1F1F;
++  color: #8fa1b2;
++  height: 24px;
++}
++
++#logs.expand {
++  height: 300px;
++}
++
++#logs:not(.expand) > .log {
++  display: none;
++}
++
++#toggle-logs {
++  height: 24px;
++  border-width: 0;
++  background-color: #0881C7;
++  color: white;
++  margin: 0;
++  display: block;
++  position: absolute;
++  bottom: 0;
++  right: 0;
++}
++
++#logs > p { margin: 0; }
++#logs > .warning { color: #d99b28; }
++#logs > .error   { color: #eb5368; }
++#logs > .success { color: #70bf53; }
+diff --git a/browser/devtools/fxide/themes/shared/icons.png b/browser/devtools/fxide/themes/shared/icons.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..3a75582b9565c86e445ac554b1eaf1cc9b4916f2
+GIT binary patch
+literal 28072
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/browser/devtools/fxide/themes/shared/newapp.css b/browser/devtools/fxide/themes/shared/newapp.css
+new file mode 100644
+index 0000000..f92b8bf
+--- /dev/null
++++ b/browser/devtools/fxide/themes/shared/newapp.css
+@@ -0,0 +1,58 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++dialog {
++  -moz-appearance: none;
++  background-image: linear-gradient(rgb(255, 255, 255), rgb(237, 237, 237) 100px);
++  font-family: "Clear Sans", sans-serif;
++  color: #424E5A;
++  overflow-y: scroll;
++}
++
++.header-name {
++  font-size: 1.5rem;
++  font-weight: normal;
++  margin: 15px 0;
++}
++
++richlistbox {
++  -moz-appearance: none;
++  overflow-y: auto;
++  border: 1px solid #424E5A;
++}
++
++richlistitem {
++  padding: 6px 0;
++}
++
++richlistitem:not([selected="true"]):hover {
++  background-color: rgba(0,0,0,0.04);
++}
++
++richlistitem > vbox > label {
++  margin: 0;
++  font-size: 1.1em;
++}
++
++richlistbox > description {
++  margin: 8px;
++}
++
++richlistitem {
++  -moz-box-align: start;
++}
++
++richlistitem:nth-child(odd) {
++  background-color: 
++}
++
++richlistitem > image {
++  height: 24px;
++  width: 24px;
++  margin: 0 6px;
++}
++
++textbox {
++  font-size: 1.2rem;
++}
+diff --git a/browser/devtools/fxide/themes/shared/throbber.svg b/browser/devtools/fxide/themes/shared/throbber.svg
+new file mode 100644
+index 0000000..d89fb38
+--- /dev/null
++++ b/browser/devtools/fxide/themes/shared/throbber.svg
+@@ -0,0 +1,22 @@
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++
++<svg  xmlns="http://www.w3.org/2000/svg"
++      width="24" height="24" viewBox="0 0 64 64">
++  <g>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(0, 32, 32)" fill="#BBB"/>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(30, 32, 32)" fill="#AAA"/>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(60, 32, 32)" fill="#999"/>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(90, 32, 32)" fill="#888"/>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(120, 32, 32)" fill="#777"/>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(150, 32, 32)" fill="#666"/>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(180, 32, 32)" fill="#555"/>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(210, 32, 32)" fill="#444"/>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(240, 32, 32)" fill="#333"/>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(270, 32, 32)" fill="#222"/>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(300, 32, 32)" fill="#111"/>
++    <rect x="30" y="4" width="4" height="15" transform="rotate(330, 32, 32)" fill="#000"/>
++    <animateTransform attributeName="transform" type="rotate" calcMode="discrete" values="0 32 32;30 32 32;60 32 32;90 32 32;120 32 32;150 32 32;180 32 32;210 32 32;240 32 32;270 32 32;300 32 32;330 32 32" dur="0.8s" repeatCount="indefinite"/>
++  </g>
++</svg>
+diff --git a/browser/devtools/fxide/themes/windows/jar.mn b/browser/devtools/fxide/themes/windows/jar.mn
+new file mode 100644
+index 0000000..4a0dd45
+--- /dev/null
++++ b/browser/devtools/fxide/themes/windows/jar.mn
+@@ -0,0 +1,11 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++fxide.jar:
++% skin fxide classic/1.0 %skin/
++  skin/fxide.css            (../shared/fxide.css)
++  skin/icons.png            (../shared/icons.png)
++  skin/details.css          (../shared/details.css)
++  skin/newapp.css           (../shared/newapp.css)
++  skin/throbber.svg         (../shared/throbber.svg)
+diff --git a/browser/devtools/fxide/themes/windows/moz.build b/browser/devtools/fxide/themes/windows/moz.build
+new file mode 100644
+index 0000000..3bbe672
+--- /dev/null
++++ b/browser/devtools/fxide/themes/windows/moz.build
+@@ -0,0 +1,7 @@
++# -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++JAR_MANIFESTS += ['jar.mn']
+diff --git a/browser/devtools/moz.build b/browser/devtools/moz.build
+index f35eb89..a6b4bed 100644
+--- a/browser/devtools/moz.build
++++ b/browser/devtools/moz.build
+@@ -24,14 +24,17 @@ DIRS += [
+     'sourceeditor',
+     'styleeditor',
+     'styleinspector',
+     'tilt',
+     'webaudioeditor',
+     'webconsole',
+ ]
+ 
++if CONFIG['MOZ_FXIDE']:
++    DIRS += ['fxide']
++
+ EXTRA_COMPONENTS += [
+     'devtools-clhandler.js',
+     'devtools-clhandler.manifest',
+ ]
+ 
+ JAR_MANIFESTS += ['jar.mn']
+diff --git a/configure.in b/configure.in
+index 57cf87c..e7193a5 100644
+--- a/configure.in
++++ b/configure.in
+@@ -7624,16 +7624,29 @@ if test "$MOZ_CHROME_FILE_FORMAT" = "symlink"; then
+ fi
+ 
+ if test "$MOZ_CHROME_FILE_FORMAT" != "jar" &&
+     test "$MOZ_CHROME_FILE_FORMAT" != "flat" &&
+     test "$MOZ_CHROME_FILE_FORMAT" != "omni"; then
+     AC_MSG_ERROR([--enable-chrome-format must be set to either jar, flat, or omni])
+ fi
+ 
++dnl ========================================================
++dnl = Enable Support for fxide
++dnl ========================================================
++MOZ_ARG_ENABLE_BOOL(fxide,
++[  --enable-fxide Set compile flags necessary for compiling fxide ],
++MOZ_FXIDE=1,
++MOZ_FXIDE= )
++
++if test -n "$MOZ_FXIDE"; then
++    AC_DEFINE(MOZ_FXIDE)
++fi
++AC_SUBST(MOZ_FXIDE)
++
+ dnl =========================================================
+ dnl Omnijar packaging (bug 552121)
+ dnl =========================================================
+ dnl Omnijar packaging is compatible with flat packaging.
+ dnl In unpackaged builds, omnijar looks for files as if
+ dnl things were flat packaged. After packaging, all files
+ dnl are loaded from a single jar. MOZ_CHROME_FILE_FORMAT
+ dnl is set to flat since putting files into jars is only
