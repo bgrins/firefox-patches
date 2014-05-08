@@ -1,0 +1,241 @@
+diff --git a/js/xpconnect/src/Sandbox.cpp b/js/xpconnect/src/Sandbox.cpp
+--- a/js/xpconnect/src/Sandbox.cpp
++++ b/js/xpconnect/src/Sandbox.cpp
+@@ -25,16 +25,17 @@
+ #include "nsPrincipal.h"
+ #include "nsXMLHttpRequest.h"
+ #include "WrapperFactory.h"
+ #include "xpcprivate.h"
+ #include "XPCQuickStubs.h"
+ #include "XPCWrapper.h"
+ #include "XrayWrapper.h"
+ #include "mozilla/dom/BindingUtils.h"
++#include "mozilla/dom/CSSBinding.h"
+ #include "mozilla/dom/indexedDB/IndexedDatabaseManager.h"
+ #include "mozilla/dom/PromiseBinding.h"
+ #include "mozilla/dom/TextDecoderBinding.h"
+ #include "mozilla/dom/TextEncoderBinding.h"
+ #include "mozilla/dom/URLBinding.h"
+ 
+ using namespace mozilla;
+ using namespace JS;
+@@ -1029,16 +1030,19 @@ xpc::GlobalProperties::Define(JSContext 
+     if (atob &&
+         !JS_DefineFunction(cx, obj, "atob", Atob, 1, 0))
+         return false;
+ 
+     if (btoa &&
+         !JS_DefineFunction(cx, obj, "btoa", Btoa, 1, 0))
+         return false;
+ 
++    if (!dom::CSSBinding::GetConstructorObject(cx, obj))
++        return false;
++
+     return true;
+ }
+ 
+ nsresult
+ xpc::CreateSandboxObject(JSContext *cx, MutableHandleValue vp, nsISupports *prinOrSop,
+                          SandboxOptions& options)
+ {
+     // Create the sandbox global object
+diff --git a/js/xpconnect/src/nsXPConnect.cpp b/js/xpconnect/src/nsXPConnect.cpp
+--- a/js/xpconnect/src/nsXPConnect.cpp
++++ b/js/xpconnect/src/nsXPConnect.cpp
+@@ -23,16 +23,17 @@
+ 
+ #ifdef MOZ_JSDEBUGGER
+ #include "jsdIDebuggerService.h"
+ #endif
+ 
+ #include "XPCQuickStubs.h"
+ 
+ #include "mozilla/dom/BindingUtils.h"
++#include "mozilla/dom/CSSBinding.h"
+ #include "mozilla/dom/Exceptions.h"
+ #include "mozilla/dom/PromiseBinding.h"
+ #include "mozilla/dom/TextDecoderBinding.h"
+ #include "mozilla/dom/TextEncoderBinding.h"
+ #include "mozilla/dom/DOMErrorBinding.h"
+ 
+ #include "nsDOMMutationObserver.h"
+ #include "nsICycleCollectorListener.h"
+@@ -436,16 +437,17 @@ InitGlobalObject(JSContext* aJSContext, 
+ 
+     // Init WebIDL binding constructors wanted on all XPConnect globals.
+     //
+     // XXX Please do not add any additional classes here without the approval of
+     //     the XPConnect module owner.
+     if (!PromiseBinding::GetConstructorObject(aJSContext, aGlobal) ||
+         !TextDecoderBinding::GetConstructorObject(aJSContext, aGlobal) ||
+         !TextEncoderBinding::GetConstructorObject(aJSContext, aGlobal) ||
++        !CSSBinding::GetConstructorObject(aJSContext, aGlobal) ||
+         !DOMErrorBinding::GetConstructorObject(aJSContext, aGlobal)) {
+         return UnexpectedFailure(false);
+     }
+ 
+     if (!(aFlags & nsIXPConnect::DONT_FIRE_ONNEWGLOBALHOOK))
+         JS_FireOnNewGlobalObject(aJSContext, aGlobal);
+ 
+     return true;
+diff --git a/toolkit/devtools/gcli/source/lib/gcli/util/util.js b/toolkit/devtools/gcli/source/lib/gcli/util/util.js
+--- a/toolkit/devtools/gcli/source/lib/gcli/util/util.js
++++ b/toolkit/devtools/gcli/source/lib/gcli/util/util.js
+@@ -573,21 +573,21 @@ exports.createEmptyNodeList = function(d
+ /**
+  * Find a unique CSS selector for a given element
+  * @returns a string such that ele.ownerDocument.querySelector(reply) === ele
+  * and ele.ownerDocument.querySelectorAll(reply).length === 1
+  */
+ exports.findCssSelector = function(ele) {
+   var document = ele.ownerDocument;
+   if (ele.id && document.getElementById(ele.id) === ele) {
+-    return '#' + ele.id;
++    return '#' + CSS.escape(ele.id);
+   }
+ 
+   // Inherently unique by tag name
+-  var tagName = ele.tagName.toLowerCase();
++  var tagName = ele.localName;
+   if (tagName === 'html') {
+     return 'html';
+   }
+   if (tagName === 'head') {
+     return 'head';
+   }
+   if (tagName === 'body') {
+     return 'body';
+@@ -597,17 +597,17 @@ exports.findCssSelector = function(ele) 
+     console.log('danger: ' + tagName);
+   }
+ 
+   // We might be able to find a unique class name
+   var selector, index, matches;
+   if (ele.classList.length > 0) {
+     for (var i = 0; i < ele.classList.length; i++) {
+       // Is this className unique by itself?
+-      selector = '.' + ele.classList.item(i);
++      selector = '.' + CSS.escape(ele.classList.item(i));
+       matches = document.querySelectorAll(selector);
+       if (matches.length === 1) {
+         return selector;
+       }
+       // Maybe it's unique with a tag name?
+       selector = tagName + selector;
+       matches = document.querySelectorAll(selector);
+       if (matches.length === 1) {
+diff --git a/toolkit/devtools/server/actors/script.js b/toolkit/devtools/server/actors/script.js
+--- a/toolkit/devtools/server/actors/script.js
++++ b/toolkit/devtools/server/actors/script.js
+@@ -10,16 +10,22 @@ const Debugger = require("Debugger");
+ const Services = require("Services");
+ const { Cc, Ci, Cu, components } = require("chrome");
+ const { ActorPool } = require("devtools/server/actors/common");
+ const { DebuggerServer } = require("devtools/server/main");
+ const DevToolsUtils = require("devtools/toolkit/DevToolsUtils");
+ const { dbg_assert, dumpn, update } = DevToolsUtils;
+ const { SourceMapConsumer, SourceMapGenerator } = require("source-map");
+ const { defer, resolve, reject, all } = require("devtools/toolkit/deprecated-sync-thenables");
++// const { findCssSelector } = require("devtools/styleinspector/css-logic");
++
++const {CssLogic} = require("devtools/styleinspector/css-logic");
++
++// console.log("HERE", CssLogic.findCssSelector);
++
+ 
+ Cu.import("resource://gre/modules/NetUtil.jsm");
+ 
+ let B2G_ID = "{3c2e2abc-06d4-11e1-ac3b-374f68613e61}";
+ 
+ let TYPED_ARRAY_CLASSES = ["Uint8Array", "Uint8ClampedArray", "Uint16Array",
+       "Uint32Array", "Int8Array", "Int16Array", "Int32Array", "Float32Array",
+       "Float64Array"];
+@@ -5525,21 +5531,21 @@ function reportError(aError, aPrefix="")
+ /**
+  * Find a unique CSS selector for a given element
+  * @returns a string such that ele.ownerDocument.querySelector(reply) === ele
+  * and ele.ownerDocument.querySelectorAll(reply).length === 1
+  */
+ function findCssSelector(ele) {
+   var document = ele.ownerDocument;
+   if (ele.id && document.getElementById(ele.id) === ele) {
+-    return '#' + ele.id;
++    return '#' + CSS.escape(ele.id);
+   }
+ 
+   // Inherently unique by tag name
+-  var tagName = ele.tagName.toLowerCase();
++  var tagName = ele.localName;
+   if (tagName === 'html') {
+     return 'html';
+   }
+   if (tagName === 'head') {
+     return 'head';
+   }
+   if (tagName === 'body') {
+     return 'body';
+@@ -5549,17 +5555,17 @@ function findCssSelector(ele) {
+     console.log('danger: ' + tagName);
+   }
+ 
+   // We might be able to find a unique class name
+   var selector, index, matches;
+   if (ele.classList.length > 0) {
+     for (var i = 0; i < ele.classList.length; i++) {
+       // Is this className unique by itself?
+-      selector = '.' + ele.classList.item(i);
++      selector = '.' + CSS.escape(ele.classList.item(i));
+       matches = document.querySelectorAll(selector);
+       if (matches.length === 1) {
+         return selector;
+       }
+       // Maybe it's unique with a tag name?
+       selector = tagName + selector;
+       matches = document.querySelectorAll(selector);
+       if (matches.length === 1) {
+diff --git a/toolkit/devtools/styleinspector/css-logic.js b/toolkit/devtools/styleinspector/css-logic.js
+--- a/toolkit/devtools/styleinspector/css-logic.js
++++ b/toolkit/devtools/styleinspector/css-logic.js
+@@ -861,21 +861,21 @@ function positionInNodeList(element, nod
+ /**
+  * Find a unique CSS selector for a given element
+  * @returns a string such that ele.ownerDocument.querySelector(reply) === ele
+  * and ele.ownerDocument.querySelectorAll(reply).length === 1
+  */
+ CssLogic.findCssSelector = function CssLogic_findCssSelector(ele) {
+   var document = ele.ownerDocument;
+   if (ele.id && document.getElementById(ele.id) === ele) {
+-    return '#' + ele.id;
++    return '#' + CSS.escape(ele.id);
+   }
+ 
+   // Inherently unique by tag name
+-  var tagName = ele.tagName.toLowerCase();
++  var tagName = ele.localName;
+   if (tagName === 'html') {
+     return 'html';
+   }
+   if (tagName === 'head') {
+     return 'head';
+   }
+   if (tagName === 'body') {
+     return 'body';
+@@ -885,17 +885,17 @@ CssLogic.findCssSelector = function CssL
+     console.log('danger: ' + tagName);
+   }
+ 
+   // We might be able to find a unique class name
+   var selector, index, matches;
+   if (ele.classList.length > 0) {
+     for (var i = 0; i < ele.classList.length; i++) {
+       // Is this className unique by itself?
+-      selector = '.' + ele.classList.item(i);
++      selector = '.' + CSS.escape(ele.classList.item(i));
+       matches = document.querySelectorAll(selector);
+       if (matches.length === 1) {
+         return selector;
+       }
+       // Maybe it's unique with a tag name?
+       selector = tagName + selector;
+       matches = document.querySelectorAll(selector);
+       if (matches.length === 1) {
