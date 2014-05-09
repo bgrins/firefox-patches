@@ -1,0 +1,358 @@
+# HG changeset patch
+# Parent 93398594c091bc415ae60abceb88a241694f72a0
+# User Brian Grinstead <bgrinstead@mozilla.com>
+Bug 920141 - [markup view] Show :before and :after pseudo elements in the tree
+
+diff --git a/browser/devtools/framework/selection.js b/browser/devtools/framework/selection.js
+--- a/browser/devtools/framework/selection.js
++++ b/browser/devtools/framework/selection.js
+@@ -220,17 +220,24 @@ Selection.prototype = {
+     // accessing node.rawNode, this needs to stay.
+     let rawNode = null;
+     if (node.isLocal_toBeDeprecated()) {
+       rawNode = node.rawNode();
+     }
+     if (rawNode) {
+       try {
+         let doc = this.document;
+-        return (doc && doc.defaultView && doc.documentElement.contains(rawNode));
++        if (doc && doc.defaultView) {
++          if (node.isAnonymous) {
++            let bindingParent = doc.getBindingParent(rawNode);
++            return doc.documentElement.contains(bindingParent);
++          } else {
++            return doc.documentElement.contains(rawNode);
++          }
++        }
+       } catch (e) {
+         // "can't access dead object" error
+         return false;
+       }
+     }
+ 
+     while(node) {
+       if (node === this._walker.rootNode) {
+diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
+--- a/browser/devtools/inspector/inspector-panel.js
++++ b/browser/devtools/inspector/inspector-panel.js
+@@ -383,17 +383,19 @@ InspectorPanel.prototype = {
+     // client know.
+     let selection = this.selection.nodeFront;
+ 
+     // On any new selection made by the user, store the unique css selector
+     // of the selected node so it can be restored after reload of the same page
+     if (reason !== "navigateaway" &&
+         this.selection.node &&
+         this.selection.isElementNode()) {
+-      this.selectionCssSelector = CssLogic.findCssSelector(this.selection.node);
++      try {
++        this.selectionCssSelector = CssLogic.findCssSelector(this.selection.node);
++      } catch(e) { }
+     }
+ 
+     let selfUpdate = this.updating("inspector-panel");
+     Services.tm.mainThread.dispatch(() => {
+       try {
+         selfUpdate(selection);
+       } catch(ex) {
+         console.error(ex);
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -247,17 +247,17 @@ MarkupView.prototype = {
+     while (parent !== this.doc.body) {
+       if (parent.container) {
+         container = parent.container;
+         break;
+       }
+       parent = parent.parentNode;
+     }
+ 
+-    if (container) {
++    if (container && container._isImagePreviewTarget) {
+       // With the newly found container, delegate the tooltip content creation
+       // and decision to show or not the tooltip
+       return container._isImagePreviewTarget(target, this.tooltip);
+     }
+   },
+ 
+   /**
+    * Given the known reason, should the current selection be briefly highlighted
+@@ -1250,16 +1250,20 @@ function MarkupContainer(aMarkupView, aN
+   this.expander = null;
+   this.tagState = null;
+   this.tagLine = null;
+   this.children = null;
+   this.markup.template("container", this);
+   this.elt.container = this;
+   this.children.container = this;
+ 
++  if (aNode.isPseudoElement) {
++    this.expander.remove();
++  }
++
+   // Expanding/collapsing the node on dblclick of the whole tag-line element
+   this._onToggle = this._onToggle.bind(this);
+   this.elt.addEventListener("dblclick", this._onToggle, false);
+   this.expander.addEventListener("click", this._onToggle, false);
+ 
+   // Appending the editor element and attaching event listeners
+   this.tagLine.appendChild(this.editor.elt);
+ 
+@@ -1743,16 +1747,27 @@ function ElementEditor(aContainer, aNode
+   // The templates will fill the following properties
+   this.elt = null;
+   this.tag = null;
+   this.closeTag = null;
+   this.attrList = null;
+   this.newAttr = null;
+   this.closeElt = null;
+ 
++  if (aNode.isPseudoElement) {
++    this.template("pseudoelement", this);
++    this.tag.textContent = aNode.isBeforePseudoElement ? "::before" : "::after";
++    // XXX: we should update functions to not access these in case
++    // of pseudo elements instead of faking them.
++    this.attrList = this.doc.createElement("span");
++    this.closeTag = this.doc.createElement("span");
++    this.newAttr = this.doc.createElement("span");
++    this.closeElt = this.doc.createElement("span");
++  } else {
++    // XXX: Don't indent yet so diff is easier to read.
+   // Create the main editor
+   this.template("element", this);
+ 
+   if (aNode.isLocal_toBeDeprecated()) {
+     this.rawNode = aNode.rawNode();
+   }
+ 
+   // Make the tag name editable (unless this is a remote node or
+@@ -1793,16 +1808,19 @@ function ElementEditor(aContainer, aNode
+       }
+     }
+   });
+ 
+   let tagName = this.node.nodeName.toLowerCase();
+   this.tag.textContent = tagName;
+   this.closeTag.textContent = tagName;
+ 
++  }
++
++
+   this.update();
+ }
+ 
+ ElementEditor.prototype = {
+   /**
+    * Update the state of the editor from the node.
+    */
+   update: function() {
+diff --git a/browser/devtools/markupview/markup-view.xhtml b/browser/devtools/markupview/markup-view.xhtml
+--- a/browser/devtools/markupview/markup-view.xhtml
++++ b/browser/devtools/markupview/markup-view.xhtml
+@@ -25,16 +25,18 @@
+       <li id="template-container" save="${elt}" class="child collapsed">
+         <div save="${tagLine}" class="tag-line"><span save="${tagState}" class="tag-state"></span><span save="${expander}" class="theme-twisty expander"></span></div>
+         <ul save="${children}" class="children"></ul>
+       </li>
+ 
+       <li id="template-more-nodes" class="more-nodes devtools-class-comment" save="${elt}"><span>${showing}</span> <button href="#" onclick="${allButtonClick}">${showAll}</button></li>
+     </ul>
+ 
++    <span id="template-pseudoelement" save="${elt}" class="editor"><span save="${tag}" class="tag theme-fg-color5" tabindex="0"></span></span>
++
+     <span id="template-element" save="${elt}" class="editor"><span class="open">&lt;<span save="${tag}" class="tag theme-fg-color3" tabindex="0"></span><span save="${attrList}"></span><span save="${newAttr}" class="newattr" tabindex="0"></span><span class="closing-bracket">&gt;</span></span><span class="close">&lt;/<span save="${closeTag}" class="tag theme-fg-color3"></span>&gt;</span></span>
+ 
+     <span id="template-attribute" save="${attr}" data-attr="${attrName}" class="attreditor" style="display:none"> <span class="editable" save="${inner}" tabindex="0"><span save="${name}" class="attr-name theme-fg-color2"></span>=&quot;<span save="${val}" class="attr-value theme-fg-color6"></span>&quot;</span></span>
+ 
+     <span id="template-text" save="${elt}" class="editor text">
+       <pre save="${value}" style="display:inline-block;" tabindex="0"></pre>
+     </span>
+ 
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -143,17 +143,21 @@ ElementStyle.prototype = {
+   dummyElement: null,
+ 
+   init: function()
+   {
+     // To figure out how shorthand properties are interpreted by the
+     // engine, we will set properties on a dummy element and observe
+     // how their .style attribute reflects them as computed values.
+     return this.dummyElementPromise = createDummyDocument().then(document => {
+-      this.dummyElement = document.createElementNS(this.element.namespaceURI,
++      // XXX ewww
++      let isPseudo = this.element.tagName == "_moz_generated_content_before" || this.element.tagName == "_moz_generated_content_after";
++      let namespaceURI = isPseudo ? document.documentElement.namespaceURI : this.element.namespaceURI;
++
++      this.dummyElement = document.createElementNS(namespaceURI,
+                                                    this.element.tagName);
+       document.documentElement.appendChild(this.dummyElement);
+       return this.dummyElement;
+     }).then(null, promiseWarn);
+   },
+ 
+   destroy: function() {
+     this.dummyElement = null;
+@@ -182,16 +186,17 @@ ElementStyle.prototype = {
+    * Returns a promise that will be resolved when the elementStyle is
+    * ready.
+    */
+   populate: function() {
+     let populated = this.pageStyle.getApplied(this.element, {
+       inherited: true,
+       matchedSelectors: true
+     }).then(entries => {
++    console.log("Get applied returned", this.element, entries);
+       // Make sure the dummy element has been created before continuing...
+       return this.dummyElementPromise.then(() => {
+         if (this.populated != populated) {
+           // Don't care anymore.
+           return promise.reject("unused");
+         }
+ 
+         // Store the current list of rules (if any) during the population
+diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/server/actors/highlighter.js
+--- a/toolkit/devtools/server/actors/highlighter.js
++++ b/toolkit/devtools/server/actors/highlighter.js
+@@ -98,43 +98,52 @@ let HighlighterActor = protocol.ActorCla
+    * method several times won't display several highlighters, it will just move
+    * the highlighter instance to these nodes.
+    *
+    * @param NodeActor The node to be highlighted
+    * @param Options See the request part for existing options. Note that not
+    * all options may be supported by all types of highlighters.
+    */
+   showBoxModel: method(function(node, options={}) {
+-    if (node && this._isNodeValidForHighlighting(node.rawNode)) {
++    if (node && this._isNodeValidForHighlighting(node)) {
+       this._boxModelHighlighter.show(node.rawNode, options);
+     } else {
+       this._boxModelHighlighter.hide();
+     }
+   }, {
+     request: {
+       node: Arg(0, "domnode"),
+       region: Option(1)
+     }
+   }),
+ 
+   _isNodeValidForHighlighting: function(node) {
+     // Is it null or dead?
+-    let isNotDead = node && !Cu.isDeadWrapper(node);
++    let rawNode = node.rawNode;
++    let isNotDead = rawNode && !Cu.isDeadWrapper(rawNode);
+ 
+     // Is it connected to the document?
+     let isConnected = false;
+     try {
+-      let doc = node.ownerDocument;
+-      isConnected = (doc && doc.defaultView && doc.documentElement.contains(node));
++      let doc = rawNode.ownerDocument;
++      let form = node.form();
++      if (doc && doc.defaultView) {
++        if (form.isAnonymous) {
++          let bindingParent = doc.getBindingParent(rawNode);
++          isConnected = doc.documentElement.contains(bindingParent);
++        } else {
++          isConnected = doc.documentElement.contains(rawNode);
++        }
++      }
+     } catch (e) {
+       // "can't access dead object" error
+     }
+ 
+     // Is it an element node
+-    let isElementNode = node.nodeType === Ci.nsIDOMNode.ELEMENT_NODE;
++    let isElementNode = rawNode.nodeType === Ci.nsIDOMNode.ELEMENT_NODE;
+ 
+     return isNotDead && isConnected && isElementNode;
+   },
+ 
+   /**
+    * Hide the box model highlighting if it was shown before
+    */
+   hideBoxModel: method(function() {
+@@ -709,19 +718,19 @@ BoxModelHighlighter.prototype = {
+       // Tag name
+       this.nodeInfo.tagNameLabel.textContent = this.currentNode.tagName;
+ 
+       // ID
+       this.nodeInfo.idLabel.textContent = this.currentNode.id ? "#" + this.currentNode.id : "";
+ 
+       // Classes
+       let classes = this.nodeInfo.classesBox;
+-
+-      classes.textContent = this.currentNode.classList.length ?
+-                              "." + Array.join(this.currentNode.classList, ".") : "";
++      let classList = this.currentNode.classList || [];
++      classes.textContent = classList.length ?
++                              "." + Array.join(classList, ".") : "";
+ 
+       // Pseudo-classes
+       let pseudos = PSEUDO_CLASSES.filter(pseudo => {
+         return DOMUtils.hasPseudoClassLock(this.currentNode, pseudo);
+       }, this);
+ 
+       let pseudoBox = this.nodeInfo.pseudoClassesBox;
+       pseudoBox.textContent = pseudos.join("");
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -218,24 +218,32 @@ var NodeActor = exports.NodeActor = prot
+       numChildren: numChildren,
+ 
+       // doctype attributes
+       name: this.rawNode.name,
+       publicId: this.rawNode.publicId,
+       systemId: this.rawNode.systemId,
+ 
+       attrs: this.writeAttrs(),
+-
++      isBeforePseudoElement: this.rawNode.nodeName === "_moz_generated_content_before",
++      isAfterPseudoElement: this.rawNode.nodeName === "_moz_generated_content_after",
+       pseudoClassLocks: this.writePseudoClassLocks(),
+     };
+ 
+     if (this.isDocumentElement()) {
+       form.isDocumentElement = true;
+     }
+ 
++    if (this.rawNode.nodeType === Ci.nsIDOMNode.ELEMENT_NODE) {
++      let bindingParent = this.rawNode.ownerDocument.getBindingParent(this.rawNode);
++
++      // XXX: should we also include a reference to the binding parent?
++      form.isAnonymous = !!bindingParent;
++    }
++
+     if (this.rawNode.nodeValue) {
+       // We only include a short version of the value if it's longer than
+       // gValueSummaryLength
+       if (this.rawNode.nodeValue.length > gValueSummaryLength) {
+         form.shortValue = this.rawNode.nodeValue.substring(0, gValueSummaryLength);
+         form.incompleteValue = true;
+       } else {
+         form.shortValue = this.rawNode.nodeValue;
+@@ -473,16 +481,21 @@ let NodeFront = protocol.FrontClass(Node
+ 
+   get className() {
+     return this.getAttribute("class") || '';
+   },
+ 
+   get hasChildren() this._form.numChildren > 0,
+   get numChildren() this._form.numChildren,
+ 
++  get isBeforePseudoElement() this._form.isBeforePseudoElement,
++  get isAfterPseudoElement() this._form.isAfterPseudoElement,
++  get isPseudoElement() this.isBeforePseudoElement || this.isAfterPseudoElement,
++  get isAnonymous() this._form.isAnonymous,
++
+   get tagName() this.nodeType === Ci.nsIDOMNode.ELEMENT_NODE ? this.nodeName : null,
+   get shortValue() this._form.shortValue,
+   get incompleteValue() !!this._form.incompleteValue,
+ 
+   get isDocumentElement() !!this._form.isDocumentElement,
+ 
+   // doctype properties
+   get name() this._form.name,
