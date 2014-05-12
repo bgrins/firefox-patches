@@ -1,8 +1,30 @@
 # HG changeset patch
-# Parent 93398594c091bc415ae60abceb88a241694f72a0
+# Parent a1837933bb2f4c82633e59d0a430b29454445777
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 920141 - [markup view] Show :before and :after pseudo elements in the tree
 
+diff --git a/browser/devtools/fontinspector/font-inspector.js b/browser/devtools/fontinspector/font-inspector.js
+--- a/browser/devtools/fontinspector/font-inspector.js
++++ b/browser/devtools/fontinspector/font-inspector.js
+@@ -88,17 +88,17 @@ FontInspector.prototype = {
+       return;
+     }
+ 
+     let node = this.inspector.selection.node;
+     let contentDocument = node.ownerDocument;
+ 
+     // We don't get fonts for a node, but for a range
+     let rng = contentDocument.createRange();
+-    rng.selectNode(node);
++    rng.selectNodeContents(node);
+     let fonts = DOMUtils.getUsedFontFaces(rng);
+     let fontsArray = [];
+     for (let i = 0; i < fonts.length; i++) {
+       fontsArray.push(fonts.item(i));
+     }
+     fontsArray = fontsArray.sort(function(a, b) {
+       return a.srcIndex < b.srcIndex;
+     });
 diff --git a/browser/devtools/framework/selection.js b/browser/devtools/framework/selection.js
 --- a/browser/devtools/framework/selection.js
 +++ b/browser/devtools/framework/selection.js
@@ -195,24 +217,6 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
  
    destroy: function() {
      this.dummyElement = null;
-@@ -182,16 +186,17 @@ ElementStyle.prototype = {
-    * Returns a promise that will be resolved when the elementStyle is
-    * ready.
-    */
-   populate: function() {
-     let populated = this.pageStyle.getApplied(this.element, {
-       inherited: true,
-       matchedSelectors: true
-     }).then(entries => {
-+    console.log("Get applied returned", this.element, entries);
-       // Make sure the dummy element has been created before continuing...
-       return this.dummyElementPromise.then(() => {
-         if (this.populated != populated) {
-           // Don't care anymore.
-           return promise.reject("unused");
-         }
- 
-         // Store the current list of rules (if any) during the population
 diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/server/actors/highlighter.js
 --- a/toolkit/devtools/server/actors/highlighter.js
 +++ b/toolkit/devtools/server/actors/highlighter.js
@@ -274,9 +278,25 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
     * Hide the box model highlighting if it was shown before
     */
    hideBoxModel: method(function() {
-@@ -709,19 +718,19 @@ BoxModelHighlighter.prototype = {
+@@ -701,27 +710,34 @@ BoxModelHighlighter.prototype = {
+     }
+   },
+ 
+   /**
+    * Update node information (tagName#id.class)
+    */
+   _updateInfobar: function() {
+     if (this.currentNode) {
++
        // Tag name
-       this.nodeInfo.tagNameLabel.textContent = this.currentNode.tagName;
+-      this.nodeInfo.tagNameLabel.textContent = this.currentNode.tagName;
++      let tagName = this.currentNode.tagName;
++      if (tagName === "_moz_generated_content_before") {
++        tagName = "::before";
++      } else if (tagName === "_moz_generated_content_after") {
++        tagName = "::after";
++      }
++      this.nodeInfo.tagNameLabel.textContent = tagName;
  
        // ID
        this.nodeInfo.idLabel.textContent = this.currentNode.id ? "#" + this.currentNode.id : "";
@@ -356,3 +376,178 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
  
    // doctype properties
    get name() this._form.name,
+diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/actors/styles.js
+--- a/toolkit/devtools/server/actors/styles.js
++++ b/toolkit/devtools/server/actors/styles.js
+@@ -18,17 +18,17 @@ loader.lazyGetter(this, "CssLogic", () =
+ loader.lazyGetter(this, "DOMUtils", () => Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils));
+ 
+ // The PageStyle actor flattens the DOM CSS objects a little bit, merging
+ // Rules and their Styles into one actor.  For elements (which have a style
+ // but no associated rule) we fake a rule with the following style id.
+ const ELEMENT_STYLE = 100;
+ exports.ELEMENT_STYLE = ELEMENT_STYLE;
+ 
+-const PSEUDO_ELEMENTS = [":first-line", ":first-letter", ":before", ":after", ":-moz-selection"];
++const PSEUDO_ELEMENTS = [":first-line", ":first-letter", ":-moz-selection"];
+ exports.PSEUDO_ELEMENTS = PSEUDO_ELEMENTS;
+ 
+ // Predeclare the domnode actor type for use in requests.
+ types.addActorType("domnode");
+ 
+ /**
+  * DOM Nodes returned by the style actor will be owned by the DOM walker
+  * for the connection.
+@@ -352,35 +352,53 @@ var PageStyleActor = protocol.ActorClass
+   },
+ 
+   /**
+    * Helper function for getApplied, adds all the rules from a given
+    * element.
+    */
+   addElementRules: function(element, inherited, options, rules)
+   {
++    if (element.style) {
++      let elementStyle = this._styleRef(element);
++      if (!inherited || this._hasInheritedProps(element.style)) {
++        rules.push({
++          rule: elementStyle,
++          inherited: inherited,
++        });
++      }
++    }
++
++    let pseudoElements = inherited ? [null] : [null, ...PSEUDO_ELEMENTS];
++    let isBeforeOrAfter = false;
++
++    // If it is before or after, then we don't want to get styles for
++    // this element.  Want to get it for the parent, but with the corresponding
++    // pseudo.  Then we want to lie to the view and tell it that it isn't a pseudo
++    // style so that it shows up normally.
++    if (element.nodeName == "_moz_generated_content_before") {
++      pseudoElements = [":before"];
++      element = element.parentNode;
++      isBeforeOrAfter = true;
++    }
++
++    if (element.nodeName == "_moz_generated_content_after") {
++      pseudoElements = [":after"];
++      element = element.parentNode;
++      isBeforeOrAfter = true;
++    }
++
+     if (!element.style) {
+       return;
+     }
+ 
+-    let elementStyle = this._styleRef(element);
+-
+-    if (!inherited || this._hasInheritedProps(element.style)) {
+-      rules.push({
+-        rule: elementStyle,
+-        inherited: inherited,
+-      });
+-    }
+-
+-    let pseudoElements = inherited ? [null] : [null, ...PSEUDO_ELEMENTS];
+     for (let pseudo of pseudoElements) {
+ 
+       // Get the styles that apply to the element.
+       let domRules = DOMUtils.getCSSStyleRules(element, pseudo);
+-
+       if (!domRules) {
+         continue;
+       }
+ 
+       // getCSSStyleRules returns ordered from least-specific to
+       // most-specific.
+       for (let i = domRules.Count() - 1; i >= 0; i--) {
+         let domRule = domRules.GetElementAt(i);
+@@ -401,17 +419,17 @@ var PageStyleActor = protocol.ActorClass
+             continue;
+           }
+         }
+ 
+         let ruleActor = this._styleRef(domRule);
+         rules.push({
+           rule: ruleActor,
+           inherited: inherited,
+-          pseudoElement: pseudo
++          pseudoElement: isBeforeOrAfter ? null : pseudo
+         });
+       }
+ 
+     }
+   },
+ 
+   /**
+    * Expand Sets of rules and sheets to include all parent rules and sheets.
+diff --git a/toolkit/devtools/styleinspector/css-logic.js b/toolkit/devtools/styleinspector/css-logic.js
+--- a/toolkit/devtools/styleinspector/css-logic.js
++++ b/toolkit/devtools/styleinspector/css-logic.js
+@@ -167,17 +167,30 @@ CssLogic.prototype = {
+     } else {
+       // Clear cached data in the CssPropertyInfo objects.
+       this._propertyInfos = {};
+     }
+ 
+     this._matchedRules = null;
+     this._matchedSelectors = null;
+     let win = this.viewedDocument.defaultView;
+-    this._computedStyle = win.getComputedStyle(this.viewedElement, "");
++
++    // Handle computed styles on pseudo by reading parent node with proper
++    // pseudo arg to getComputedStyle.
++    let elementToRead = this.viewedElement;
++    let pseudoToRead = "";
++    if (this.viewedElement.nodeName == "_moz_generated_content_before") {
++      elementToRead = this.viewedElement.parentNode;
++      pseudoToRead = ":before";
++    }
++    if (this.viewedElement.nodeName == "_moz_generated_content_after") {
++      elementToRead = this.viewedElement.parentNode;
++      pseudoToRead = ":after";
++    }
++    this._computedStyle = win.getComputedStyle(elementToRead, pseudoToRead);
+   },
+ 
+   /**
+    * Get the source filter.
+    * @returns {string} The source filter being used.
+    */
+   get sourceFilter() {
+     return this._sourceFilter;
+@@ -578,17 +591,32 @@ CssLogic.prototype = {
+       return;
+     }
+ 
+     do {
+       let status = this.viewedElement === element ?
+                    CssLogic.STATUS.MATCHED : CssLogic.STATUS.PARENT_MATCH;
+ 
+       try {
+-        domRules = domUtils.getCSSStyleRules(element);
++
++      // Handle computed styles on pseudo by reading parent node with proper
++      // pseudo arg to getCSSStyleRules.
++        let cssRuleElement = element;
++        let pseudoElement = null;
++        if (element.nodeName == "_moz_generated_content_before") {
++          pseudoElement = ":before";
++          cssRuleElement = element.parentNode;
++        }
++
++        if (element.nodeName == "_moz_generated_content_after") {
++          pseudoElement = ":after";
++          cssRuleElement = element.parentNode;
++        }
++
++        domRules = domUtils.getCSSStyleRules(cssRuleElement, pseudoElement);
+       } catch (ex) {
+         Services.console.
+           logStringMessage("CL__buildMatchedRules error: " + ex);
+         continue;
+       }
+ 
+       for (let i = 0, n = domRules.Count(); i < n; i++) {
+         let domRule = domRules.GetElementAt(i);
