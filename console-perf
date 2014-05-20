@@ -1,34 +1,185 @@
 # HG changeset patch
-# Parent f463040ec3913bb468a5558c1805a7d78dc1ee68
+# Parent a07d85da5600807431fe4e280ae3d3e11a4c1842
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 998344 - Console input is slow when accessing large Uint8Array object properties
 
+diff --git a/toolkit/devtools/webconsole/test/test_jsterm.html b/toolkit/devtools/webconsole/test/test_jsterm.html
+--- a/toolkit/devtools/webconsole/test/test_jsterm.html
++++ b/toolkit/devtools/webconsole/test/test_jsterm.html
+@@ -11,16 +11,19 @@
+ <body>
+ <p>Test for JavaScript terminal functionality</p>
+ 
+ <script class="testbody" type="text/javascript;version=1.8">
+ SimpleTest.waitForExplicitFinish();
+ 
+ let gState;
+ 
++let {devtools} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
++let {MAX_AUTOCOMPLETE_ATTEMPT,MAX_AUTOCOMPLETIONS} =devtools.require("devtools/toolkit/webconsole/utils");
++
+ function startTest()
+ {
+   removeEventListener("load", startTest);
+ 
+   attachConsole(["PageError"], onAttach, true);
+ }
+ 
+ function onAttach(aState, aResponse)
+@@ -30,20 +33,31 @@ function onAttach(aState, aResponse)
+   top.foobarObject.foobar = 2;
+   top.foobarObject.foobaz = 3;
+   top.foobarObject.omg = 4;
+   top.foobarObject.omgfoo = 5;
+   top.foobarObject.strfoo = "foobarz";
+   top.foobarObject.omgstr = "foobarz" +
+     (new Array(DebuggerServer.LONG_STRING_LENGTH * 2)).join("abb");
+ 
++  top.largeObject1 = Object.create(null);
++  for (let i = 0; i < MAX_AUTOCOMPLETE_ATTEMPT + 1; i++) {
++    top.largeObject1['a' + i] = i;
++  }
++
++  top.largeObject2 = Object.create(null);
++  for (let i = 0; i < MAX_AUTOCOMPLETIONS * 2; i++) {
++    top.largeObject2['a' + i] = i;
++  }
++
+   gState = aState;
+ 
+   let tests = [doAutocomplete1, doAutocomplete2, doAutocomplete3,
+-               doAutocomplete4, doSimpleEval, doWindowEval, doEvalWithException,
++               doAutocomplete4, doAutocompleteLarge1, doAutocompleteLarge2,
++               doSimpleEval, doWindowEval, doEvalWithException,
+                doEvalWithHelper, doEvalString, doEvalLongString];
+   runTests(tests, testEnd);
+ }
+ 
+ function doAutocomplete1()
+ {
+   info("test autocomplete for 'window.foo'");
+   gState.client.autocomplete("window.foo", 10, onAutocomplete1);
+@@ -107,16 +121,49 @@ function doAutocomplete4()
+ function onAutocomplete4(aResponse)
+ {
+   ok(!aResponse.matchProp, "matchProp");
+   is(aResponse.matches.length, 0, "matches.length");
+ 
+   nextTest();
+ }
+ 
++function doAutocompleteLarge1()
++{
++  // Check that completion requests with too large objects will
++  // have no suggestions.
++  info("test autocomplete for 'window.largeObject1.'");
++  gState.client.autocomplete("window.largeObject1.", 20, onAutocompleteLarge1);
++}
++
++function onAutocompleteLarge1(aResponse)
++{
++  ok(!aResponse.matchProp, "matchProp");
++  info (aResponse.matches.join("|"));
++  is(aResponse.matches.length, 0, "Bailed out with too many properties");
++
++  nextTest();
++}
++
++function doAutocompleteLarge2()
++{
++  // Check that completion requests with pretty large objects will
++  // have MAX_AUTOCOMPLETIONS suggestions
++  info("test autocomplete for 'window.largeObject2.'");
++  gState.client.autocomplete("window.largeObject2.", 20, onAutocompleteLarge2);
++}
++
++function onAutocompleteLarge2(aResponse)
++{
++  ok(!aResponse.matchProp, "matchProp");
++  is(aResponse.matches.length, MAX_AUTOCOMPLETIONS + 1, "matches.length is MAX_AUTOCOMPLETIONS");
++
++  nextTest();
++}
++
+ function doSimpleEval()
+ {
+   info("test eval '2+2'");
+   gState.client.evaluateJS("2+2", onSimpleEval);
+ }
+ 
+ function onSimpleEval(aResponse)
+ {
 diff --git a/toolkit/devtools/webconsole/utils.js b/toolkit/devtools/webconsole/utils.js
 --- a/toolkit/devtools/webconsole/utils.js
 +++ b/toolkit/devtools/webconsole/utils.js
-@@ -966,21 +966,30 @@ function getMatchedProps(aObj, aMatch)
+@@ -26,16 +26,24 @@ loader.lazyImporter(this, "DevToolsUtils
+ // (function foobar(a, b) { ...
+ // function foobar2(a) { ...
+ // function() { ...
+ const REGEX_MATCH_FUNCTION_NAME = /^\(?function\s+([^(\s]+)\s*\(/;
+ 
+ // Match the function arguments from the result of toString() or toSource().
+ const REGEX_MATCH_FUNCTION_ARGS = /^\(?function\s*[^\s(]*\s*\((.+?)\)/;
+ 
++// Provide an easy way to bail out of even attempting an autocompletion
++// if an object has way too many properties. Protects against large objects
++// with numeric values that wouldn't be tallied towards MAX_AUTOCOMPLETIONS.
++const MAX_AUTOCOMPLETE_ATTEMPT = exports.MAX_AUTOCOMPLETE_ATTEMPT = 100000;
++
++// Prevent iterating over too many properties during autocomplete suggestions.
++const MAX_AUTOCOMPLETIONS = exports.MAX_AUTOCOMPLETIONS = 1500;
++
+ let WebConsoleUtils = {
+   /**
+    * Convenience function to unwrap a wrapped object.
+    *
+    * @param aObject the object to unwrap.
+    * @return aObject unwrapped.
+    */
+   unwrap: function WCU_unwrap(aObject)
+@@ -630,18 +638,16 @@ const STATE_DQUOTE = 3;
+ const OPEN_BODY = "{[(".split("");
+ const CLOSE_BODY = "}])".split("");
+ const OPEN_CLOSE_BODY = {
+   "{": "}",
+   "[": "]",
+   "(": ")",
+ };
+ 
+-const MAX_COMPLETIONS = 1500;
+-
+ /**
+  * Analyses a given string to find the last statement that is interesting for
+  * later completion.
+  *
+  * @param   string aStr
+  *          A string to analyse.
+  *
+  * @returns object
+@@ -964,40 +970,48 @@ function getMatchedProps(aObj, aMatch)
+  * @param string aMatch
+  *        Filter for properties that match this string.
   * @return object
   *         Object that contains the matchProp and the list of names.
   */
  function getMatchedProps_impl(aObj, aMatch, {chainIterator, getProperties})
  {
    let matches = new Set();
++  let numProps = 0;
  
    // We need to go up the prototype chain.
-+  console.time("Matching");
    let iter = chainIterator(aObj);
++  let props = [];
    for (let obj of iter) {
      let props = getProperties(obj);
-+        console.log("Unfiltered props length", props.length);
++    numProps += props.length;
 +
-+    console.log(typeof obj, aObj.toString(), props[0] == "0", props[props.length] == "length");
-+    // if (props[0] == "0" && props[props.length] == "length");
++    if (numProps > MAX_AUTOCOMPLETE_ATTEMPT) {
++      break;
++    }
 +
-+    // props = props.filter(prop=>prop.indexOf(aMatch) != 0 && +prop != +prop);
-+    // console.log("Filtered props length", props.length);
      for (let i = 0; i < props.length; i++) {
        let prop = props[i];
-+      console.log(prop, i);
        if (prop.indexOf(aMatch) != 0) {
          continue;
        }
@@ -37,22 +188,22 @@ diff --git a/toolkit/devtools/webconsole/utils.js b/toolkit/devtools/webconsole/
        // This uses a trick: converting a string to a number yields NaN if
        // the operation failed, and NaN is not equal to itself.
        if (+prop != +prop) {
-@@ -991,16 +1000,18 @@ function getMatchedProps_impl(aObj, aMat
+         matches.add(prop);
+       }
+ 
+-      if (matches.size > MAX_COMPLETIONS) {
++      if (matches.size > MAX_AUTOCOMPLETIONS) {
          break;
        }
      }
  
-     if (matches.size > MAX_COMPLETIONS) {
+-    if (matches.size > MAX_COMPLETIONS) {
++    if (matches.size > MAX_AUTOCOMPLETIONS) {
        break;
      }
    }
-+  console.log("Finished ", matches.size);
-+  console.timeEnd("Matching");
  
    return {
      matchProp: aMatch,
      matches: [...matches],
    };
- }
- 
- /**
