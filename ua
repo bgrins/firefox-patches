@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 43daa13856bea6ef5e7db97719a901f0cc64c3a0
+# Parent d36b2edb017b8cdb179ca4228eabc4c9966d35d0
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 935803 - Display browser styles in the rule view (UA style sheet rules)
 
@@ -15,7 +15,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
  
  const HTML_NS = "http://www.w3.org/1999/xhtml";
  const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
-+const INSPECT_UA_STYLES = false;
++const INSPECT_UA_STYLES = true;
  
  /**
   * These regular expressions are adapted from firebug's css.js, and are
@@ -128,7 +128,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
 +
 +    this.closeBrace = createChild(code, "div", {
 +      class: "ruleview-ruleclose",
-+      tabindex: "0", //this.editable ? "0" : "-1",
++      tabindex: this.editable ? "0" : "-1",
 +      textContent: "}"
 +    });
  
@@ -242,7 +242,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      this.nameSpan = createChild(this.nameContainer, "span", {
        class: "ruleview-propertyname theme-fg-color5",
 -      tabindex: "0",
-+      tabindex: "0" //this.ruleEditor.editable ? "0" : "-1",
++      tabindex: this.ruleEditor.editable ? "0" : "-1",
      });
  
 -    editableField({
@@ -283,7 +283,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      this.valueSpan = createChild(propertyContainer, "span", {
        class: "ruleview-propertyvalue theme-fg-color1",
 -      tabindex: "0",
-+      tabindex: "0" //this.ruleEditor.editable ? "0" : "-1",
++      tabindex: this.ruleEditor.editable ? "0" : "-1",
      });
  
 -    this.valueSpan.addEventListener("click", (event) => {
@@ -390,10 +390,47 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
     * @return {string} the stylesheet's href.
     */
    get sheetHref() {
+@@ -2232,25 +2250,27 @@ TextPropertyEditor.prototype = {
+       urlClass: "theme-link",
+       baseURI: this.sheetURI
+     });
+     this.valueSpan.innerHTML = "";
+     this.valueSpan.appendChild(frag);
+ 
+     // Attach the color picker tooltip to the color swatches
+     this._swatchSpans = this.valueSpan.querySelectorAll("." + swatchClass);
+-    for (let span of this._swatchSpans) {
+-      // Capture the original declaration value to be able to revert later
+-      let originalValue = this.valueSpan.textContent;
+-      // Adding this swatch to the list of swatches our colorpicker knows about
+-      this.ruleEditor.ruleView.colorPicker.addSwatch(span, {
+-        onPreview: () => this._previewValue(this.valueSpan.textContent),
+-        onCommit: () => this._applyNewValue(this.valueSpan.textContent),
+-        onRevert: () => this._applyNewValue(originalValue)
+-      });
++    if (this.ruleEditor.editable) {
++      for (let span of this._swatchSpans) {
++        // Capture the original declaration value to be able to revert later
++        let originalValue = this.valueSpan.textContent;
++        // Adding this swatch to the list of swatches our colorpicker knows about
++        this.ruleEditor.ruleView.colorPicker.addSwatch(span, {
++          onPreview: () => this._previewValue(this.valueSpan.textContent),
++          onCommit: () => this._applyNewValue(this.valueSpan.textContent),
++          onRevert: () => this._applyNewValue(originalValue)
++        });
++      }
+     }
+ 
+     // Populate the computed styles.
+     this._updateComputed();
+   },
+ 
+   _onStartEditing: function() {
+     this.element.classList.remove("ruleview-overridden");
 diff --git a/browser/themes/shared/devtools/ruleview.css b/browser/themes/shared/devtools/ruleview.css
 --- a/browser/themes/shared/devtools/ruleview.css
 +++ b/browser/themes/shared/devtools/ruleview.css
-@@ -36,16 +36,23 @@
+@@ -36,16 +36,38 @@
    text-decoration: underline;
  }
  
@@ -402,11 +439,26 @@ diff --git a/browser/themes/shared/devtools/ruleview.css b/browser/themes/shared
    padding: 2px 4px;
  }
  
-+.ruleview-rule[uneditable=true] {
-+  background: rgba(128, 128, 128, .1);
++/* User agent styles are not editable, display them differently */
++.theme-light .ruleview-rule[uneditable=true] {
++  background: #ebeced; /* Tab Toolbar */
++}
++.theme-dark .ruleview-rule[uneditable=true] {
++  background: #252c33; /* Tab Toolbar */
++}
++.ruleview-rule[uneditable=true] :focus {
++  outline: none;
++}
++.ruleview-rule[uneditable=true] .theme-link {
++  color: #5f88b0; /* Blue - Grey */
++  text-decoration: none;
 +}
 +.ruleview-rule[uneditable=true] .ruleview-enableproperty {
 +  visibility: hidden;
++}
++.ruleview-rule[uneditable=true] .ruleview-namecontainer > .ruleview-propertyname,
++.ruleview-rule[uneditable=true] .ruleview-propertycontainer > .ruleview-propertyvalue {
++  border-bottom-color: transparent;
 +}
 +
  #noResults {
