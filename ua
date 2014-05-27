@@ -619,7 +619,7 @@ diff --git a/browser/devtools/styleinspector/ruleview.css b/browser/devtools/sty
 diff --git a/browser/devtools/styleinspector/test/browser.ini b/browser/devtools/styleinspector/test/browser.ini
 --- a/browser/devtools/styleinspector/test/browser.ini
 +++ b/browser/devtools/styleinspector/test/browser.ini
-@@ -78,16 +78,17 @@ skip-if = os == "win" && debug # bug 963
+@@ -78,16 +78,18 @@ skip-if = os == "win" && debug # bug 963
  [browser_ruleview_override.js]
  [browser_ruleview_pseudo-element.js]
  [browser_ruleview_refresh-on-attribute-change_01.js]
@@ -629,6 +629,7 @@ diff --git a/browser/devtools/styleinspector/test/browser.ini b/browser/devtools
  [browser_ruleview_style-editor-link.js]
  [browser_ruleview_urls-clickable.js]
 +[browser_ruleview_user-agent-styles.js]
++[browser_ruleview_user-agent-styles-uneditable.js]
  [browser_ruleview_user-property-reset.js]
  [browser_styleinspector_csslogic-content-stylesheets.js]
  [browser_styleinspector_csslogic-inherited-properties.js]
@@ -637,40 +638,128 @@ diff --git a/browser/devtools/styleinspector/test/browser.ini b/browser/devtools
  [browser_styleinspector_output-parser.js]
  [browser_styleinspector_tooltip-background-image.js]
  [browser_styleinspector_tooltip-closes-on-new-selection.js]
-diff --git a/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles.js b/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles.js
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles-uneditable.js b/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles-uneditable.js
 new file mode 100644
 --- /dev/null
-+++ b/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles.js
-@@ -0,0 +1,133 @@
++++ b/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles-uneditable.js
+@@ -0,0 +1,84 @@
 +/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
 +/* Any copyright is dedicated to the Public Domain.
 + http://creativecommons.org/publicdomain/zero/1.0/ */
 +
 +"use strict";
 +
-+// Check that user agent styles are inspectable via rule view
++// Check that user agent styles are inspectable via rule view if
++// it is preffed on.
 +
-+  // XXX check matching styles from server with styles from frontend.
-+  // Probably can't hardcode the checks here since UA styles could be different across platforms
-+  // Could also run through after toggling pref to make sure there are less (and no isSystem styles)
++let PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
++const TEST_URI = "data:text/html;charset=utf-8," +
++  "<blockquote type=cite>" +
++  " <pre _moz_quote=true>" +
++  "   inspect <a href='foo' style='color:orange'>user agent</a> styles" +
++  " </pre>" +
++  "</blockquote>";
 +
++let test = asyncTest(function*() {
++  info ("Starting the test with the pref set to true before toolbox is opened");
++  Services.prefs.setBoolPref(PREF_UA_STYLES, true);
++
++  info ("Opening the testcase and toolbox")
++  yield addTab(TEST_URI);
++  let {toolbox, inspector, view} = yield openRuleView();
++
++  yield userAgentStylesUneditable(inspector, view);
++
++  info("Resetting " + PREF_UA_STYLES);
++  Services.prefs.clearUserPref(PREF_UA_STYLES);
++});
++
++function* userAgentStylesUneditable(inspector, view) {
++  info ("Making sure that UI is not editable for user agent styles");
++
++  yield selectNode("a", inspector);
++  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
++  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
++
++  for (let rule of uaRules) {
++    ok (rule.editor.element.hasAttribute("uneditable"), "UA rules have uneditable attribute");
++
++    let colorswatch = rule.editor.element.querySelector(".ruleview-colorswatch");
++    if (colorswatch) {
++      info ("Clicking color swatch and waiting to make sure popup doesn't show up");
++      let onShown = view.colorPicker.tooltip.once("shown");
++      let popupShownPromise = waitForPromise(onShown);
++      colorswatch.click();
++      let popupWasShown = yield popupShownPromise;
++      ok (!popupWasShown, "Popup was not shown when clicking on color swatch")
++    }
++
++    let editable = rule.editor.closeBrace;
++    let onFocus = waitForPromise(once(editable.parentNode, "focus", true));
++    EventUtils.synthesizeMouse(editable, 1, 1, {},
++      editable.ownerDocument.defaultView);
++    yield onFocus;
++
++    ok (!rule.editor.newPropSpan, "There is no new prop span");
++
++    let nameSpan = rule.textProps[0].editor.nameSpan;
++    let onNameFocus = waitForPromise(once(nameSpan.parentNode, "focus", true));
++    EventUtils.synthesizeMouse(nameSpan, 1, 1, {},
++      editable.ownerDocument.defaultView);
++    yield onNameFocus;
++
++    is (editable.ownerDocument.activeElement.tagName, "span", "No input is focused");
++  }
++}
++
++function waitForPromise(p, ms = 200) {
++  // Wait for a designated amount of time for a promise to finish,
++  // then resolve with `true` if the promise finished, or `false`
++  // if the timeout happened first.
++  let def = promise.defer();
++  let timeout = setTimeout(() => {
++    def.resolve(false);
++    p = null;
++  }, ms);
++  p.then(() => {
++    def.resolve(true);
++    clearTimeout(timeout);
++  });
++  return def.promise;
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles.js b/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles.js
+@@ -0,0 +1,138 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Check that user agent styles are inspectable via rule view if
++// it is preffed on.
 +
 +let PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
 +const { PrefObserver } = devtools.require("devtools/styleeditor/utils");
++const TEST_URI = "data:text/html;charset=utf-8," +
++  "<blockquote type=cite>" +
++  " <pre _moz_quote=true>" +
++  "   inspect <a href='foo' style='color:orange'>user agent</a> styles" +
++  " </pre>" +
++  "</blockquote>";
 +
 +let test = asyncTest(function*() {
-+
 +  info ("Starting the test with the pref set to true before toolbox is opened");
 +  yield setUserAgentStylesPref(true);
 +
-+  yield addTab("data:text/html;charset=utf-8," +
-+    "<blockquote type=cite><pre _moz_quote=true>inspect <em style='color:orange'>user agent</em> styles</pre></blockquote>"
-+  );
-+
++  info ("Opening the testcase and toolbox")
++  yield addTab(TEST_URI);
 +  let {toolbox, inspector, view} = yield openRuleView();
 +
++  info ("Making sure that UA styles are visible on initial load")
 +  yield userAgentStylesVisible(inspector, view);
-+  yield userAgentStylesUneditable(inspector, view);
 +
 +  info ("Making sure that setting the pref to false hides UA styles");
 +  yield setUserAgentStylesPref(false);
@@ -685,9 +774,10 @@ new file mode 100644
 +});
 +
 +function* setUserAgentStylesPref(val) {
-+  // Reset the pref and wait for PrefObserver to return so UI
-+  // Has a chance to get updated.
 +  info("Setting the pref " + PREF_UA_STYLES + " to: " + val);
++
++  // Reset the pref and wait for PrefObserver to callback so UI
++  // has a chance to get updated.
 +  let oncePrefChanged = promise.defer();
 +  let prefObserver = new PrefObserver("devtools.");
 +  prefObserver.on(PREF_UA_STYLES, oncePrefChanged.resolve);
@@ -697,13 +787,15 @@ new file mode 100644
 +}
 +
 +function* userAgentStylesVisible(inspector, view) {
++  info ("Making sure that user agent styles are currently visible");
++
 +  yield selectNode("blockquote", inspector);
 +  yield compareAppliedStylesWithUI(inspector, view, "ua");
 +
 +  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
 +  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
 +  is (userRules.length, 1, "Correct number of user rules");
-+  is (uaRules.length, 4, "Correct number of UA rules");
++  ok (uaRules.length > 0, "Has UA rules");
 +
 +  yield selectNode("pre", inspector);
 +  yield compareAppliedStylesWithUI(inspector, view, "ua");
@@ -711,25 +803,36 @@ new file mode 100644
 +  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
 +  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
 +  is (userRules.length, 1, "Correct number of user rules");
-+  is (uaRules.length, 3, "Correct number of UA rules");
++  ok (uaRules.length > 0, "Has UA rules");
 +
-+  yield selectNode("em", inspector);
++  yield selectNode("a", inspector);
 +  yield compareAppliedStylesWithUI(inspector, view, "ua");
 +
 +  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
 +  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
 +  is (userRules.length, 1, "Correct number of user rules");
-+  is (uaRules.length, 3, "Correct number of UA rules");
++
++  ok (userRules.some(rule=> rule.matchedSelectors.length === 0),
++    "There is an inline style for element in user styles");
++
++  ok (uaRules.some(rule=> rule.matchedSelectors.indexOf(":-moz-any-link")),
++    "There is a rule for :-moz-any-link");
++  ok (uaRules.some(rule=> rule.matchedSelectors.indexOf("*|*:link")),
++    "There is a rule for *|*:link");
++  ok (!uaRules.some(rule=> rule.matchedSelectors.length === 0),
++    "No inline styles for ua styles");
 +}
 +
 +function* userAgentStylesNotVisible(inspector, view) {
++  info ("Making sure that user agent styles are not currently visible");
++
 +  yield selectNode("blockquote", inspector);
 +  yield compareAppliedStylesWithUI(inspector, view);
 +
 +  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
 +  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
 +  is (userRules.length, 1, "Correct number of user rules");
-+  is (uaRules.length, 0, "Correct number of UA rules");
++  is (uaRules.length, 0, "No UA rules");
 +
 +  yield selectNode("pre", inspector);
 +  yield compareAppliedStylesWithUI(inspector, view);
@@ -737,18 +840,20 @@ new file mode 100644
 +  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
 +  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
 +  is (userRules.length, 1, "Correct number of user rules");
-+  is (uaRules.length, 0, "Correct number of UA rules");
++  is (uaRules.length, 0, "No UA rules");
 +
-+  yield selectNode("em", inspector);
++  yield selectNode("a", inspector);
 +  yield compareAppliedStylesWithUI(inspector, view);
 +
 +  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
 +  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
 +  is (userRules.length, 1, "Correct number of user rules");
-+  is (uaRules.length, 0, "Correct number of UA rules");
++  is (uaRules.length, 0, "No UA rules");
 +}
 +
 +function* compareAppliedStylesWithUI(inspector, view, filter) {
++  info ("Making sure that UI is consistent with pageStyle.getApplied");
++
 +  let entries = yield inspector.pageStyle.getApplied(inspector.selection.nodeFront, {
 +    inherited: true,
 +    matchedSelectors: true,
@@ -764,16 +869,6 @@ new file mode 100644
 +    is (elementStyleRule.isSystem, entry.isSystem, "Same isSystem (" +entry.isSystem+ ")");
 +    is (elementStyleRule.editor.isEditable, !entry.isSystem, "Editor isEditable opposite of UA (" +entry.isSystem+ ")");
 +  });
-+}
-+
-+function* userAgentStylesUneditable(inspector, view, iflter) {
-+  yield selectNode("blockquote", inspector);
-+  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
-+
-+  for (let rule of uaRules) {
-+    // let editor = yield focusEditableField(rule.editor.closeBrace);
-+    // is(inplaceEditor(elementRuleEditor.newPropSpan), editor, "The new property editor got focused");
-+  }
 +}
 diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
 --- a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
