@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 52632d896ef75107104861ae63083c452f25b161
+# Parent 2675e3bbdc0633cd4a1ae40f9acb01745c14f544
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 935803 - Display browser styles in the rule view (UA style sheet rules)
 
@@ -51,7 +51,7 @@ diff --git a/browser/devtools/framework/toolbox-options.xul b/browser/devtools/f
 diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
 --- a/browser/devtools/styleinspector/rule-view.js
 +++ b/browser/devtools/styleinspector/rule-view.js
-@@ -17,16 +17,17 @@ const {OutputParser} = require("devtools
+@@ -17,16 +17,18 @@ const {OutputParser} = require("devtools
  const {PrefObserver, PREF_ORIG_SOURCES} = require("devtools/styleeditor/utils");
  const {parseSingleValue, parseDeclarations} = require("devtools/styleinspector/css-parsing-utils");
  
@@ -61,6 +61,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
  const HTML_NS = "http://www.w3.org/1999/xhtml";
  const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
 +const PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
++const PREF_DEFAULT_COLOR_UNIT = "devtools.defaultColorUnit";
  
  /**
   * These regular expressions are adapted from firebug's css.js, and are
@@ -69,7 +70,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
  
  // Used to split on css line separators
  const CSS_LINE_RE = /(?:[^;\(]*(?:\([^\)]*?\))?[^;\(]*)*;?/g;
-@@ -107,23 +108,26 @@ function createDummyDocument() {
+@@ -107,23 +109,26 @@ function createDummyDocument() {
   *        The element whose style we are viewing.
   * @param {object} aStore
   *        The ElementStyle can use this object to store metadata
@@ -97,7 +98,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    }
  
    if (!("disabled" in this.store)) {
-@@ -180,17 +184,18 @@ ElementStyle.prototype = {
+@@ -180,17 +185,18 @@ ElementStyle.prototype = {
     * Upon completion, this.rules[] will hold a list of Rule objects.
     *
     * Returns a promise that will be resolved when the elementStyle is
@@ -117,7 +118,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
            return;
          }
  
-@@ -396,25 +401,27 @@ ElementStyle.prototype = {
+@@ -396,25 +402,27 @@ ElementStyle.prototype = {
   *
   * @param {ElementStyle} aElementStyle
   *        The ElementStyle to which this rule belongs.
@@ -145,7 +146,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      if (parentRule && parentRule.type == Ci.nsIDOMCSSRule.MEDIA_RULE) {
        this.mediaText = parentRule.mediaText;
      }
-@@ -1077,16 +1084,18 @@ function CssRuleView(aInspector, aDoc, a
+@@ -1077,16 +1085,18 @@ function CssRuleView(aInspector, aDoc, a
  
    this._handlePrefChange = this._handlePrefChange.bind(this);
    gDevTools.on("pref-changed", this._handlePrefChange);
@@ -164,7 +165,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
  
    // Create a tooltip for previewing things in the rule view (images for now)
    this.previewTooltip = new Tooltip(this.inspector.panelDoc);
-@@ -1328,17 +1337,23 @@ CssRuleView.prototype = {
+@@ -1328,17 +1338,23 @@ CssRuleView.prototype = {
     * Return {bool} true if the rule view currently has an input editor visible.
     */
    get isEditing() {
@@ -179,8 +180,8 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
 +    }
 +
 +    // Reselect the currently selected element
-+    if (data.pref === PREF_UA_STYLES ||
-+        data.pref === "devtools.defaultColorUnit") {
++    let refreshOnPrefs = [PREF_UA_STYLES, PREF_DEFAULT_COLOR_UNIT];
++    if (refreshOnPrefs.indexOf(data.pref) > -1) {
        let element = this._viewedElement;
        this._viewedElement = null;
        this.highlight(element);
@@ -189,7 +190,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
  
    _onSourcePrefChanged: function() {
      if (this.menuitemSources) {
-@@ -1423,17 +1438,17 @@ CssRuleView.prototype = {
+@@ -1423,17 +1439,19 @@ CssRuleView.prototype = {
      }
  
      this._viewedElement = aElement;
@@ -199,7 +200,9 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      }
  
 -    this._elementStyle = new ElementStyle(aElement, this.store, this.pageStyle);
-+    this._elementStyle = new ElementStyle(aElement, this.store, this.pageStyle, this.showUserAgentStyles);
++    this._elementStyle = new ElementStyle(aElement, this.store,
++      this.pageStyle, this.showUserAgentStyles);
++
      return this._elementStyle.init().then(() => {
        return this._populate();
      }).then(() => {
@@ -208,7 +211,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
        if (this._elementStyle) {
          this._elementStyle.onChanged = () => {
            this._changed();
-@@ -1645,27 +1660,29 @@ CssRuleView.prototype = {
+@@ -1645,27 +1663,29 @@ CssRuleView.prototype = {
   * @param {Rule} aRule
   *        The Rule object we're editing.
   * @constructor
@@ -217,7 +220,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    this.ruleView = aRuleView;
    this.doc = this.ruleView.doc;
    this.rule = aRule;
-+  this.editable = !aRule.isSystem;
++  this.isEditable = !aRule.isSystem;
  
    this._onNewProperty = this._onNewProperty.bind(this);
    this._newPropertyDestroy = this._newPropertyDestroy.bind(this);
@@ -229,7 +232,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    _create: function() {
      this.element = this.doc.createElementNS(HTML_NS, "div");
      this.element.className = "ruleview-rule theme-separator";
-+    this.element.setAttribute("uneditable", !this.editable);
++    this.element.setAttribute("uneditable", !this.isEditable);
      this.element._ruleEditor = this;
      if (this.rule.pseudoElement) {
        this.element.classList.add("ruleview-rule-pseudo-element");
@@ -238,7 +241,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      // Give a relative position for the inplace editor's measurement
      // span to be placed absolutely against.
      this.element.style.position = "relative";
-@@ -1699,26 +1716,27 @@ RuleEditor.prototype = {
+@@ -1699,26 +1719,27 @@ RuleEditor.prototype = {
        class: "ruleview-selector theme-fg-color3"
      });
  
@@ -265,7 +268,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
 +
 +    this.closeBrace = createChild(code, "div", {
 +      class: "ruleview-ruleclose",
-+      tabindex: this.editable ? "0" : "-1",
++      tabindex: this.isEditable ? "0" : "-1",
 +      textContent: "}"
 +    });
  
@@ -276,7 +279,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
          this.doc.popupNode = event.explicitOriginalTarget;
          let win = this.doc.defaultView;
          win.focus();
-@@ -1726,46 +1744,51 @@ RuleEditor.prototype = {
+@@ -1726,46 +1747,51 @@ RuleEditor.prototype = {
          this.ruleView._contextmenu.openPopupAtScreen(
            event.screenX, event.screenY, true);
  
@@ -301,17 +304,17 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
 -    editableItem({ element: this.closeBrace }, (aElement) => {
 -      this.newProperty();
 -    });
-+    if (this.editable) {
-+      code.addEventListener("click", function() {
++    if (this.isEditable) {
++      code.addEventListener("click", () => {
 +        let selection = this.doc.defaultView.getSelection();
 +        if (selection.isCollapsed) {
 +          this.newProperty();
 +        }
-+      }.bind(this), false);
++      }, false);
 +
-+      this.element.addEventListener("mousedown", function() {
++      this.element.addEventListener("mousedown", () => {
 +        this.doc.defaultView.focus();
-+      }.bind(this), false);
++      }, false);
 +
 +      // Create a property editor when the close brace is clicked.
 +      editableItem({ element: this.closeBrace }, (aElement) => {
@@ -348,7 +351,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    },
  
    /**
-@@ -2009,92 +2032,51 @@ TextPropertyEditor.prototype = {
+@@ -2009,92 +2035,52 @@ TextPropertyEditor.prototype = {
      this.element = this.doc.createElementNS(HTML_NS, "li");
      this.element.classList.add("ruleview-property");
  
@@ -363,7 +366,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      this.expander = createChild(this.element, "span", {
        class: "ruleview-expander theme-twisty"
      });
--    this.expander.addEventListener("click", this._onExpandClicked, true);
+     this.expander.addEventListener("click", this._onExpandClicked, true);
  
      this.nameContainer = createChild(this.element, "span", {
        class: "ruleview-namecontainer"
@@ -443,7 +446,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      // for restoring after pressing escape.
      this.committed = { name: this.prop.name,
                         value: this.prop.value,
-@@ -2109,27 +2091,74 @@ TextPropertyEditor.prototype = {
+@@ -2109,27 +2095,73 @@ TextPropertyEditor.prototype = {
      });
  
      // Holds the viewers for the computed properties.
@@ -466,7 +469,6 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
 +    // Only bind event handlers if the rule is editable.
 +    if (this.ruleEditor.editable) {
 +      this.enable.addEventListener("click", this._onEnableClicked, true);
-+      this.expander.addEventListener("click", this._onExpandClicked, true);
 +
 +      this.nameContainer.addEventListener("click", (aEvent) => {
 +        // Clicks within the name shouldn't propagate any further.
@@ -529,7 +531,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
     * @return {string} the stylesheet's href.
     */
    get sheetHref() {
-@@ -2232,25 +2261,27 @@ TextPropertyEditor.prototype = {
+@@ -2232,25 +2264,27 @@ TextPropertyEditor.prototype = {
        urlClass: "theme-link",
        baseURI: this.sheetURI
      });
@@ -566,6 +568,22 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
  
    _onStartEditing: function() {
      this.element.classList.remove("ruleview-overridden");
+diff --git a/browser/devtools/styleinspector/ruleview.css b/browser/devtools/styleinspector/ruleview.css
+--- a/browser/devtools/styleinspector/ruleview.css
++++ b/browser/devtools/styleinspector/ruleview.css
+@@ -53,12 +53,8 @@
+   vertical-align: middle;
+   min-height: 1.5em;
+   line-height: 1.5em;
+ }
+ 
+ .ruleview-header.ruleview-expandable-header {
+   cursor: pointer;
+ }
+-
+-.ruleview-colorswatch {
+-  cursor: pointer;
+-}
 diff --git a/browser/devtools/styleinspector/test/browser.ini b/browser/devtools/styleinspector/test/browser.ini
 --- a/browser/devtools/styleinspector/test/browser.ini
 +++ b/browser/devtools/styleinspector/test/browser.ini
@@ -669,7 +687,28 @@ diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser
 diff --git a/browser/themes/shared/devtools/ruleview.css b/browser/themes/shared/devtools/ruleview.css
 --- a/browser/themes/shared/devtools/ruleview.css
 +++ b/browser/themes/shared/devtools/ruleview.css
-@@ -36,16 +36,38 @@
+@@ -9,16 +9,20 @@
+ .ruleview-rule-source {
+   -moz-padding-start: 5px;
+   cursor: pointer;
+   text-align: right;
+   float: right;
+   -moz-user-select: none;
+ }
+ 
++.ruleview-rule-source > label {
++  cursor: pointer;
++}
++
+ .ruleview-header {
+   border-top-width: 1px;
+   border-bottom-width: 1px;
+   border-top-style: solid;
+   border-bottom-style: solid;
+   padding: 1px 4px;
+   -moz-user-select: none;
+   word-wrap: break-word;
+@@ -36,16 +40,47 @@
    text-decoration: underline;
  }
  
@@ -682,19 +721,28 @@ diff --git a/browser/themes/shared/devtools/ruleview.css b/browser/themes/shared
 +.theme-light .ruleview-rule[uneditable=true] {
 +  background: #ebeced; /* Tab Toolbar */
 +}
++
 +.theme-dark .ruleview-rule[uneditable=true] {
 +  background: #252c33; /* Tab Toolbar */
 +}
++
 +.ruleview-rule[uneditable=true] :focus {
 +  outline: none;
 +}
++
 +.ruleview-rule[uneditable=true] .theme-link {
 +  color: #5f88b0; /* Blue - Grey */
-+  text-decoration: none;
 +}
++
 +.ruleview-rule[uneditable=true] .ruleview-enableproperty {
 +  visibility: hidden;
 +}
++
++.ruleview-rule[uneditable=true] .ruleview-colorswatch {
++  cursor: default;
++}
++
++
 +.ruleview-rule[uneditable=true] .ruleview-namecontainer > .ruleview-propertyname,
 +.ruleview-rule[uneditable=true] .ruleview-propertycontainer > .ruleview-propertyvalue {
 +  border-bottom-color: transparent;
@@ -708,6 +756,24 @@ diff --git a/browser/themes/shared/devtools/ruleview.css b/browser/themes/shared
  .ruleview-rule + .ruleview-rule {
    border-top-width: 1px;
    border-top-style: dotted;
+@@ -108,16 +143,17 @@
+   padding: 0;
+ }
+ 
+ .ruleview-computed {
+   -moz-margin-start: 35px;
+ }
+ 
+ .ruleview-colorswatch {
++  cursor: pointer;
+   border-radius: 50%;
+   width: 1em;
+   height: 1em;
+   vertical-align: text-top;
+   -moz-margin-end: 5px;
+   display: inline-block;
+   position: relative;
+ }
 diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/actors/styles.js
 --- a/toolkit/devtools/server/actors/styles.js
 +++ b/toolkit/devtools/server/actors/styles.js
