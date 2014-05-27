@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent d36b2edb017b8cdb179ca4228eabc4c9966d35d0
+# Parent 52632d896ef75107104861ae63083c452f25b161
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 935803 - Display browser styles in the rule view (UA style sheet rules)
 
@@ -591,56 +591,54 @@ diff --git a/browser/devtools/styleinspector/test/browser_ruleview_user-agent-st
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles.js
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,48 @@
 +/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
 +/* Any copyright is dedicated to the Public Domain.
 + http://creativecommons.org/publicdomain/zero/1.0/ */
 +
 +"use strict";
 +
-+// Check that inherited properties appear as such in the rule-view
++// Check that user agent styles are inspectable via rule view
 +
-+let {ELEMENT_STYLE} = devtools.require("devtools/server/actors/styles");
-+const PREF = "devtools.inspector.showUserAgentStyles";
++
++  // XXX check matching styles from server with styles from frontend.
++  // Probably can't hardcode the checks here since UA styles could be different across platforms
++  // Could also run through after toggling pref to make sure there are less (and no isSystem styles)
 +
 +let test = asyncTest(function*() {
-+  info("Turning the pref " + PREF + " on");
-+  Services.prefs.setBoolPref(PREF, true);
 +
-+  yield addTab("data:text/html;charset=utf-8," +
-+    "<blockquote type=cite><pre _moz_quote=true>fun <em style='color:orange'>to</em> inspect</code></blockquote>"
-+  );
-+  let {toolbox, inspector, view} = yield openRuleView();
++  // let {ELEMENT_STYLE} = devtools.require("devtools/server/actors/styles");
++  // let PREF = "devtools.inspector.showUserAgentStyles";
 +
-+  yield simpleInherit(inspector, view);
++  // info("Turning the pref " + PREF + " on");
++  // Services.prefs.setBoolPref(PREF, true);
 +
-+  info("Resetting " + PREF);
-+  Services.prefs.clearUserPref(PREF);
++  // yield addTab("data:text/html;charset=utf-8," +
++  //   "<blockquote type=cite><pre _moz_quote=true>fun <em style='color:orange'>to</em> inspect</code></blockquote>"
++  // );
++  // let {toolbox, inspector, view} = yield openRuleView();
++
++  // yield simpleInherit(inspector, view);
++
++  // info("Resetting " + PREF);
++  // Services.prefs.clearUserPref(PREF);
++
 +});
 +
 +function* simpleInherit(inspector, view) {
 +  yield selectNode("blockquote", inspector);
 +
-+is (inspector.selection.node, "bar", "w");
-+  let entries = yield inspector.pageStyle.getApplied(inspector.selection.node, {
++  let entries = yield inspector.pageStyle.getApplied(inspector.selection.nodeFront, {
 +    inherited: true,
 +    matchedSelectors: true,
 +    filter: "ua"
 +  });
 +
-+is (entries, "foo", "w");
 +  let elementStyle = view._elementStyle;
-+  is(elementStyle.rules.length, 2, "Should have 2 rules.");
-+
-+  let elementRule = elementStyle.rules[0];
-+  ok(!elementRule.inherited, "Element style attribute should not consider itself inherited.");
-+
-+  let inheritRule = elementStyle.rules[1];
-+  is(inheritRule.selectorText, "#test2", "Inherited rule should be the one that includes inheritable properties.");
-+  ok(!!inheritRule.inherited, "Rule should consider itself inherited.");
-+  is(inheritRule.textProps.length, 1, "Should only display one inherited style");
-+  let inheritProp = inheritRule.textProps[0];
-+  is(inheritProp.name, "color", "color should have been inherited.");
++  is(elementStyle.rules.length, entries.length, "Should have correct number of rules.");
++  entries.forEach((entry, i) => {
++    let elementStyleRule = elementStyle.rules[i];
++  });
 +}
 diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
 --- a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
