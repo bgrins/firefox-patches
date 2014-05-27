@@ -146,17 +146,26 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      if (parentRule && parentRule.type == Ci.nsIDOMCSSRule.MEDIA_RULE) {
        this.mediaText = parentRule.mediaText;
      }
-@@ -1077,16 +1085,18 @@ function CssRuleView(aInspector, aDoc, a
+@@ -1071,21 +1079,24 @@ function CssRuleView(aInspector, aDoc, a
+   this._contextMenuUpdate = this._contextMenuUpdate.bind(this);
+   this._onSelectAll = this._onSelectAll.bind(this);
+   this._onCopy = this._onCopy.bind(this);
+   this._onToggleOrigSources = this._onToggleOrigSources.bind(this);
+ 
+   this.element.addEventListener("copy", this._onCopy);
  
    this._handlePrefChange = this._handlePrefChange.bind(this);
-   gDevTools.on("pref-changed", this._handlePrefChange);
- 
+-  gDevTools.on("pref-changed", this._handlePrefChange);
+-
    this._onSourcePrefChanged = this._onSourcePrefChanged.bind(this);
++
    this._prefObserver = new PrefObserver("devtools.");
    this._prefObserver.on(PREF_ORIG_SOURCES, this._onSourcePrefChanged);
- 
-+  this.showUserAgentStyles = Services.prefs.getBoolPref(PREF_UA_STYLES);
++  this._prefObserver.on(PREF_UA_STYLES, this._handlePrefChange);
++  this._prefObserver.on(PREF_DEFAULT_COLOR_UNIT, this._handlePrefChange);
 +
++  this.showUserAgentStyles = Services.prefs.getBoolPref(PREF_UA_STYLES);
+ 
    let options = {
      autoSelect: true,
      theme: "auto"
@@ -164,8 +173,8 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    this.popup = new AutocompletePopup(aDoc.defaultView.parent.document, options);
  
    // Create a tooltip for previewing things in the rule view (images for now)
-   this.previewTooltip = new Tooltip(this.inspector.panelDoc);
-@@ -1328,17 +1338,23 @@ CssRuleView.prototype = {
+@@ -1327,18 +1338,24 @@ CssRuleView.prototype = {
+   /**
     * Return {bool} true if the rule view currently has an input editor visible.
     */
    get isEditing() {
@@ -173,15 +182,16 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
        || this.colorPicker.tooltip.isShown();
    },
  
-   _handlePrefChange: function(event, data) {
+-  _handlePrefChange: function(event, data) {
 -    if (data.pref == "devtools.defaultColorUnit") {
-+    if (data.pref == PREF_UA_STYLES) {
-+      this.showUserAgentStyles = Services.prefs.getBoolPref(PREF_UA_STYLES);
++  _handlePrefChange: function(pref) {
++    if (pref === PREF_UA_STYLES) {
++      this.showUserAgentStyles = Services.prefs.getBoolPref(pref);
 +    }
 +
 +    // Reselect the currently selected element
 +    let refreshOnPrefs = [PREF_UA_STYLES, PREF_DEFAULT_COLOR_UNIT];
-+    if (refreshOnPrefs.indexOf(data.pref) > -1) {
++    if (refreshOnPrefs.indexOf(pref) > -1) {
        let element = this._viewedElement;
        this._viewedElement = null;
        this.highlight(element);
@@ -190,7 +200,29 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
  
    _onSourcePrefChanged: function() {
      if (this.menuitemSources) {
-@@ -1423,17 +1439,19 @@ CssRuleView.prototype = {
+@@ -1353,19 +1370,20 @@ CssRuleView.prototype = {
+       }
+     }
+   },
+ 
+   destroy: function() {
+     this.clear();
+ 
+     gDummyPromise = null;
+-    gDevTools.off("pref-changed", this._handlePrefChange);
+ 
+     this._prefObserver.off(PREF_ORIG_SOURCES, this._onSourcePrefChanged);
++    this._prefObserver.off(PREF_UA_STYLES, this._handlePrefChange);
++    this._prefObserver.off(PREF_DEFAULT_COLOR_UNIT, this._handlePrefChange);
+     this._prefObserver.destroy();
+ 
+     this.element.removeEventListener("copy", this._onCopy);
+     delete this._onCopy;
+ 
+     delete this._outputParser;
+ 
+     // Remove context menu
+@@ -1423,17 +1441,19 @@ CssRuleView.prototype = {
      }
  
      this._viewedElement = aElement;
@@ -211,7 +243,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
        if (this._elementStyle) {
          this._elementStyle.onChanged = () => {
            this._changed();
-@@ -1645,27 +1663,29 @@ CssRuleView.prototype = {
+@@ -1645,27 +1665,29 @@ CssRuleView.prototype = {
   * @param {Rule} aRule
   *        The Rule object we're editing.
   * @constructor
@@ -241,7 +273,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      // Give a relative position for the inplace editor's measurement
      // span to be placed absolutely against.
      this.element.style.position = "relative";
-@@ -1699,26 +1719,27 @@ RuleEditor.prototype = {
+@@ -1699,26 +1721,27 @@ RuleEditor.prototype = {
        class: "ruleview-selector theme-fg-color3"
      });
  
@@ -279,7 +311,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
          this.doc.popupNode = event.explicitOriginalTarget;
          let win = this.doc.defaultView;
          win.focus();
-@@ -1726,46 +1747,51 @@ RuleEditor.prototype = {
+@@ -1726,46 +1749,51 @@ RuleEditor.prototype = {
          this.ruleView._contextmenu.openPopupAtScreen(
            event.screenX, event.screenY, true);
  
@@ -351,7 +383,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    },
  
    /**
-@@ -2009,92 +2035,52 @@ TextPropertyEditor.prototype = {
+@@ -2009,92 +2037,52 @@ TextPropertyEditor.prototype = {
      this.element = this.doc.createElementNS(HTML_NS, "li");
      this.element.classList.add("ruleview-property");
  
@@ -384,7 +416,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      this.nameSpan = createChild(this.nameContainer, "span", {
        class: "ruleview-propertyname theme-fg-color5",
 -      tabindex: "0",
-+      tabindex: this.ruleEditor.editable ? "0" : "-1",
++      tabindex: this.ruleEditor.isEditable ? "0" : "-1",
      });
  
 -    editableField({
@@ -425,7 +457,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      this.valueSpan = createChild(propertyContainer, "span", {
        class: "ruleview-propertyvalue theme-fg-color1",
 -      tabindex: "0",
-+      tabindex: this.ruleEditor.editable ? "0" : "-1",
++      tabindex: this.ruleEditor.isEditable ? "0" : "-1",
      });
  
 -    this.valueSpan.addEventListener("click", (event) => {
@@ -446,7 +478,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      // for restoring after pressing escape.
      this.committed = { name: this.prop.name,
                         value: this.prop.value,
-@@ -2109,27 +2095,73 @@ TextPropertyEditor.prototype = {
+@@ -2109,27 +2097,73 @@ TextPropertyEditor.prototype = {
      });
  
      // Holds the viewers for the computed properties.
@@ -467,7 +499,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
 -      popup: this.popup
 -    });
 +    // Only bind event handlers if the rule is editable.
-+    if (this.ruleEditor.editable) {
++    if (this.ruleEditor.isEditable) {
 +      this.enable.addEventListener("click", this._onEnableClicked, true);
 +
 +      this.nameContainer.addEventListener("click", (aEvent) => {
@@ -531,7 +563,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
     * @return {string} the stylesheet's href.
     */
    get sheetHref() {
-@@ -2232,25 +2264,27 @@ TextPropertyEditor.prototype = {
+@@ -2232,25 +2266,27 @@ TextPropertyEditor.prototype = {
        urlClass: "theme-link",
        baseURI: this.sheetURI
      });
@@ -549,7 +581,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
 -        onCommit: () => this._applyNewValue(this.valueSpan.textContent),
 -        onRevert: () => this._applyNewValue(originalValue)
 -      });
-+    if (this.ruleEditor.editable) {
++    if (this.ruleEditor.isEditable) {
 +      for (let span of this._swatchSpans) {
 +        // Capture the original declaration value to be able to revert later
 +        let originalValue = this.valueSpan.textContent;
@@ -609,7 +641,7 @@ diff --git a/browser/devtools/styleinspector/test/browser_ruleview_user-agent-st
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles.js
-@@ -0,0 +1,48 @@
+@@ -0,0 +1,133 @@
 +/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
 +/* Any copyright is dedicated to the Public Domain.
 + http://creativecommons.org/publicdomain/zero/1.0/ */
@@ -618,45 +650,130 @@ new file mode 100644
 +
 +// Check that user agent styles are inspectable via rule view
 +
-+
 +  // XXX check matching styles from server with styles from frontend.
 +  // Probably can't hardcode the checks here since UA styles could be different across platforms
 +  // Could also run through after toggling pref to make sure there are less (and no isSystem styles)
 +
++
++let PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
++const { PrefObserver } = devtools.require("devtools/styleeditor/utils");
++
 +let test = asyncTest(function*() {
 +
-+  // let {ELEMENT_STYLE} = devtools.require("devtools/server/actors/styles");
-+  // let PREF = "devtools.inspector.showUserAgentStyles";
++  info ("Starting the test with the pref set to true before toolbox is opened");
++  yield setUserAgentStylesPref(true);
 +
-+  // info("Turning the pref " + PREF + " on");
-+  // Services.prefs.setBoolPref(PREF, true);
++  yield addTab("data:text/html;charset=utf-8," +
++    "<blockquote type=cite><pre _moz_quote=true>inspect <em style='color:orange'>user agent</em> styles</pre></blockquote>"
++  );
 +
-+  // yield addTab("data:text/html;charset=utf-8," +
-+  //   "<blockquote type=cite><pre _moz_quote=true>fun <em style='color:orange'>to</em> inspect</code></blockquote>"
-+  // );
-+  // let {toolbox, inspector, view} = yield openRuleView();
++  let {toolbox, inspector, view} = yield openRuleView();
 +
-+  // yield simpleInherit(inspector, view);
++  yield userAgentStylesVisible(inspector, view);
++  yield userAgentStylesUneditable(inspector, view);
 +
-+  // info("Resetting " + PREF);
-+  // Services.prefs.clearUserPref(PREF);
++  info ("Making sure that setting the pref to false hides UA styles");
++  yield setUserAgentStylesPref(false);
++  yield userAgentStylesNotVisible(inspector, view);
 +
++  info ("Making sure that resetting the pref to true shows UA styles again");
++  yield setUserAgentStylesPref(true);
++  yield userAgentStylesVisible(inspector, view);
++
++  info("Resetting " + PREF_UA_STYLES);
++  Services.prefs.clearUserPref(PREF_UA_STYLES);
 +});
 +
-+function* simpleInherit(inspector, view) {
-+  yield selectNode("blockquote", inspector);
++function* setUserAgentStylesPref(val) {
++  // Reset the pref and wait for PrefObserver to return so UI
++  // Has a chance to get updated.
++  info("Setting the pref " + PREF_UA_STYLES + " to: " + val);
++  let oncePrefChanged = promise.defer();
++  let prefObserver = new PrefObserver("devtools.");
++  prefObserver.on(PREF_UA_STYLES, oncePrefChanged.resolve);
++  Services.prefs.setBoolPref(PREF_UA_STYLES, val);
++  yield oncePrefChanged.promise;
++  prefObserver.off(PREF_UA_STYLES, oncePrefChanged.resolve);
++}
 +
++function* userAgentStylesVisible(inspector, view) {
++  yield selectNode("blockquote", inspector);
++  yield compareAppliedStylesWithUI(inspector, view, "ua");
++
++  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
++  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
++  is (userRules.length, 1, "Correct number of user rules");
++  is (uaRules.length, 4, "Correct number of UA rules");
++
++  yield selectNode("pre", inspector);
++  yield compareAppliedStylesWithUI(inspector, view, "ua");
++
++  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
++  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
++  is (userRules.length, 1, "Correct number of user rules");
++  is (uaRules.length, 3, "Correct number of UA rules");
++
++  yield selectNode("em", inspector);
++  yield compareAppliedStylesWithUI(inspector, view, "ua");
++
++  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
++  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
++  is (userRules.length, 1, "Correct number of user rules");
++  is (uaRules.length, 3, "Correct number of UA rules");
++}
++
++function* userAgentStylesNotVisible(inspector, view) {
++  yield selectNode("blockquote", inspector);
++  yield compareAppliedStylesWithUI(inspector, view);
++
++  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
++  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
++  is (userRules.length, 1, "Correct number of user rules");
++  is (uaRules.length, 0, "Correct number of UA rules");
++
++  yield selectNode("pre", inspector);
++  yield compareAppliedStylesWithUI(inspector, view);
++
++  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
++  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
++  is (userRules.length, 1, "Correct number of user rules");
++  is (uaRules.length, 0, "Correct number of UA rules");
++
++  yield selectNode("em", inspector);
++  yield compareAppliedStylesWithUI(inspector, view);
++
++  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
++  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
++  is (userRules.length, 1, "Correct number of user rules");
++  is (uaRules.length, 0, "Correct number of UA rules");
++}
++
++function* compareAppliedStylesWithUI(inspector, view, filter) {
 +  let entries = yield inspector.pageStyle.getApplied(inspector.selection.nodeFront, {
 +    inherited: true,
 +    matchedSelectors: true,
-+    filter: "ua"
++    filter: filter
 +  });
 +
 +  let elementStyle = view._elementStyle;
-+  is(elementStyle.rules.length, entries.length, "Should have correct number of rules.");
++  is(elementStyle.rules.length, entries.length, "Should have correct number of rules (" +  entries.length + ")");
++
 +  entries.forEach((entry, i) => {
 +    let elementStyleRule = elementStyle.rules[i];
++    is (elementStyleRule.inherited, entry.inherited, "Same inherited (" +entry.inherited+ ")" );
++    is (elementStyleRule.isSystem, entry.isSystem, "Same isSystem (" +entry.isSystem+ ")");
++    is (elementStyleRule.editor.isEditable, !entry.isSystem, "Editor isEditable opposite of UA (" +entry.isSystem+ ")");
 +  });
++}
++
++function* userAgentStylesUneditable(inspector, view, iflter) {
++  yield selectNode("blockquote", inspector);
++  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
++
++  for (let rule of uaRules) {
++    // let editor = yield focusEditableField(rule.editor.closeBrace);
++    // is(inplaceEditor(elementRuleEditor.newPropSpan), editor, "The new property editor got focused");
++  }
 +}
 diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
 --- a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
