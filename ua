@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 2675e3bbdc0633cd4a1ae40f9acb01745c14f544
+# Parent 6940c3eb040ee476b0203d267c4cac6037962b41
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 935803 - Display browser styles in the rule view (UA style sheet rules)
 
@@ -173,7 +173,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    this.popup = new AutocompletePopup(aDoc.defaultView.parent.document, options);
  
    // Create a tooltip for previewing things in the rule view (images for now)
-@@ -1327,18 +1338,24 @@ CssRuleView.prototype = {
+@@ -1331,18 +1342,24 @@ CssRuleView.prototype = {
    /**
     * Return {bool} true if the rule view currently has an input editor visible.
     */
@@ -200,7 +200,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
  
    _onSourcePrefChanged: function() {
      if (this.menuitemSources) {
-@@ -1353,19 +1370,20 @@ CssRuleView.prototype = {
+@@ -1357,19 +1374,20 @@ CssRuleView.prototype = {
        }
      }
    },
@@ -222,7 +222,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      delete this._outputParser;
  
      // Remove context menu
-@@ -1423,17 +1441,19 @@ CssRuleView.prototype = {
+@@ -1427,17 +1445,19 @@ CssRuleView.prototype = {
      }
  
      this._viewedElement = aElement;
@@ -243,7 +243,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
        if (this._elementStyle) {
          this._elementStyle.onChanged = () => {
            this._changed();
-@@ -1645,27 +1665,29 @@ CssRuleView.prototype = {
+@@ -1649,27 +1669,29 @@ CssRuleView.prototype = {
   * @param {Rule} aRule
   *        The Rule object we're editing.
   * @constructor
@@ -273,7 +273,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      // Give a relative position for the inplace editor's measurement
      // span to be placed absolutely against.
      this.element.style.position = "relative";
-@@ -1699,26 +1721,27 @@ RuleEditor.prototype = {
+@@ -1703,26 +1725,27 @@ RuleEditor.prototype = {
        class: "ruleview-selector theme-fg-color3"
      });
  
@@ -311,7 +311,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
          this.doc.popupNode = event.explicitOriginalTarget;
          let win = this.doc.defaultView;
          win.focus();
-@@ -1726,46 +1749,51 @@ RuleEditor.prototype = {
+@@ -1730,46 +1753,52 @@ RuleEditor.prototype = {
          this.ruleView._contextmenu.openPopupAtScreen(
            event.screenX, event.screenY, true);
  
@@ -366,8 +366,9 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      sourceLabel.setAttribute("tooltiptext", sourceHref);
  
 +    if (this.rule.isSystem) {
-+      // xxx: internationalize string
-+      sourceLabel.setAttribute("value", "(user agent) " + this.rule.title);
++      sourceLabel.setAttribute("value",
++        _strings.GetStringFromName("rule.userAgentStyles") +
++        " " + this.rule.title);
 +    } else {
 +      sourceLabel.setAttribute("value", this.rule.title);
 +    }
@@ -383,7 +384,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    },
  
    /**
-@@ -2009,92 +2037,52 @@ TextPropertyEditor.prototype = {
+@@ -2013,92 +2042,52 @@ TextPropertyEditor.prototype = {
      this.element = this.doc.createElementNS(HTML_NS, "li");
      this.element.classList.add("ruleview-property");
  
@@ -478,7 +479,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      // for restoring after pressing escape.
      this.committed = { name: this.prop.name,
                         value: this.prop.value,
-@@ -2109,27 +2097,73 @@ TextPropertyEditor.prototype = {
+@@ -2113,27 +2102,73 @@ TextPropertyEditor.prototype = {
      });
  
      // Holds the viewers for the computed properties.
@@ -563,7 +564,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
     * @return {string} the stylesheet's href.
     */
    get sheetHref() {
-@@ -2232,25 +2266,27 @@ TextPropertyEditor.prototype = {
+@@ -2236,25 +2271,27 @@ TextPropertyEditor.prototype = {
        urlClass: "theme-link",
        baseURI: this.sheetURI
      });
@@ -642,15 +643,15 @@ diff --git a/browser/devtools/styleinspector/test/browser_ruleview_user-agent-st
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles-uneditable.js
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,50 @@
 +/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
 +/* Any copyright is dedicated to the Public Domain.
 + http://creativecommons.org/publicdomain/zero/1.0/ */
 +
 +"use strict";
 +
-+// Check that user agent styles are inspectable via rule view if
-+// it is preffed on.
++// Check that user agent styles are never editable via
++// the UI
 +
 +let PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
 +const TEST_URI = "data:text/html;charset=utf-8," +
@@ -678,54 +679,20 @@ new file mode 100644
 +  info ("Making sure that UI is not editable for user agent styles");
 +
 +  yield selectNode("a", inspector);
-+  let userRules = view._elementStyle.rules.filter(rule=>rule.editor.isEditable);
 +  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
 +
 +  for (let rule of uaRules) {
 +    ok (rule.editor.element.hasAttribute("uneditable"), "UA rules have uneditable attribute");
 +
++    ok (!rule.textProps[0].editor.nameSpan._editable, "nameSpan is not editable");
++    ok (!rule.textProps[0].editor.valueSpan._editable, "valueSpan is not editable");
++    ok (!rule.editor.closeBrace._editable, "closeBrace is not editable");
++
 +    let colorswatch = rule.editor.element.querySelector(".ruleview-colorswatch");
 +    if (colorswatch) {
-+      info ("Clicking color swatch and waiting to make sure popup doesn't show up");
-+      let onShown = view.colorPicker.tooltip.once("shown");
-+      let popupShownPromise = waitForPromise(onShown);
-+      colorswatch.click();
-+      let popupWasShown = yield popupShownPromise;
-+      ok (!popupWasShown, "Popup was not shown when clicking on color swatch")
++      ok (!view.colorPicker.swatches.has(colorswatch), "The swatch is not editable");
 +    }
-+
-+    let editable = rule.editor.closeBrace;
-+    let onFocus = waitForPromise(once(editable.parentNode, "focus", true));
-+    EventUtils.synthesizeMouse(editable, 1, 1, {},
-+      editable.ownerDocument.defaultView);
-+    yield onFocus;
-+
-+    ok (!rule.editor.newPropSpan, "There is no new prop span");
-+
-+    let nameSpan = rule.textProps[0].editor.nameSpan;
-+    let onNameFocus = waitForPromise(once(nameSpan.parentNode, "focus", true));
-+    EventUtils.synthesizeMouse(nameSpan, 1, 1, {},
-+      editable.ownerDocument.defaultView);
-+    yield onNameFocus;
-+
-+    is (editable.ownerDocument.activeElement.tagName, "span", "No input is focused");
 +  }
-+}
-+
-+function waitForPromise(p, ms = 200) {
-+  // Wait for a designated amount of time for a promise to finish,
-+  // then resolve with `true` if the promise finished, or `false`
-+  // if the timeout happened first.
-+  let def = promise.defer();
-+  let timeout = setTimeout(() => {
-+    def.resolve(false);
-+    p = null;
-+  }, ms);
-+  p.then(() => {
-+    def.resolve(true);
-+    clearTimeout(timeout);
-+  });
-+  return def.promise;
 +}
 diff --git a/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles.js b/browser/devtools/styleinspector/test/browser_ruleview_user-agent-styles.js
 new file mode 100644
@@ -1009,3 +976,29 @@ diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/
  
    /**
     * Expand Sets of rules and sheets to include all parent rules and sheets.
+diff --git a/toolkit/locales/en-US/chrome/global/devtools/styleinspector.properties b/toolkit/locales/en-US/chrome/global/devtools/styleinspector.properties
+--- a/toolkit/locales/en-US/chrome/global/devtools/styleinspector.properties
++++ b/toolkit/locales/en-US/chrome/global/devtools/styleinspector.properties
+@@ -30,16 +30,22 @@ rule.sourceInline=inline
+ rule.sourceElement=element
+ 
+ # LOCALIZATION NOTE (rule.inheritedFrom): Shown for CSS rules
+ # that were inherited from a parent node. Will be passed a node
+ # identifier of the parent node.
+ # e.g "Inherited from body#bodyID"
+ rule.inheritedFrom=Inherited from %S
+ 
++# LOCALIZATION NOTE (rule.userAgentStyles): Shown next to the style sheet
++# link for CSS rules that were loaded from a user agent style sheet.
++# These styles will not be editable, and will only be visible if the
++# devtools.inspector.showUserAgentStyles pref is true.
++rule.userAgentStyles=(user agent)
++
+ # LOCALIZATION NOTE (rule.pseudoElement): Shown for CSS rules
+ # pseudo element header
+ rule.pseudoElement=Pseudo-elements
+ 
+ # LOCALIZATION NOTE (rule.pseudoElement): Shown for CSS rules
+ # pseudo element header
+ rule.selectedElement=This Element
+ 
