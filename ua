@@ -1,7 +1,7 @@
 # HG changeset patch
 # Parent 6940c3eb040ee476b0203d267c4cac6037962b41
 # User Brian Grinstead <bgrinstead@mozilla.com>
-Bug 935803 - Display browser styles in the rule view (UA style sheet rules)
+Bug 935803 - Display browser styles in the rule view (UA style sheet rules);r=pbrosset
 
 diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
 --- a/browser/app/profile/firefox.js
@@ -243,7 +243,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
        if (this._elementStyle) {
          this._elementStyle.onChanged = () => {
            this._changed();
-@@ -1649,27 +1669,29 @@ CssRuleView.prototype = {
+@@ -1649,41 +1669,46 @@ CssRuleView.prototype = {
   * @param {Rule} aRule
   *        The Rule object we're editing.
   * @constructor
@@ -273,7 +273,24 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      // Give a relative position for the inplace editor's measurement
      // span to be placed absolutely against.
      this.element.style.position = "relative";
-@@ -1703,26 +1725,27 @@ RuleEditor.prototype = {
+ 
+     // Add the source link.
+     let source = createChild(this.element, "div", {
+       class: "ruleview-rule-source theme-link"
+     });
+     source.addEventListener("click", function() {
++      if (source.hasAttribute("unselectable")) {
++        return;
++      }
+       let rule = this.rule.domRule;
+       let evt = this.doc.createEvent("CustomEvent");
+       evt.initCustomEvent("CssRuleViewCSSLinkClicked", true, false, {
+         rule: rule,
+       });
+       this.element.dispatchEvent(evt);
+     }.bind(this));
+     let sourceLabel = this.doc.createElementNS(XUL_NS, "label");
+@@ -1703,26 +1728,27 @@ RuleEditor.prototype = {
        class: "ruleview-selector theme-fg-color3"
      });
  
@@ -311,7 +328,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
          this.doc.popupNode = event.explicitOriginalTarget;
          let win = this.doc.defaultView;
          win.focus();
-@@ -1730,46 +1753,52 @@ RuleEditor.prototype = {
+@@ -1730,46 +1756,60 @@ RuleEditor.prototype = {
          this.ruleView._contextmenu.openPopupAtScreen(
            event.screenX, event.screenY, true);
  
@@ -366,9 +383,17 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      sourceLabel.setAttribute("tooltiptext", sourceHref);
  
 +    if (this.rule.isSystem) {
-+      sourceLabel.setAttribute("value",
-+        _strings.GetStringFromName("rule.userAgentStyles") +
-+        " " + this.rule.title);
++      let uaLabel = _strings.GetStringFromName("rule.userAgentStyles");
++      sourceLabel.setAttribute("value", uaLabel + " " + this.rule.title);
++
++      // Special case about:PreferenceStyleSheet, as it is generated on the
++      // fly and the URI is not registered with the about: handler.
++      // https://bugzilla.mozilla.org/show_bug.cgi?id=935803#c37
++      if (sourceHref === "about:PreferenceStyleSheet") {
++        sourceLabel.parentNode.setAttribute("unselectable", "true");
++        sourceLabel.setAttribute("value", uaLabel);
++        sourceLabel.removeAttribute("tooltiptext");
++      }
 +    } else {
 +      sourceLabel.setAttribute("value", this.rule.title);
 +    }
@@ -384,7 +409,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    },
  
    /**
-@@ -2013,92 +2042,52 @@ TextPropertyEditor.prototype = {
+@@ -2013,92 +2053,52 @@ TextPropertyEditor.prototype = {
      this.element = this.doc.createElementNS(HTML_NS, "li");
      this.element.classList.add("ruleview-property");
  
@@ -479,7 +504,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
      // for restoring after pressing escape.
      this.committed = { name: this.prop.name,
                         value: this.prop.value,
-@@ -2113,27 +2102,73 @@ TextPropertyEditor.prototype = {
+@@ -2113,27 +2113,73 @@ TextPropertyEditor.prototype = {
      });
  
      // Holds the viewers for the computed properties.
@@ -564,7 +589,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
     * @return {string} the stylesheet's href.
     */
    get sheetHref() {
-@@ -2236,25 +2271,27 @@ TextPropertyEditor.prototype = {
+@@ -2236,25 +2282,27 @@ TextPropertyEditor.prototype = {
        urlClass: "theme-link",
        baseURI: this.sheetURI
      });
@@ -866,17 +891,33 @@ diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser
 diff --git a/browser/themes/shared/devtools/ruleview.css b/browser/themes/shared/devtools/ruleview.css
 --- a/browser/themes/shared/devtools/ruleview.css
 +++ b/browser/themes/shared/devtools/ruleview.css
-@@ -9,16 +9,20 @@
+@@ -3,22 +3,35 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ .ruleview {
+   height: 100%;
+ }
+ 
  .ruleview-rule-source {
    -moz-padding-start: 5px;
-   cursor: pointer;
+-  cursor: pointer;
    text-align: right;
    float: right;
    -moz-user-select: none;
  }
  
++.ruleview-rule-source,
 +.ruleview-rule-source > label {
 +  cursor: pointer;
++}
++
++.ruleview-rule-source[unselectable],
++.ruleview-rule-source[unselectable] > label {
++  cursor: default;
++}
++
++.ruleview-rule-source:not([unselectable]):hover {
++  text-decoration: underline;
 +}
 +
  .ruleview-header {
@@ -887,10 +928,19 @@ diff --git a/browser/themes/shared/devtools/ruleview.css b/browser/themes/shared
    padding: 1px 4px;
    -moz-user-select: none;
    word-wrap: break-word;
-@@ -36,16 +40,47 @@
-   text-decoration: underline;
+@@ -27,25 +40,52 @@
+ %endif
  }
  
+ .ruleview-rule-pseudo-element {
+   padding-left:20px;
+   border-left: solid 10px;
+ }
+ 
+-.ruleview-rule-source:hover {
+-  text-decoration: underline;
+-}
+-
  .ruleview-rule,
  #noResults {
    padding: 2px 4px;
@@ -935,7 +985,7 @@ diff --git a/browser/themes/shared/devtools/ruleview.css b/browser/themes/shared
  .ruleview-rule + .ruleview-rule {
    border-top-width: 1px;
    border-top-style: dotted;
-@@ -108,16 +143,17 @@
+@@ -108,16 +148,17 @@
    padding: 0;
  }
  
