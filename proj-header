@@ -28,7 +28,7 @@ diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.
   */
  document.addEventListener("DOMContentLoaded", function onDOMReady(e) {
    document.removeEventListener("DOMContentLoaded", onDOMReady, false);
-@@ -51,17 +51,18 @@ document.addEventListener("DOMContentLoa
+@@ -51,21 +51,33 @@ document.addEventListener("DOMContentLoa
    projecteditor.on("onCommand", (cmd) => {
      console.log("Command: " + cmd);
    });
@@ -39,15 +39,30 @@ diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.
        iconUrl: SAMPLE_ICON,
 -      projectOverviewURL: SAMPLE_PROJECT_URL
 +      projectOverviewURL: SAMPLE_PROJECT_URL,
-+      status: "warning"
++      status: "valid"
      }).then(() => {
        let allResources = projecteditor.project.allResources();
        console.log("All resources have been loaded", allResources, allResources.map(r=>r.basename).join("|"));
      });
++
++    setTimeout(() => {
++      projecteditor.setProjectToAppPath(SAMPLE_PATH, {
++        name: SAMPLE_NAME,
++        iconUrl: SAMPLE_ICON,
++        projectOverviewURL: SAMPLE_PROJECT_URL,
++        status: "error"
++      })
++
++    }, 2000);
++
    });
  
  }, false);
  
+ /**
+  * Build a temporary directory as a workspace for this loader
+  * https://developer.mozilla.org/en-US/Add-ons/Code_snippets/File_I_O
+  */
 diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor.xul b/browser/devtools/projecteditor/chrome/content/projecteditor.xul
 --- a/browser/devtools/projecteditor/chrome/content/projecteditor.xul
 +++ b/browser/devtools/projecteditor/chrome/content/projecteditor.xul
@@ -73,7 +88,7 @@ diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor.xul b/b
 diff --git a/browser/devtools/projecteditor/lib/plugins/app-manager/plugin.js b/browser/devtools/projecteditor/lib/plugins/app-manager/plugin.js
 --- a/browser/devtools/projecteditor/lib/plugins/app-manager/plugin.js
 +++ b/browser/devtools/projecteditor/lib/plugins/app-manager/plugin.js
-@@ -1,15 +1,16 @@
+@@ -1,47 +1,62 @@
  const { Cu } = require("chrome");
  const { Class } = require("sdk/core/heritage");
  const { EventTarget } = require("sdk/event/target");
@@ -90,12 +105,17 @@ diff --git a/browser/devtools/projecteditor/lib/plugins/app-manager/plugin.js b/
      return !!this.host.project.appManagerOpts;
    },
    editorForResource: function(resource) {
-@@ -20,28 +21,40 @@ var AppManagerRenderer = Class({
+     if (!resource.parent && this.isAppManagerProject()) {
+       return AppProjectEditor;
+     }
+   },
    onAnnotate: function(resource, editor, elt) {
      if (resource.parent || !this.isAppManagerProject()) {
        return;
      }
++    console.trace();
  
++    console.log("ON ANNOTATE", resource);
      let {appManagerOpts} = this.host.project;
      let doc = elt.ownerDocument;
      let image = doc.createElement("image");
@@ -135,6 +155,96 @@ diff --git a/browser/devtools/projecteditor/lib/plugins/app-manager/plugin.js b/
  
  exports.AppManagerRenderer = AppManagerRenderer;
  registerPlugin(AppManagerRenderer);
+diff --git a/browser/devtools/projecteditor/lib/project.js b/browser/devtools/projecteditor/lib/project.js
+--- a/browser/devtools/projecteditor/lib/project.js
++++ b/browser/devtools/projecteditor/lib/project.js
+@@ -131,23 +131,21 @@ var Project = Class({
+     for (let [path, store] of this.localStores) {
+       yield store;
+     }
+   },
+ 
+   /**
+    * Get every file path used inside of the project.
+    *
+-   * @returns generator-iterator<string>
++   * @returns Array<string>
+    *          A list of all file paths
+    */
+-  allPaths: function*() {
+-    for (let [path, store] of this.localStores) {
+-      yield path;
+-    }
++  allPaths: function() {
++    return [path for (path of this.localStores.keys())];
+   },
+ 
+   /**
+    * Get the store that contains a path.
+    *
+    * @returns Store
+    *          The store, if any.  Will return null if no store
+    *          contains the given path.
+diff --git a/browser/devtools/projecteditor/lib/projecteditor.js b/browser/devtools/projecteditor/lib/projecteditor.js
+--- a/browser/devtools/projecteditor/lib/projecteditor.js
++++ b/browser/devtools/projecteditor/lib/projecteditor.js
+@@ -265,18 +265,28 @@ var ProjectEditor = Class({
+    *               The file path to set
+    * @param Object opts
+    *               Custom options used by the project. See plugins/app-manager.
+    * @param Promise
+    *        Promise that is resolved once the project is ready to be used.
+    */
+   setProjectToAppPath: function(path, opts = {}) {
+     this.project.appManagerOpts = opts;
+-    this.project.removeAllStores();
+-    this.project.addPath(path);
++
++    let existingPaths = this.project.allPaths();
++    if (existingPaths.length !== 1 || existingPaths[0] !== path) {
++      // Only fully reset if this is a new path.
++      this.project.removeAllStores();
++      this.project.addPath(path);
++    } else {
++      // Otherwise, just ask for the root to be redrawn
++      let rootResource = this.project.localStores.get(path).root;
++      rootResource.needsRefresh = true;
++    }
++
+     return this.project.refresh();
+   },
+ 
+   /**
+    * Open a resource in a particular shell.
+    *
+    * @param Resource resource
+    *                 The file to be opened.
+diff --git a/browser/devtools/projecteditor/lib/stores/resource.js b/browser/devtools/projecteditor/lib/stores/resource.js
+--- a/browser/devtools/projecteditor/lib/stores/resource.js
++++ b/browser/devtools/projecteditor/lib/stores/resource.js
+@@ -91,17 +91,21 @@ var Resource = Class({
+       if (!oldChildren.has(child)) {
+         change = true;
+         child.parent = this;
+         this.store.notifyAdd(child);
+       }
+     }
+ 
+     this.children = newChildren;
+-    if (change) {
++
++    // Always Emit change event always for a resource if its children
++    // have change or if the object has a flag set requesting it.
++    if (this.needsRefresh || change) {
++      this.needsRefresh = false;
+       emit(this, "children-changed", this);
+     }
+   },
+ 
+   /**
+    * Add a resource to children set and notify of the change.
+    *
+    * @param Resource resource
 diff --git a/browser/devtools/projecteditor/lib/tree.js b/browser/devtools/projecteditor/lib/tree.js
 --- a/browser/devtools/projecteditor/lib/tree.js
 +++ b/browser/devtools/projecteditor/lib/tree.js
@@ -204,10 +314,76 @@ diff --git a/browser/devtools/projecteditor/lib/tree.js b/browser/devtools/proje
      });
    },
  
+diff --git a/browser/devtools/projecteditor/test/browser_projecteditor_editing_01.js b/browser/devtools/projecteditor/test/browser_projecteditor_editing_01.js
+--- a/browser/devtools/projecteditor/test/browser_projecteditor_editing_01.js
++++ b/browser/devtools/projecteditor/test/browser_projecteditor_editing_01.js
+@@ -2,17 +2,17 @@
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+ // Test ProjectEditor basic functionality
+ let test = asyncTest(function*() {
+   let projecteditor = yield addProjectEditorTabForTempDirectory();
+-  let TEMP_PATH = [...projecteditor.project.allPaths()][0];
++  let TEMP_PATH = project.allPaths()[0];
+ 
+   is (getTempFile("").path, TEMP_PATH, "Temp path is set correctly.");
+ 
+   ok (projecteditor.currentEditor, "There is an editor for projecteditor");
+   let resources = projecteditor.project.allResources();
+ 
+   resources.forEach((r, i) => {
+     console.log("Resource detected", r.path, i);
+diff --git a/browser/devtools/projecteditor/test/browser_projecteditor_stores.js b/browser/devtools/projecteditor/test/browser_projecteditor_stores.js
+--- a/browser/devtools/projecteditor/test/browser_projecteditor_stores.js
++++ b/browser/devtools/projecteditor/test/browser_projecteditor_stores.js
+@@ -2,15 +2,15 @@
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+ // Test ProjectEditor basic functionality
+ let test = asyncTest(function*() {
+   let projecteditor = yield addProjectEditorTabForTempDirectory();
+-  let TEMP_PATH = [...projecteditor.project.allPaths()][0];
++  let TEMP_PATH = allPaths()[0];
+   is (getTempFile("").path, TEMP_PATH, "Temp path is set correctly.");
+ 
+-  is ([...projecteditor.project.allPaths()].length, 1, "1 path is set");
++  is (project.allPaths().length, 1, "1 path is set");
+   projecteditor.project.removeAllStores();
+-  is ([...projecteditor.project.allPaths()].length, 0, "No paths are remaining");
++  is (project.allPaths().length, 0, "No paths are remaining");
+ });
+diff --git a/browser/devtools/projecteditor/test/browser_projecteditor_tree_selection.js b/browser/devtools/projecteditor/test/browser_projecteditor_tree_selection.js
+--- a/browser/devtools/projecteditor/test/browser_projecteditor_tree_selection.js
++++ b/browser/devtools/projecteditor/test/browser_projecteditor_tree_selection.js
+@@ -3,17 +3,17 @@
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+ // Test tree selection functionality
+ 
+ let test = asyncTest(function*() {
+   let projecteditor = yield addProjectEditorTabForTempDirectory();
+-  let TEMP_PATH = [...projecteditor.project.allPaths()][0];
++  let TEMP_PATH = project.allPaths()[0];
+ 
+   is (getTempFile("").path, TEMP_PATH, "Temp path is set correctly.");
+ 
+   ok (projecteditor.currentEditor, "There is an editor for projecteditor");
+   let resources = projecteditor.project.allResources();
+ 
+   is (
+     resources.map(r=>r.basename).join("|"),
 diff --git a/browser/themes/shared/devtools/projecteditor/projecteditor.css b/browser/themes/shared/devtools/projecteditor/projecteditor.css
 --- a/browser/themes/shared/devtools/projecteditor/projecteditor.css
 +++ b/browser/themes/shared/devtools/projecteditor/projecteditor.css
-@@ -6,130 +6,150 @@
+@@ -6,130 +6,151 @@
   :root {
    color: #18191a;
  }
@@ -279,6 +455,7 @@ diff --git a/browser/themes/shared/devtools/projecteditor/projecteditor.css b/br
 +.entry .file-label {
 +  display: flex;
 +  flex: 1;
++  align-items: center;
  }
  
 -#main-deck .sources-tree .side-menu-widget-item .file-icon {
@@ -402,7 +579,7 @@ diff --git a/browser/themes/shared/devtools/projecteditor/projecteditor.css b/br
    display: none;
  }
  
-@@ -138,35 +158,62 @@
+@@ -138,35 +159,63 @@
  #projecteditor-toolbar textbox {
    margin: 0;
  }
@@ -411,14 +588,7 @@ diff --git a/browser/themes/shared/devtools/projecteditor/projecteditor.css b/br
    padding: 0 3px;
  }
  
-+.projecteditor-file-label {
-+  font-weight: bold;
-+  padding-left: 29px;
-+  padding-right: 10px;
-+  flex: 1;
-+  align-items: center;
-+}
-+
++/* App Manager */
  .project-name-label {
    font-weight: bold;
    padding-left: 10px;
@@ -435,15 +605,16 @@ diff --git a/browser/themes/shared/devtools/projecteditor/projecteditor.css b/br
  }
  
  .project-image {
-   max-height: 28px;
+-  max-height: 28px;
 -  margin-left: -.5em;
 -  vertical-align: middle;
-+}
-+
++  max-height: 25px;
++  margin-left: -10px;
+ }
+ 
 +.project-image,
 +.project-status,
-+.project-options,
-+.project-flex {
++.project-options {
 +  flex-shrink: 0;
 +}
 +
@@ -453,7 +624,6 @@ diff --git a/browser/themes/shared/devtools/projecteditor/projecteditor.css b/br
 +  border-radius: 50%;
 +  border: solid 1px #ccc;
 +  margin-right: 10px;
-+  align-self: center;
 +}
 +
 +.project-status[status=valid] {
@@ -466,8 +636,17 @@ diff --git a/browser/themes/shared/devtools/projecteditor/projecteditor.css b/br
 +
 +.project-status[status=error] {
 +  background: #ed2655;
- }
- 
++}
++
++/* Status Bar */
++.projecteditor-file-label {
++  font-weight: bold;
++  padding-left: 29px;
++  padding-right: 10px;
++  flex: 1;
++}
++
++/* Image View */
  .editor-image {
    padding: 10px;
  }
