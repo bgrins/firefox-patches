@@ -1,7 +1,7 @@
 # HG changeset patch
-# Parent 6d1665a6dfe5078647f901f3388a4bc408caf253
+# Parent 7df243d320995bfa2cd24b4fbfb72fa9d283ef8a
 # User Patrick Brosset <pbrosset@mozilla.com>
-Bug 1014547 - part 4 - Add a css transform highlighter
+Bug 1014547 - part 4 - Add a css transform highlighter to the style-inspector; r=bgrins
 
 diff --git a/browser/base/content/highlighter.css b/browser/base/content/highlighter.css
 --- a/browser/base/content/highlighter.css
@@ -25,9 +25,100 @@ diff --git a/browser/base/content/highlighter.css b/browser/base/content/highlig
 diff --git a/browser/devtools/framework/toolbox-highlighter-utils.js b/browser/devtools/framework/toolbox-highlighter-utils.js
 --- a/browser/devtools/framework/toolbox-highlighter-utils.js
 +++ b/browser/devtools/framework/toolbox-highlighter-utils.js
-@@ -194,17 +194,22 @@ exports.getHighlighterUtils = function(t
+@@ -25,17 +25,18 @@ Cu.import("resource:///modules/devtools/
+  * This should be done once only by the toolbox itself and stored there so that
+  * panels can get it from there. That's because the API returned has a stateful
+  * scope that would be different for another instance returned by this function.
+  *
+  * @param {Toolbox} toolbox
+  * @return {Object} the highlighterUtils public API
+  */
+ exports.getHighlighterUtils = function(toolbox) {
+-  if (!toolbox || !toolbox.target) {
++  let target = toolbox.target;
++  if (!toolbox || !target) {
+     throw new Error("Missing or invalid toolbox passed to getHighlighterUtils");
+     return;
+   }
+ 
+   let isPicking = false;
+ 
+   /**
+    * Make a function that initializes the inspector before it runs.
+@@ -125,27 +126,36 @@ exports.getHighlighterUtils = function(t
+    * When a node has been picked while the highlighter is in picker mode
+    * @param {Object} data Information about the picked node
+    */
+   function onPickerNodePicked(data) {
+     toolbox.selection.setNodeFront(data.node, "picker-node-picked");
+     stopPicker();
+   }
+ 
++  // Prepare the show/hide box model promise used for queuing up requests to
++  // the highlighter
++  let showBoxModelPromise = promise.resolve();
++
+   /**
+    * Show the box model highlighter on a node in the content page.
+    * The node needs to be a NodeFront, as defined by the inspector actor
+    * @see toolkit/devtools/server/actors/inspector.js
+    * @param {NodeFront} nodeFront The node to highlight
+    * @param {Object} options
+    * @return A promise that resolves when the node has been highlighted
+    */
+   let highlightNodeFront = exported.highlightNodeFront = requireInspector(
+   function*(nodeFront, options={}) {
+-    yield toolbox.highlighter.showBoxModel(nodeFront, options);
++    if (!nodeFront) {
++      return;
++    }
++
++    showBoxModelPromise = toolbox.highlighter.showBoxModel(nodeFront, options);
++    yield showBoxModelPromise;
+     toolbox.emit("node-highlight", nodeFront);
    });
  
+   /**
+    * This is a convenience method in case you don't have a nodeFront but a
+    * valueGrip. This is often the case with VariablesView properties.
+    * This method will simply translate the grip into a nodeFront and call
+    * highlightNodeFront, so it has the same signature.
+@@ -180,29 +190,56 @@ exports.getHighlighterUtils = function(t
+    * markup view, which is when this param is passed to true
+    * @return a promise that resolves when the highlighter is hidden
+    */
+   let unhighlight = exported.unhighlight = Task.async(
+   function*(forceHide=false) {
+     forceHide = forceHide || !gDevTools.testing;
+ 
+     if (forceHide && toolbox.highlighter) {
++      let currentPromise = showBoxModelPromise;
++      yield showBoxModelPromise;
++      // At this stage, showBoxModelPromise may be different if a request to
++      // show was made in parallel, in which case wait for the new one
++      if (currentPromise !== showBoxModelPromise) {
++        return yield unhighlight(forceHide);
++      }
+       yield toolbox.highlighter.hideBoxModel();
+     }
+ 
+     toolbox.emit("node-unhighlight");
+   });
+ 
++  let supportsCustomHighlighters = function() {
++    return !!target.client.traits.customHighlighters;
++  }
++
++  /**
++   * Is typeName a known custom highlighter
++   * @param {String} typeName
++   * @return {Boolean}
++   */
++  let hasCustomHighlighter = exported.hasCustomHighlighter = function(typeName) {
++    return supportsCustomHighlighters() &&
++           target.client.traits.customHighlighters.indexOf(typeName) !== -1;
++  }
++
    /**
     * If the main, box-model, highlighter isn't enough, or if multiple
     * highlighters are needed in parallel, this method can be used to return a
@@ -41,39 +132,16 @@ diff --git a/browser/devtools/framework/toolbox-highlighter-utils.js b/browser/d
    let getHighlighterByType = exported.getHighlighterByType = requireInspector(
    function*(typeName) {
 -    return yield toolbox.inspector.getHighlighterByType(typeName);
-+    if (toolbox._target.client.traits.hasCustomHighlighters) {
++    if (hasCustomHighlighter(typeName)) {
 +      return yield toolbox.inspector.getHighlighterByType(typeName);
 +    } else {
-+      throw "The target doesn't support creating highlighters by type";
++      throw "The target doesn't support creating highlighters by types or " +
++        typeName + " is unknown";
 +    }
    });
  
    return exported;
  };
-diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
---- a/browser/devtools/inspector/inspector-panel.js
-+++ b/browser/devtools/inspector/inspector-panel.js
-@@ -101,16 +101,20 @@ InspectorPanel.prototype = {
-   get isOuterHTMLEditable() {
-     return this._target.client.traits.editOuterHTML;
-   },
- 
-   get hasUrlToImageDataResolver() {
-     return this._target.client.traits.urlToImageDataResolver;
-   },
- 
-+  get hasCustomHighlighters() {
-+    return this._target.client.traits.hasCustomHighlighters;
-+  },
-+
-   _deferredOpen: function(defaultSelection) {
-     let deferred = promise.defer();
- 
-     this.onNewRoot = this.onNewRoot.bind(this);
-     this.walker.on("new-root", this.onNewRoot);
- 
-     this.nodemenu = this.panelDoc.getElementById("inspector-node-popup");
-     this.lastNodemenuItem = this.nodemenu.lastChild;
 diff --git a/browser/devtools/inspector/test/browser_inspector_invalidate.js b/browser/devtools/inspector/test/browser_inspector_invalidate.js
 --- a/browser/devtools/inspector/test/browser_inspector_invalidate.js
 +++ b/browser/devtools/inspector/test/browser_inspector_invalidate.js
@@ -111,19 +179,52 @@ diff --git a/browser/devtools/inspector/test/browser_inspector_invalidate.js b/b
    function finishUp() {
      inspector.toolbox.highlighter.hideBoxModel().then(() => {
        doc = div = inspector = null;
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -167,20 +167,36 @@ MarkupView.prototype = {
+   _onMouseLeave: function() {
+     this._hideBoxModel(true);
+     if (this._hoveredNode) {
+       this._containers.get(this._hoveredNode).hovered = false;
+     }
+     this._hoveredNode = null;
+   },
+ 
++  /**
++   * Show the box model highlighter on a given node front
++   * @param {NodeFront} nodeFront The node to show the highlighter for
++   * @param {Object} options Options for the highlighter
++   * @return a promise that resolves when the highlighter for this nodeFront is
++   * shown, taking into account that there could already be highlighter requests
++   * queued up
++   */
+   _showBoxModel: function(nodeFront, options={}) {
+-    this._inspector.toolbox.highlighterUtils.highlightNodeFront(nodeFront, options);
++    return this._inspector.toolbox.highlighterUtils.highlightNodeFront(nodeFront, options);
+   },
+ 
++  /**
++   * Hide the box model highlighter on a given node front
++   * @param {NodeFront} nodeFront The node to hide the highlighter for
++   * @param {Boolean} forceHide See toolbox-highlighter-utils/unhighlight
++   * @return a promise that resolves when the highlighter for this nodeFront is
++   * hidden, taking into account that there could already be highlighter requests
++   * queued up
++   */
+   _hideBoxModel: function(forceHide) {
+     return this._inspector.toolbox.highlighterUtils.unhighlight(forceHide);
+   },
+ 
+   _briefBoxModelTimer: null,
+   _brieflyShowBoxModel: function(nodeFront, options) {
+     let win = this._frame.contentWindow;
+ 
 diff --git a/browser/devtools/styleinspector/computed-view.js b/browser/devtools/styleinspector/computed-view.js
 --- a/browser/devtools/styleinspector/computed-view.js
 +++ b/browser/devtools/styleinspector/computed-view.js
-@@ -14,16 +14,17 @@ const {EventEmitter} = require("devtools
- const {OutputParser} = require("devtools/output-parser");
- const {Tooltip} = require("devtools/shared/widgets/Tooltip");
- const {PrefObserver, PREF_ORIG_SOURCES} = require("devtools/styleeditor/utils");
- const {gDevTools} = Cu.import("resource:///modules/devtools/gDevTools.jsm", {});
- 
- Cu.import("resource://gre/modules/Services.jsm");
- Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+@@ -21,16 +21,17 @@ Cu.import("resource://gre/modules/XPCOMU
  Cu.import("resource://gre/modules/devtools/Templater.jsm");
-+Cu.import("resource://gre/modules/Task.jsm");
  
  XPCOMUtils.defineLazyModuleGetter(this, "PluralForm",
                                    "resource://gre/modules/PluralForm.jsm");
@@ -131,8 +232,16 @@ diff --git a/browser/devtools/styleinspector/computed-view.js b/browser/devtools
  const FILTER_CHANGED_TIMEOUT = 300;
  const HTML_NS = "http://www.w3.org/1999/xhtml";
  const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
++const TRANSFORM_HIGHLIGHTER_TYPE = "CssTransformHighlighter";
  
-@@ -181,16 +182,21 @@ function CssHtmlTree(aStyleInspector, aP
+ /**
+  * Helper for long-running processes that should yield occasionally to
+  * the mainloop.
+  *
+  * @param {Window} aWin
+  *        Timeouts will be set on this window when appropriate.
+  * @param {Generator} aGenerator
+@@ -181,16 +182,22 @@ function CssHtmlTree(aStyleInspector, aP
  
    // Properties preview tooltip
    this.tooltip = new Tooltip(this.styleInspector.inspector.panelDoc);
@@ -142,8 +251,9 @@ diff --git a/browser/devtools/styleinspector/computed-view.js b/browser/devtools
    this._buildContextMenu();
    this.createStyleViews();
 +
-+  if (this.styleInspector.inspector.hasCustomHighlighters) {
-+    // Initialize the css transform highlighter
++  // Initialize the css transform highlighter if the target supports it
++  let hUtils = this.styleInspector.inspector.toolbox.highlighterUtils;
++  if (hUtils.hasCustomHighlighter(TRANSFORM_HIGHLIGHTER_TYPE)) {
 +    this._initTransformHighlighter();
 +  }
  }
@@ -154,7 +264,7 @@ diff --git a/browser/devtools/styleinspector/computed-view.js b/browser/devtools
   * @returns A localized version of the given key.
   */
  CssHtmlTree.l10n = function CssHtmlTree_l10n(aName)
-@@ -508,16 +514,75 @@ CssHtmlTree.prototype = {
+@@ -508,16 +515,75 @@ CssHtmlTree.prototype = {
     */
    focusWindow: function(aEvent)
    {
@@ -173,10 +283,10 @@ diff --git a/browser/devtools/styleinspector/computed-view.js b/browser/devtools
 +
 +    let utils = this.styleInspector.inspector.toolbox.highlighterUtils;
 +    this.transformHighlighterPromise =
-+    utils.getHighlighterByType("CssTransformHighlighter").then(highlighter => {
-+      this.transformHighlighter = highlighter;
-+      return this.transformHighlighter;
-+    });
++      utils.getHighlighterByType(TRANSFORM_HIGHLIGHTER_TYPE).then(highlighter => {
++        this.transformHighlighter = highlighter;
++        return this.transformHighlighter;
++      });
 +
 +    return this.transformHighlighterPromise;
 +  },
@@ -230,7 +340,7 @@ diff --git a/browser/devtools/styleinspector/computed-view.js b/browser/devtools
    _onTooltipTargetHover: function(target)
    {
      let inspector = this.styleInspector.inspector;
-@@ -749,16 +814,26 @@ CssHtmlTree.prototype = {
+@@ -749,16 +815,26 @@ CssHtmlTree.prototype = {
        this._contextmenu.removeEventListener("popupshowing", this._contextMenuUpdate);
        this._contextmenu.parentNode.removeChild(this._contextmenu);
        this._contextmenu = null;
@@ -260,7 +370,25 @@ diff --git a/browser/devtools/styleinspector/computed-view.js b/browser/devtools
 diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
 --- a/browser/devtools/styleinspector/rule-view.js
 +++ b/browser/devtools/styleinspector/rule-view.js
-@@ -1025,17 +1025,16 @@ TextProperty.prototype = {
+@@ -19,16 +19,17 @@ const {parseSingleValue, parseDeclaratio
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ 
+ const HTML_NS = "http://www.w3.org/1999/xhtml";
+ const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+ const PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
+ const PREF_DEFAULT_COLOR_UNIT = "devtools.defaultColorUnit";
++const TRANSFORM_HIGHLIGHTER_TYPE = "CssTransformHighlighter";
+ 
+ /**
+  * These regular expressions are adapted from firebug's css.js, and are
+  * used to parse CSSStyleDeclaration's cssText attribute.
+  */
+ 
+ // Used to split on css line separators
+ const CSS_LINE_RE = /(?:[^;\(]*(?:\([^\)]*?\))?[^;\(]*)*;?/g;
+@@ -1025,17 +1026,16 @@ TextProperty.prototype = {
      this.updateEditor();
    },
  
@@ -278,7 +406,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
   *    Rules.
   * RuleEditor:
   *   Owns a Rule object and creates a list of TextPropertyEditors
-@@ -1105,16 +1104,21 @@ function CssRuleView(aInspector, aDoc, a
+@@ -1105,16 +1105,22 @@ function CssRuleView(aInspector, aDoc, a
      this._onTooltipTargetHover.bind(this));
  
    // Also create a more complex tooltip for editing colors with the spectrum
@@ -288,8 +416,9 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    this._buildContextMenu();
    this._showEmpty();
 +
-+  if (this.inspector.hasCustomHighlighters) {
-+    // Initialize the css transform highlighter
++  // Initialize the css transform highlighter if the target supports it
++  let hUtils = this.inspector.toolbox.highlighterUtils;
++  if (hUtils.hasCustomHighlighter(TRANSFORM_HIGHLIGHTER_TYPE)) {
 +    this._initTransformHighlighter();
 +  }
  }
@@ -300,7 +429,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    // The element that we're inspecting.
    _viewedElement: null,
  
-@@ -1149,16 +1153,73 @@ CssRuleView.prototype = {
+@@ -1149,16 +1155,76 @@ CssRuleView.prototype = {
        popupset = doc.createElementNS(XUL_NS, "popupset");
        doc.documentElement.appendChild(popupset);
      }
@@ -319,7 +448,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
 +
 +    let utils = this.inspector.toolbox.highlighterUtils;
 +    this.transformHighlighterPromise =
-+    utils.getHighlighterByType("CssTransformHighlighter").then(highlighter => {
++    utils.getHighlighterByType(TRANSFORM_HIGHLIGHTER_TYPE).then(highlighter => {
 +      this.transformHighlighter = highlighter;
 +      return this.transformHighlighter;
 +    });
@@ -349,8 +478,11 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
 +
 +    this._lastHovered = event.target;
 +    let prop = event.target.textProperty;
++    let isHighlightable = prop && prop.name === "transform" &&
++                          prop.enabled && !prop.overridden &&
++                          !prop.rule.pseudoElement;
 +
-+    if (prop && prop.name === "transform" && prop.enabled && !prop.overridden) {
++    if (isHighlightable) {
 +      this.isTransformHighlighterShown = true;
 +      let node = this.inspector.selection.nodeFront;
 +      this.getTransformHighlighter().then(highlighter => highlighter.show(node));
@@ -374,7 +506,7 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
    _getHoverTooltipTypeForTarget: function(el) {
      let prop = el.textProperty;
  
-@@ -1401,24 +1462,35 @@ CssRuleView.prototype = {
+@@ -1401,16 +1467,26 @@ CssRuleView.prototype = {
  
      // We manage the popupNode ourselves so we also need to destroy it.
      this.doc.popupNode = null;
@@ -401,15 +533,6 @@ diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/sty
        this.elementStyle.destroy();
      }
  
-+
-     this.popup.destroy();
-   },
- 
-   /**
-    * Update the highlighted element.
-    *
-    * @param {NodeActor} aElement
-    *        The node whose style rules we'll inspect.
 diff --git a/browser/devtools/styleinspector/test/browser.ini b/browser/devtools/styleinspector/test/browser.ini
 --- a/browser/devtools/styleinspector/test/browser.ini
 +++ b/browser/devtools/styleinspector/test/browser.ini
@@ -685,46 +808,6 @@ new file mode 100644
 +  let h = yield rView.transformHighlighterPromise;
 +  is(h, rView.transformHighlighter, "The initialized highlighter is the right one");
 +});
-diff --git a/browser/devtools/styleinspector/test/head.js b/browser/devtools/styleinspector/test/head.js
---- a/browser/devtools/styleinspector/test/head.js
-+++ b/browser/devtools/styleinspector/test/head.js
-@@ -10,17 +10,17 @@ let {devtools} = Cu.import("resource://g
- let TargetFactory = devtools.TargetFactory;
- let {CssHtmlTree} = devtools.require("devtools/styleinspector/computed-view");
- let {CssRuleView, _ElementStyle} = devtools.require("devtools/styleinspector/rule-view");
- let {CssLogic, CssSelector} = devtools.require("devtools/styleinspector/css-logic");
- let {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
- let {editableField, getInplaceEditorForSpan: inplaceEditor} = devtools.require("devtools/shared/inplace-editor");
- let {console} = Components.utils.import("resource://gre/modules/devtools/Console.jsm", {});
- 
--// All test are asynchronous
-+// All tests are asynchronous
- waitForExplicitFinish();
- 
- const TEST_URL_ROOT = "http://example.com/browser/browser/devtools/styleinspector/test/";
- const TEST_URL_ROOT_SSL = "https://example.com/browser/browser/devtools/styleinspector/test/";
- 
- // Auto clean-up when a test ends
- registerCleanupFunction(() => {
-   try {
-@@ -31,16 +31,17 @@ registerCleanupFunction(() => {
-   }
-   while (gBrowser.tabs.length > 1) {
-     gBrowser.removeCurrentTab();
-   }
- });
- 
- // Uncomment to log events
- // Services.prefs.setBoolPref("devtools.dump.emit", true);
-+// Services.prefs.setBoolPref("devtools.debugger.log", true);
- 
- // Set the testing flag on gDevTools and reset it when the test ends
- gDevTools.testing = true;
- registerCleanupFunction(() => gDevTools.testing = false);
- 
- // Clean-up all prefs that might have been changed during a test run
- // (safer here because if the test fails, then the pref is never reverted)
- registerCleanupFunction(() => {
 diff --git a/browser/themes/shared/devtools/highlighter.inc.css b/browser/themes/shared/devtools/highlighter.inc.css
 --- a/browser/themes/shared/devtools/highlighter.inc.css
 +++ b/browser/themes/shared/devtools/highlighter.inc.css
@@ -855,7 +938,8 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
  require("devtools/server/actors/inspector");
  
  Cu.import("resource://gre/modules/devtools/LayoutHelpers.jsm");
-@@ -26,17 +27,18 @@ let HELPER_SHEET = ".__fx-devtools-hide-
+@@ -25,18 +26,19 @@ const HIGHLIGHTED_PSEUDO_CLASS = ":-moz-
+ let HELPER_SHEET = ".__fx-devtools-hide-shortcut__ { visibility: hidden !important } ";
  HELPER_SHEET += ":-moz-devtools-highlighted { outline: 2px dashed #F06!important; outline-offset: -2px!important } ";
  const XHTML_NS = "http://www.w3.org/1999/xhtml";
  const SVG_NS = "http://www.w3.org/2000/svg";
@@ -863,8 +947,9 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
  const INFO_BAR_OFFSET = 5;
  
  // All possible highlighter classes
- const HIGHLIGHTER_CLASSES = {
+-const HIGHLIGHTER_CLASSES = {
 -  "BoxModelHighlighter": BoxModelHighlighter
++let HIGHLIGHTER_CLASSES = exports.HIGHLIGHTER_CLASSES = {
 +  "BoxModelHighlighter": BoxModelHighlighter,
 +  "CssTransformHighlighter": CssTransformHighlighter
  };
@@ -1057,9 +1142,9 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
 +  _attachPageListeners: function() {
 +    if (isNodeValid(this.currentNode)) {
 +      let win = this.currentNode.ownerDocument.defaultView;
-+      win.addEventListener("scroll", this.update, false);
-+      win.addEventListener("resize", this.update, false);
-+      this.browser.addEventListener("MozAfterPaint", this.update, false);
++      win.addEventListener("scroll", this.update);
++      win.addEventListener("resize", this.update);
++      this.browser.addEventListener("MozAfterPaint", this.update);
 +    }
 +  },
 +
@@ -1069,9 +1154,9 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
 +  _detachPageListeners: function() {
 +    if (isNodeValid(this.currentNode)) {
 +      let win = this.currentNode.ownerDocument.defaultView;
-+      win.removeEventListener("scroll", this.update, false);
-+      win.removeEventListener("resize", this.update, false);
-+      this.browser.removeEventListener("MozAfterPaint", this.update, false);
++      win.removeEventListener("scroll", this.update);
++      win.removeEventListener("resize", this.update);
++      this.browser.removeEventListener("MozAfterPaint", this.update);
 +    }
 +  },
 +
@@ -1135,7 +1220,7 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
    _initMarkup: function() {
      let stack = this.browser.parentNode;
  
-@@ -495,49 +601,33 @@ BoxModelHighlighter.prototype = {
+@@ -495,107 +601,81 @@ BoxModelHighlighter.prototype = {
  
      return node;
    },
@@ -1179,17 +1264,44 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
 -    this._attachPageListeners();
 +  _show: function(options={}) {
      this._update();
--    this._trackMutations();
+     this._trackMutations();
 +    this.emit("ready");
    },
  
++  /**
++   * Track the current node markup mutations so that the node info bar can be
++   * updated to reflects the node's attributes
++   */
    _trackMutations: function() {
-     if (this.currentNode) {
+-    if (this.currentNode) {
++    if (isNodeValid(this.currentNode)) {
        let win = this.currentNode.ownerDocument.defaultView;
-       this.currentNodeObserver = new win.MutationObserver(() => {
-         this._update();
-       });
-@@ -563,39 +653,33 @@ BoxModelHighlighter.prototype = {
+-      this.currentNodeObserver = new win.MutationObserver(() => {
+-        this._update();
+-      });
++      this.currentNodeObserver = new win.MutationObserver(this.update);
+       this.currentNodeObserver.observe(this.currentNode, {attributes: true});
+     }
+   },
+ 
+   _untrackMutations: function() {
+-    if (this.currentNode) {
+-      if (this.currentNodeObserver) {
+-        // The following may fail with a "can't access dead object" exception
+-        // when the actor is being destroyed
+-        try {
+-          this.currentNodeObserver.disconnect();
+-        } catch (e) {}
+-        this.currentNodeObserver = null;
+-      }
++    if (isNodeValid(this.currentNode) && this.currentNodeObserver) {
++      this.currentNodeObserver.disconnect();
++      this.currentNodeObserver = null;
+     }
+   },
+ 
+   /**
+    * Update the highlighter on the current highlighted node (the one that was
     * passed as an argument to show(node)).
     * Should be called whenever node size or attributes change
     * @param {Object} options
@@ -1209,7 +1321,6 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
 +    if (this._updateBoxModel(options)) {
 +      this._showInfobar();
 +      this._showBoxModel();
-+      this._trackMutations();
 +    } else {
 +      // Nothing to highlight (0px rectangle like a <script> tag for instance)
 +      this._hide();
@@ -1240,7 +1351,7 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
    _hideInfobar: function() {
      this.nodeInfo.positioner.setAttribute("hidden", "true");
    },
-@@ -618,68 +702,55 @@ BoxModelHighlighter.prototype = {
+@@ -618,68 +698,55 @@ BoxModelHighlighter.prototype = {
    /**
     * Show the box model
     */
@@ -1329,7 +1440,73 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
     *
     * @param  {DOMPoint} p1
     *                    Point 1
-@@ -831,54 +902,220 @@ BoxModelHighlighter.prototype = {
+@@ -755,39 +822,49 @@ BoxModelHighlighter.prototype = {
+       return false;
+     }
+   },
+ 
+   /**
+    * Update node information (tagName#id.class)
+    */
+   _updateInfobar: function() {
+-    if (this.currentNode) {
+-      // Tag name
+-      this.nodeInfo.tagNameLabel.textContent = this.currentNode.tagName;
++    if (!this.currentNode) {
++      return;
++    }
+ 
+-      // ID
+-      this.nodeInfo.idLabel.textContent = this.currentNode.id ? "#" + this.currentNode.id : "";
++    let node = this.currentNode;
++    let info = this.nodeInfo;
+ 
+-      // Classes
+-      let classes = this.nodeInfo.classesBox;
++    // Update the tag, id, classes and pseudo-classes only if they changed to
++    // avoid triggering paint events
+ 
+-      classes.textContent = this.currentNode.classList.length ?
+-                              "." + Array.join(this.currentNode.classList, ".") : "";
++    let tagName = node.tagName;
++    if (info.tagNameLabel.textContent !== tagName) {
++      info.tagNameLabel.textContent = tagName;
++    }
+ 
+-      // Pseudo-classes
+-      let pseudos = PSEUDO_CLASSES.filter(pseudo => {
+-        return DOMUtils.hasPseudoClassLock(this.currentNode, pseudo);
+-      }, this);
++    let id = node.id ? "#" + node.id : "";
++    if (info.idLabel.textContent !== id) {
++      info.idLabel.textContent = id;
++    }
+ 
+-      let pseudoBox = this.nodeInfo.pseudoClassesBox;
+-      pseudoBox.textContent = pseudos.join("");
++    let classList = node.classList.length ? "." + [...node.classList].join(".") : "";
++    if (info.classesBox.textContent !== classList) {
++      info.classesBox.textContent = classList;
++    }
+ 
+-      this._moveInfobar();
++    let pseudos = PSEUDO_CLASSES.filter(pseudo => {
++      return DOMUtils.hasPseudoClassLock(node, pseudo);
++    }, this).join("");
++    if (info.pseudoClassesBox.textContent !== pseudos) {
++      info.pseudoClassesBox.textContent = pseudos;
+     }
++
++    this._moveInfobar();
+   },
+ 
+   /**
+    * Move the Infobar to the right place in the highlighter.
+    */
+   _moveInfobar: function() {
+     if (this.rect) {
+       let bounds = this.rect.bounds;
+@@ -831,54 +908,220 @@ BoxModelHighlighter.prototype = {
        }
        this.nodeInfo.positioner.style.left = left + "px";
      } else {
@@ -1575,7 +1752,7 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
   * It is used by the HighlighterActor too, but in case the more complex
   * BoxModelHighlighter can't be attached (which is the case for FirefoxOS and
   * Fennec targets for instance).
-@@ -946,30 +1183,31 @@ SimpleOutlineHighlighter.prototype = {
+@@ -946,30 +1189,31 @@ SimpleOutlineHighlighter.prototype = {
  function supportXULBasedHighlighter(tabActor) {
    // Note that <browser>s on Fennec also have a XUL parentNode but the box
    // model highlighter doesn't display correctly on Fennec (bug 993190)
@@ -1617,10 +1794,72 @@ diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/se
  XPCOMUtils.defineLazyGetter(this, "DOMUtils", function () {
    return Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils)
  });
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -56,18 +56,21 @@ const protocol = require("devtools/serve
+ const {Arg, Option, method, RetVal, types} = protocol;
+ const {LongStringActor, ShortLongString} = require("devtools/server/actors/string");
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const object = require("sdk/util/object");
+ const events = require("sdk/event/core");
+ const {Unknown} = require("sdk/platform/xpcom");
+ const {Class} = require("sdk/core/heritage");
+ const {PageStyleActor} = require("devtools/server/actors/styles");
+-const {HighlighterActor,
+-  CustomHighlighterActor} = require("devtools/server/actors/highlighter");
++const {
++  HighlighterActor,
++  CustomHighlighterActor,
++  HIGHLIGHTER_CLASSES
++} = require("devtools/server/actors/highlighter");
+ 
+ const FONT_FAMILY_PREVIEW_TEXT = "The quick brown fox jumps over the lazy dog";
+ const FONT_FAMILY_PREVIEW_TEXT_SIZE = 20;
+ const PSEUDO_CLASSES = [":hover", ":active", ":focus"];
+ const HIDDEN_CLASS = "__fx-devtools-hide-shortcut__";
+ const XHTML_NS = "http://www.w3.org/1999/xhtml";
+ const IMAGE_FETCHING_TIMEOUT = 500;
+ // The possible completions to a ':' with added score to give certain values
+@@ -2564,26 +2567,31 @@ var InspectorActor = protocol.ActorClass
+   /**
+    * If consumers need to display several highlighters at the same time or
+    * different types of highlighters, then this method should be used, passing
+    * the type name of the highlighter needed as argument.
+    * A new instance will be created everytime the method is called, so it's up
+    * to the consumer to release it when it is not needed anymore
+    *
+    * @param {String} type The type of highlighter to create
+-   * @return {Highlighter}
++   * @return {Highlighter} The highlighter actor instance or null if the
++   * typeName passed doesn't match any available highlighter
+    */
+   getHighlighterByType: method(function (typeName) {
+-    return CustomHighlighterActor(this, typeName);
++    if (HIGHLIGHTER_CLASSES[typeName]) {
++      return CustomHighlighterActor(this, typeName);
++    } else {
++      return null;
++    }
+   }, {
+     request: {
+       typeName: Arg(0)
+     },
+     response: {
+-      highlighter: RetVal("customhighlighter")
++      highlighter: RetVal("nullable:customhighlighter")
+     }
+   }),
+ 
+   /**
+    * Get the node's image data if any (for canvas and img nodes).
+    * Returns an imageData object with the actual data being a LongStringActor
+    * and a size json object.
+    * The image data is transmitted as a base64 encoded png data-uri.
 diff --git a/toolkit/devtools/server/actors/root.js b/toolkit/devtools/server/actors/root.js
 --- a/toolkit/devtools/server/actors/root.js
 +++ b/toolkit/devtools/server/actors/root.js
-@@ -96,19 +96,19 @@ function RootActor(aConnection, aParamet
+@@ -96,19 +96,22 @@ function RootActor(aConnection, aParamet
  
  RootActor.prototype = {
    constructor: RootActor,
@@ -1632,9 +1871,12 @@ diff --git a/toolkit/devtools/server/actors/root.js b/toolkit/devtools/server/ac
 -    // Whether the server-side highlighter actor exists and can be used to
 -    // remotely highlight nodes (see server/actors/highlighter.js)
 -    highlightable: true,
-+    // Whether the server-side highlighter actor supports custom highlighters
++    // Which custom highlighter does the server-side highlighter actor supports?
 +    // (see server/actors/highlighter.js)
-+    hasCustomHighlighters: true,
++    customHighlighters: [
++      "BoxModelHighlighter",
++      "CssTransformHighlighter"
++    ],
      // Whether the inspector actor implements the getImageDataFromURL
      // method that returns data-uris for image URLs. This is used for image
      // tooltips for instance
@@ -1669,7 +1911,7 @@ diff --git a/toolkit/devtools/server/tests/mochitest/test_highlighter-csstransfo
 new file mode 100644
 --- /dev/null
 +++ b/toolkit/devtools/server/tests/mochitest/test_highlighter-csstransform_01.html
-@@ -0,0 +1,111 @@
+@@ -0,0 +1,113 @@
 +<!DOCTYPE HTML>
 +<html>
 +<!--
@@ -1715,6 +1957,7 @@ new file mode 100644
 +        yield manyInstancesOfCustomHighlighters(front);
 +        yield showHideMethodsAreAvailable(front);
 +        yield unknownHighlighterTypeShouldntBeAccepted(front);
++        yield rootActorTraitsShouldContainKnownTypes(client);
 +      }).then(null, ok.bind(null, false)).then(() => {
 +        client.close(() => {
 +          DebuggerServer.destroy();
@@ -1731,7 +1974,7 @@ new file mode 100644
 +    let h2 = yield inspectorFront.getHighlighter(false);
 +    is(h1, h2, "The same highlighter front was returned");
 +
-+    is(h1.typeName, "mainhighlighter", "The right front type was returned");
++    is(h1.typeName, "highlighter", "The right front type was returned");
 +  }
 +
 +  function* manyInstancesOfCustomHighlighters(inspectorFront) {
@@ -1767,14 +2010,15 @@ new file mode 100644
 +  }
 +
 +  function* unknownHighlighterTypeShouldntBeAccepted(inspectorFront) {
-+    let hasThrown = false;
-+    try {
-+      let h = yield inspectorFront.getHighlighterByType("whatever");
-+    } catch (e) {
-+      hasThrown = true;
-+    }
++    let h = yield inspectorFront.getHighlighterByType("whatever");
++    ok(!h, "No highlighter was returned for the invalid type");
++  }
 +
-+    ok(hasThrown, "An exception was thrown for the invalid highlighter type");
++  function* rootActorTraitsShouldContainKnownTypes(client) {
++    ok(client.traits.customHighlighters.indexOf("BoxModelHighlighter") !== -1,
++      "The root actor's trait contains BoxModelHighlighter as a known type");
++    ok(client.traits.customHighlighters.indexOf("CssTransformHighlighter") !== -1,
++      "The root actor's trait contains CssTransformHighlighter as a known type");
 +  }
 +}
 +</script>
