@@ -1,0 +1,326 @@
+# HG changeset patch
+# Date 1399682503 25200
+# User David Caldwell <david@porkrind.org>
+# Parent 5760f837efb84102162ef0a08c8547f6d1f1a1e7
+Bug 907310 - (shift)+F5, Cmd/Ctrl+R should be available in Detached Devtools Window; r=bgrins
+
+diff --git a/browser/devtools/framework/test/browser.ini b/browser/devtools/framework/test/browser.ini
+--- a/browser/devtools/framework/test/browser.ini
++++ b/browser/devtools/framework/test/browser.ini
+@@ -22,16 +22,17 @@ support-files =
+ [browser_toolbox_options_disable_js.js]
+ # [browser_toolbox_raise.js] # Bug 962258
+ # skip-if = os == "win"
+ [browser_toolbox_ready.js]
+ [browser_toolbox_select_event.js]
+ [browser_toolbox_sidebar.js]
+ [browser_toolbox_tabsswitch_shortcuts.js]
+ [browser_toolbox_tool_ready.js]
++[browser_toolbox_window_reload_target.js]
+ [browser_toolbox_window_shortcuts.js]
+ [browser_toolbox_window_title_changes.js]
+ [browser_toolbox_zoom.js]
+ [browser_toolbox_custom_host.js]
+ 
+ # We want this test to run for mochitest-dt as well, so we include it here:
+ [../../../base/content/test/general/browser_parsable_css.js]
+ 
+diff --git a/browser/devtools/framework/test/browser_toolbox_window_reload_target.js b/browser/devtools/framework/test/browser_toolbox_window_reload_target.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/framework/test/browser_toolbox_window_reload_target.js
+@@ -0,0 +1,101 @@
++/* Any copyright is dedicated to the Public Domain.
++ * http://creativecommons.org/publicdomain/zero/1.0/ */
++
++let Toolbox = devtools.Toolbox;
++
++let target, toolbox, description, reloadsSent, toolIDs;
++
++function test() {
++  waitForExplicitFinish();
++
++  addTab("data:text/html;charset=utf-8,"+
++         "<html><head><title>Test reload</title></head>"+
++         "<body><h1>Testing reload from devtools</h1></body></html>",
++         () => {
++    target = TargetFactory.forTab(gBrowser.selectedTab);
++
++    target.makeRemote().then(() => {
++      toolIDs = gDevTools.getToolDefinitionArray()
++                  .filter(def => def.isTargetSupported(target))
++                  .map(def => def.id);
++      gDevTools.showToolbox(target, toolIDs[0], Toolbox.HostType.BOTTOM)
++               .then(startReloadTest);
++    });
++  });
++}
++
++function startReloadTest(aToolbox) {
++  toolbox = aToolbox;
++
++  reloadsSent = 0;
++  let reloads = 0;
++  let reloadCounter = (event) => {
++    reloads++;
++    info("Detected reload #"+reloads);
++    is(reloads, reloadsSent, "Reloaded from devtools window once and only for "+description+"");
++  };
++  gBrowser.selectedBrowser.addEventListener('load', reloadCounter, true);
++
++  testAllTheTools("docked", () => {
++    let origHostType = toolbox.hostType;
++    toolbox.switchHost(Toolbox.HostType.WINDOW).then(() => {
++      toolbox.doc.defaultView.focus();
++      testAllTheTools("undocked", () => {
++        toolbox.switchHost(origHostType).then(() => {
++          gBrowser.selectedBrowser.removeEventListener('load', reloadCounter, true);
++          // If we finish too early, the inspector breaks promises:
++          toolbox.getPanel("inspector").once("new-root", finishUp);
++        });
++      });
++    });
++  }, toolIDs.length-1 /* only test 1 tool in docked mode, to cut down test time */);
++}
++
++function testAllTheTools(docked, callback, toolNum=0) {
++  if (toolNum >= toolIDs.length) {
++    return callback();
++  }
++  toolbox.selectTool(toolIDs[toolNum]).then(() => {
++    testReload("toolbox-reload-key", docked, toolIDs[toolNum], () => {
++      testReload("toolbox-reload-key2", docked, toolIDs[toolNum], () => {
++        testReload("toolbox-force-reload-key", docked, toolIDs[toolNum], () => {
++          testReload("toolbox-force-reload-key2", docked, toolIDs[toolNum], () => {
++            testAllTheTools(docked, callback, toolNum+1);
++          });
++        });
++      });
++    });
++  });
++}
++
++function synthesizeKeyForToolbox(keyId) {
++  let el = toolbox.doc.getElementById(keyId);
++  let key = el.getAttribute("key") || el.getAttribute("keycode");
++  let mod = {};
++  el.getAttribute("modifiers").split(" ").forEach((m) => mod[m+"Key"] = true);
++  info("Synthesizing: key="+key+", mod="+JSON.stringify(mod));
++  EventUtils.synthesizeKey(key, mod, toolbox.doc.defaultView);
++}
++
++function testReload(key, docked, toolID, callback) {
++  let complete = () => {
++    gBrowser.selectedBrowser.removeEventListener('load', complete, true);
++    return callback();
++  };
++  gBrowser.selectedBrowser.addEventListener('load', complete, true);
++
++  description = docked+" devtools with tool "+toolID+", key #" + key;
++  info("Testing reload in "+description);
++  synthesizeKeyForToolbox(key);
++  reloadsSent++;
++}
++
++function finishUp() {
++  toolbox.destroy().then(() => {
++    gBrowser.removeCurrentTab();
++
++    target = toolbox = description = reloadsSent = toolIDs = null;
++
++    finish();
++  });
++}
+diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/toolbox.js
+--- a/browser/devtools/framework/toolbox.js
++++ b/browser/devtools/framework/toolbox.js
+@@ -242,16 +242,17 @@ Toolbox.prototype = {
+         let closeButton = this.doc.getElementById("toolbox-close");
+         closeButton.addEventListener("command", this.destroy, true);
+ 
+         this._buildDockButtons();
+         this._buildOptions();
+         this._buildTabs();
+         this._buildButtons();
+         this._addKeysToWindow();
++        this._addReloadKeys();
+         this._addToolSwitchingKeys();
+         this._addZoomKeys();
+         this._loadInitialZoom();
+ 
+         this._telemetry.toolOpened("toolbox");
+ 
+         this.selectTool(this._defaultToolId).then(panel => {
+           this.emit("ready");
+@@ -290,16 +291,29 @@ Toolbox.prototype = {
+ 
+   _splitConsoleOnKeypress: function(e) {
+     let responsiveModeActive = this._isResponsiveModeActive();
+     if (e.keyCode === e.DOM_VK_ESCAPE && !responsiveModeActive) {
+       this.toggleSplitConsole();
+     }
+   },
+ 
++  _addReloadKeys: function() {
++    [
++      ["toolbox-reload-key", false],
++      ["toolbox-reload-key2", false],
++      ["toolbox-force-reload-key", true],
++      ["toolbox-force-reload-key2", true]
++    ].forEach(([id, force]) => {
++      this.doc.getElementById(id).addEventListener("command", (event) => {
++        this.reloadTarget(force);
++      }, true);
++    });
++  },
++
+   _addToolSwitchingKeys: function() {
+     let nextKey = this.doc.getElementById("toolbox-next-tool-key");
+     nextKey.addEventListener("command", this.selectNextTool.bind(this), true);
+     let prevKey = this.doc.getElementById("toolbox-previous-tool-key");
+     prevKey.addEventListener("command", this.selectPreviousTool.bind(this), true);
+ 
+     // Split console uses keypress instead of command so the event can be
+     // cancelled with stopPropagation on the keypress, and not preventDefault.
+@@ -910,16 +924,23 @@ Toolbox.prototype = {
+         this.loadTool("webconsole").then(() => {
+           this.focusConsoleInput();
+         });
+       }
+     }
+   },
+ 
+   /**
++   * Tells the target tab to reload.
++   */
++  reloadTarget: function(force) {
++    this.target.activeTab.reload({ force: force });
++  },
++
++  /**
+    * Loads the tool next to the currently selected tool.
+    */
+   selectNextTool: function() {
+     let tools = this.doc.querySelectorAll(".devtools-tab");
+     let selected = this.doc.querySelector(".devtools-tab[selected]");
+     let nextIndex = [...tools].indexOf(selected) + 1;
+     let next = tools[nextIndex] || tools[0];
+     let tool = next.getAttribute("toolid");
+diff --git a/browser/devtools/framework/toolbox.xul b/browser/devtools/framework/toolbox.xul
+--- a/browser/devtools/framework/toolbox.xul
++++ b/browser/devtools/framework/toolbox.xul
+@@ -42,16 +42,32 @@
+     <key id="toolbox-zoom-out-key"
+          key="&toolboxZoomOut.key;"
+          oncommand="void(0);"
+          modifiers="accel"/>
+     <key id="toolbox-zoom-reset-key"
+          key="&toolboxZoomReset.key;"
+          oncommand="void(0);"
+          modifiers="accel"/>
++    <key id="toolbox-reload-key"
++         key="&toolboxReload.key;"
++         oncommand="void(0);"
++         modifiers="accel"/>
++    <key id="toolbox-force-reload-key"
++         key="&toolboxReload.key;"
++         oncommand="void(0);"
++         modifiers="accel shift"/>
++    <key id="toolbox-reload-key2"
++         keycode="VK_F5"
++         oncommand="void(0);"
++         modifiers=""/>
++    <key id="toolbox-force-reload-key2"
++         keycode="VK_F5"
++         oncommand="void(0);"
++         modifiers="accel"/>
+   </keyset>
+ 
+   <notificationbox id="toolbox-notificationbox" flex="1">
+     <toolbar class="devtools-tabbar">
+       <hbox id="toolbox-picker-container" />
+       <hbox id="toolbox-tabs" flex="1" />
+       <hbox id="toolbox-buttons" pack="end"/>
+       <vbox id="toolbox-controls-separator"/>
+diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
+--- a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
++++ b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
+@@ -12,16 +12,18 @@
+ <!ENTITY toolboxNextTool.key           "]">
+ <!ENTITY toolboxPreviousTool.key       "[">
+ 
+ <!ENTITY toolboxZoomIn.key             "+">
+ <!ENTITY toolboxZoomIn.key2            "="> <!-- + is above this key on many keyboards -->
+ <!ENTITY toolboxZoomOut.key            "-">
+ <!ENTITY toolboxZoomReset.key          "0">
+ 
++<!ENTITY toolboxReload.key             "r">
++
+ <!-- LOCALIZATION NOTE (options.context.advancedSettings): This is the label for
+   -  the heading of the advanced settings group in the options panel. -->
+ <!ENTITY options.context.advancedSettings "Advanced settings">
+ 
+ <!-- LOCALIZATION NOTE (options.context.inspector): This is the label for
+   -  the heading of the Inspector group in the options panel. -->
+ <!ENTITY options.context.inspector "Inspector">
+ 
+diff --git a/toolkit/devtools/client/dbg-client.jsm b/toolkit/devtools/client/dbg-client.jsm
+--- a/toolkit/devtools/client/dbg-client.jsm
++++ b/toolkit/devtools/client/dbg-client.jsm
+@@ -1256,19 +1256,27 @@ TabClient.prototype = {
+       this.client._tabClients.delete(this.actor);
+       return aResponse;
+     },
+     telemetry: "TABDETACH"
+   }),
+ 
+   /**
+    * Reload the page in this tab.
++   *
++   * @param [optional] object options
++   *        An object with a `force` property indicating whether or not
++   *        this reload should skip the cache
+    */
+-  reload: DebuggerClient.requester({
+-    type: "reload"
++  reload: function(options = { force: false }) {
++    return this._reload(options);
++  },
++  _reload: DebuggerClient.requester({
++    type: "reload",
++    options: args(0)
+   }, {
+     telemetry: "RELOAD"
+   }),
+ 
+   /**
+    * Navigate to another URL.
+    *
+    * @param string url
+diff --git a/toolkit/devtools/server/actors/webbrowser.js b/toolkit/devtools/server/actors/webbrowser.js
+--- a/toolkit/devtools/server/actors/webbrowser.js
++++ b/toolkit/devtools/server/actors/webbrowser.js
+@@ -823,20 +823,22 @@ TabActor.prototype = {
+ 
+     return { type: "detached" };
+   },
+ 
+   /**
+    * Reload the page in this tab.
+    */
+   onReload: function(aRequest) {
++    let force = aRequest && aRequest.options && aRequest.options.force;
+     // Wait a tick so that the response packet can be dispatched before the
+     // subsequent navigation event packet.
+     Services.tm.currentThread.dispatch(DevToolsUtils.makeInfallible(() => {
+-      this.window.location.reload();
++      this.webNavigation.reload(force ? Ci.nsIWebNavigation.LOAD_FLAGS_BYPASS_CACHE
++                                      : Ci.nsIWebNavigation.LOAD_FLAGS_NONE);
+     }, "TabActor.prototype.onReload's delayed body"), 0);
+     return {};
+   },
+ 
+   /**
+    * Navigate this tab to a new location
+    */
+   onNavigateTo: function(aRequest) {
