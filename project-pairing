@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 3524eef660be4d6d74a01e59640f5633550377d3
+# Parent aed7dce46a117aef9e160160c58a014716cce3fc
 # User Brian Grinstead <bgrinstead@mozilla.com>
 pairing with project editor
 
@@ -30,11 +30,20 @@ diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.
   * This emulates the integration points that the app manager uses.
   */
  document.addEventListener("DOMContentLoaded", function onDOMReady(e) {
-@@ -51,27 +54,78 @@ document.addEventListener("DOMContentLoa
+@@ -47,25 +50,39 @@ document.addEventListener("DOMContentLoa
+   });
+   projecteditor.on("onEditorCursorActivity", (editor) => {
+     console.log("editor cursor activity: " + editor);
+   });
    projecteditor.on("onCommand", (cmd) => {
      console.log("Command: " + cmd);
    });
  
++
++  let topWindow = Services.wm.getMostRecentWindow("navigator:browser");
++  let gBrowser = topWindow.gBrowser;
++
++console.log(gBrowser.mCurrentTab);
    projecteditor.loaded.then(() => {
      projecteditor.setProjectToAppPath(SAMPLE_PATH, {
        name: SAMPLE_NAME,
@@ -47,18 +56,11 @@ diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.
 +      let win = projecteditor.editorFor(root).iframe.contentWindow;
        let allResources = projecteditor.project.allResources();
 -      console.log("All resources have been loaded", allResources, allResources.map(r=>r.basename).join("|"));
-+      console.log(TargetFactory, root, win, TargetFactory.forWindow(win));
-+
-+      let target;
-+      let tab = openTab(
-+        "file:///" + FileUtils.getFile("TmpD", ["ProjectEditor", "index.html"]).path
-+      ).then((tab) => {
-+        console.log("TAB", tab);
-+        target = TargetFactory.forTab(tab);
-+        return target.makeRemote();
-+      }).then(() => {
++      let tab = gBrowser.mCurrentTab;
++      let target = TargetFactory.forTab(tab);
++      target.makeRemote().then(() => {
 +        console.log("Making remote", target);
-+        projecteditor.setTarget(target);
++        projecteditor.setTarget(target, win);
 +      });
 +
 +      console.log("All resources have been loaded", allResources.map(r=>r.basename).join("|"));
@@ -68,54 +70,13 @@ diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.
  
  }, false);
  
-+
-+function getTab(url) {
-+  let topWindow = Services.wm.getMostRecentWindow("navigator:browser");
-+  let gBrowser = topWindow.gBrowser;
-+
-+  let i = 0;
-+  for (let tab of tabs) {
-+    console.log("Iterating ", tab, url);
-+    if (tab.url === url) {
-+      return {
-+        simple: gBrowser.tabs[i],
-+        sdk: tab
-+      };
-+    }
-+    i++;
-+  }
-+}
-+
-+function openTab(url) {
-+  let def = promise.defer();
-+  let tab = getTab(url);
-+  if (tab) {
-+    tab.sdk.reload();
-+    def.resolve(tab.simple);
-+  } else {
-+    tabs.open({
-+      url: url,
-+      onOpen: (tab) => {
-+        def.resolve(getTab(tab.url).simple);
-+      }
-+    });
-+  }
-+  return def.promise;
-+}
-+
  /**
   * Build a temporary directory as a workspace for this loader
-  * https://developer.mozilla.org/en-US/Add-ons/Code_snippets/File_I_O
-  */
- function buildTempDirectoryStructure() {
- 
-   // First create (and remove) the temp dir to discard any changes
-   let TEMP_DIR = FileUtils.getDir("TmpD", ["ProjectEditor"], true);
 diff --git a/browser/devtools/projecteditor/lib/plugins/pairing/pairing.js b/browser/devtools/projecteditor/lib/plugins/pairing/pairing.js
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/projecteditor/lib/plugins/pairing/pairing.js
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,92 @@
 +/* -*- Mode: Javascript; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -139,10 +100,14 @@ new file mode 100644
 +  },
 +
 +  get target() {
-+    return this.host.target
++    return this.host.target;
 +  },
 +
-+  newTarget: function(target) {
++  get targetWin() {
++    return this.host.targetWin;
++  },
++
++  newTarget: function(target, win) {
 +    console.log("NEW PARING", target);
 +
 +    // XXX: Need to share style editor fronts with the style editor.
@@ -159,6 +124,14 @@ new file mode 100644
 +      }
 +      console.log("SETTING SHEETS", this.debuggee, styleSheets);
 +      // this.root.setSheets(styleSheets);
++      styleSheets.forEach((sheet) => {
++        if (this.targetWin) {
++          let location = this.targetWin.location.toString();
++          if (sheet.nodeHref === location) {
++            sheet.update("body { color: red }", true);
++          }
++        }
++      });
 +      this.target.on("will-navigate", this._onStyleSheetsCleared);
 +      this.target.on("navigate", this._onNavigate);
 +    }).then(null, console.error);
@@ -217,7 +190,7 @@ diff --git a/browser/devtools/projecteditor/lib/projecteditor.js b/browser/devto
   * This is the main class tying together an instance of the ProjectEditor.
   * The frontend is contained inside of this.iframe, which loads projecteditor.xul.
   *
-@@ -282,16 +283,36 @@ var ProjectEditor = Class({
+@@ -282,16 +283,40 @@ var ProjectEditor = Class({
        let rootResource = this.project.localStores.get(path).root;
        emit(rootResource, "label-change", rootResource);
      }
@@ -230,17 +203,21 @@ diff --git a/browser/devtools/projecteditor/lib/projecteditor.js b/browser/devto
 +   *
 +   * @param Target target
 +   *               The target for pairing
++   * @param Window win
++   *               The window that you care about
 +   */
-+  setTarget: function(target) {
++  setTarget: function(target, win=null) {
 +    if (!target) {
 +      this.pluginDispatch("removeTarget", this.target);
-+      this.target = null;
++      this.target = this.targetWin =null;
 +    } else if (target !== this.target) {
 +      if (this.target) {
-+        this.pluginDispatch("removeTarget", this.target);
++        this.pluginDispatch("removeTarget", this.target, this.targetWin);
 +      }
 +      this.target = target;
-+      this.pluginDispatch("newTarget", target);
++      this.targetWin = win;
++      console.log("HERE", win);
++      this.pluginDispatch("newTarget", target, win);
 +    }
 +
 +  },
