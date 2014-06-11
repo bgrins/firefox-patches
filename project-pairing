@@ -1,6 +1,256 @@
 # HG changeset patch
-# Parent 652092f2085d9f987e0deeeb1533fa48789009f0
+# Parent 3524eef660be4d6d74a01e59640f5633550377d3
 # User Brian Grinstead <bgrinstead@mozilla.com>
 pairing with project editor
 
-
+diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.js b/browser/devtools/projecteditor/chrome/content/projecteditor-loader.js
+--- a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.js
++++ b/browser/devtools/projecteditor/chrome/content/projecteditor-loader.js
+@@ -1,19 +1,22 @@
+ const Cu = Components.utils;
+ const {devtools} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
+ const {FileUtils} = Cu.import("resource://gre/modules/FileUtils.jsm", {});
+ const {NetUtil} = Cu.import("resource://gre/modules/NetUtil.jsm", {});
+ const require = devtools.require;
+ const promise = require("projecteditor/helpers/promise");
+ const ProjectEditor = require("projecteditor/projecteditor");
++const TargetFactory = require("devtools/framework/target").TargetFactory;
++const tabs = require("sdk/tabs");
++Cu.import("resource://gre/modules/Services.jsm");
++
+ 
+ const SAMPLE_PATH = buildTempDirectoryStructure();
+ const SAMPLE_NAME = "DevTools Content Application Name";
+-const SAMPLE_PROJECT_URL = "http://mozilla.org";
+ const SAMPLE_ICON = "chrome://browser/skin/devtools/tool-debugger.svg";
+ 
+ /**
+  * Create a workspace for working on projecteditor, available at
+  * chrome://browser/content/devtools/projecteditor-loader.xul.
+  * This emulates the integration points that the app manager uses.
+  */
+ document.addEventListener("DOMContentLoaded", function onDOMReady(e) {
+@@ -51,27 +54,78 @@ document.addEventListener("DOMContentLoa
+   projecteditor.on("onCommand", (cmd) => {
+     console.log("Command: " + cmd);
+   });
+ 
+   projecteditor.loaded.then(() => {
+     projecteditor.setProjectToAppPath(SAMPLE_PATH, {
+       name: SAMPLE_NAME,
+       iconUrl: SAMPLE_ICON,
+-      projectOverviewURL: SAMPLE_PROJECT_URL,
++      projectOverviewURL: "file://" + FileUtils.getFile("TmpD", ["ProjectEditor", "index.html"]).path,
+       validationStatus: "valid"
+     }).then(() => {
++      let root = projecteditor.project.allResources()[0];
++      let win = projecteditor.editorFor(root).iframe.contentWindow;
+       let allResources = projecteditor.project.allResources();
+-      console.log("All resources have been loaded", allResources, allResources.map(r=>r.basename).join("|"));
++      console.log(TargetFactory, root, win, TargetFactory.forWindow(win));
++
++      let target;
++      let tab = openTab(
++        "file:///" + FileUtils.getFile("TmpD", ["ProjectEditor", "index.html"]).path
++      ).then((tab) => {
++        console.log("TAB", tab);
++        target = TargetFactory.forTab(tab);
++        return target.makeRemote();
++      }).then(() => {
++        console.log("Making remote", target);
++        projecteditor.setTarget(target);
++      });
++
++      console.log("All resources have been loaded", allResources.map(r=>r.basename).join("|"));
+     });
+ 
+   });
+ 
+ }, false);
+ 
++
++function getTab(url) {
++  let topWindow = Services.wm.getMostRecentWindow("navigator:browser");
++  let gBrowser = topWindow.gBrowser;
++
++  let i = 0;
++  for (let tab of tabs) {
++    console.log("Iterating ", tab, url);
++    if (tab.url === url) {
++      return {
++        simple: gBrowser.tabs[i],
++        sdk: tab
++      };
++    }
++    i++;
++  }
++}
++
++function openTab(url) {
++  let def = promise.defer();
++  let tab = getTab(url);
++  if (tab) {
++    tab.sdk.reload();
++    def.resolve(tab.simple);
++  } else {
++    tabs.open({
++      url: url,
++      onOpen: (tab) => {
++        def.resolve(getTab(tab.url).simple);
++      }
++    });
++  }
++  return def.promise;
++}
++
+ /**
+  * Build a temporary directory as a workspace for this loader
+  * https://developer.mozilla.org/en-US/Add-ons/Code_snippets/File_I_O
+  */
+ function buildTempDirectoryStructure() {
+ 
+   // First create (and remove) the temp dir to discard any changes
+   let TEMP_DIR = FileUtils.getDir("TmpD", ["ProjectEditor"], true);
+diff --git a/browser/devtools/projecteditor/lib/plugins/pairing/pairing.js b/browser/devtools/projecteditor/lib/plugins/pairing/pairing.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/projecteditor/lib/plugins/pairing/pairing.js
+@@ -0,0 +1,80 @@
++/* -*- Mode: Javascript; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++const { Class } = require("sdk/core/heritage");
++const { registerPlugin, Plugin } = require("projecteditor/plugins/core");
++const { StyleSheetsFront } = require("devtools/server/actors/stylesheets");
++const { StyleEditorFront } = require("devtools/server/actors/styleeditor");
++const {CssLogic} = require("devtools/styleinspector/css-logic");
++
++// Handles the new command.
++var Pairing = Class({
++  extends: Plugin,
++
++  init: function() {
++    console.log("PAIRING INIT");
++    this._onStyleSheetsCleared = this._onStyleSheetsCleared.bind(this);
++    this._onNavigate = this._onNavigate.bind(this);
++  },
++
++  get target() {
++    return this.host.target
++  },
++
++  newTarget: function(target) {
++    console.log("NEW PARING", target);
++
++    // XXX: Need to share style editor fronts with the style editor.
++    if (this.target.form.styleSheetsActor) {
++      this.debuggee = StyleSheetsFront(this.target.client, this.target.form);
++    } else {
++      // We're talking to a pre-firefox 29 server-side
++      this.debuggee = StyleEditorFront(this.target.client, this.target.form);
++    }
++
++    this.debuggee.getStyleSheets().then(styleSheets => {
++      if (this.target !== target) {
++        return;
++      }
++      console.log("SETTING SHEETS", this.debuggee, styleSheets);
++      // this.root.setSheets(styleSheets);
++      this.target.on("will-navigate", this._onStyleSheetsCleared);
++      this.target.on("navigate", this._onNavigate);
++    }).then(null, console.error);
++  },
++
++  _makeAFakeStyleSheet: function() {
++    this.debuggee.addStyleSheet("").then(sheet => {
++      console.log("SHEET", sheet);
++    });
++  },
++  _onStyleSheetsCleared: function() {
++    console.log("on stylesheets cleared");
++  },
++  _onNavigate: function() {
++    console.log("on navigate");
++  },
++  removeTarget: function(target) {
++    console.log("REMOVE PARING", target);
++    this.resources.clear();
++    this.debuggee.destroy();
++    this.target.off("will-navigate", this._onStyleSheetsCleared);
++    this.target.off("navigate", this._onNavigate);
++  }
++    // if (this.debuggee) {
++    //   this.pluginDispatch("removeTarget", target);
++    // }
++
++
++
++    // if (!target) {
++    //   return;
++    // }
++    // console.log("HAVE A TARGET", this.target.form, this.target.client, this.target )
++
++})
++exports.Pairing = Pairing;
++registerPlugin(Pairing);
+diff --git a/browser/devtools/projecteditor/lib/projecteditor.js b/browser/devtools/projecteditor/lib/projecteditor.js
+--- a/browser/devtools/projecteditor/lib/projecteditor.js
++++ b/browser/devtools/projecteditor/lib/projecteditor.js
+@@ -24,16 +24,17 @@ const ITCHPAD_URL = "chrome://browser/co
+ // Enabled Plugins
+ require("projecteditor/plugins/dirty/dirty");
+ require("projecteditor/plugins/delete/delete");
+ require("projecteditor/plugins/new/new");
+ require("projecteditor/plugins/save/save");
+ require("projecteditor/plugins/image-view/plugin");
+ require("projecteditor/plugins/app-manager/plugin");
+ require("projecteditor/plugins/status-bar/plugin");
++require("projecteditor/plugins/pairing/pairing");
+ 
+ // Uncomment to enable logging.
+ // require("projecteditor/plugins/logging/logging");
+ 
+ /**
+  * This is the main class tying together an instance of the ProjectEditor.
+  * The frontend is contained inside of this.iframe, which loads projecteditor.xul.
+  *
+@@ -282,16 +283,36 @@ var ProjectEditor = Class({
+       let rootResource = this.project.localStores.get(path).root;
+       emit(rootResource, "label-change", rootResource);
+     }
+ 
+     return this.project.refresh();
+   },
+ 
+   /**
++   * Set a TabTarget for pairing with the editor
++   *
++   * @param Target target
++   *               The target for pairing
++   */
++  setTarget: function(target) {
++    if (!target) {
++      this.pluginDispatch("removeTarget", this.target);
++      this.target = null;
++    } else if (target !== this.target) {
++      if (this.target) {
++        this.pluginDispatch("removeTarget", this.target);
++      }
++      this.target = target;
++      this.pluginDispatch("newTarget", target);
++    }
++
++  },
++
++  /**
+    * Open a resource in a particular shell.
+    *
+    * @param Resource resource
+    *                 The file to be opened.
+    */
+   openResource: function(resource) {
+     this.shells.open(resource);
+     this.projectTree.selectResource(resource);
