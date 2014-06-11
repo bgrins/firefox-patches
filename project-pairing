@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent aed7dce46a117aef9e160160c58a014716cce3fc
+# Parent 24f5ae7f57082c7cbfc27612ff8ce4eacdc4bee8
 # User Brian Grinstead <bgrinstead@mozilla.com>
 pairing with project editor
 
@@ -76,7 +76,7 @@ diff --git a/browser/devtools/projecteditor/lib/plugins/pairing/pairing.js b/bro
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/projecteditor/lib/plugins/pairing/pairing.js
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,86 @@
 +/* -*- Mode: Javascript; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -87,7 +87,8 @@ new file mode 100644
 +const { registerPlugin, Plugin } = require("projecteditor/plugins/core");
 +const { StyleSheetsFront } = require("devtools/server/actors/stylesheets");
 +const { StyleEditorFront } = require("devtools/server/actors/styleeditor");
-+const {CssLogic} = require("devtools/styleinspector/css-logic");
++const { CssLogic } = require("devtools/styleinspector/css-logic");
++const { ResourceMap } = require("projecteditor/plugins/pairing/resource-map");
 +
 +// Handles the new command.
 +var Pairing = Class({
@@ -97,6 +98,7 @@ new file mode 100644
 +    console.log("PAIRING INIT");
 +    this._onStyleSheetsCleared = this._onStyleSheetsCleared.bind(this);
 +    this._onNavigate = this._onNavigate.bind(this);
++    this.resourceMap = new ResourceMap(this.host);
 +  },
 +
 +  get target() {
@@ -122,16 +124,8 @@ new file mode 100644
 +      if (this.target !== target) {
 +        return;
 +      }
-+      console.log("SETTING SHEETS", this.debuggee, styleSheets);
-+      // this.root.setSheets(styleSheets);
-+      styleSheets.forEach((sheet) => {
-+        if (this.targetWin) {
-+          let location = this.targetWin.location.toString();
-+          if (sheet.nodeHref === location) {
-+            sheet.update("body { color: red }", true);
-+          }
-+        }
-+      });
++
++      this.resourceMap.setSheets(styleSheets);
 +      this.target.on("will-navigate", this._onStyleSheetsCleared);
 +      this.target.on("navigate", this._onNavigate);
 +    }).then(null, console.error);
@@ -169,6 +163,255 @@ new file mode 100644
 +})
 +exports.Pairing = Pairing;
 +registerPlugin(Pairing);
+diff --git a/browser/devtools/projecteditor/lib/plugins/pairing/resource-map.js b/browser/devtools/projecteditor/lib/plugins/pairing/resource-map.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/projecteditor/lib/plugins/pairing/resource-map.js
+@@ -0,0 +1,243 @@
++const { Class } = require("sdk/core/heritage");
++const { emit } = require("sdk/event/core");
++const { EventTarget } = require("sdk/event/target");
++const timers = require("sdk/timers");
++const { on, off, forget } = require("projecteditor/helpers/event");
++
++// Maintains the list of pairs.
++var ResourceMap = Class({
++  initialize: function(host) {
++    this.map = new Map();
++    this.styleSheetMap = new Map();
++    this.host = host;
++
++    this.scheduleRebuild = this.scheduleRebuild.bind(this);
++    this.rebuild = this.rebuild.bind(this)
++    this.watchCollection = this.watchCollection.bind(this);
++    this.unwatchCollection = this.unwatchCollection.bind(this);
++
++    [...this.host.project.allStores()].forEach(this.watchCollection);
++    on(this, this.host.project, "store-added", this.watchCollection);
++    on(this, this.host.project, "store-removed", this.unwatchCollection);
++    console.log("NEW RESOURCE MAP");
++  },
++
++  get target () {
++    return this.host.target;
++  },
++  get targetWin () {
++    return this.host.targetWin;
++  },
++  allResources: function() {
++    return this.host.project.allResources();
++  },
++
++  setSheets: function(styleSheets) {
++
++    this.styleSheetMap = new Map();
++
++    console.log("SETTING SHEETS", this.debuggee, styleSheets);
++    // this.root.setSheets(styleSheets);
++    this.styleSheets = styleSheets;
++    styleSheets.forEach((sheet) => {
++      let processSheet = !!sheet.href;
++      if (this.targetWin) {
++        let location = this.targetWin.location.toString();
++        if (sheet.nodeHref !== location) {
++          processSheet = false;
++        }
++      }
++      if (processSheet) {
++        this.styleSheetMap.set(sheet.href, sheet);
++        sheet.update("body { color: red }", true);
++      }
++    });
++    this.rebuild();
++  },
++
++  watchCollection: function(collection) {
++    console.log("Watching collection", collection);
++    on(this, collection, "resource-added", this.scheduleRebuild);
++    on(this, collection, "resource-removed", this.scheduleRebuild);
++  },
++
++  unwatchCollection: function(collection) {
++    forget(this, collection);
++  },
++
++  scheduleRebuild: function() {
++    if (this._scheduledRebuild) {
++      timers.clearTimeout(this._scheduledRebuild);
++    }
++    this._scheduledRebuild = timers.setTimeout(this.rebuild, 100);
++  },
++
++  /**
++  * Rebuild the project pairings.
++  */
++  rebuild: function() {
++    if (this._scheduledRebuild) {
++      timers.clearTimeout(this._scheduledRebuild);
++      this._scheduledRebuild = null;
++    }
++    let start = Date.now();
++    // Rules:
++    // - Pairs stay with the local resource if they change.
++
++    let newPairs = new Map();
++    console.log("foo",this.styleSheetMap, this.styleSheetMap.size,this.styleSheets);
++    for (let resource of this.allResources()) {
++      console.log(resource.path);
++      if (this.map.get(resource)) {
++      }
++      // let newPair = newPairs.get(resource);
++      // if (newPair) {
++      //   // Already taken care of.
++      //   continue;
++      // }
++      // let oldPair = this.map.get(resource);
++      // if (oldPair) {
++      //   oldPair.live = null;
++      //   newPairs.set(project, oldPair);
++      // }
++    }
++
++
++    let end = Date.now();
++    console.log("Rebuilt project map in " + (end - start) + "ms");
++
++
++
++    // console.log("aboutto fail hard");
++    // // Walk through all live resources...
++    // for (let live of this.page.allResources()) {
++    //   if (live.isDir) {
++    //     continue;
++    //   }
++
++    //   // If there's a manual pair, just trust it.
++    //   if (this.manualPairs.has(live)) {
++    //     let manual = this.manualPairs.get(live);
++    //     newPairs.set(manual.project, manual);
++    //     newPairs.set(manual.live, manual);
++    //     continue;
++    //   }
++
++    //   // Find a project resource for this resource...
++    //   let project = this._findPair(live);
++
++    //   if (!project) {
++    //     // No paired resource, no need to save a pair, but do
++    //     // keep the one-sided pair around if there is one.
++    //     let oldPair = this.pairs.get(live);
++    //     if (oldPair) {
++    //       // Just in case.
++    //       oldPair.project = null;
++
++    //       newPairs.set(live, oldPair);
++    //     }
++    //     continue;
++    //   }
++
++    //   // We have a real pair. Update it if it already exists.
++    //   // XXX: This could leave us with an empty pair, make
++    //   // sure editors close properly...
++    //   let pair = this.pairs.get(project);
++    //   if (pair) {
++    //     pair.live = live;
++    //   } else {
++    //     pair = new Pair(this, project, live);
++    //   }
++    //   newPairs.set(live, pair);
++    //   newPairs.set(project, pair);
++
++    //   // Remove the project link from the map so the next pass
++    //   // doesn't pick it up.
++    //   this.pairs.delete(project);
++    // }
++
++    // // Now newPairs has pairs for all live resources that
++    // // need them (either because they already had a single-sided pair
++    // // in the wild or because they found a real pair)
++    // // Now make sure that any project resources with an outstanding pair
++    // // are included.
++    // for (let project of this.allResources()) {
++    //   let newPair = newPairs.get(project);
++    //   if (newPair) {
++    //     // Already taken care of.
++    //     continue;
++    //   }
++    //   let oldPair = this.pairs.get(project);
++    //   if (oldPair) {
++    //     oldPair.live = null;
++    //     newPairs.set(project, oldPair);
++    //   }
++    // }
++
++    // this.pairs = newPairs;
++
++  },
++
++  /**
++  * Find the best project pair for a given live resource.
++  *
++  * Right now we only have one strategy, but new strategies
++  * can be added here.
++  */
++  _findPair: function(live) {
++    return this._fuzzyStrategy(live);
++  },
++
++  /**
++  * The default fuzzy match strategy for finding a live pairing.
++  * Finds a project resources with the same basename, and chooses
++  * the one with the most path component matches.
++  */
++  _fuzzyStrategy: function(resource) {
++    let matches = this._findBasenameMatches(resource.basename);
++    if (matches.length < 1) {
++      return null;
++    }
++
++    let searchPath = resource.uri.path.split('/').filter(item => !!item);
++    searchPath.reverse();
++
++    let bestMatch = null;
++    let bestMatchComponents = 0;
++    let bestMatchExtra = 1000;
++    for (let match of matches) {
++      let matchPath = match.uri.path.split('/').filter(item => !!item);
++      matchPath.reverse();
++      let i;
++      for (i = 0; i < matchPath.length && i < searchPath.length; i++) {
++        if (matchPath[i] != searchPath[i]) {
++          break;
++        }
++      }
++
++      // In case of a tie in matched components, arbitrarily assume that
++      // resources closer to the project root are correct.
++      let remaining = matchPath.length - i;
++      if (i > bestMatchComponents ||
++          (i === bestMatchComponents && remaining < bestMatchExtra)) {
++        bestMatch = match;
++        bestMatchComponents = i;
++        bestMatchExtra = remaining;
++      }
++    }
++
++    return bestMatch;
++  },
++
++  _findBasenameMatches: function(basename) {
++    let matches = [];
++    for (let resource of this.project.index.findBasename(basename)) {
++      if (!resource.store.canPair) {
++        continue;
++      }
++      matches.push(resource);
++    }
++    return matches;
++  }
++});
++exports.ResourceMap = ResourceMap;
+\ No newline at end of file
 diff --git a/browser/devtools/projecteditor/lib/projecteditor.js b/browser/devtools/projecteditor/lib/projecteditor.js
 --- a/browser/devtools/projecteditor/lib/projecteditor.js
 +++ b/browser/devtools/projecteditor/lib/projecteditor.js
