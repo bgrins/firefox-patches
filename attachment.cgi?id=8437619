@@ -1,0 +1,570 @@
+# HG changeset patch
+# Parent 68d1129c369cede6a81a8e3601884b429b75e4be
+# User Patrick Brosset <pbrosset@mozilla.com>
+Bug 1014547 - part 2 - Move the highlighter utils to its own module; r=bgrins
+
+diff --git a/browser/devtools/framework/toolbox-highlighter-utils.js b/browser/devtools/framework/toolbox-highlighter-utils.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/framework/toolbox-highlighter-utils.js
+@@ -0,0 +1,231 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++const {Cc, Ci, Cu} = require("chrome");
++const {Promise: promise} = require("resource://gre/modules/Promise.jsm");
++Cu.import("resource://gre/modules/Task.jsm");
++Cu.import("resource:///modules/devtools/gDevTools.jsm");
++
++/**
++ * Client-side highlighter shared module.
++ * To be used by toolbox panels that need to highlight DOM elements.
++ *
++ * Highlighting and selecting elements is common enough that it needs to be at
++ * toolbox level, accessible by any panel that needs it.
++ * That's why the toolbox is the one that initializes the inspector and
++ * highlighter. It's also why the API returned by this module needs a reference
++ * to the toolbox which should be set once only.
++ */
++
++/**
++ * Get the highighterUtils instance for a given toolbox.
++ * This should be done once only by the toolbox itself and stored there so that
++ * panels can get it from there. That's because the API returned has a stateful
++ * scope that would be different for another instance returned by this function.
++ *
++ * @param {Toolbox} toolbox
++ * @return {Object} the highlighterUtils public API
++ */
++exports.getHighlighterUtils = function(toolbox) {
++  if (!toolbox || !toolbox.target) {
++    throw new Error("Missing or invalid toolbox passed to getHighlighterUtils");
++    return;
++  }
++
++  let isPicking = false;
++
++  /**
++   * Does the target have the highlighter actor.
++   * The devtools must be backwards compatible with at least B2G 1.3 (28),
++   * which doesn't have the highlighter actor. This can be removed as soon as
++   * the minimal supported version becomes 1.4 (29)
++   */
++  function isRemoteHighlightable() {
++    return toolbox.target.client.traits.highlightable;
++  }
++
++  /**
++   * Make a function that initializes the inspector before it runs.
++   * Since the init of the inspector is asynchronous, the return value will be
++   * produced by Task.async and the argument should be a generator
++   * @param {Function*} generator A generator function
++   * @return {Function} A function
++   */
++  let requireInspector = generator => {
++    return Task.async(function*(...args) {
++      yield toolbox.initInspector();
++      return yield generator.apply(null, args);
++    });
++  };
++
++  /**
++   * Start/stop the element picker on the debuggee target.
++   * @return A promise that resolves when done
++   */
++  function togglePicker() {
++    if (isPicking) {
++      return stopPicker();
++    } else {
++      return startPicker();
++    }
++  }
++
++  /**
++   * Start the element picker on the debuggee target.
++   * This will request the inspector actor to start listening for mouse events
++   * on the target page to highlight the hovered/picked element.
++   * Depending on the server-side capabilities, this may fire events when nodes
++   * are hovered.
++   * @return A promise that resolves when the picker has started or immediately
++   * if it is already started
++   */
++  let startPicker = requireInspector(function*() {
++    if (isPicking) {
++      return;
++    }
++    isPicking = true;
++
++    toolbox.pickerButtonChecked = true;
++    yield toolbox.selectTool("inspector");
++    toolbox.on("select", stopPicker);
++
++    if (isRemoteHighlightable()) {
++      toolbox.walker.on("picker-node-hovered", onPickerNodeHovered);
++      toolbox.walker.on("picker-node-picked", onPickerNodePicked);
++
++      yield toolbox.highlighter.pick();
++      toolbox.emit("picker-started");
++    } else {
++      // If the target doesn't have the highlighter actor, we can use the
++      // walker's pick method instead, knowing that it only responds when a node
++      // is picked (instead of emitting events)
++      toolbox.emit("picker-started");
++      let node = yield toolbox.walker.pick();
++      onPickerNodePicked({node: node});
++    }
++  });
++
++  /**
++   * Stop the element picker. Note that the picker is automatically stopped when
++   * an element is picked
++   * @return A promise that resolves when the picker has stopped or immediately
++   * if it is already stopped
++   */
++  let stopPicker = requireInspector(function*() {
++    if (!isPicking) {
++      return;
++    }
++    isPicking = false;
++
++    toolbox.pickerButtonChecked = false;
++
++    if (isRemoteHighlightable()) {
++      yield toolbox.highlighter.cancelPick();
++      toolbox.walker.off("picker-node-hovered", onPickerNodeHovered);
++      toolbox.walker.off("picker-node-picked", onPickerNodePicked);
++    } else {
++      // If the target doesn't have the highlighter actor, use the walker's
++      // cancelPick method instead
++      yield toolbox.walker.cancelPick();
++    }
++
++    toolbox.off("select", stopPicker);
++    toolbox.emit("picker-stopped");
++  });
++
++  /**
++   * When a node is hovered by the mouse when the highlighter is in picker mode
++   * @param {Object} data Information about the node being hovered
++   */
++  function onPickerNodeHovered(data) {
++    toolbox.emit("picker-node-hovered", data.node);
++  }
++
++  /**
++   * When a node has been picked while the highlighter is in picker mode
++   * @param {Object} data Information about the picked node
++   */
++  function onPickerNodePicked(data) {
++    toolbox.selection.setNodeFront(data.node, "picker-node-picked");
++    stopPicker();
++  }
++
++  /**
++   * Show the box model highlighter on a node in the content page.
++   * The node needs to be a NodeFront, as defined by the inspector actor
++   * @see toolkit/devtools/server/actors/inspector.js
++   * @param {NodeFront} nodeFront The node to highlight
++   * @param {Object} options
++   * @return A promise that resolves when the node has been highlighted
++   */
++  let highlightNodeFront = requireInspector(function*(nodeFront, options={}) {
++    if (isRemoteHighlightable()) {
++      yield toolbox.highlighter.showBoxModel(nodeFront, options);
++    } else {
++      // If the target doesn't have the highlighter actor, revert to the
++      // walker's highlight method, which draws a simple outline
++      yield toolbox.walker.highlight(nodeFront);
++    }
++    toolbox.emit("node-highlight", nodeFront);
++  });
++
++  /**
++   * This is a convenience method in case you don't have a nodeFront but a
++   * valueGrip. This is often the case with VariablesView properties.
++   * This method will simply translate the grip into a nodeFront and call
++   * highlightNodeFront, so it has the same signature.
++   * @see highlightNodeFront
++   */
++  let highlightDomValueGrip = requireInspector(function*(valueGrip, options={}) {
++    let nodeFront = yield translateGripToNodeFront(valueGrip);
++    if (nodeFront) {
++      yield highlightNodeFront(nodeFront, options);
++    } else {
++      throw new Error("The ValueGrip passed could not be translated to a NodeFront");
++    }
++  });
++
++  /**
++   * Translate a debugger value grip into a node front usable by the inspector
++   * @param {ValueGrip}
++   * @return a promise that resolves to the node front when done
++   */
++  let translateGripToNodeFront = requireInspector(function*(grip) {
++    return yield toolbox.walker.getNodeActorFromObjectActor(grip.actor);
++  });
++
++  /**
++   * Hide the highlighter.
++   * @param {Boolean} forceHide Only really matters in test mode (when
++   * gDevTools.testing is true). In test mode, hovering over several nodes in
++   * the markup view doesn't hide/show the highlighter to ease testing. The
++   * highlighter stays visible at all times, except when the mouse leaves the
++   * markup view, which is when this param is passed to true
++   * @return a promise that resolves when the highlighter is hidden
++   */
++  let unhighlight = Task.async(function*(forceHide=false) {
++    forceHide = forceHide || !gDevTools.testing;
++
++    if (forceHide && toolbox.highlighter && isRemoteHighlightable()) {
++      // Note that if isRemoteHighlightable is true, there's no need to hide the
++      // highlighter as the walker uses setTimeout to hide it after some time
++      yield toolbox.highlighter.hideBoxModel();
++    }
++
++    toolbox.emit("node-unhighlight");
++  });
++
++  // Public API
++  return {
++    isRemoteHighlightable: isRemoteHighlightable,
++    togglePicker: togglePicker,
++    startPicker: startPicker,
++    stopPicker: stopPicker,
++    highlightNodeFront: highlightNodeFront,
++    highlightDomValueGrip: highlightDomValueGrip,
++    unhighlight: unhighlight
++  };
++};
+diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/toolbox.js
+--- a/browser/devtools/framework/toolbox.js
++++ b/browser/devtools/framework/toolbox.js
+@@ -8,16 +8,17 @@ const MAX_ORDINAL = 99;
+ const ZOOM_PREF = "devtools.toolbox.zoomValue";
+ const MIN_ZOOM = 0.5;
+ const MAX_ZOOM = 2;
+ 
+ let {Cc, Ci, Cu} = require("chrome");
+ let {Promise: promise} = require("resource://gre/modules/Promise.jsm");
+ let EventEmitter = require("devtools/toolkit/event-emitter");
+ let Telemetry = require("devtools/shared/telemetry");
++let {getHighlighterUtils} = require("devtools/framework/toolbox-highlighter-utils");
+ let HUDService = require("devtools/webconsole/hudservice");
+ 
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource:///modules/devtools/gDevTools.jsm");
+ Cu.import("resource:///modules/devtools/scratchpad-manager.jsm");
+ Cu.import("resource:///modules/devtools/DOMHelpers.jsm");
+ Cu.import("resource://gre/modules/Task.jsm");
+@@ -63,17 +64,17 @@ function Toolbox(target, selectedTool, h
+   this._toolPanels = new Map();
+   this._telemetry = new Telemetry();
+ 
+   this._toolRegistered = this._toolRegistered.bind(this);
+   this._toolUnregistered = this._toolUnregistered.bind(this);
+   this._refreshHostTitle = this._refreshHostTitle.bind(this);
+   this._splitConsoleOnKeypress = this._splitConsoleOnKeypress.bind(this)
+   this.destroy = this.destroy.bind(this);
+-  this.highlighterUtils = new ToolboxHighlighterUtils(this);
++  this.highlighterUtils = getHighlighterUtils(this);
+   this._highlighterReady = this._highlighterReady.bind(this);
+   this._highlighterHidden = this._highlighterHidden.bind(this);
+ 
+   this._target.on("close", this.destroy);
+ 
+   if (!hostType) {
+     hostType = Services.prefs.getCharPref(this._prefs.LAST_HOST);
+   }
+@@ -182,23 +183,21 @@ Toolbox.prototype = {
+    */
+   get zoomValue() {
+     return parseFloat(Services.prefs.getCharPref(ZOOM_PREF));
+   },
+ 
+   /**
+    * Get the toolbox highlighter front. Note that it may not always have been
+    * initialized first. Use `initInspector()` if needed.
++   * Consider using highlighterUtils instead, it exposes the highlighter API in
++   * a useful way for the toolbox panels
+    */
+   get highlighter() {
+-    if (this.highlighterUtils.isRemoteHighlightable) {
+-      return this._highlighter;
+-    } else {
+-      return null;
+-    }
++    return this._highlighter;
+   },
+ 
+   /**
+    * Get the toolbox's inspector front. Note that it may not always have been
+    * initialized first. Use `initInspector()` if needed.
+    */
+   get inspector() {
+     return this._inspector;
+@@ -577,16 +576,28 @@ Toolbox.prototype = {
+     let container = this.doc.querySelector("#toolbox-picker-container");
+     container.appendChild(this._pickerButton);
+ 
+     this._togglePicker = this.highlighterUtils.togglePicker.bind(this.highlighterUtils);
+     this._pickerButton.addEventListener("command", this._togglePicker, false);
+   },
+ 
+   /**
++   * Setter for the checked state of the picker button in the toolbar
++   * @param {Boolean} isChecked
++   */
++  set pickerButtonChecked(isChecked) {
++    if (isChecked) {
++      this._pickerButton.setAttribute("checked", "true");
++    } else {
++      this._pickerButton.removeAttribute("checked");
++    }
++  },
++
++  /**
+    * Return all toolbox buttons (command buttons, plus any others that were
+    * added manually).
+    */
+   get toolboxButtons() {
+     // White-list buttons that can be toggled to prevent adding prefs for
+     // addons that have manually inserted toolbarbuttons into DOM.
+     return [
+       "command-button-pick",
+@@ -1137,22 +1148,21 @@ Toolbox.prototype = {
+    */
+   initInspector: function() {
+     if (!this._initInspector) {
+       this._initInspector = Task.spawn(function*() {
+         this._inspector = InspectorFront(this._target.client, this._target.form);
+         this._walker = yield this._inspector.getWalker();
+         this._selection = new Selection(this._walker);
+ 
+-        if (this.highlighterUtils.isRemoteHighlightable) {
+-          let autohide = !gDevTools.testing;
+-
++        if (this.highlighterUtils.isRemoteHighlightable()) {
+           this.walker.on("highlighter-ready", this._highlighterReady);
+           this.walker.on("highlighter-hide", this._highlighterHidden);
+ 
++          let autohide = !gDevTools.testing;
+           this._highlighter = yield this._inspector.getHighlighter(autohide);
+         }
+       }.bind(this));
+     }
+     return this._initInspector;
+   },
+ 
+   /**
+@@ -1289,207 +1299,10 @@ Toolbox.prototype = {
+   },
+ 
+   _highlighterReady: function() {
+     this.emit("highlighter-ready");
+   },
+ 
+   _highlighterHidden: function() {
+     this.emit("highlighter-hide");
+-  },
+-};
+-
+-/**
+- * The ToolboxHighlighterUtils is what you should use for anything related to
+- * node highlighting and picking.
+- * It encapsulates the logic to connecting to the HighlighterActor.
+- */
+-function ToolboxHighlighterUtils(toolbox) {
+-  this.toolbox = toolbox;
+-  this._onPickerNodeHovered = this._onPickerNodeHovered.bind(this);
+-  this._onPickerNodePicked = this._onPickerNodePicked.bind(this);
+-  this.stopPicker = this.stopPicker.bind(this);
+-}
+-
+-ToolboxHighlighterUtils.prototype = {
+-  /**
+-   * Indicates whether the highlighter actor exists on the server.
+-   */
+-  get isRemoteHighlightable() {
+-    return this.toolbox._target.client.traits.highlightable;
+-  },
+-
+-  /**
+-   * Start/stop the element picker on the debuggee target.
+-   */
+-  togglePicker: function() {
+-    if (this._isPicking) {
+-      return this.stopPicker();
+-    } else {
+-      return this.startPicker();
+-    }
+-  },
+-
+-  _onPickerNodeHovered: function(res) {
+-    this.toolbox.emit("picker-node-hovered", res.node);
+-  },
+-
+-  _onPickerNodePicked: function(res) {
+-    this.toolbox.selection.setNodeFront(res.node, "picker-node-picked");
+-    this.stopPicker();
+-  },
+-
+-  /**
+-   * Start the element picker on the debuggee target.
+-   * This will request the inspector actor to start listening for mouse/touch
+-   * events on the target to highlight the hovered/picked element.
+-   * Depending on the server-side capabilities, this may fire events when nodes
+-   * are hovered.
+-   * @return A promise that resolves when the picker has started or immediately
+-   * if it is already started
+-   */
+-  startPicker: function() {
+-    if (this._isPicking) {
+-      return promise.resolve();
+-    }
+-
+-    let deferred = promise.defer();
+-
+-    let done = () => {
+-      this._isPicking = true;
+-      this.toolbox.emit("picker-started");
+-      this.toolbox.on("select", this.stopPicker);
+-      deferred.resolve();
+-    };
+-
+-    promise.all([
+-      this.toolbox.initInspector(),
+-      this.toolbox.selectTool("inspector")
+-    ]).then(() => {
+-      this.toolbox._pickerButton.setAttribute("checked", "true");
+-
+-      if (this.isRemoteHighlightable) {
+-        this.toolbox.walker.on("picker-node-hovered", this._onPickerNodeHovered);
+-        this.toolbox.walker.on("picker-node-picked", this._onPickerNodePicked);
+-
+-        this.toolbox.highlighter.pick().then(done);
+-      } else {
+-        return this.toolbox.walker.pick().then(node => {
+-          this.toolbox.selection.setNodeFront(node, "picker-node-picked").then(() => {
+-            this.stopPicker();
+-            done();
+-          });
+-        });
+-      }
+-    });
+-
+-    return deferred.promise;
+-  },
+-
+-  /**
+-   * Stop the element picker
+-   * @return A promise that resolves when the picker has stopped or immediately
+-   * if it is already stopped
+-   */
+-  stopPicker: function() {
+-    if (!this._isPicking) {
+-      return promise.resolve();
+-    }
+-
+-    let deferred = promise.defer();
+-
+-    let done = () => {
+-      this.toolbox.emit("picker-stopped");
+-      this.toolbox.off("select", this.stopPicker);
+-      deferred.resolve();
+-    };
+-
+-    this.toolbox.initInspector().then(() => {
+-      this._isPicking = false;
+-      this.toolbox._pickerButton.removeAttribute("checked");
+-      if (this.isRemoteHighlightable) {
+-        this.toolbox.highlighter.cancelPick().then(done);
+-        this.toolbox.walker.off("picker-node-hovered", this._onPickerNodeHovered);
+-        this.toolbox.walker.off("picker-node-picked", this._onPickerNodePicked);
+-      } else {
+-        this.toolbox.walker.cancelPick().then(done);
+-      }
+-    });
+-
+-    return deferred.promise;
+-  },
+-
+-  /**
+-   * Show the box model highlighter on a node, given its NodeFront (this type
+-   * of front is normally returned by the WalkerActor).
+-   * @return a promise that resolves to the nodeFront when the node has been
+-   * highlit
+-   */
+-  highlightNodeFront: function(nodeFront, options={}) {
+-    let deferred = promise.defer();
+-
+-    // If the remote highlighter exists on the target, use it
+-    if (this.isRemoteHighlightable) {
+-      this.toolbox.initInspector().then(() => {
+-        this.toolbox.highlighter.showBoxModel(nodeFront, options).then(() => {
+-          this.toolbox.emit("node-highlight", nodeFront);
+-          deferred.resolve(nodeFront);
+-        });
+-      });
+-    }
+-    // Else, revert to the "older" version of the highlighter in the walker
+-    // actor
+-    else {
+-      this.toolbox.walker.highlight(nodeFront).then(() => {
+-        this.toolbox.emit("node-highlight", nodeFront);
+-        deferred.resolve(nodeFront);
+-      });
+-    }
+-
+-    return deferred.promise;
+-  },
+-
+-  /**
+-   * This is a convenience method in case you don't have a nodeFront but a
+-   * valueGrip. This is often the case with VariablesView properties.
+-   * This method will simply translate the grip into a nodeFront and call
+-   * highlightNodeFront
+-   * @return a promise that resolves to the nodeFront when the node has been
+-   * highlit
+-   */
+-  highlightDomValueGrip: function(valueGrip, options={}) {
+-    return this._translateGripToNodeFront(valueGrip).then(nodeFront => {
+-      if (nodeFront) {
+-        return this.highlightNodeFront(nodeFront, options);
+-      } else {
+-        return promise.reject();
+-      }
+-    });
+-  },
+-
+-  _translateGripToNodeFront: function(grip) {
+-    return this.toolbox.initInspector().then(() => {
+-      return this.toolbox.walker.getNodeActorFromObjectActor(grip.actor);
+-    });
+-  },
+-
+-  /**
+-   * Hide the highlighter.
+-   * @return a promise that resolves when the highlighter is hidden
+-   */
+-  unhighlight: function(forceHide=false) {
+-    let unhighlightPromise;
+-    forceHide = forceHide || !gDevTools.testing;
+-
+-    if (forceHide && this.isRemoteHighlightable && this.toolbox.highlighter) {
+-      // If the remote highlighter exists on the target, use it
+-      unhighlightPromise = this.toolbox.highlighter.hideBoxModel();
+-    } else {
+-      // If not, no need to unhighlight as the older highlight method uses a
+-      // setTimeout to hide itself
+-      unhighlightPromise = promise.resolve();
+-    }
+-
+-    return unhighlightPromise.then(() => {
+-      this.toolbox.emit("node-unhighlight");
+-    });
+   }
+ };
