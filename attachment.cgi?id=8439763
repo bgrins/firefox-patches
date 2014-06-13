@@ -1,0 +1,3331 @@
+# HG changeset patch
+# Parent 18449f389deb50da2f417a53976282e2f941a0fa
+# User Patrick Brosset <pbrosset@mozilla.com>
+Bug 1014547 - part 4 - Add a css transform highlighter to the style-inspector; r=bgrins
+* * *
+try: -b d -p win32 -u mochitest-dt -t none
+
+diff --git a/browser/base/content/highlighter.css b/browser/base/content/highlighter.css
+--- a/browser/base/content/highlighter.css
++++ b/browser/base/content/highlighter.css
+@@ -66,8 +66,15 @@ html|*.highlighter-nodeinfobar-tagname {
+ 
+ .highlighter-nodeinfobar-positioner[disabled] {
+   visibility: hidden;
+ }
+ 
+ html|*.highlighter-nodeinfobar-tagname {
+   text-transform: lowercase;
+ }
++
++/*
++ * Css transform highlighter
++ */
++svg|svg.css-transform-root[hidden] {
++  display: none;
++}
+diff --git a/browser/devtools/framework/toolbox-highlighter-utils.js b/browser/devtools/framework/toolbox-highlighter-utils.js
+--- a/browser/devtools/framework/toolbox-highlighter-utils.js
++++ b/browser/devtools/framework/toolbox-highlighter-utils.js
+@@ -30,40 +30,73 @@ Cu.import("resource:///modules/devtools/
+  * @return {Object} the highlighterUtils public API
+  */
+ exports.getHighlighterUtils = function(toolbox) {
+   if (!toolbox || !toolbox.target) {
+     throw new Error("Missing or invalid toolbox passed to getHighlighterUtils");
+     return;
+   }
+ 
++  // Exported API properties will go here
+   let exported = {};
+ 
++  // The current toolbox target
++  let target = toolbox.target;
++
++  // Is the highlighter currently in pick mode
+   let isPicking = false;
+ 
+   /**
++   * Release this utils, nullifying the references to the toolbox
++   */
++  exported.release = function() {
++    toolbox = target = null;
++  }
++
++  /**
+    * Does the target have the highlighter actor.
+    * The devtools must be backwards compatible with at least B2G 1.3 (28),
+    * which doesn't have the highlighter actor. This can be removed as soon as
+    * the minimal supported version becomes 1.4 (29)
+    */
+   let isRemoteHighlightable = exported.isRemoteHighlightable = function() {
+-    return toolbox.target.client.traits.highlightable;
++    return target.client.traits.highlightable;
++  }
++
++  /**
++   * Does the target support custom highlighters.
++   */
++  let supportsCustomHighlighters = function() {
++    return !!target.client.traits.customHighlighters;
++  }
++
++  /**
++   * Is typeName a known custom highlighter
++   * @param {String} typeName
++   * @return {Boolean}
++   */
++  let hasCustomHighlighter = exported.hasCustomHighlighter = function(typeName) {
++    return supportsCustomHighlighters() &&
++           target.client.traits.customHighlighters.indexOf(typeName) !== -1;
+   }
+ 
+   /**
+    * Make a function that initializes the inspector before it runs.
+    * Since the init of the inspector is asynchronous, the return value will be
+    * produced by Task.async and the argument should be a generator
+    * @param {Function*} generator A generator function
+    * @return {Function} A function
+    */
++  let isInspectorInitialized = false;
+   let requireInspector = generator => {
+     return Task.async(function*(...args) {
+-      yield toolbox.initInspector();
++      if (!isInspectorInitialized) {
++        yield toolbox.initInspector();
++        isInspectorInitialized = true;
++      }
+       return yield generator.apply(null, args);
+     });
+   };
+ 
+   /**
+    * Start/stop the element picker on the debuggee target.
+    * @return A promise that resolves when done
+    */
+@@ -160,23 +193,28 @@ exports.getHighlighterUtils = function(t
+    * The node needs to be a NodeFront, as defined by the inspector actor
+    * @see toolkit/devtools/server/actors/inspector.js
+    * @param {NodeFront} nodeFront The node to highlight
+    * @param {Object} options
+    * @return A promise that resolves when the node has been highlighted
+    */
+   let highlightNodeFront = exported.highlightNodeFront = requireInspector(
+   function*(nodeFront, options={}) {
++    if (!nodeFront) {
++      return;
++    }
++
+     if (isRemoteHighlightable()) {
+       yield toolbox.highlighter.showBoxModel(nodeFront, options);
+     } else {
+       // If the target doesn't have the highlighter actor, revert to the
+       // walker's highlight method, which draws a simple outline
+       yield toolbox.walker.highlight(nodeFront);
+     }
++
+     toolbox.emit("node-highlight", nodeFront);
+   });
+ 
+   /**
+    * This is a convenience method in case you don't have a nodeFront but a
+    * valueGrip. This is often the case with VariablesView properties.
+    * This method will simply translate the grip into a nodeFront and call
+    * highlightNodeFront, so it has the same signature.
+@@ -210,33 +248,39 @@ exports.getHighlighterUtils = function(t
+    * highlighter stays visible at all times, except when the mouse leaves the
+    * markup view, which is when this param is passed to true
+    * @return a promise that resolves when the highlighter is hidden
+    */
+   let unhighlight = exported.unhighlight = Task.async(
+   function*(forceHide=false) {
+     forceHide = forceHide || !gDevTools.testing;
+ 
++    // Note that if isRemoteHighlightable is true, there's no need to hide the
++    // highlighter as the walker uses setTimeout to hide it after some time
+     if (forceHide && toolbox.highlighter && isRemoteHighlightable()) {
+-      // Note that if isRemoteHighlightable is true, there's no need to hide the
+-      // highlighter as the walker uses setTimeout to hide it after some time
+       yield toolbox.highlighter.hideBoxModel();
+     }
+ 
+     toolbox.emit("node-unhighlight");
+   });
+ 
+   /**
+    * If the main, box-model, highlighter isn't enough, or if multiple
+    * highlighters are needed in parallel, this method can be used to return a
+    * new instance of a highlighter actor, given a type.
+    * The type of the highlighter passed must be known by the server.
+    * The highlighter actor returned will have the show(nodeFront) and hide()
+-   * methods and needs to be released by the consumer when not needed anymore
++   * methods and needs to be released by the consumer when not needed anymore.
++   * @return a promise that resolves to the highlighter
+    */
+   let getHighlighterByType = exported.getHighlighterByType = requireInspector(
+   function*(typeName) {
+-    return yield toolbox.inspector.getHighlighterByType(typeName);
++    if (hasCustomHighlighter(typeName)) {
++      return yield toolbox.inspector.getHighlighterByType(typeName);
++    } else {
++      throw "The target doesn't support creating highlighters by types or " +
++        typeName + " is unknown";
++    }
+   });
+ 
+   // Return the public API
+   return exported;
+ };
+diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/toolbox.js
+--- a/browser/devtools/framework/toolbox.js
++++ b/browser/devtools/framework/toolbox.js
+@@ -1282,16 +1282,17 @@ Toolbox.prototype = {
+       // This is done after other destruction tasks since it may tear down
+       // fronts and the debugger transport which earlier destroy methods may
+       // require to complete.
+       if (!this._target) {
+         return null;
+       }
+       let target = this._target;
+       this._target = null;
++      this.highlighterUtils.release();
+       target.off("close", this.destroy);
+       return target.destroy();
+     }).then(() => {
+       this.emit("destroyed");
+       // Free _host after the call to destroyed in order to let a chance
+       // to destroyed listeners to still query toolbox attributes
+       this._host = null;
+       this._toolPanels.clear();
+diff --git a/browser/devtools/inspector/test/browser_inspector_highlighter.js b/browser/devtools/inspector/test/browser_inspector_highlighter.js
+--- a/browser/devtools/inspector/test/browser_inspector_highlighter.js
++++ b/browser/devtools/inspector/test/browser_inspector_highlighter.js
+@@ -37,39 +37,42 @@ function testMouseOverDivHighlights() {
+   is(getHighlitNode(), div, "Highlighter's outline correspond to the non-rotated div");
+   testNonTransformedBoxModelDimensionsNoZoom();
+ }
+ 
+ function testNonTransformedBoxModelDimensionsNoZoom() {
+   info("Highlighted the non-rotated div");
+   isNodeCorrectlyHighlighted(div, "non-zoomed");
+ 
+-  inspector.toolbox.once("highlighter-ready", testNonTransformedBoxModelDimensionsZoomed);
++  waitForBoxModelUpdate().then(testNonTransformedBoxModelDimensionsZoomed);
+   contentViewer = gBrowser.selectedBrowser.docShell.contentViewer
+                           .QueryInterface(Ci.nsIMarkupDocumentViewer);
+   contentViewer.fullZoom = 2;
+ }
+ 
+ function testNonTransformedBoxModelDimensionsZoomed() {
+   info("Highlighted the zoomed, non-rotated div");
+   isNodeCorrectlyHighlighted(div, "zoomed");
+ 
+-  inspector.toolbox.once("highlighter-ready", testMouseOverRotatedHighlights);
++  waitForBoxModelUpdate().then(testMouseOverRotatedHighlights);
+   contentViewer.fullZoom = 1;
+ }
+ 
+ function testMouseOverRotatedHighlights() {
+-  inspector.toolbox.once("highlighter-ready", () => {
+-    ok(isHighlighting(), "Highlighter is shown");
+-    info("Highlighted the rotated div");
+-    isNodeCorrectlyHighlighted(rotated, "rotated");
++  let onBoxModelUpdate = waitForBoxModelUpdate();
++  inspector.selection.setNode(rotated);
++  inspector.once("inspector-updated", () => {
++    onBoxModelUpdate.then(() => {
++      ok(isHighlighting(), "Highlighter is shown");
++      info("Highlighted the rotated div");
++      isNodeCorrectlyHighlighted(rotated, "rotated");
+ 
+-    executeSoon(finishUp);
++      executeSoon(finishUp);
++    });
+   });
+-  inspector.selection.setNode(rotated);
+ }
+ 
+ function finishUp() {
+   inspector.toolbox.highlighterUtils.stopPicker().then(() => {
+     doc = div = rotated = inspector = contentViewer = null;
+     let target = TargetFactory.forTab(gBrowser.selectedTab);
+     gDevTools.closeToolbox(target);
+     gBrowser.removeCurrentTab();
+diff --git a/browser/devtools/inspector/test/browser_inspector_invalidate.js b/browser/devtools/inspector/test/browser_inspector_invalidate.js
+--- a/browser/devtools/inspector/test/browser_inspector_invalidate.js
++++ b/browser/devtools/inspector/test/browser_inspector_invalidate.js
+@@ -13,24 +13,28 @@ function test() {
+ 
+     openInspector(aInspector => {
+       inspector = aInspector;
+       inspector.toolbox.highlighter.showBoxModel(getNodeFront(div)).then(runTest);
+     });
+   }
+ 
+   function runTest() {
++    info("Checking that the highlighter has the right size");
+     let rect = getSimpleBorderRect();
+     is(rect.width, 100, "outline has the right width");
+ 
++    waitForBoxModelUpdate().then(testRectWidth);
++
++    info("Changing the test element's size");
+     div.style.width = "200px";
+-    inspector.toolbox.once("highlighter-ready", testRectWidth);
+   }
+ 
+   function testRectWidth() {
++    info("Checking that the highlighter has the right size after update");
+     let rect = getSimpleBorderRect();
+     is(rect.width, 200, "outline updated");
+     finishUp();
+   }
+ 
+   function finishUp() {
+     inspector.toolbox.highlighter.hideBoxModel().then(() => {
+       doc = div = inspector = null;
+diff --git a/browser/devtools/inspector/test/head.js b/browser/devtools/inspector/test/head.js
+--- a/browser/devtools/inspector/test/head.js
++++ b/browser/devtools/inspector/test/head.js
+@@ -304,16 +304,36 @@ function isRegionHidden(region) {
+ }
+ 
+ function isHighlighting()
+ {
+   let root = getBoxModelRoot();
+   return !root.hasAttribute("hidden");
+ }
+ 
++/**
++ * Observes mutation changes on the box-model highlighter and returns a promise
++ * that resolves when one of the attributes changes.
++ * If an attribute changes in the box-model, it means its position/dimensions
++ * got updated
++ */
++function waitForBoxModelUpdate() {
++  let def = promise.defer();
++
++  let root = getBoxModelRoot();
++  let polygon = root.querySelector(".box-model-content");
++  let observer = new polygon.ownerDocument.defaultView.MutationObserver(() => {
++    observer.disconnect();
++    def.resolve();
++  });
++  observer.observe(polygon, {attributes: true});
++
++  return def.promise;
++}
++
+ function getHighlitNode()
+ {
+   if (isHighlighting()) {
+     let helper = new LayoutHelpers(window.content);
+     let points = getBoxModelStatus().content.points;
+     let x = (points.p1.x + points.p2.x + points.p3.x + points.p4.x) / 4;
+     let y = (points.p1.y + points.p2.y + points.p3.y + points.p4.y) / 4;
+ 
+@@ -432,59 +452,25 @@ function isNodeCorrectlyHighlighted(node
+   let boxModel = getBoxModelStatus();
+   let helper = new LayoutHelpers(window.content);
+ 
+   prefix += (prefix ? " " : "") + node.nodeName;
+   prefix += (node.id ? "#" + node.id : "");
+   prefix += (node.classList.length ? "." + [...node.classList].join(".") : "");
+   prefix += " ";
+ 
+-  let quads = helper.getAdjustedQuads(node, "content");
+-  let {p1:cp1, p2:cp2, p3:cp3, p4:cp4} = boxModel.content.points;
+-  is(cp1.x, quads.p1.x, prefix + "content point 1 x co-ordinate is correct");
+-  is(cp1.y, quads.p1.y, prefix + "content point 1 y co-ordinate is correct");
+-  is(cp2.x, quads.p2.x, prefix + "content point 2 x co-ordinate is correct");
+-  is(cp2.y, quads.p2.y, prefix + "content point 2 y co-ordinate is correct");
+-  is(cp3.x, quads.p3.x, prefix + "content point 3 x co-ordinate is correct");
+-  is(cp3.y, quads.p3.y, prefix + "content point 3 y co-ordinate is correct");
+-  is(cp4.x, quads.p4.x, prefix + "content point 4 x co-ordinate is correct");
+-  is(cp4.y, quads.p4.y, prefix + "content point 4 y co-ordinate is correct");
+-
+-  quads = helper.getAdjustedQuads(node, "padding");
+-  let {p1:pp1, p2:pp2, p3:pp3, p4:pp4} = boxModel.padding.points;
+-  is(pp1.x, quads.p1.x, prefix + "padding point 1 x co-ordinate is correct");
+-  is(pp1.y, quads.p1.y, prefix + "padding point 1 y co-ordinate is correct");
+-  is(pp2.x, quads.p2.x, prefix + "padding point 2 x co-ordinate is correct");
+-  is(pp2.y, quads.p2.y, prefix + "padding point 2 y co-ordinate is correct");
+-  is(pp3.x, quads.p3.x, prefix + "padding point 3 x co-ordinate is correct");
+-  is(pp3.y, quads.p3.y, prefix + "padding point 3 y co-ordinate is correct");
+-  is(pp4.x, quads.p4.x, prefix + "padding point 4 x co-ordinate is correct");
+-  is(pp4.y, quads.p4.y, prefix + "padding point 4 y co-ordinate is correct");
+-
+-  quads = helper.getAdjustedQuads(node, "border");
+-  let {p1:bp1, p2:bp2, p3:bp3, p4:bp4} = boxModel.border.points;
+-  is(bp1.x, quads.p1.x, prefix + "border point 1 x co-ordinate is correct");
+-  is(bp1.y, quads.p1.y, prefix + "border point 1 y co-ordinate is correct");
+-  is(bp2.x, quads.p2.x, prefix + "border point 2 x co-ordinate is correct");
+-  is(bp2.y, quads.p2.y, prefix + "border point 2 y co-ordinate is correct");
+-  is(bp3.x, quads.p3.x, prefix + "border point 3 x co-ordinate is correct");
+-  is(bp3.y, quads.p3.y, prefix + "border point 3 y co-ordinate is correct");
+-  is(bp4.x, quads.p4.x, prefix + "border point 4 x co-ordinate is correct");
+-  is(bp4.y, quads.p4.y, prefix + "border point 4 y co-ordinate is correct");
+-
+-  quads = helper.getAdjustedQuads(node, "margin");
+-  let {p1:mp1, p2:mp2, p3:mp3, p4:mp4} = boxModel.margin.points;
+-  is(mp1.x, quads.p1.x, prefix + "margin point 1 x co-ordinate is correct");
+-  is(mp1.y, quads.p1.y, prefix + "margin point 1 y co-ordinate is correct");
+-  is(mp2.x, quads.p2.x, prefix + "margin point 2 x co-ordinate is correct");
+-  is(mp2.y, quads.p2.y, prefix + "margin point 2 y co-ordinate is correct");
+-  is(mp3.x, quads.p3.x, prefix + "margin point 3 x co-ordinate is correct");
+-  is(mp3.y, quads.p3.y, prefix + "margin point 3 y co-ordinate is correct");
+-  is(mp4.x, quads.p4.x, prefix + "margin point 4 x co-ordinate is correct");
+-  is(mp4.y, quads.p4.y, prefix + "margin point 4 y co-ordinate is correct");
++  for (let boxType of ["content", "padding", "border", "margin"]) {
++    let quads = helper.getAdjustedQuads(node, boxType);
++    for (let point in boxModel[boxType].points) {
++      is(boxModel[boxType].points[point].x, quads[point].x,
++        prefix + boxType + " point " + point + " x coordinate is correct");
++      is(boxModel[boxType].points[point].y, quads[point].y,
++        prefix + boxType + " point " + point + " y coordinate is correct");
++    }
++  }
+ }
+ 
+ function getContainerForRawNode(markupView, rawNode)
+ {
+   let front = markupView.walker.frontForRawNode(rawNode);
+   let container = markupView.getContainer(front);
+   return container;
+ }
+diff --git a/browser/devtools/layoutview/test/browser_editablemodel.js b/browser/devtools/layoutview/test/browser_editablemodel.js
+--- a/browser/devtools/layoutview/test/browser_editablemodel.js
++++ b/browser/devtools/layoutview/test/browser_editablemodel.js
+@@ -19,18 +19,17 @@ function getStyle(node, property) {
+   return node.style.getPropertyValue(property);
+ }
+ 
+ let test = asyncTest(function*() {
+   yield addTab("data:text/html," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openLayoutView();
+ 
+   yield runTests(inspector, view);
+-  // TODO: Closing the toolbox in this test leaks - bug 994314
+-  // yield destroyToolbox(inspector);
++  yield destroyToolbox(inspector);
+ });
+ 
+ addTest("Test that editing margin dynamically updates the document, pressing escape cancels the changes",
+ function*(inspector, view) {
+   let node = content.document.getElementById("div1");
+   is(getStyle(node, "margin-top"), "", "Should be no margin-top on the element.")
+   yield selectNode(node, inspector);
+ 
+diff --git a/browser/devtools/layoutview/test/browser_editablemodel_allproperties.js b/browser/devtools/layoutview/test/browser_editablemodel_allproperties.js
+--- a/browser/devtools/layoutview/test/browser_editablemodel_allproperties.js
++++ b/browser/devtools/layoutview/test/browser_editablemodel_allproperties.js
+@@ -18,18 +18,17 @@ function getStyle(node, property) {
+   return node.style.getPropertyValue(property);
+ }
+ 
+ let test = asyncTest(function*() {
+   yield addTab("data:text/html," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openLayoutView();
+ 
+   yield runTests(inspector, view);
+-  // TODO: Closing the toolbox in this test leaks - bug 994314
+-  // yield destroyToolbox(inspector);
++  yield destroyToolbox(inspector);
+ });
+ 
+ addTest("When all properties are set on the node editing one should work",
+ function*(inspector, view) {
+   let node = content.document.getElementById("div1");
+ 
+   node.style.padding = "5px";
+   yield waitForUpdate(inspector);
+diff --git a/browser/devtools/layoutview/test/browser_editablemodel_border.js b/browser/devtools/layoutview/test/browser_editablemodel_border.js
+--- a/browser/devtools/layoutview/test/browser_editablemodel_border.js
++++ b/browser/devtools/layoutview/test/browser_editablemodel_border.js
+@@ -18,18 +18,17 @@ function getStyle(node, property) {
+   return node.style.getPropertyValue(property);
+ }
+ 
+ let test = asyncTest(function*() {
+   yield addTab("data:text/html," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openLayoutView();
+ 
+   yield runTests(inspector, view);
+-  // TODO: Closing the toolbox in this test leaks - bug 994314
+-  // yield destroyToolbox(inspector);
++  yield destroyToolbox(inspector);
+ });
+ 
+ addTest("Test that adding a border applies a border style when necessary",
+ function*(inspector, view) {
+   let node = content.document.getElementById("div1");
+   is(getStyle(node, "border-top-width"), "", "Should have the right border");
+   is(getStyle(node, "border-top-style"), "", "Should have the right border");
+   yield selectNode(node, inspector);
+diff --git a/browser/devtools/layoutview/test/browser_editablemodel_stylerules.js b/browser/devtools/layoutview/test/browser_editablemodel_stylerules.js
+--- a/browser/devtools/layoutview/test/browser_editablemodel_stylerules.js
++++ b/browser/devtools/layoutview/test/browser_editablemodel_stylerules.js
+@@ -19,18 +19,17 @@ function getStyle(node, property) {
+   return node.style.getPropertyValue(property);
+ }
+ 
+ let test = asyncTest(function*() {
+   yield addTab("data:text/html," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openLayoutView();
+ 
+   yield runTests(inspector, view);
+-  // TODO: Closing the toolbox in this test leaks - bug 994314
+-  // yield destroyToolbox(inspector);
++  yield destroyToolbox(inspector);
+ });
+ 
+ addTest("Test that entering units works",
+ function*(inspector, view) {
+   let node = content.document.getElementById("div1");
+   is(getStyle(node, "padding-top"), "", "Should have the right padding");
+   yield selectNode(node, inspector);
+ 
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -170,20 +170,36 @@ MarkupView.prototype = {
+   _onMouseLeave: function() {
+     this._hideBoxModel(true);
+     if (this._hoveredNode) {
+       this._containers.get(this._hoveredNode).hovered = false;
+     }
+     this._hoveredNode = null;
+   },
+ 
++  /**
++   * Show the box model highlighter on a given node front
++   * @param {NodeFront} nodeFront The node to show the highlighter for
++   * @param {Object} options Options for the highlighter
++   * @return a promise that resolves when the highlighter for this nodeFront is
++   * shown, taking into account that there could already be highlighter requests
++   * queued up
++   */
+   _showBoxModel: function(nodeFront, options={}) {
+-    this._inspector.toolbox.highlighterUtils.highlightNodeFront(nodeFront, options);
++    return this._inspector.toolbox.highlighterUtils.highlightNodeFront(nodeFront, options);
+   },
+ 
++  /**
++   * Hide the box model highlighter on a given node front
++   * @param {NodeFront} nodeFront The node to hide the highlighter for
++   * @param {Boolean} forceHide See toolbox-highlighter-utils/unhighlight
++   * @return a promise that resolves when the highlighter for this nodeFront is
++   * hidden, taking into account that there could already be highlighter requests
++   * queued up
++   */
+   _hideBoxModel: function(forceHide) {
+     return this._inspector.toolbox.highlighterUtils.unhighlight(forceHide);
+   },
+ 
+   _briefBoxModelTimer: null,
+   _brieflyShowBoxModel: function(nodeFront, options) {
+     let win = this._frame.contentWindow;
+ 
+diff --git a/browser/devtools/shared/test/browser.ini b/browser/devtools/shared/test/browser.ini
+--- a/browser/devtools/shared/test/browser.ini
++++ b/browser/devtools/shared/test/browser.ini
+@@ -1,13 +1,14 @@
+ [DEFAULT]
+ skip-if = e10s # Bug ?????? - devtools tests disabled with e10s
+ subsuite = devtools
+ support-files =
+   browser_layoutHelpers.html
++  browser_layoutHelpers-getBoxQuads.html
+   browser_layoutHelpers_iframe.html
+   browser_templater_basic.html
+   browser_toolbar_basic.html
+   browser_toolbar_webconsole_errors_count.html
+   head.js
+   leakhunt.js
+ 
+ [browser_css_color.js]
+@@ -17,16 +18,17 @@ support-files =
+ [browser_graphs-04.js]
+ [browser_graphs-05.js]
+ [browser_graphs-06.js]
+ [browser_graphs-07.js]
+ [browser_graphs-08.js]
+ [browser_graphs-09.js]
+ [browser_graphs-10.js]
+ [browser_layoutHelpers.js]
++[browser_layoutHelpers-getBoxQuads.js]
+ [browser_observableobject.js]
+ [browser_outputparser.js]
+ [browser_require_basic.js]
+ [browser_telemetry_button_paintflashing.js]
+ [browser_telemetry_button_responsive.js]
+ [browser_telemetry_button_scratchpad.js]
+ [browser_telemetry_button_tilt.js]
+ [browser_telemetry_sidebar.js]
+diff --git a/browser/devtools/shared/test/browser_layoutHelpers-getBoxQuads.html b/browser/devtools/shared/test/browser_layoutHelpers-getBoxQuads.html
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/shared/test/browser_layoutHelpers-getBoxQuads.html
+@@ -0,0 +1,62 @@
++<!doctype html>
++<meta charset=utf-8>
++<title>Layout Helpers</title>
++<style id="styles">
++  body {
++    margin: 0;
++    padding: 0;
++  }
++
++  #hidden-node {
++    display: none;
++  }
++
++  #simple-node-with-margin-padding-border {
++    width: 200px;
++    height: 200px;
++    background: #f06;
++
++    padding: 20px;
++    margin: 50px;
++    border: 10px solid black;
++  }
++
++  #scrolled-node {
++    position: absolute;
++    top: 0;
++    left: 0;
++
++    width: 300px;
++    height: 100px;
++    overflow: scroll;
++    background: linear-gradient(red, pink);
++  }
++
++  #sub-scrolled-node {
++    width: 200px;
++    height: 200px;
++    overflow: scroll;
++    background: linear-gradient(yellow, green);
++  }
++
++  #inner-scrolled-node {
++    width: 100px;
++    height: 400px;
++    background: linear-gradient(black, white);
++  }
++</style>
++<div id="hidden-node"></div>
++<div id="simple-node-with-margin-padding-border"></div>
++<!-- The inline encoded code below corresponds to:
++<iframe style="margin:10px;border:0;width:300px;height:300px;">
++  <iframe style="margin:10px;border:0;width:200px;height:200px;">
++    <div id="inner-node" style="width:100px;height:100px;border:10px solid red;margin:10px;padding:10px;"></div>
++  </iframe>
++</iframe>
++ -->
++<iframe src="data:text/html,%3Cstyle%3Ebody%7Bmargin:0;padding:0;%7D%3C/style%3E%3Ciframe%20src=%22data:text/html,%253Cstyle%253Ebody%257Bmargin:0;padding:0;%257D%253C/style%253E%253Cdiv%2520id='inner-node'%2520style='width:100px;height:100px;border:10px%2520solid%2520red;margin:10px;padding:10px;'%253E%253C/div%253E%22%20style=%22margin:10px;border:0;width:200px;height:200px;%22%3E%3C/iframe%3E" style="margin:10px;border:0;width:300px;height:300px;"></iframe>
++<div id="scrolled-node">
++  <div id="sub-scrolled-node">
++    <div id="inner-scrolled-node"></div>
++  </div>
++</div>
+\ No newline at end of file
+diff --git a/browser/devtools/shared/test/browser_layoutHelpers-getBoxQuads.js b/browser/devtools/shared/test/browser_layoutHelpers-getBoxQuads.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/shared/test/browser_layoutHelpers-getBoxQuads.js
+@@ -0,0 +1,209 @@
++/* Any copyright is dedicated to the Public Domain.
++ * http://creativecommons.org/publicdomain/zero/1.0/ */
++
++// Tests that LayoutHelpers.getAdjustedQuads works properly in a variety of use
++// cases including iframes, scroll and zoom
++
++const {utils: Cu} = Components;
++const {LayoutHelpers} = Cu.import("resource://gre/modules/devtools/LayoutHelpers.jsm", {});
++
++const TEST_URI = TEST_URI_ROOT + "browser_layoutHelpers-getBoxQuads.html";
++
++function test() {
++  addTab(TEST_URI, function(browser, tab) {
++    let doc = browser.contentDocument;
++    let win = doc.defaultView;
++
++    info("Creating a new LayoutHelpers instance for the test window");
++    let helper = new LayoutHelpers(win);
++    ok(helper.getAdjustedQuads, "getAdjustedQuads is defined");
++
++    info("Running tests");
++
++    returnsTheRightDataStructure(doc, helper);
++    returnsNullForMissingNode(doc, helper);
++    returnsNullForHiddenNodes(doc, helper);
++    defaultsToBorderBoxIfNoneProvided(doc, helper);
++    returnsLikeGetBoxQuadsInSimpleCase(doc, helper);
++    takesIframesOffsetsIntoAccount(doc, helper);
++    takesScrollingIntoAccount(doc, helper);
++    takesZoomIntoAccount(doc, helper);
++
++    gBrowser.removeCurrentTab();
++    finish();
++  });
++}
++
++function returnsTheRightDataStructure(doc, helper) {
++  info("Checks that the returned data contains bounds and 4 points");
++
++  let node = doc.querySelector("body");
++  let res = helper.getAdjustedQuads(node, "content");
++
++  ok("bounds" in res, "The returned data has a bounds property");
++  ok("p1" in res, "The returned data has a p1 property");
++  ok("p2" in res, "The returned data has a p2 property");
++  ok("p3" in res, "The returned data has a p3 property");
++  ok("p4" in res, "The returned data has a p4 property");
++
++  for (let boundProp of
++    ["bottom", "top", "right", "left", "width", "height", "x", "y"]) {
++    ok(boundProp in res.bounds, "The bounds has a " + boundProp + " property");
++  }
++
++  for (let point of ["p1", "p2", "p3", "p4"]) {
++    for (let pointProp of ["x", "y", "z", "w"]) {
++      ok(pointProp in res[point], point + " has a " + pointProp + " property");
++    }
++  }
++}
++
++function returnsNullForMissingNode(doc, helper) {
++  info("Checks that null is returned for invalid nodes");
++
++  for (let input of [null, undefined, "", 0]) {
++    ok(helper.getAdjustedQuads(input) === null, "null is returned for input " +
++      input);
++  }
++}
++
++function returnsNullForHiddenNodes(doc, helper) {
++  info("Checks that null is returned for nodes that aren't rendered");
++
++  let style = doc.querySelector("#styles");
++  ok(helper.getAdjustedQuads(style) === null,
++    "null is returned for a <style> node");
++
++  let hidden = doc.querySelector("#hidden-node");
++  ok(helper.getAdjustedQuads(hidden) === null,
++    "null is returned for a hidden node");
++}
++
++function defaultsToBorderBoxIfNoneProvided(doc, helper) {
++  info("Checks that if no boxtype is passed, then border is the default one");
++
++  let node = doc.querySelector("#simple-node-with-margin-padding-border");
++  let withBoxType = helper.getAdjustedQuads(node, "border");
++  let withoutBoxType = helper.getAdjustedQuads(node);
++
++  for (let boundProp of
++    ["bottom", "top", "right", "left", "width", "height", "x", "y"]) {
++    is(withBoxType.bounds[boundProp], withoutBoxType.bounds[boundProp],
++      boundProp + " bound is equal with or without the border box type");
++  }
++
++  for (let point of ["p1", "p2", "p3", "p4"]) {
++    for (let pointProp of ["x", "y", "z", "w"]) {
++      is(withBoxType[point][pointProp], withoutBoxType[point][pointProp],
++        point + "." + pointProp +
++        " is equal with or without the border box type");
++    }
++  }
++}
++
++function returnsLikeGetBoxQuadsInSimpleCase(doc, helper) {
++  info("Checks that for an element in the main frame, without scroll nor zoom" +
++    "that the returned value is similar to the returned value of getBoxQuads");
++
++  let node = doc.querySelector("#simple-node-with-margin-padding-border");
++
++  for (let region of ["content", "padding", "border", "margin"]) {
++    let expected = node.getBoxQuads({
++      box: region
++    })[0];
++    let actual = helper.getAdjustedQuads(node, region);
++
++    for (let boundProp of
++      ["bottom", "top", "right", "left", "width", "height", "x", "y"]) {
++      is(actual.bounds[boundProp], expected.bounds[boundProp],
++        boundProp + " bound is equal to the one returned by getBoxQuads for " +
++        region + " box");
++    }
++
++    for (let point of ["p1", "p2", "p3", "p4"]) {
++      for (let pointProp of ["x", "y", "z", "w"]) {
++        is(actual[point][pointProp], expected[point][pointProp],
++          point + "." + pointProp +
++          " is equal to the one returned by getBoxQuads for " + region + " box");
++      }
++    }
++  }
++}
++
++function takesIframesOffsetsIntoAccount(doc, helper) {
++  info("Checks that the quad returned for a node inside iframes that have " +
++    "margins takes those offsets into account");
++
++  let rootIframe = doc.querySelector("iframe");
++  let subIframe = rootIframe.contentDocument.querySelector("iframe");
++  let innerNode = subIframe.contentDocument.querySelector("#inner-node");
++
++  let quad = helper.getAdjustedQuads(innerNode, "content");
++
++  //rootIframe margin + subIframe margin + node margin + node border + node padding
++  let p1x = 10 + 10 + 10 + 10 + 10;
++  is(quad.p1.x, p1x, "The inner node's p1 x position is correct");
++
++  // Same as p1x + the inner node width
++  let p2x = p1x + 100;
++  is(quad.p2.x, p2x, "The inner node's p2 x position is correct");
++}
++
++function takesScrollingIntoAccount(doc, helper) {
++  info("Checks that the quad returned for a node inside multiple scrolled " +
++    "containers takes the scroll values into account");
++
++  // For info, the container being tested here is absolutely positioned at 0 0
++  // to simplify asserting the coordinates
++
++  info("Scroll the container nodes down");
++  let scrolledNode = doc.querySelector("#scrolled-node");
++  scrolledNode.scrollTop = 100;
++  let subScrolledNode = doc.querySelector("#sub-scrolled-node");
++  subScrolledNode.scrollTop = 200;
++  let innerNode = doc.querySelector("#inner-scrolled-node");
++
++  let quad = helper.getAdjustedQuads(innerNode, "content");
++  is(quad.p1.x, 0, "p1.x of the scrolled node is correct after scrolling down");
++  is(quad.p1.y, -300, "p1.y of the scrolled node is correct after scrolling down");
++
++  info("Scrolling back up");
++  scrolledNode.scrollTop = 0;
++  subScrolledNode.scrollTop = 0;
++
++  let quad = helper.getAdjustedQuads(innerNode, "content");
++  is(quad.p1.x, 0, "p1.x of the scrolled node is correct after scrolling up");
++  is(quad.p1.y, 0, "p1.y of the scrolled node is correct after scrolling up");
++}
++
++function takesZoomIntoAccount(doc, helper) {
++  info("Checks that if the page is zoomed in/out, the quad returned is correct");
++
++  // Hard-coding coordinates in this zoom test is a bad idea as it can vary
++  // depending on the platform, so we simply test that zooming in produces a
++  // bigger quad and zooming out produces a smaller quad
++
++  let node = doc.querySelector("#simple-node-with-margin-padding-border");
++  let defaultQuad = helper.getAdjustedQuads(node);
++
++  info("Zoom in");
++  window.FullZoom.enlarge();
++  let zoomedInQuad = helper.getAdjustedQuads(node);
++
++  ok(zoomedInQuad.bounds.width > defaultQuad.bounds.width,
++    "The zoomed in quad is bigger than the default one");
++  ok(zoomedInQuad.bounds.height > defaultQuad.bounds.height,
++    "The zoomed in quad is bigger than the default one");
++
++  info("Zoom out");
++  window.FullZoom.reset();
++  window.FullZoom.reduce();
++  let zoomedOutQuad = helper.getAdjustedQuads(node);
++
++  ok(zoomedOutQuad.bounds.width < defaultQuad.bounds.width,
++    "The zoomed out quad is smaller than the default one");
++  ok(zoomedOutQuad.bounds.height < defaultQuad.bounds.height,
++    "The zoomed out quad is smaller than the default one");
++
++  window.FullZoom.reset();
++}
+diff --git a/browser/devtools/shared/test/browser_layoutHelpers.js b/browser/devtools/shared/test/browser_layoutHelpers.js
+--- a/browser/devtools/shared/test/browser_layoutHelpers.js
++++ b/browser/devtools/shared/test/browser_layoutHelpers.js
+@@ -7,17 +7,17 @@ let imported = {};
+ Components.utils.import("resource://gre/modules/devtools/LayoutHelpers.jsm",
+     imported);
+ registerCleanupFunction(function () {
+   imported = {};
+ });
+ 
+ let LayoutHelpers = imported.LayoutHelpers;
+ 
+-const TEST_URI = "http://example.com/browser/browser/devtools/shared/test/browser_layoutHelpers.html";
++const TEST_URI = TEST_URI_ROOT + "browser_layoutHelpers.html";
+ 
+ function test() {
+   addTab(TEST_URI, function(browser, tab) {
+     info("Starting browser_layoutHelpers.js");
+     let doc = browser.contentDocument;
+     runTest(doc.defaultView, doc.getElementById('some'));
+     gBrowser.removeCurrentTab();
+     finish();
+diff --git a/browser/devtools/shared/test/browser_templater_basic.js b/browser/devtools/shared/test/browser_templater_basic.js
+--- a/browser/devtools/shared/test/browser_templater_basic.js
++++ b/browser/devtools/shared/test/browser_templater_basic.js
+@@ -7,17 +7,17 @@
+  * These tests run both in Mozilla/Mochitest and plain browsers (as does
+  * domtemplate)
+  * We should endevour to keep the source in sync.
+  */
+ 
+ var promise = Cu.import("resource://gre/modules/devtools/deprecated-sync-thenables.js", {}).Promise;
+ var template = Cu.import("resource://gre/modules/devtools/Templater.jsm", {}).template;
+ 
+-const TEST_URI = "http://example.com/browser/browser/devtools/shared/test/browser_templater_basic.html";
++const TEST_URI = TEST_URI_ROOT + "browser_templater_basic.html";
+ 
+ function test() {
+   addTab(TEST_URI, function() {
+     info("Starting DOM Templater Tests");
+     runTest(0);
+   });
+ }
+ 
+diff --git a/browser/devtools/shared/test/browser_toolbar_basic.js b/browser/devtools/shared/test/browser_toolbar_basic.js
+--- a/browser/devtools/shared/test/browser_toolbar_basic.js
++++ b/browser/devtools/shared/test/browser_toolbar_basic.js
+@@ -1,14 +1,14 @@
+ /* Any copyright is dedicated to the Public Domain.
+    http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ // Tests that the developer toolbar works properly
+ 
+-const TEST_URI = "http://example.com/browser/browser/devtools/shared/test/browser_toolbar_basic.html";
++const TEST_URI = TEST_URI_ROOT + "browser_toolbar_basic.html";
+ 
+ function test() {
+   addTab(TEST_URI, function(browser, tab) {
+     info("Starting browser_toolbar_basic.js");
+     runTest();
+   });
+ }
+ 
+diff --git a/browser/devtools/shared/test/browser_toolbar_webconsole_errors_count.js b/browser/devtools/shared/test/browser_toolbar_webconsole_errors_count.js
+--- a/browser/devtools/shared/test/browser_toolbar_webconsole_errors_count.js
++++ b/browser/devtools/shared/test/browser_toolbar_webconsole_errors_count.js
+@@ -1,16 +1,15 @@
+ /* Any copyright is dedicated to the Public Domain.
+    http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ // Tests that the developer toolbar errors count works properly.
+ 
+ function test() {
+-  const TEST_URI = "http://example.com/browser/browser/devtools/shared/test/" +
+-                   "browser_toolbar_webconsole_errors_count.html";
++  const TEST_URI = TEST_URI_ROOT + "browser_toolbar_webconsole_errors_count.html";
+ 
+   let gDevTools = Cu.import("resource:///modules/devtools/gDevTools.jsm",
+                              {}).gDevTools;
+ 
+   let webconsole = document.getElementById("developer-toolbar-toolbox-button");
+   let tab1, tab2;
+ 
+   Services.prefs.setBoolPref("javascript.options.strict", true);
+diff --git a/browser/devtools/shared/test/head.js b/browser/devtools/shared/test/head.js
+--- a/browser/devtools/shared/test/head.js
++++ b/browser/devtools/shared/test/head.js
+@@ -6,16 +6,18 @@ let {devtools} = Cu.import("resource://g
+ let {console} = Cu.import("resource://gre/modules/devtools/Console.jsm", {});
+ let TargetFactory = devtools.TargetFactory;
+ 
+ gDevTools.testing = true;
+ SimpleTest.registerCleanupFunction(() => {
+   gDevTools.testing = false;
+ });
+ 
++const TEST_URI_ROOT = "http://example.com/browser/browser/devtools/shared/test/";
++
+ /**
+  * Open a new tab at a URL and call a callback on load
+  */
+ function addTab(aURL, aCallback)
+ {
+   waitForExplicitFinish();
+ 
+   gBrowser.selectedTab = gBrowser.addTab();
+diff --git a/browser/devtools/styleinspector/computed-view.js b/browser/devtools/styleinspector/computed-view.js
+--- a/browser/devtools/styleinspector/computed-view.js
++++ b/browser/devtools/styleinspector/computed-view.js
+@@ -21,16 +21,17 @@ Cu.import("resource://gre/modules/XPCOMU
+ Cu.import("resource://gre/modules/devtools/Templater.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "PluralForm",
+                                   "resource://gre/modules/PluralForm.jsm");
+ 
+ const FILTER_CHANGED_TIMEOUT = 300;
+ const HTML_NS = "http://www.w3.org/1999/xhtml";
+ const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
++const TRANSFORM_HIGHLIGHTER_TYPE = "CssTransformHighlighter";
+ 
+ /**
+  * Helper for long-running processes that should yield occasionally to
+  * the mainloop.
+  *
+  * @param {Window} aWin
+  *        Timeouts will be set on this window when appropriate.
+  * @param {Generator} aGenerator
+@@ -182,16 +183,22 @@ function CssHtmlTree(aStyleInspector, aP
+ 
+   // Properties preview tooltip
+   this.tooltip = new Tooltip(this.styleInspector.inspector.panelDoc);
+   this.tooltip.startTogglingOnHover(this.propertyContainer,
+     this._onTooltipTargetHover.bind(this));
+ 
+   this._buildContextMenu();
+   this.createStyleViews();
++
++  // Initialize the css transform highlighter if the target supports it
++  let hUtils = this.styleInspector.inspector.toolbox.highlighterUtils;
++  if (hUtils.hasCustomHighlighter(TRANSFORM_HIGHLIGHTER_TYPE)) {
++    this._initTransformHighlighter();
++  }
+ }
+ 
+ /**
+  * Memoized lookup of a l10n string from a string bundle.
+  * @param {string} aName The key to lookup.
+  * @returns A localized version of the given key.
+  */
+ CssHtmlTree.l10n = function CssHtmlTree_l10n(aName)
+@@ -509,16 +516,75 @@ CssHtmlTree.prototype = {
+    */
+   focusWindow: function(aEvent)
+   {
+     let win = this.styleDocument.defaultView;
+     win.focus();
+   },
+ 
+   /**
++   * Get the css transform highlighter front, initializing it if needed
++   * @param a promise that resolves to the highlighter
++   */
++  getTransformHighlighter: function() {
++    if (this.transformHighlighterPromise) {
++      return this.transformHighlighterPromise;
++    }
++
++    let utils = this.styleInspector.inspector.toolbox.highlighterUtils;
++    this.transformHighlighterPromise =
++      utils.getHighlighterByType(TRANSFORM_HIGHLIGHTER_TYPE).then(highlighter => {
++        this.transformHighlighter = highlighter;
++        return this.transformHighlighter;
++      });
++
++    return this.transformHighlighterPromise;
++  },
++
++  _initTransformHighlighter: function() {
++    this.isTransformHighlighterShown = false;
++
++    this._onMouseMove = this._onMouseMove.bind(this);
++    this._onMouseLeave = this._onMouseLeave.bind(this);
++
++    this.propertyContainer.addEventListener("mousemove", this._onMouseMove, false);
++    this.propertyContainer.addEventListener("mouseleave", this._onMouseLeave, false);
++  },
++
++  _onMouseMove: function(event) {
++    if (event.target === this._lastHovered) {
++      return;
++    }
++
++    if (this.isTransformHighlighterShown) {
++      this.isTransformHighlighterShown = false;
++      this.getTransformHighlighter().then(highlighter => highlighter.hide());
++    }
++
++    this._lastHovered = event.target;
++    if (this._lastHovered.classList.contains("property-value")) {
++      let propName = this._lastHovered.parentNode.querySelector(".property-name");
++
++      if (propName.textContent === "transform") {
++        this.isTransformHighlighterShown = true;
++        let node = this.styleInspector.inspector.selection.nodeFront;
++        this.getTransformHighlighter().then(highlighter => highlighter.show(node));
++      }
++    }
++  },
++
++  _onMouseLeave: function(event) {
++    this._lastHovered = null;
++    if (this.isTransformHighlighterShown) {
++      this.isTransformHighlighterShown = false;
++      this.getTransformHighlighter().then(highlighter => highlighter.hide());
++    }
++  },
++
++  /**
+    * Executed by the tooltip when the pointer hovers over an element of the view.
+    * Used to decide whether the tooltip should be shown or not and to actually
+    * put content in it.
+    * Checks if the hovered target is a css value we support tooltips for.
+    */
+   _onTooltipTargetHover: function(target)
+   {
+     let inspector = this.styleInspector.inspector;
+@@ -801,16 +867,26 @@ CssHtmlTree.prototype = {
+       this._contextmenu = null;
+     }
+ 
+     this.popupNode = null;
+ 
+     this.tooltip.stopTogglingOnHover(this.propertyContainer);
+     this.tooltip.destroy();
+ 
++    if (this.transformHighlighter) {
++      this.transformHighlighter.finalize();
++      this.transformHighlighter = null;
++
++      this.propertyContainer.removeEventListener("mousemove", this._onMouseMove, false);
++      this.propertyContainer.removeEventListener("mouseleave", this._onMouseLeave, false);
++
++      this._lastHovered = null;
++    }
++
+     // Remove bound listeners
+     this.styleDocument.removeEventListener("contextmenu", this._onContextMenu);
+     this.styleDocument.removeEventListener("copy", this._onCopy);
+     this.styleDocument.removeEventListener("mousedown", this.focusWindow);
+ 
+     // Nodes used in templating
+     delete this.root;
+     delete this.propertyContainer;
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -19,16 +19,17 @@ const {parseSingleValue, parseDeclaratio
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ 
+ const HTML_NS = "http://www.w3.org/1999/xhtml";
+ const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+ const PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
+ const PREF_DEFAULT_COLOR_UNIT = "devtools.defaultColorUnit";
++const TRANSFORM_HIGHLIGHTER_TYPE = "CssTransformHighlighter";
+ 
+ /**
+  * These regular expressions are adapted from firebug's css.js, and are
+  * used to parse CSSStyleDeclaration's cssText attribute.
+  */
+ 
+ // Used to split on css line separators
+ const CSS_LINE_RE = /(?:[^;\(]*(?:\([^\)]*?\))?[^;\(]*)*;?/g;
+@@ -1025,17 +1026,16 @@ TextProperty.prototype = {
+     this.updateEditor();
+   },
+ 
+   remove: function() {
+     this.rule.removeProperty(this);
+   }
+ };
+ 
+-
+ /**
+  * View hierarchy mostly follows the model hierarchy.
+  *
+  * CssRuleView:
+  *   Owns an ElementStyle and creates a list of RuleEditors for its
+  *    Rules.
+  * RuleEditor:
+  *   Owns a Rule object and creates a list of TextPropertyEditors
+@@ -1106,16 +1106,22 @@ function CssRuleView(aInspector, aDoc, a
+     this._onTooltipTargetHover.bind(this));
+ 
+   // Also create a more complex tooltip for editing colors with the spectrum
+   // color picker
+   this.colorPicker = new SwatchColorPickerTooltip(this.inspector.panelDoc);
+ 
+   this._buildContextMenu();
+   this._showEmpty();
++
++  // Initialize the css transform highlighter if the target supports it
++  let hUtils = this.inspector.toolbox.highlighterUtils;
++  if (hUtils.hasCustomHighlighter(TRANSFORM_HIGHLIGHTER_TYPE)) {
++    this._initTransformHighlighter();
++  }
+ }
+ 
+ exports.CssRuleView = CssRuleView;
+ 
+ CssRuleView.prototype = {
+   // The element that we're inspecting.
+   _viewedElement: null,
+ 
+@@ -1155,16 +1161,76 @@ CssRuleView.prototype = {
+       popupset = doc.createElementNS(XUL_NS, "popupset");
+       doc.documentElement.appendChild(popupset);
+     }
+ 
+     popupset.appendChild(this._contextmenu);
+   },
+ 
+   /**
++   * Get the css transform highlighter front, initializing it if needed
++   * @param a promise that resolves to the highlighter
++   */
++  getTransformHighlighter: function() {
++    if (this.transformHighlighterPromise) {
++      return this.transformHighlighterPromise;
++    }
++
++    let utils = this.inspector.toolbox.highlighterUtils;
++    this.transformHighlighterPromise =
++    utils.getHighlighterByType(TRANSFORM_HIGHLIGHTER_TYPE).then(highlighter => {
++      this.transformHighlighter = highlighter;
++      return this.transformHighlighter;
++    });
++
++    return this.transformHighlighterPromise;
++  },
++
++  _initTransformHighlighter: function() {
++    this.isTransformHighlighterShown = false;
++
++    this._onMouseMove = this._onMouseMove.bind(this);
++    this._onMouseLeave = this._onMouseLeave.bind(this);
++
++    this.element.addEventListener("mousemove", this._onMouseMove, false);
++    this.element.addEventListener("mouseleave", this._onMouseLeave, false);
++  },
++
++  _onMouseMove: function(event) {
++    if (event.target === this._lastHovered) {
++      return;
++    }
++
++    if (this.isTransformHighlighterShown) {
++      this.isTransformHighlighterShown = false;
++      this.getTransformHighlighter().then(highlighter => highlighter.hide());
++    }
++
++    this._lastHovered = event.target;
++    let prop = event.target.textProperty;
++    let isHighlightable = prop && prop.name === "transform" &&
++                          prop.enabled && !prop.overridden &&
++                          !prop.rule.pseudoElement;
++
++    if (isHighlightable) {
++      this.isTransformHighlighterShown = true;
++      let node = this.inspector.selection.nodeFront;
++      this.getTransformHighlighter().then(highlighter => highlighter.show(node));
++    }
++  },
++
++  _onMouseLeave: function(event) {
++    this._lastHovered = null;
++    if (this.isTransformHighlighterShown) {
++      this.isTransformHighlighterShown = false;
++      this.getTransformHighlighter().then(highlighter => highlighter.hide());
++    }
++  },
++
++  /**
+    * Which type of hover-tooltip should be shown for the given element?
+    * This depends on the element: does it contain a URL, a font-family, ...
+    * @param {DOMNode} el The element to test
+    * @return {String} The type of hover-tooltip
+    */
+   _getHoverTooltipTypeForTarget: function(el) {
+     let prop = el.textProperty;
+ 
+@@ -1450,16 +1516,26 @@ CssRuleView.prototype = {
+ 
+     // We manage the popupNode ourselves so we also need to destroy it.
+     this.doc.popupNode = null;
+ 
+     this.previewTooltip.stopTogglingOnHover(this.element);
+     this.previewTooltip.destroy();
+     this.colorPicker.destroy();
+ 
++    if (this.transformHighlighter) {
++      this.transformHighlighter.finalize();
++      this.transformHighlighter = null;
++
++      this.element.removeEventListener("mousemove", this._onMouseMove, false);
++      this.element.removeEventListener("mouseleave", this._onMouseLeave, false);
++
++      this._lastHovered = null;
++    }
++
+     if (this.element.parentNode) {
+       this.element.parentNode.removeChild(this.element);
+     }
+ 
+     if (this.elementStyle) {
+       this.elementStyle.destroy();
+     }
+ 
+diff --git a/browser/devtools/styleinspector/test/browser.ini b/browser/devtools/styleinspector/test/browser.ini
+--- a/browser/devtools/styleinspector/test/browser.ini
++++ b/browser/devtools/styleinspector/test/browser.ini
+@@ -94,8 +94,12 @@ skip-if = os == "win" && debug # bug 963
+ [browser_styleinspector_csslogic-specificity.js]
+ [browser_styleinspector_inplace-editor.js]
+ [browser_styleinspector_output-parser.js]
+ [browser_styleinspector_tooltip-background-image.js]
+ [browser_styleinspector_tooltip-closes-on-new-selection.js]
+ [browser_styleinspector_tooltip-longhand-fontfamily.js]
+ [browser_styleinspector_tooltip-shorthand-fontfamily.js]
+ [browser_styleinspector_tooltip-size.js]
++[browser_styleinspector_transform-highlighter-01.js]
++[browser_styleinspector_transform-highlighter-02.js]
++[browser_styleinspector_transform-highlighter-03.js]
++[browser_styleinspector_transform-highlighter-04.js]
+diff --git a/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-01.js b/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-01.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-01.js
+@@ -0,0 +1,38 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Test that the css transform highlighter is created only when asked
++
++const PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  body {',
++  '    transform: skew(16deg);',
++  '  }',
++  '</style>',
++  'Test the css transform highlighter'
++].join("\n");
++
++let test = asyncTest(function*() {
++  yield addTab("data:text/html," + PAGE_CONTENT);
++
++  let {view: rView} = yield openRuleView();
++
++  ok(!rView.transformHighlighter, "No highlighter exists in the rule-view");
++  let h = yield rView.getTransformHighlighter();
++  ok(rView.transformHighlighter, "The highlighter has been created in the rule-view");
++  is(h, rView.transformHighlighter, "The right highlighter has been created");
++  let h2 = yield rView.getTransformHighlighter();
++  is(h, h2, "The same instance of highlighter is returned everytime in the rule-view");
++
++  let {view: cView} = yield openComputedView();
++
++  ok(!cView.transformHighlighter, "No highlighter exists in the computed-view");
++  let h = yield cView.getTransformHighlighter();
++  ok(cView.transformHighlighter, "The highlighter has been created in the computed-view");
++  is(h, cView.transformHighlighter, "The right highlighter has been created");
++  let h2 = yield cView.getTransformHighlighter();
++  is(h, h2, "The same instance of highlighter is returned everytime in the computed-view");
++});
+diff --git a/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-02.js b/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-02.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-02.js
+@@ -0,0 +1,54 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Test that the css transform highlighter is created when hovering over a
++// transform property
++
++const PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  body {',
++  '    transform: skew(16deg);',
++  '    color: yellow;',
++  '  }',
++  '</style>',
++  'Test the css transform highlighter'
++].join("\n");
++
++let test = asyncTest(function*() {
++  yield addTab("data:text/html," + PAGE_CONTENT);
++
++  let {view: rView} = yield openRuleView();
++  ok(!rView.transformHighlighter, "No highlighter exists in the rule-view (1)");
++
++  info("Faking a mousemove on a non-transform property");
++  let {valueSpan} = getRuleViewProperty(rView, "body", "color");
++  rView._onMouseMove({target: valueSpan});
++  ok(!rView.transformHighlighter, "No highlighter exists in the rule-view (2)");
++  ok(!rView.transformHighlighterPromise, "No highlighter is being initialized");
++
++  info("Faking a mousemove on a transform property");
++  let {valueSpan} = getRuleViewProperty(rView, "body", "transform");
++  rView._onMouseMove({target: valueSpan});
++  ok(rView.transformHighlighterPromise, "The highlighter is being initialized");
++  let h = yield rView.transformHighlighterPromise;
++  is(h, rView.transformHighlighter, "The initialized highlighter is the right one");
++
++  let {view: cView} = yield openComputedView();
++  ok(!cView.transformHighlighter, "No highlighter exists in the computed-view (1)");
++
++  info("Faking a mousemove on a non-transform property");
++  let {valueSpan} = getComputedViewProperty(cView, "color");
++  cView._onMouseMove({target: valueSpan});
++  ok(!cView.transformHighlighter, "No highlighter exists in the computed-view (2)");
++  ok(!cView.transformHighlighterPromise, "No highlighter is being initialized");
++
++  info("Faking a mousemove on a transform property");
++  let {valueSpan} = getComputedViewProperty(cView, "transform");
++  cView._onMouseMove({target: valueSpan});
++  ok(cView.transformHighlighterPromise, "The highlighter is being initialized");
++  let h = yield cView.transformHighlighterPromise;
++  is(h, cView.transformHighlighter, "The initialized highlighter is the right one");
++});
+diff --git a/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-03.js b/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-03.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-03.js
+@@ -0,0 +1,89 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Test that the css transform highlighter is shown when hovering over transform
++// properties
++
++// Note that in this test, we mock the highlighter front, merely testing the
++// behavior of the style-inspector UI for now
++
++const PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  html {',
++  '    transform: scale(.9);',
++  '  }',
++  '  body {',
++  '    transform: skew(16deg);',
++  '    color: purple;',
++  '  }',
++  '</style>',
++  'Test the css transform highlighter'
++].join("\n");
++
++let test = asyncTest(function*() {
++  yield addTab("data:text/html," + PAGE_CONTENT);
++
++  let {inspector, view: rView} = yield openRuleView();
++
++  // Mock the highlighter front to get the reference of the NodeFront
++  let HighlighterFront = {
++    isShown: false,
++    nodeFront: null,
++    nbOfTimesShown: 0,
++    show: function(nodeFront) {
++      this.nodeFront = nodeFront;
++      this.isShown = true;
++      this.nbOfTimesShown ++;
++    },
++    hide: function() {
++      this.nodeFront = null;
++      this.isShown = false;
++    }
++  };
++
++  // Inject the mock highlighter in the rule-view
++  rView.transformHighlighterPromise = {
++    then: function(cb) {
++      cb(HighlighterFront);
++    }
++  };
++
++  let {valueSpan} = getRuleViewProperty(rView, "body", "transform");
++
++  info("Checking that the HighlighterFront's show/hide methods are called");
++  rView._onMouseMove({target: valueSpan});
++  ok(HighlighterFront.isShown, "The highlighter is shown");
++  rView._onMouseLeave();
++  ok(!HighlighterFront.isShown, "The highlighter is hidden");
++
++  info("Checking that hovering several times over the same property doesn't" +
++    " show the highlighter several times");
++  let nb = HighlighterFront.nbOfTimesShown;
++  rView._onMouseMove({target: valueSpan});
++  is(HighlighterFront.nbOfTimesShown, nb + 1, "The highlighter was shown once");
++  rView._onMouseMove({target: valueSpan});
++  rView._onMouseMove({target: valueSpan});
++  is(HighlighterFront.nbOfTimesShown, nb + 1,
++    "The highlighter was shown once, after several mousemove");
++
++  info("Checking that the right NodeFront reference is passed");
++  yield selectNode(content.document.documentElement, inspector);
++  let {valueSpan} = getRuleViewProperty(rView, "html", "transform");
++  rView._onMouseMove({target: valueSpan});
++  is(HighlighterFront.nodeFront.tagName, "HTML",
++    "The right NodeFront is passed to the highlighter (1)");
++
++  yield selectNode("body", inspector);
++  let {valueSpan} = getRuleViewProperty(rView, "body", "transform");
++  rView._onMouseMove({target: valueSpan});
++  is(HighlighterFront.nodeFront.tagName, "BODY",
++    "The right NodeFront is passed to the highlighter (2)");
++
++  info("Checking that the highlighter gets hidden when hovering a non-transform property");
++  let {valueSpan} = getRuleViewProperty(rView, "body", "color");
++  rView._onMouseMove({target: valueSpan});
++  ok(!HighlighterFront.isShown, "The highlighter is hidden");
++});
+diff --git a/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-04.js b/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-04.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_styleinspector_transform-highlighter-04.js
+@@ -0,0 +1,58 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Test that the css transform highlighter is shown only when hovering over a
++// transform declaration that isn't overriden or disabled
++
++// Note that unlike the other browser_styleinspector_transform-highlighter-N.js
++// tests, this one only tests the rule-view as only this view features disabled
++// and overriden properties
++
++const PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  div {',
++  '    background: purple;',
++  '    width:300px;height:300px;',
++  '    transform: rotate(16deg);',
++  '  }',
++  '  .test {',
++  '    transform: skew(25deg);',
++  '  }',
++  '</style>',
++  '<div class="test"></div>'
++].join("\n");
++
++let test = asyncTest(function*() {
++  yield addTab("data:text/html," + PAGE_CONTENT);
++
++  let {view: rView, inspector} = yield openRuleView();
++  yield selectNode(".test", inspector);
++
++  info("Faking a mousemove on the overriden property");
++  let {valueSpan} = getRuleViewProperty(rView, "div", "transform");
++  rView._onMouseMove({target: valueSpan});
++  ok(!rView.transformHighlighter, "No highlighter was created for the overriden property");
++  ok(!rView.transformHighlighterPromise, "And no highlighter is being initialized either");
++
++  info("Disabling the applied property");
++  let classRuleEditor = rView.element.children[1]._ruleEditor;
++  let propEditor = classRuleEditor.rule.textProps[0].editor;
++  propEditor.enable.click();
++  yield classRuleEditor.rule._applyingModifications;
++
++  info("Faking a mousemove on the disabled property");
++  let {valueSpan} = getRuleViewProperty(rView, ".test", "transform");
++  rView._onMouseMove({target: valueSpan});
++  ok(!rView.transformHighlighter, "No highlighter was created for the disabled property");
++  ok(!rView.transformHighlighterPromise, "And no highlighter is being initialized either");
++
++  info("Faking a mousemove on the now unoverriden property");
++  let {valueSpan} = getRuleViewProperty(rView, "div", "transform");
++  rView._onMouseMove({target: valueSpan});
++  ok(rView.transformHighlighterPromise, "The highlighter is being initialized now");
++  let h = yield rView.transformHighlighterPromise;
++  is(h, rView.transformHighlighter, "The initialized highlighter is the right one");
++});
+diff --git a/browser/themes/shared/devtools/highlighter.inc.css b/browser/themes/shared/devtools/highlighter.inc.css
+--- a/browser/themes/shared/devtools/highlighter.inc.css
++++ b/browser/themes/shared/devtools/highlighter.inc.css
+@@ -1,15 +1,16 @@
+ %if 0
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ %endif
+ 
+ /* Box model highlighter */
++
+ svg|g.box-model-container {
+   opacity: 0.4;
+ }
+ 
+ svg|polygon.box-model-content {
+   fill: #80d4ff;
+ }
+ 
+@@ -102,8 +103,28 @@ html|*.highlighter-nodeinfobar-dimension
+   margin-top: -8px;
+   margin-bottom: 8px;
+   background-image: linear-gradient(to bottom left, transparent 50%, hsl(210,2%,22%) 50%);
+ }
+ 
+ .highlighter-nodeinfobar-container[hide-arrow] > .highlighter-nodeinfobar {
+   margin: 7px 0;
+ }
++
++/* Css transform highlighter */
++
++svg|polygon.css-transform-transformed {
++  fill: #80d4ff;
++  opacity: 0.8;
++}
++
++svg|polygon.css-transform-untransformed {
++  fill: #66cc52;
++  opacity: 0.8;
++}
++
++svg|polygon.css-transform-transformed,
++svg|polygon.css-transform-untransformed,
++svg|line.css-transform-line {
++  stroke: #08C;
++  stroke-dasharray: 5 3;
++  stroke-width: 2;
++}
+diff --git a/toolkit/devtools/LayoutHelpers.jsm b/toolkit/devtools/LayoutHelpers.jsm
+--- a/toolkit/devtools/LayoutHelpers.jsm
++++ b/toolkit/devtools/LayoutHelpers.jsm
+@@ -20,37 +20,39 @@ this.LayoutHelpers = LayoutHelpers = fun
+                                      .getInterface(Ci.nsIWebNavigation)
+                                      .QueryInterface(Ci.nsIDocShell);
+ };
+ 
+ LayoutHelpers.prototype = {
+ 
+   /**
+    * Get box quads adjusted for iframes and zoom level.
+-   *
++
+    * @param {DOMNode} node
+    *        The node for which we are to get the box model region quads
+    * @param  {String} region
+    *         The box model region to return:
+    *         "content", "padding", "border" or "margin"
++   * @return {Object} An object that has the same structure as one quad returned
++   *         by getBoxQuads
+    */
+   getAdjustedQuads: function(node, region) {
+-    if (!node) {
+-      return;
++    if (!node || !node.getBoxQuads) {
++      return null;
+     }
+ 
+     let [quads] = node.getBoxQuads({
+       box: region
+     });
+ 
+     if (!quads) {
+-      return;
++      return null;
+     }
+ 
+-    let [xOffset, yOffset] = this._getNodeOffsets(node);
++    let [xOffset, yOffset] = this.getFrameOffsets(node);
+     let scale = this.calculateScale(node);
+ 
+     return {
+       p1: {
+         w: quads.p1.w * scale,
+         x: quads.p1.x * scale + xOffset,
+         y: quads.p1.y * scale + yOffset,
+         z: quads.p1.z * scale
+@@ -81,46 +83,53 @@ LayoutHelpers.prototype = {
+         top: quads.bounds.top * scale + yOffset,
+         width: quads.bounds.width * scale,
+         x: quads.bounds.x * scale + xOffset,
+         y: quads.bounds.y * scale + yOffset
+       }
+     };
+   },
+ 
++  /**
++   * Get the current zoom factor applied to the container window of a given node
++   * @param {DOMNode}
++   *        The node for which the zoom factor should be calculated
++   * @return {Number}
++   */
+   calculateScale: function(node) {
+     let win = node.ownerDocument.defaultView;
+     let winUtils = win.QueryInterface(Ci.nsIInterfaceRequestor)
+                       .getInterface(Ci.nsIDOMWindowUtils);
+     return winUtils.fullZoom;
+   },
+ 
+   /**
+    * Compute the absolute position and the dimensions of a node, relativalely
+    * to the root window.
+    *
+-   * @param nsIDOMNode aNode
++   * @param {DOMNode} aNode
+    *        a DOM element to get the bounds for
+-   * @param nsIWindow aContentWindow
++   * @param {DOMWindow} aContentWindow
+    *        the content window holding the node
++   * @return {Object}
++   *         A rect object with the {top, left, width, height} properties
+    */
+-  getRect: function LH_getRect(aNode, aContentWindow) {
++  getRect: function(aNode, aContentWindow) {
+     let frameWin = aNode.ownerDocument.defaultView;
+     let clientRect = aNode.getBoundingClientRect();
+ 
+     // Go up in the tree of frames to determine the correct rectangle.
+     // clientRect is read-only, we need to be able to change properties.
+     let rect = {top: clientRect.top + aContentWindow.pageYOffset,
+             left: clientRect.left + aContentWindow.pageXOffset,
+             width: clientRect.width,
+             height: clientRect.height};
+ 
+     // We iterate through all the parent windows.
+     while (true) {
+-
+       // Are we in the top-level window?
+       if (this.isTopLevelWindow(frameWin)) {
+         break;
+       }
+ 
+       let frameElement = this.getFrameElement(frameWin);
+       if (!frameElement) {
+         break;
+@@ -144,25 +153,25 @@ LayoutHelpers.prototype = {
+   },
+ 
+   /**
+    * Returns iframe content offset (iframe border + padding).
+    * Note: this function shouldn't need to exist, had the platform provided a
+    * suitable API for determining the offset between the iframe's content and
+    * its bounding client rect. Bug 626359 should provide us with such an API.
+    *
+-   * @param aIframe
++   * @param {DOMNode} aIframe
+    *        The iframe.
+-   * @returns array [offsetTop, offsetLeft]
+-   *          offsetTop is the distance from the top of the iframe and the
+-   *            top of the content document.
+-   *          offsetLeft is the distance from the left of the iframe and the
+-   *            left of the content document.
++   * @return {Array} [offsetTop, offsetLeft]
++   *         offsetTop is the distance from the top of the iframe and the top of
++   *         the content document.
++   *         offsetLeft is the distance from the left of the iframe and the left
++   *         of the content document.
+    */
+-  getIframeContentOffset: function LH_getIframeContentOffset(aIframe) {
++  getIframeContentOffset: function(aIframe) {
+     let style = aIframe.contentWindow.getComputedStyle(aIframe, null);
+ 
+     // In some cases, the computed style is null
+     if (!style) {
+       return [0, 0];
+     }
+ 
+     let paddingTop = parseInt(style.getPropertyValue("padding-top"));
+@@ -173,22 +182,24 @@ LayoutHelpers.prototype = {
+ 
+     return [borderTop + paddingTop, borderLeft + paddingLeft];
+   },
+ 
+   /**
+    * Find an element from the given coordinates. This method descends through
+    * frames to find the element the user clicked inside frames.
+    *
+-   * @param DOMDocument aDocument the document to look into.
+-   * @param integer aX
+-   * @param integer aY
+-   * @returns Node|null the element node found at the given coordinates.
++   * @param {DOMDocument} aDocument the document to look into.
++   * @param {Number} aX
++   * @param {Number} aY
++   * @return {DOMNode}
++   *         the element node found at the given coordinates, or null if no node
++   *         was found
+    */
+-  getElementFromPoint: function LH_elementFromPoint(aDocument, aX, aY) {
++  getElementFromPoint: function(aDocument, aX, aY) {
+     let node = aDocument.elementFromPoint(aX, aY);
+     if (node && node.contentDocument) {
+       if (node instanceof Ci.nsIDOMHTMLIFrameElement) {
+         let rect = node.getBoundingClientRect();
+ 
+         // Gap between the iframe and its content window.
+         let [offsetTop, offsetLeft] = this.getIframeContentOffset(node);
+ 
+@@ -209,20 +220,22 @@ LayoutHelpers.prototype = {
+       }
+     }
+     return node;
+   },
+ 
+   /**
+    * Scroll the document so that the element "elem" appears in the viewport.
+    *
+-   * @param Element elem the element that needs to appear in the viewport.
+-   * @param bool centered true if you want it centered, false if you want it to
+-   * appear on the top of the viewport. It is true by default, and that is
+-   * usually what you want.
++   * @param {DOMNode} elem
++   *        The element that needs to appear in the viewport.
++   * @param {Boolean} centered
++   *        true if you want it centered, false if you want it to appear on the
++   *        top of the viewport. It is true by default, and that is usually what
++   *        you want.
+    */
+   scrollIntoViewIfNeeded: function(elem, centered) {
+     // We want to default to centering the element in the page,
+     // so as to keep the context of the element.
+     centered = centered === undefined? true: !!centered;
+ 
+     let win = elem.ownerDocument.defaultView;
+     let clientRect = elem.getBoundingClientRect();
+@@ -288,62 +301,71 @@ LayoutHelpers.prototype = {
+       this.scrollIntoViewIfNeeded(frameElement, centered);
+     }
+   },
+ 
+   /**
+    * Check if a node and its document are still alive
+    * and attached to the window.
+    *
+-   * @param aNode
++   * @param {DOMNode} aNode
++   * @return {Boolean}
+    */
+-  isNodeConnected: function LH_isNodeConnected(aNode)
+-  {
++  isNodeConnected: function(aNode) {
+     try {
+       let connected = (aNode.ownerDocument && aNode.ownerDocument.defaultView &&
+                       !(aNode.compareDocumentPosition(aNode.ownerDocument.documentElement) &
+                       aNode.DOCUMENT_POSITION_DISCONNECTED));
+       return connected;
+     } catch (e) {
+       // "can't access dead object" error
+       return false;
+     }
+   },
+ 
+   /**
+    * like win.parent === win, but goes through mozbrowsers and mozapps iframes.
++   *
++   * @param {DOMWindow} win
++   * @return {Boolean}
+    */
+-  isTopLevelWindow: function LH_isTopLevelWindow(win) {
++  isTopLevelWindow: function(win) {
+     let docShell = win.QueryInterface(Ci.nsIInterfaceRequestor)
+                    .getInterface(Ci.nsIWebNavigation)
+                    .QueryInterface(Ci.nsIDocShell);
+ 
+     return docShell === this._topDocShell;
+   },
+ 
+   /**
+    * Check a window is part of the top level window.
++   *
++   * @param {DOMWindow} win
++   * @return {Boolean}
+    */
+   isIncludedInTopLevelWindow: function LH_isIncludedInTopLevelWindow(win) {
+     if (this.isTopLevelWindow(win)) {
+       return true;
+     }
+ 
+     let parent = this.getParentWindow(win);
+     if (!parent || parent === win) {
+       return false;
+     }
+ 
+     return this.isIncludedInTopLevelWindow(parent);
+   },
+ 
+   /**
+    * like win.parent, but goes through mozbrowsers and mozapps iframes.
++   *
++   * @param {DOMWindow} win
++   * @return {DOMWindow}
+    */
+-  getParentWindow: function LH_getParentWindow(win) {
++  getParentWindow: function(win) {
+     if (this.isTopLevelWindow(win)) {
+       return null;
+     }
+ 
+     let docShell = win.QueryInterface(Ci.nsIInterfaceRequestor)
+                    .getInterface(Ci.nsIWebNavigation)
+                    .QueryInterface(Ci.nsIDocShell);
+ 
+@@ -353,38 +375,42 @@ LayoutHelpers.prototype = {
+     } else {
+       return win.parent;
+     }
+   },
+ 
+   /**
+    * like win.frameElement, but goes through mozbrowsers and mozapps iframes.
+    *
+-   * @param DOMWindow win The window to get the frame for
+-   * @return DOMElement The element in which the window is embedded.
++   * @param {DOMWindow} win
++   *        The window to get the frame for
++   * @return {DOMNode}
++   *         The element in which the window is embedded.
+    */
+-  getFrameElement: function LH_getFrameElement(win) {
++  getFrameElement: function(win) {
+     if (this.isTopLevelWindow(win)) {
+       return null;
+     }
+ 
+     let winUtils = win.
+       QueryInterface(Components.interfaces.nsIInterfaceRequestor).
+       getInterface(Components.interfaces.nsIDOMWindowUtils);
+ 
+     return winUtils.containerElement;
+   },
+ 
+   /**
+-   * Get the x and y offsets for a node taking iframes into account.
++   * Get the x/y offsets for of all the parent frames of a given node
+    *
+    * @param {DOMNode} node
+    *        The node for which we are to get the offset
++   * @return {Array}
++   *         The frame offset [x, y]
+    */
+-  _getNodeOffsets: function(node) {
++  getFrameOffsets: function(node) {
+     let xOffset = 0;
+     let yOffset = 0;
+     let frameWin = node.ownerDocument.defaultView;
+     let scale = this.calculateScale(node);
+ 
+     while (true) {
+       // Are we in the top-level window?
+       if (this.isTopLevelWindow(frameWin)) {
+@@ -407,9 +433,66 @@ LayoutHelpers.prototype = {
+       xOffset += frameRect.left + offsetLeft;
+       yOffset += frameRect.top + offsetTop;
+ 
+       frameWin = this.getParentWindow(frameWin);
+     }
+ 
+     return [xOffset * scale, yOffset * scale];
+   },
++
++  /**
++   * Get the 4 bounding points for a node taking iframes into account.
++   * Note that for transformed nodes, this will return the untransformed bound.
++   *
++   * @param {DOMNode} node
++   * @return {Object}
++   *         An object with p1,p2,p3,p4 properties being {x,y} objects
++   */
++  getNodeBounds: function(node) {
++    if (!node) {
++      return;
++    }
++
++    let scale = this.calculateScale(node);
++
++    // Find out the offset of the node in its current frame
++    let offsetLeft = 0;
++    let offsetTop = 0;
++    let el = node;
++    while (el && el.parentNode) {
++      offsetLeft += el.offsetLeft;
++      offsetTop += el.offsetTop;
++      el = el.offsetParent;
++    }
++
++    // Also take scrolled containers into account
++    let el = node;
++    while (el && el.parentNode) {
++      if (el.scrollTop) {
++        offsetTop -= el.scrollTop;
++      }
++      if (el.scrollLeft) {
++        offsetLeft -= el.scrollLeft;
++      }
++      el = el.parentNode;
++    }
++
++    // And add the potential frame offset if the node is nested
++    let [xOffset, yOffset] = this.getFrameOffsets(node);
++    xOffset += offsetLeft;
++    yOffset += offsetTop;
++
++    xOffset *= scale;
++    yOffset *= scale;
++
++    // Get the width and height
++    let width = node.offsetWidth * scale;
++    let height = node.offsetHeight * scale;
++
++    return {
++      p1: {x: xOffset, y: yOffset},
++      p2: {x: xOffset + width, y: yOffset},
++      p3: {x: xOffset + width, y: yOffset + height},
++      p4: {x: xOffset, y: yOffset + height}
++    };
++  }
+ };
+diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/server/actors/highlighter.js
+--- a/toolkit/devtools/server/actors/highlighter.js
++++ b/toolkit/devtools/server/actors/highlighter.js
+@@ -4,16 +4,17 @@
+ 
+ "use strict";
+ 
+ const {Cu, Cc, Ci} = require("chrome");
+ const Services = require("Services");
+ const protocol = require("devtools/server/protocol");
+ const {Arg, Option, method} = protocol;
+ const events = require("sdk/event/core");
++const Heritage = require("sdk/core/heritage");
+ 
+ const EventEmitter = require("devtools/toolkit/event-emitter");
+ const GUIDE_STROKE_WIDTH = 1;
+ 
+ // Make sure the domnode type is known here
+ require("devtools/server/actors/inspector");
+ 
+ Cu.import("resource://gre/modules/devtools/LayoutHelpers.jsm");
+@@ -23,20 +24,23 @@ Cu.import("resource://gre/modules/XPCOMU
+ const PSEUDO_CLASSES = [":hover", ":active", ":focus"];
+ const HIGHLIGHTED_PSEUDO_CLASS = ":-moz-devtools-highlighted";
+ let HELPER_SHEET = ".__fx-devtools-hide-shortcut__ { visibility: hidden !important } ";
+ HELPER_SHEET += ":-moz-devtools-highlighted { outline: 2px dashed #F06!important; outline-offset: -2px!important } ";
+ const XHTML_NS = "http://www.w3.org/1999/xhtml";
+ const SVG_NS = "http://www.w3.org/2000/svg";
+ const HIGHLIGHTER_PICKED_TIMER = 1000;
+ const INFO_BAR_OFFSET = 5;
++// The minimum distance a line should be before it has an arrow marker-end
++const ARROW_LINE_MIN_DISTANCE = 10;
+ 
+ // All possible highlighter classes
+-const HIGHLIGHTER_CLASSES = {
+-  "BoxModelHighlighter": BoxModelHighlighter
++let HIGHLIGHTER_CLASSES = exports.HIGHLIGHTER_CLASSES = {
++  "BoxModelHighlighter": BoxModelHighlighter,
++  "CssTransformHighlighter": CssTransformHighlighter
+ };
+ 
+ /**
+  * The Highlighter is the server-side entry points for any tool that wishes to
+  * highlight elements in some way in the content document.
+  *
+  * A little bit of vocabulary:
+  * - <something>HighlighterActor classes are the actors that can be used from
+@@ -107,17 +111,17 @@ let HighlighterActor = exports.Highlight
+    * method several times won't display several highlighters, it will just move
+    * the highlighter instance to these nodes.
+    *
+    * @param NodeActor The node to be highlighted
+    * @param Options See the request part for existing options. Note that not
+    * all options may be supported by all types of highlighters.
+    */
+   showBoxModel: method(function(node, options={}) {
+-    if (node && isNodeValidForHighlighting(node.rawNode)) {
++    if (node && isNodeValid(node.rawNode)) {
+       this._boxModelHighlighter.show(node.rawNode, options);
+     } else {
+       this._boxModelHighlighter.hide();
+     }
+   }, {
+     request: {
+       node: Arg(0, "domnode"),
+       region: Option(1)
+@@ -260,72 +264,185 @@ let CustomHighlighterActor = exports.Cus
+   /**
+    * Create a highlighter instance given its typename
+    * The typename must be one of HIGHLIGHTER_CLASSES and the class must
+    * implement constructor(tab, inspector), show(node), hide(), destroy()
+    */
+   initialize: function(inspector, typeName) {
+     protocol.Actor.prototype.initialize.call(this, null);
+ 
++    this._inspector = inspector;
++
+     let constructor = HIGHLIGHTER_CLASSES[typeName];
+     if (!constructor) {
+-      throw new Error(typeName + " isn't a valid highlighter class");
++      throw new Error(typeName + " isn't a valid highlighter class (" +
++        Object.keys(HIGHLIGHTER_CLASSES) + ")");
+       return;
+     }
+ 
+     // The assumption is that all custom highlighters need a XUL parent in the
+     // browser to append their elements
+     if (supportXULBasedHighlighter(inspector.tabActor)) {
+       this._highlighter = new constructor(inspector.tabActor, inspector);
+     }
+   },
+ 
+   get conn() this._inspector && this._inspector.conn,
+ 
+   destroy: function() {
+     protocol.Actor.prototype.destroy.call(this);
+-    if (this._highlighter) {
+-      this._boxModelHighlighter.destroy();
+-      this._boxModelHighlighter = null;
+-    }
++    this.finalize();
+   },
+ 
+   /**
+    * Display the highlighter on a given NodeActor.
+    * @param NodeActor The node to be highlighted
+-   * @param Options Passed to the highlighter's show function
+    */
+-  show: method(function(node, options={}) {
+-    if (!node || !isNodeValidForHighlighting(node.rawNode) || !this._highlighter) {
++  show: method(function(node) {
++    if (!node || !isNodeValid(node.rawNode) || !this._highlighter) {
+       return;
+     }
+ 
+-    this._highlighter.show(node.rawNode, options);
++    this._highlighter.show(node.rawNode);
+   }, {
+     request: {
+-      node: Arg(0, "domnode"),
+-      options: Arg(1, "json")
++      node: Arg(0, "domnode")
+     }
+   }),
+ 
+   /**
+    * Hide the highlighter if it was shown before
+    */
+   hide: method(function() {
+     if (this._highlighter) {
+       this._highlighter.hide();
+     }
+   }, {
+     request: {}
++  }),
++
++  /**
++   * Kill this actor. This method is called automatically just before the actor
++   * is destroyed.
++   */
++  finalize: method(function() {
++    if (this._highlighter) {
++      this._highlighter.destroy();
++      this._highlighter = null;
++    }
++  }, {
++    oneway: true
+   })
+ });
+ 
+ let CustomHighlighterFront = protocol.FrontClass(CustomHighlighterActor, {});
+ 
+ /**
++ * Parent class for XUL-based complex highlighter that are inserted in the
++ * parent browser structure
++ */
++function XULBasedHighlighter(tabActor, inspector) {
++  this._inspector = inspector;
++
++  this.browser = tabActor.browser;
++  this.win = tabActor.window;
++  this.chromeDoc = this.browser.ownerDocument;
++  this.currentNode = null;
++
++  this.update = this.update.bind(this);
++}
++
++XULBasedHighlighter.prototype = {
++  /**
++   * Show the highlighter on a given node
++   * @param {DOMNode} node
++   */
++  show: function(node) {
++    if (!isNodeValid(node) || node === this.currentNode) {
++      return;
++    }
++
++    this._detachPageListeners();
++    this.currentNode = node;
++    this._attachPageListeners();
++    this._show();
++  },
++
++  /**
++   * Hide the highlighter
++   */
++  hide: function() {
++    if (!isNodeValid(this.currentNode)) {
++      return;
++    }
++
++    this._hide();
++    this._detachPageListeners();
++    this.currentNode = null;
++  },
++
++  /**
++   * Update the highlighter while shown
++   */
++  update: function() {
++    if (isNodeValid(this.currentNode)) {
++      this._update();
++    }
++  },
++
++  _show: function() {
++    // To be implemented by sub classes
++    // When called, sub classes should actually show the highlighter for
++    // this.currentNode
++  },
++
++  _update: function() {
++    // To be implemented by sub classes
++    // When called, sub classes should update the highlighter shown for
++    // this.currentNode
++    // This is called as a result of a page scroll, zoom or repaint
++  },
++
++  _hide: function() {
++    // To be implemented by sub classes
++    // When called, sub classes should actually hide the highlighter
++  },
++
++  /**
++   * Listen to changes on the content page to update the highlighter
++   */
++  _attachPageListeners: function() {
++    if (isNodeValid(this.currentNode)) {
++      let win = this.currentNode.ownerDocument.defaultView;
++      this.browser.addEventListener("MozAfterPaint", this.update);
++    }
++  },
++
++  /**
++   * Stop listening to page changes
++   */
++  _detachPageListeners: function() {
++    if (isNodeValid(this.currentNode)) {
++      let win = this.currentNode.ownerDocument.defaultView;
++      this.browser.removeEventListener("MozAfterPaint", this.update);
++    }
++  },
++
++  destroy: function() {
++    this.hide();
++
++    this.win = null;
++    this.browser = null;
++    this.chromeDoc = null;
++    this._inspector = null;
++    this.currentNode = null;
++  }
++};
++
++/**
+  * The BoxModelHighlighter is the class that actually draws the the box model
+  * regions on top of a node.
+  * It is used by the HighlighterActor.
+  *
+  * Usage example:
+  *
+  * let h = new BoxModelHighlighter(browser);
+  * h.show(node);
+@@ -358,36 +475,23 @@ let CustomHighlighterFront = protocol.Fr
+  *         </hbox>
+  *       </hbox>
+  *       <box class="highlighter-nodeinfobar-arrow highlighter-nodeinfobar-arrow-bottom"/>
+  *     </box>
+  *   </box>
+  * </stack>
+  */
+ function BoxModelHighlighter(tabActor, inspector) {
+-  this.browser = tabActor.browser;
+-  this.win = tabActor.window;
+-  this.chromeDoc = this.browser.ownerDocument;
+-  this.chromeWin = this.chromeDoc.defaultView;
+-  this._inspector = inspector;
+-
++  XULBasedHighlighter.call(this, tabActor, inspector);
+   this.layoutHelpers = new LayoutHelpers(this.win);
+-  this.chromeLayoutHelper = new LayoutHelpers(this.chromeWin);
+-
+-  this.transitionDisabler = null;
+-  this.pageEventsMuter = null;
+-  this._update = this._update.bind(this);
+-  this.handleEvent = this.handleEvent.bind(this);
+-  this.currentNode = null;
+-
++  this._initMarkup();
+   EventEmitter.decorate(this);
+-  this._initMarkup();
+ }
+ 
+-BoxModelHighlighter.prototype = {
++BoxModelHighlighter.prototype = Heritage.extend(XULBasedHighlighter.prototype, {
+   get zoom() {
+     return this.win.QueryInterface(Ci.nsIInterfaceRequestor)
+                .getInterface(Ci.nsIDOMWindowUtils).fullZoom;
+   },
+ 
+   _initMarkup: function() {
+     let stack = this.browser.parentNode;
+ 
+@@ -500,107 +604,81 @@ BoxModelHighlighter.prototype = {
+ 
+     return node;
+   },
+ 
+   /**
+    * Destroy the nodes. Remove listeners.
+    */
+   destroy: function() {
+-    this.hide();
+-
+-    this.chromeWin.clearTimeout(this.transitionDisabler);
+-    this.chromeWin.clearTimeout(this.pageEventsMuter);
+-
+-    this.nodeInfo = null;
++    XULBasedHighlighter.prototype.destroy.call(this);
+ 
+     this._highlighterContainer.remove();
+     this._highlighterContainer = null;
+ 
++    this.nodeInfo = null;
+     this.rect = null;
+-    this.win = null;
+-    this.browser = null;
+-    this.chromeDoc = null;
+-    this.chromeWin = null;
+-    this.currentNode = null;
+   },
+ 
+   /**
+    * Show the highlighter on a given node
+-   *
+-   * @param {DOMNode} node
+    * @param {Object} options
+    *        Object used for passing options
+    */
+-  show: function(node, options={}) {
+-    this.currentNode = node;
+-
+-    this._showInfobar();
+-    this._detachPageListeners();
+-    this._attachPageListeners();
++  _show: function(options={}) {
+     this._update();
+     this._trackMutations();
++    this.emit("ready");
+   },
+ 
++  /**
++   * Track the current node markup mutations so that the node info bar can be
++   * updated to reflects the node's attributes
++   */
+   _trackMutations: function() {
+-    if (this.currentNode) {
++    if (isNodeValid(this.currentNode)) {
+       let win = this.currentNode.ownerDocument.defaultView;
+-      this.currentNodeObserver = new win.MutationObserver(() => {
+-        this._update();
+-      });
++      this.currentNodeObserver = new win.MutationObserver(this.update);
+       this.currentNodeObserver.observe(this.currentNode, {attributes: true});
+     }
+   },
+ 
+   _untrackMutations: function() {
+-    if (this.currentNode) {
+-      if (this.currentNodeObserver) {
+-        // The following may fail with a "can't access dead object" exception
+-        // when the actor is being destroyed
+-        try {
+-          this.currentNodeObserver.disconnect();
+-        } catch (e) {}
+-        this.currentNodeObserver = null;
+-      }
++    if (isNodeValid(this.currentNode) && this.currentNodeObserver) {
++      this.currentNodeObserver.disconnect();
++      this.currentNodeObserver = null;
+     }
+   },
+ 
+   /**
+    * Update the highlighter on the current highlighted node (the one that was
+    * passed as an argument to show(node)).
+    * Should be called whenever node size or attributes change
+    * @param {Object} options
+    *        Object used for passing options. Valid options are:
+    *          - box: "content", "padding", "border" or "margin." This specifies
+    *            the box that the guides should outline. Default is content.
+    */
+   _update: function(options={}) {
+-    if (this.currentNode) {
+-      if (this._highlightBoxModel(options)) {
+-        this._showInfobar();
+-      } else {
+-        // Nothing to highlight (0px rectangle like a <script> tag for instance)
+-        this.hide();
+-      }
+-      this.emit("ready");
++    if (this._updateBoxModel(options)) {
++      this._showInfobar();
++      this._showBoxModel();
++    } else {
++      // Nothing to highlight (0px rectangle like a <script> tag for instance)
++      this._hide();
+     }
+   },
+ 
+   /**
+    * Hide the highlighter, the outline and the infobar.
+    */
+-  hide: function() {
+-    if (this.currentNode) {
+-      this._untrackMutations();
+-      this.currentNode = null;
+-      this._hideBoxModel();
+-      this._hideInfobar();
+-      this._detachPageListeners();
+-    }
+-    this.emit("hide");
++  _hide: function() {
++    this._untrackMutations();
++    this._hideBoxModel();
++    this._hideInfobar();
+   },
+ 
+   /**
+    * Hide the infobar
+    */
+   _hideInfobar: function() {
+     this.nodeInfo.positioner.setAttribute("hidden", "true");
+   },
+@@ -623,65 +701,50 @@ BoxModelHighlighter.prototype = {
+   /**
+    * Show the box model
+    */
+   _showBoxModel: function() {
+     this._svgRoot.removeAttribute("hidden");
+   },
+ 
+   /**
+-   * Highlight the box model.
++   * Update the box model as per the current node.
+    *
+    * @param {Object} options
+    *        Object used for passing options. Valid options are:
+    *          - region: "content", "padding", "border" or "margin." This specifies
+    *            the region that the guides should outline. Default is content.
+    * @return {boolean}
+-   *         True if the rectangle was highlighted, false otherwise.
++   *         True if the current node has a box model to be highlighted
+    */
+-  _highlightBoxModel: function(options) {
+-    let isShown = false;
+-
++  _updateBoxModel: function(options) {
+     options.region = options.region || "content";
+-
+     this.rect = this.layoutHelpers.getAdjustedQuads(this.currentNode, "margin");
+ 
+-    if (!this.rect) {
+-      return null;
++    if (!this.rect || (this.rect.bounds.width <= 0 && this.rect.bounds.height <= 0)) {
++      return false;
+     }
+ 
+-    if (this.rect.bounds.width > 0 && this.rect.bounds.height > 0) {
+-      for (let boxType in this._boxModelNodes) {
+-        let {p1, p2, p3, p4} = boxType === "margin" ? this.rect :
+-          this.layoutHelpers.getAdjustedQuads(this.currentNode, boxType);
++    for (let boxType in this._boxModelNodes) {
++      let {p1, p2, p3, p4} = boxType === "margin" ? this.rect :
++        this.layoutHelpers.getAdjustedQuads(this.currentNode, boxType);
+ 
+-        let boxNode = this._boxModelNodes[boxType];
+-        boxNode.setAttribute("points",
+-                             p1.x + "," + p1.y + " " +
+-                             p2.x + "," + p2.y + " " +
+-                             p3.x + "," + p3.y + " " +
+-                             p4.x + "," + p4.y);
++      let boxNode = this._boxModelNodes[boxType];
++      boxNode.setAttribute("points",
++                           p1.x + "," + p1.y + " " +
++                           p2.x + "," + p2.y + " " +
++                           p3.x + "," + p3.y + " " +
++                           p4.x + "," + p4.y);
+ 
+-        if (boxType === options.region) {
+-          this._showGuides(p1, p2, p3, p4);
+-        }
+-      }
+-
+-      isShown = true;
+-      this._showBoxModel();
+-    } else {
+-      // Only return false if the element really is invisible.
+-      // A height of 0 and a non-0 width corresponds to a visible element that
+-      // is below the fold for instance
+-      if (this.rect.width > 0 || this.rect.height > 0) {
+-        isShown = true;
+-        this._hideBoxModel();
++      if (boxType === options.region) {
++        this._showGuides(p1, p2, p3, p4);
+       }
+     }
+-    return isShown;
++
++    return true;
+   },
+ 
+   /**
+    * We only want to show guides for horizontal and vertical edges as this helps
+    * to line them up. This method finds these edges and displays a guide there.
+    *
+    * @param  {DOMPoint} p1
+    *                    Point 1
+@@ -761,41 +824,50 @@ BoxModelHighlighter.prototype = {
+   /**
+    * Update node information (tagName#id.class)
+    */
+   _updateInfobar: function() {
+     if (!this.currentNode) {
+       return;
+     }
+ 
+-    // Tag name
+-    this.nodeInfo.tagNameLabel.textContent = this.currentNode.tagName;
++    let node = this.currentNode;
++    let info = this.nodeInfo;
+ 
+-    // ID
+-    this.nodeInfo.idLabel.textContent = this.currentNode.id ? "#" + this.currentNode.id : "";
++    // Update the tag, id, classes, pseudo-classes and dimensions only if they
++    // changed to avoid triggering paint events
+ 
+-    // Classes
+-    let classes = this.nodeInfo.classesBox;
++    let tagName = node.tagName;
++    if (info.tagNameLabel.textContent !== tagName) {
++      info.tagNameLabel.textContent = tagName;
++    }
+ 
+-    classes.textContent = this.currentNode.classList.length ?
+-                            "." + Array.join(this.currentNode.classList, ".") : "";
++    let id = node.id ? "#" + node.id : "";
++    if (info.idLabel.textContent !== id) {
++      info.idLabel.textContent = id;
++    }
+ 
+-    // Pseudo-classes
++    let classList = node.classList.length ? "." + [...node.classList].join(".") : "";
++    if (info.classesBox.textContent !== classList) {
++      info.classesBox.textContent = classList;
++    }
++
+     let pseudos = PSEUDO_CLASSES.filter(pseudo => {
+-      return DOMUtils.hasPseudoClassLock(this.currentNode, pseudo);
+-    }, this);
++      return DOMUtils.hasPseudoClassLock(node, pseudo);
++    }, this).join("");
++    if (info.pseudoClassesBox.textContent !== pseudos) {
++      info.pseudoClassesBox.textContent = pseudos;
++    }
+ 
+-    let pseudoBox = this.nodeInfo.pseudoClassesBox;
+-    pseudoBox.textContent = pseudos.join("");
++    let rect = node.getBoundingClientRect();
++    let dim = Math.ceil(rect.width) + " x " + Math.ceil(rect.height);
++    if (info.dimensionBox.textContent !== dim) {
++      info.dimensionBox.textContent = dim;
++    }
+ 
+-    // Dimensions
+-    let dimensionBox = this.nodeInfo.dimensionBox;
+-    let rect = this.currentNode.getBoundingClientRect();
+-    dimensionBox.textContent = Math.ceil(rect.width) + " x " +
+-                               Math.ceil(rect.height);
+     this._moveInfobar();
+   },
+ 
+   /**
+    * Move the Infobar to the right place in the highlighter.
+    */
+   _moveInfobar: function() {
+     if (this.rect) {
+@@ -840,54 +912,183 @@ BoxModelHighlighter.prototype = {
+       }
+       this.nodeInfo.positioner.style.left = left + "px";
+     } else {
+       this.nodeInfo.positioner.style.left = "0";
+       this.nodeInfo.positioner.style.top = "0";
+       this.nodeInfo.positioner.setAttribute("position", "top");
+       this.nodeInfo.positioner.setAttribute("hide-arrow", "true");
+     }
++  }
++});
++
++/**
++ * The CssTransformHighlighter is the class that draws an outline around a
++ * transformed element and an outline around where it would be if untransformed
++ * as well as arrows connecting the 2 outlines' corners.
++ */
++function CssTransformHighlighter(tabActor, inspector) {
++  XULBasedHighlighter.call(this, tabActor, inspector);
++
++  this.layoutHelpers = new LayoutHelpers(tabActor.window);
++  this._initMarkup();
++}
++
++let MARKER_COUNTER = 1;
++
++CssTransformHighlighter.prototype = Heritage.extend(XULBasedHighlighter.prototype, {
++  _initMarkup: function() {
++    let stack = this.browser.parentNode;
++
++    this._container = this.chromeDoc.createElement("stack");
++    this._container.className = "highlighter-container";
++
++    this._svgRoot = this._createSVGNode("root", "svg", this._container);
++    this._svgRoot.setAttribute("hidden", "true");
++
++    // Add a marker tag to the svg root for the arrow tip
++    let marker = this.chromeDoc.createElementNS(SVG_NS, "marker");
++    this.markerId = "css-transform-arrow-marker-" + MARKER_COUNTER;
++    MARKER_COUNTER ++;
++    marker.setAttribute("id", this.markerId);
++    marker.setAttribute("markerWidth", "10");
++    marker.setAttribute("markerHeight", "5");
++    marker.setAttribute("orient", "auto");
++    marker.setAttribute("markerUnits", "strokeWidth");
++    marker.setAttribute("refX", "10");
++    marker.setAttribute("refY", "5");
++    marker.setAttribute("viewBox", "0 0 10 10");
++    let path = this.chromeDoc.createElementNS(SVG_NS, "path");
++    path.setAttribute("d", "M 0 0 L 10 5 L 0 10 z");
++    path.setAttribute("fill", "#08C");
++    marker.appendChild(path);
++    this._svgRoot.appendChild(marker);
++
++    // Create the 2 polygons (transformed and untransformed)
++    let shapesGroup = this._createSVGNode("container", "g", this._svgRoot);
++    this._shapes = {
++      untransformed: this._createSVGNode("untransformed", "polygon", shapesGroup),
++      transformed: this._createSVGNode("transformed", "polygon", shapesGroup)
++    };
++
++    // Create the arrows
++    for (let nb of ["1", "2", "3", "4"]) {
++      let line = this._createSVGNode("line", "line", shapesGroup);
++      line.setAttribute("marker-end", "url(#" + this.markerId + ")");
++      this._shapes["line" + nb] = line;
++    }
++
++    this._container.appendChild(this._svgRoot);
++
++    // Insert the highlighter right after the browser
++    stack.insertBefore(this._container, stack.childNodes[1]);
+   },
+ 
+-  _attachPageListeners: function() {
+-    if (this.currentNode) {
+-      let win = this.currentNode.ownerGlobal;
++  _createSVGNode: function(classPostfix, nodeType, parent) {
++    let node = this.chromeDoc.createElementNS(SVG_NS, nodeType);
++    node.setAttribute("class", "css-transform-" + classPostfix);
+ 
+-      win.addEventListener("scroll", this, false);
+-      win.addEventListener("resize", this, false);
+-      win.addEventListener("MozAfterPaint", this, false);
+-    }
++    parent.appendChild(node);
++    return node;
+   },
+ 
+-  _detachPageListeners: function() {
+-    if (this.currentNode) {
+-      let win = this.currentNode.ownerGlobal;
++  /**
++   * Destroy the nodes. Remove listeners.
++   */
++  destroy: function() {
++    XULBasedHighlighter.prototype.destroy.call(this);
+ 
+-      win.removeEventListener("scroll", this, false);
+-      win.removeEventListener("resize", this, false);
+-      win.removeEventListener("MozAfterPaint", this, false);
++    this._container.remove();
++    this._container = null;
++  },
++
++  /**
++   * Show the highlighter on a given node
++   * @param {DOMNode} node
++   */
++  _show: function() {
++    if (!this._isTransformed(this.currentNode)) {
++      this.hide();
++      return;
++    }
++
++    this._update();
++  },
++
++  /**
++   * Checks if the supplied node is transformed and not inline
++   */
++  _isTransformed: function(node) {
++    let style = node.ownerDocument.defaultView.getComputedStyle(node);
++    return style.transform !== "none" && style.display !== "inline";
++  },
++
++  _setPolygonPoints: function(quad, poly) {
++    let points = [];
++    for (let point of ["p1","p2", "p3", "p4"]) {
++      points.push(quad[point].x + "," + quad[point].y);
++    }
++    poly.setAttribute("points", points.join(" "));
++  },
++
++  _setLinePoints: function(p1, p2, line) {
++    line.setAttribute("x1", p1.x);
++    line.setAttribute("y1", p1.y);
++    line.setAttribute("x2", p2.x);
++    line.setAttribute("y2", p2.y);
++
++    let dist = Math.sqrt(Math.pow(p2.x - p1.x, 2) + Math.pow(p2.y - p1.y, 2));
++    if (dist < ARROW_LINE_MIN_DISTANCE) {
++      line.removeAttribute("marker-end");
++    } else {
++      line.setAttribute("marker-end", "url(#" + this.markerId + ")");
+     }
+   },
+ 
+   /**
+-   * Generic event handler.
+-   *
+-   * @param nsIDOMEvent aEvent
+-   *        The DOM event object.
++   * Update the highlighter on the current highlighted node (the one that was
++   * passed as an argument to show(node)).
++   * Should be called whenever node size or attributes change
+    */
+-  handleEvent: function(event) {
+-    switch (event.type) {
+-      case "resize":
+-      case "MozAfterPaint":
+-      case "scroll":
+-        this._update();
+-        break;
++  _update: function() {
++    // Getting the points for the transformed shape
++    let quad = this.layoutHelpers.getAdjustedQuads(this.currentNode, "border");
++    if (!quad || quad.bounds.width <= 0 || quad.bounds.height <= 0) {
++      this._hideShapes();
++      return null;
+     }
++
++    // Getting the points for the untransformed shape
++    let untransformedQuad = this.layoutHelpers.getNodeBounds(this.currentNode);
++
++    this._setPolygonPoints(quad, this._shapes.transformed);
++    this._setPolygonPoints(untransformedQuad, this._shapes.untransformed);
++    for (let nb of ["1", "2", "3", "4"]) {
++      this._setLinePoints(untransformedQuad["p" + nb], quad["p" + nb],
++        this._shapes["line" + nb]);
++    }
++
++    this._showShapes();
+   },
+-};
++
++  /**
++   * Hide the highlighter, the outline and the infobar.
++   */
++  _hide: function() {
++    this._hideShapes();
++  },
++
++  _hideShapes: function() {
++    this._svgRoot.setAttribute("hidden", "true");
++  },
++
++  _showShapes: function() {
++    this._svgRoot.removeAttribute("hidden");
++  }
++});
+ 
+ /**
+  * The SimpleOutlineHighlighter is a class that has the same API than the
+  * BoxModelHighlighter, but adds a pseudo-class on the target element itself
+  * to draw a simple outline.
+  * It is used by the HighlighterActor too, but in case the more complex
+  * BoxModelHighlighter can't be attached (which is the case for FirefoxOS and
+  * Fennec targets for instance).
+@@ -955,30 +1156,31 @@ SimpleOutlineHighlighter.prototype = {
+ function supportXULBasedHighlighter(tabActor) {
+   // Note that <browser>s on Fennec also have a XUL parentNode but the box
+   // model highlighter doesn't display correctly on Fennec (bug 993190)
+   return tabActor.browser &&
+          !!tabActor.browser.parentNode &&
+          Services.appinfo.ID !== "{aa3c5121-dab2-40e2-81ca-7ea25febc110}";
+ }
+ 
+-function isNodeValidForHighlighting(node) {
++function isNodeValid(node) {
+   // Is it null or dead?
+-  let isNotDead = node && !Cu.isDeadWrapper(node);
+-
+-  // Is it connected to the document?
+-  let isConnected = false;
+-  try {
+-    let doc = node.ownerDocument;
+-    isConnected = (doc && doc.defaultView && doc.documentElement.contains(node));
+-  } catch (e) {
+-    // "can't access dead object" error
++  if(!node || Cu.isDeadWrapper(node)) {
++    return false;
+   }
+ 
+   // Is it an element node
+-  let isElementNode = node.nodeType === Ci.nsIDOMNode.ELEMENT_NODE;
++  if (node.nodeType !== Ci.nsIDOMNode.ELEMENT_NODE) {
++    return false;
++  }
+ 
+-  return isNotDead && isConnected && isElementNode;
++  // Is it connected to the document?
++  let doc = node.ownerDocument;
++  if (!doc || !doc.defaultView || !doc.documentElement.contains(node)) {
++    return false;
++  }
++
++  return true;
+ }
+ 
+ XPCOMUtils.defineLazyGetter(this, "DOMUtils", function () {
+   return Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils)
+ });
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -56,18 +56,21 @@ const protocol = require("devtools/serve
+ const {Arg, Option, method, RetVal, types} = protocol;
+ const {LongStringActor, ShortLongString} = require("devtools/server/actors/string");
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const object = require("sdk/util/object");
+ const events = require("sdk/event/core");
+ const {Unknown} = require("sdk/platform/xpcom");
+ const {Class} = require("sdk/core/heritage");
+ const {PageStyleActor} = require("devtools/server/actors/styles");
+-const {HighlighterActor,
+-  CustomHighlighterActor} = require("devtools/server/actors/highlighter");
++const {
++  HighlighterActor,
++  CustomHighlighterActor,
++  HIGHLIGHTER_CLASSES
++} = require("devtools/server/actors/highlighter");
+ const {getLayoutChangesObserver, releaseLayoutChangesObserver} =
+   require("devtools/server/actors/layout");
+ 
+ const FONT_FAMILY_PREVIEW_TEXT = "The quick brown fox jumps over the lazy dog";
+ const FONT_FAMILY_PREVIEW_TEXT_SIZE = 20;
+ const PSEUDO_CLASSES = [":hover", ":active", ":focus"];
+ const HIDDEN_CLASS = "__fx-devtools-hide-shortcut__";
+ const XHTML_NS = "http://www.w3.org/1999/xhtml";
+@@ -2636,26 +2639,31 @@ var InspectorActor = protocol.ActorClass
+   /**
+    * If consumers need to display several highlighters at the same time or
+    * different types of highlighters, then this method should be used, passing
+    * the type name of the highlighter needed as argument.
+    * A new instance will be created everytime the method is called, so it's up
+    * to the consumer to release it when it is not needed anymore
+    *
+    * @param {String} type The type of highlighter to create
+-   * @return {Highlighter}
++   * @return {Highlighter} The highlighter actor instance or null if the
++   * typeName passed doesn't match any available highlighter
+    */
+   getHighlighterByType: method(function (typeName) {
+-    return CustomHighlighterActor(this, typeName);
++    if (HIGHLIGHTER_CLASSES[typeName]) {
++      return CustomHighlighterActor(this, typeName);
++    } else {
++      return null;
++    }
+   }, {
+     request: {
+       typeName: Arg(0)
+     },
+     response: {
+-      highlighter: RetVal("customhighlighter")
++      highlighter: RetVal("nullable:customhighlighter")
+     }
+   }),
+ 
+   /**
+    * Get the node's image data if any (for canvas and img nodes).
+    * Returns an imageData object with the actual data being a LongStringActor
+    * and a size json object.
+    * The image data is transmitted as a base64 encoded png data-uri.
+diff --git a/toolkit/devtools/server/actors/root.js b/toolkit/devtools/server/actors/root.js
+--- a/toolkit/devtools/server/actors/root.js
++++ b/toolkit/devtools/server/actors/root.js
+@@ -99,16 +99,22 @@ RootActor.prototype = {
+   applicationType: "browser",
+ 
+   traits: {
+     sources: true,
+     editOuterHTML: true,
+     // Whether the server-side highlighter actor exists and can be used to
+     // remotely highlight nodes (see server/actors/highlighter.js)
+     highlightable: true,
++    // Which custom highlighter does the server-side highlighter actor supports?
++    // (see server/actors/highlighter.js)
++    customHighlighters: [
++      "BoxModelHighlighter",
++      "CssTransformHighlighter"
++    ],
+     // Whether the inspector actor implements the getImageDataFromURL
+     // method that returns data-uris for image URLs. This is used for image
+     // tooltips for instance
+     urlToImageDataResolver: true,
+     networkMonitor: true,
+     // Whether the storage inspector actor to inspect cookies, etc.
+     storageInspector: true,
+     // Whether storage inspector is read only
+diff --git a/toolkit/devtools/server/tests/mochitest/chrome.ini b/toolkit/devtools/server/tests/mochitest/chrome.ini
+--- a/toolkit/devtools/server/tests/mochitest/chrome.ini
++++ b/toolkit/devtools/server/tests/mochitest/chrome.ini
+@@ -18,16 +18,19 @@ support-files =
+ [test_Debugger.Script.prototype.global.html]
+ [test_connection-manager.html]
+ [test_css-logic.html]
+ [test_device.html]
+ [test_framerate_01.html]
+ [test_framerate_02.html]
+ [test_framerate_03.html]
+ [test_framerate_04.html]
++[test_highlighter-csstransform_01.html]
++[test_highlighter-csstransform_02.html]
++[test_highlighter-csstransform_03.html]
+ [test_inspector-changeattrs.html]
+ [test_inspector-changevalue.html]
+ [test_inspector-hide.html]
+ [test_inspector-insert.html]
+ [test_inspector-mutations-attr.html]
+ [test_inspector-mutations-childlist.html]
+ [test_inspector-mutations-frameload.html]
+ [test_inspector-mutations-value.html]
+diff --git a/toolkit/devtools/server/tests/mochitest/test_highlighter-csstransform_01.html b/toolkit/devtools/server/tests/mochitest/test_highlighter-csstransform_01.html
+new file mode 100644
+--- /dev/null
++++ b/toolkit/devtools/server/tests/mochitest/test_highlighter-csstransform_01.html
+@@ -0,0 +1,113 @@
++<!DOCTYPE HTML>
++<html>
++<!--
++Bug 1014547 - CSS transforms highlighter
++Test the high level API of the highlighters
++-->
++<head>
++  <meta charset="utf-8">
++  <title>Framerate actor test</title>
++  <script type="application/javascript" src="chrome://mochikit/content/tests/SimpleTest/SimpleTest.js"></script>
++  <link rel="stylesheet" type="text/css" href="chrome://mochikit/content/tests/SimpleTest/test.css">
++</head>
++<body>
++<pre id="test">
++<script type="application/javascript;version=1.8">
++
++window.onload = function() {
++  var Cu = Components.utils;
++  var Cc = Components.classes;
++  var Ci = Components.interfaces;
++
++  Cu.import("resource://gre/modules/Services.jsm");
++  Cu.import("resource://gre/modules/devtools/Loader.jsm");
++  Cu.import("resource://gre/modules/devtools/dbg-client.jsm");
++  Cu.import("resource://gre/modules/devtools/dbg-server.jsm");
++  Cu.import("resource://gre/modules/Task.jsm");
++
++  SimpleTest.waitForExplicitFinish();
++
++  var {InspectorFront} = devtools.require("devtools/server/actors/inspector");
++
++  DebuggerServer.init(() => true);
++  DebuggerServer.addBrowserActors();
++
++  var client = new DebuggerClient(DebuggerServer.connectPipe());
++  client.connect(() => {
++    client.listTabs(response => {
++      var form = response.tabs[response.selected];
++      var front = InspectorFront(client, form);
++
++      Task.spawn(function*() {
++        yield onlyOneInstanceOfMainHighlighter(front);
++        yield manyInstancesOfCustomHighlighters(front);
++        yield showHideMethodsAreAvailable(front);
++        yield unknownHighlighterTypeShouldntBeAccepted(front);
++        yield rootActorTraitsShouldContainKnownTypes(client);
++      }).then(null, ok.bind(null, false)).then(() => {
++        client.close(() => {
++          DebuggerServer.destroy();
++          SimpleTest.finish();
++        });
++      });
++    });
++  });
++
++  function* onlyOneInstanceOfMainHighlighter(inspectorFront) {
++    info("Check that the inspector always sends back the same main highlighter");
++
++    let h1 = yield inspectorFront.getHighlighter(false);
++    let h2 = yield inspectorFront.getHighlighter(false);
++    is(h1, h2, "The same highlighter front was returned");
++
++    is(h1.typeName, "highlighter", "The right front type was returned");
++  }
++
++  function* manyInstancesOfCustomHighlighters(inspectorFront) {
++    let h1 = yield inspectorFront.getHighlighterByType("BoxModelHighlighter");
++    let h2 = yield inspectorFront.getHighlighterByType("BoxModelHighlighter");
++    ok(h1 !== h2, "getHighlighterByType returns new instances every time (1)");
++
++    let h3 = yield inspectorFront.getHighlighterByType("CssTransformHighlighter");
++    let h4 = yield inspectorFront.getHighlighterByType("CssTransformHighlighter");
++    ok(h3 !== h4, "getHighlighterByType returns new instances every time (2)");
++    ok(h3 !== h1 && h3 !== h2,
++      "getHighlighterByType returns new instances every time (3)");
++    ok(h4 !== h1 && h4 !== h2,
++      "getHighlighterByType returns new instances every time (4)");
++
++    yield h1.finalize();
++    yield h2.finalize();
++    yield h3.finalize();
++    yield h4.finalize();
++  }
++
++  function* showHideMethodsAreAvailable(inspectorFront) {
++    let h1 = yield inspectorFront.getHighlighterByType("BoxModelHighlighter");
++    let h2 = yield inspectorFront.getHighlighterByType("CssTransformHighlighter");
++
++    ok("show" in h1, "Show method is present on the front API");
++    ok("show" in h2, "Show method is present on the front API");
++    ok("hide" in h1, "Hide method is present on the front API");
++    ok("hide" in h2, "Hide method is present on the front API");
++
++    yield h1.finalize();
++    yield h2.finalize();
++  }
++
++  function* unknownHighlighterTypeShouldntBeAccepted(inspectorFront) {
++    let h = yield inspectorFront.getHighlighterByType("whatever");
++    ok(!h, "No highlighter was returned for the invalid type");
++  }
++
++  function* rootActorTraitsShouldContainKnownTypes(client) {
++    ok(client.traits.customHighlighters.indexOf("BoxModelHighlighter") !== -1,
++      "The root actor's trait contains BoxModelHighlighter as a known type");
++    ok(client.traits.customHighlighters.indexOf("CssTransformHighlighter") !== -1,
++      "The root actor's trait contains CssTransformHighlighter as a known type");
++  }
++}
++</script>
++</pre>
++</body>
++</html>
+diff --git a/toolkit/devtools/server/tests/mochitest/test_highlighter-csstransform_02.html b/toolkit/devtools/server/tests/mochitest/test_highlighter-csstransform_02.html
+new file mode 100644
+--- /dev/null
++++ b/toolkit/devtools/server/tests/mochitest/test_highlighter-csstransform_02.html
+@@ -0,0 +1,156 @@
++<!DOCTYPE HTML>
++<html>
++<!--
++Bug 1014547 - CSS transforms highlighter
++Test the creation of the SVG highlighter elements in the browser
++-->
++<head>
++  <meta charset="utf-8">
++  <title>Framerate actor test</title>
++  <script type="application/javascript" src="chrome://mochikit/content/tests/SimpleTest/SimpleTest.js"></script>
++  <link rel="stylesheet" type="text/css" href="chrome://mochikit/content/tests/SimpleTest/test.css">
++</head>
++<body>
++  <div id="transformed" style="border:1px solid red;width:100px;height:100px;transform:skew(13deg);"></div>
++  <div id="untransformed" style="border:1px solid blue;width:100px;height:100px;"></div>
++  <span id="inline" style="transform:rotate(90deg);">this is an inline transformed element</span>
++<pre id="test">
++<script type="application/javascript;version=1.8">
++
++window.onload = function() {
++  var Cu = Components.utils;
++  var Cc = Components.classes;
++  var Ci = Components.interfaces;
++
++  Cu.import("resource://gre/modules/Services.jsm");
++  Cu.import("resource://gre/modules/devtools/Loader.jsm");
++  Cu.import("resource://gre/modules/devtools/dbg-client.jsm");
++  Cu.import("resource://gre/modules/devtools/dbg-server.jsm");
++  Cu.import("resource://gre/modules/Task.jsm");
++  const promise = Cu.import("resource://gre/modules/Promise.jsm", {}).Promise;
++
++  SimpleTest.waitForExplicitFinish();
++
++  var {InspectorFront} = devtools.require("devtools/server/actors/inspector");
++
++  DebuggerServer.init(() => true);
++  DebuggerServer.addBrowserActors();
++
++  var client = new DebuggerClient(DebuggerServer.connectPipe());
++  client.connect(() => {
++    client.listTabs(response => {
++      var form = response.tabs[response.selected];
++      var front = InspectorFront(client, form);
++
++      Task.spawn(function*() {
++        let walkerFront = yield front.getWalker();
++        let highlighterFront = yield front.getHighlighterByType(
++          "CssTransformHighlighter");
++
++        let gBrowser = Services.wm.getMostRecentWindow("navigator:browser").gBrowser;
++        let container =
++          gBrowser.selectedBrowser.parentNode.querySelector(".highlighter-container");
++        ok(container, "The highlighter container was found");
++
++        yield isHiddenByDefault(container);
++        yield has2PolygonsAnd4Lines(container);
++        yield isNotShownForUntransformed(highlighterFront, walkerFront, container);
++        yield isNotShownForInline(highlighterFront, walkerFront, container);
++        yield isVisibleWhenShown(highlighterFront, walkerFront, container);
++        yield linesLinkThePolygons(highlighterFront, walkerFront, container);
++
++        yield highlighterFront.finalize();
++      }).then(null, ok.bind(null, false)).then(() => {
++        client.close(() => {
++          DebuggerServer.destroy();
++          SimpleTest.finish();
++        });
++      });
++    });
++  });
++
++  function* isHiddenByDefault(container) {
++    let svg = container.querySelector("svg");
++    ok(svg.hasAttribute("hidden"), "The highlighter is hidden by default");
++  }
++
++  function* has2PolygonsAnd4Lines(container) {
++    is(container.querySelectorAll("polygon").length, 2, "Found 2 polygons");
++    is(container.querySelectorAll("line").length, 4, "Found 4 lines");
++  }
++
++  function* isNotShownForUntransformed(highlighterFront, walkerFront, container) {
++    let rawNode = document.getElementById("untransformed");
++    let node = walkerFront.frontForRawNode(rawNode);
++
++    info("Asking to show the highlighter on the untransformed test node");
++    yield highlighterFront.show(node);
++    let svg = container.querySelector("svg");
++    ok(svg.hasAttribute("hidden"), "The highlighter is still hidden");
++  }
++
++  function* isNotShownForInline(highlighterFront, walkerFront, container) {
++    let rawNode = document.getElementById("inline");
++    let node = walkerFront.frontForRawNode(rawNode);
++
++    info("Asking to show the highlighter on the inline test node");
++    yield highlighterFront.show(node);
++    let svg = container.querySelector("svg");
++    ok(svg.hasAttribute("hidden"), "The highlighter is still hidden");
++  }
++
++  function* isVisibleWhenShown(highlighterFront, walkerFront, container) {
++    let rawNode = document.getElementById("transformed");
++    let node = walkerFront.frontForRawNode(rawNode);
++
++    info("Asking to show the highlighter on the test node");
++    yield highlighterFront.show(node);
++    let svg = container.querySelector("svg");
++    ok(!svg.hasAttribute("hidden"), "The highlighter is visible");
++
++    info("Hiding the highlighter");
++    yield highlighterFront.hide();
++    ok(svg.hasAttribute("hidden"), "The highlighter is hidden");
++  }
++
++  function* linesLinkThePolygons(highlighterFront, walkerFront, container) {
++    let rawNode = document.getElementById("transformed");
++    let node = walkerFront.frontForRawNode(rawNode);
++
++    info("Showing the highlighter on the transformed node");
++    yield highlighterFront.show(node);
++
++    info("Checking that the 4 lines do link the 2 shape's corners");
++    let lines = [...container.querySelectorAll("line")];
++
++    let polygon1 = container.querySelector(".css-transform-untransformed");
++    let points1 = polygon1.getAttribute("points").split(" ");
++
++    let polygon2 = container.querySelector(".css-transform-transformed");
++    let points2 = polygon2.getAttribute("points").split(" ");
++
++    for (let i = 0; i < lines.length; i++) {
++      info("Checking line nb " + i);
++      let line = lines[i];
++
++      let p1 = points1[i].split(",");
++      let x1 = line.getAttribute("x1");
++      let y1 = line.getAttribute("y1");
++      is(p1[0], x1, "line " + i + "'s first point matches the untransformed x coordinate");
++      is(p1[1], y1, "line " + i + "'s first point matches the untransformed y coordinate");
++
++      let p2 = points2[i].split(",");
++      let x2 = line.getAttribute("x2");
++      let y2 = line.getAttribute("y2");
++      is(p2[0], x2, "line " + i + "'s first point matches the transformed x coordinate");
++      is(p2[1], y2, "line " + i + "'s first point matches the transformed y coordinate");
++    }
++
++    yield highlighterFront.hide();
++  }
++
++}
++</script>
++</pre>
++</body>
++</html>
+diff --git a/toolkit/devtools/server/tests/mochitest/test_highlighter-csstransform_03.html b/toolkit/devtools/server/tests/mochitest/test_highlighter-csstransform_03.html
+new file mode 100644
+--- /dev/null
++++ b/toolkit/devtools/server/tests/mochitest/test_highlighter-csstransform_03.html
+@@ -0,0 +1,119 @@
++<!DOCTYPE HTML>
++<html>
++<!--
++Bug 1014547 - CSS transforms highlighter
++Test that the highlighter elements created have the right size and coordinates.
++
++Note that instead of hard-coding values here, the assertions are made by
++comparing with the result of LayoutHelpers.getAdjustedQuads.
++
++There's a separate test for checking that getAdjustedQuads actually returns
++sensible values
++(browser/devtools/shared/test/browser_layoutHelpers-getBoxQuads.js),
++so the present test doesn't care about that, it just verifies that the css
++transform highlighter applies those values correctly to the SVG elements
++-->
++<head>
++  <meta charset="utf-8">
++  <title>Framerate actor test</title>
++  <script type="application/javascript" src="chrome://mochikit/content/tests/SimpleTest/SimpleTest.js"></script>
++  <link rel="stylesheet" type="text/css" href="chrome://mochikit/content/tests/SimpleTest/test.css">
++  <style type="text/css">
++    #test-node {
++      position: absolute;
++      top: 0;
++      left: 0;
++
++      width: 300px;
++      height: 300px;
++
++      transform: rotate(90deg) skew(13deg) scale(.8) translateX(50px);
++      transform-origin: 50%;
++
++      background: linear-gradient(green, yellow);
++    }
++  </style>
++</head>
++<body>
++  <div id="test-node"></div>
++<pre id="test">
++<script type="application/javascript;version=1.8">
++
++window.onload = function() {
++  var Cu = Components.utils;
++  var Cc = Components.classes;
++  var Ci = Components.interfaces;
++
++  Cu.import("resource://gre/modules/Services.jsm");
++  Cu.import("resource://gre/modules/devtools/Loader.jsm");
++  Cu.import("resource://gre/modules/devtools/dbg-client.jsm");
++  Cu.import("resource://gre/modules/devtools/dbg-server.jsm");
++  Cu.import("resource://gre/modules/devtools/LayoutHelpers.jsm");
++  Cu.import("resource://gre/modules/Task.jsm");
++  const promise = Cu.import("resource://gre/modules/Promise.jsm", {}).Promise;
++
++  SimpleTest.waitForExplicitFinish();
++
++  var {InspectorFront} = devtools.require("devtools/server/actors/inspector");
++
++  DebuggerServer.init(() => true);
++  DebuggerServer.addBrowserActors();
++
++  var client = new DebuggerClient(DebuggerServer.connectPipe());
++  client.connect(() => {
++    client.listTabs(response => {
++      var form = response.tabs[response.selected];
++      var front = InspectorFront(client, form);
++
++      Task.spawn(function*() {
++        let walker = yield front.getWalker();
++        let highlighter = yield front.getHighlighterByType(
++          "CssTransformHighlighter");
++
++        let browser = Services.wm.getMostRecentWindow("navigator:browser")
++          .gBrowser.selectedBrowser;
++
++        let container = browser.parentNode.querySelector(".highlighter-container");
++
++        let node = document.querySelector("#test-node");
++        let helper = new LayoutHelpers(browser.docShell
++          .QueryInterface(Ci.nsIInterfaceRequestor).getInterface(Ci.nsIDOMWindow));
++
++        info("Displaying the transform highlighter on test node " +
++          node.tagName);
++        yield highlighter.show(walker.frontForRawNode(node));
++
++        let expected = helper.getAdjustedQuads(node, "border");
++        let polygon = container.querySelector(".css-transform-transformed");
++        let polygonPoints = polygon.getAttribute("points").split(" ").map(p => {
++          return {
++            x: +p.substring(0, p.indexOf(",")),
++            y: +p.substring(p.indexOf(",")+1)
++          };
++        });
++
++        for (let i = 1; i < 5; i ++) {
++          is(polygonPoints[i - 1].x, expected["p" + i].x,
++            "p" + i + " x coordinate is correct");
++          is(polygonPoints[i - 1].y, expected["p" + i].y,
++            "p" + i + " y coordinate is correct");
++        }
++
++        info("Hiding the transform highlighter");
++        yield highlighter.hide();
++
++        yield highlighter.finalize();
++      }).then(null, ok.bind(null, false)).then(() => {
++        client.close(() => {
++          DebuggerServer.destroy();
++          SimpleTest.finish();
++        });
++      });
++    });
++  });
++
++}
++</script>
++</pre>
++</body>
++</html>
