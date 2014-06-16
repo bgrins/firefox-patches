@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent d26c54bb8c631dd5fb7b9be5ff37363bb03308c1
+# Parent 3cc0b4b7911d583ab5ae66272ad5aac8905cff12
 # User Brian Grinstead <bgrinstead@mozilla.com>
 pairing with project editor
 
@@ -139,11 +139,60 @@ diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.
  
    FileUtils.getFile("TmpD", ["ProjectEditor", "img", "fake.png"]).createUnique(Components.interfaces.nsIFile.NORMAL_FILE_TYPE, FileUtils.PERMS_FILE);
    FileUtils.getFile("TmpD", ["ProjectEditor", "img", "icons", "16x16.png"]).createUnique(Components.interfaces.nsIFile.NORMAL_FILE_TYPE, FileUtils.PERMS_FILE);
+diff --git a/browser/devtools/projecteditor/lib/editors.js b/browser/devtools/projecteditor/lib/editors.js
+--- a/browser/devtools/projecteditor/lib/editors.js
++++ b/browser/devtools/projecteditor/lib/editors.js
+@@ -142,20 +142,20 @@ var TextEditor = Class({
+       lineNumbers: true,
+       extraKeys: this.extraKeys,
+       themeSwitching: false,
+       autocomplete: true
+     });
+ 
+     // Trigger editor specific events on `this`
+     this.editor.on("change", (...args) => {
+-      this.emit("change", ...args);
++      this.emit("change", this.editor.getText());
+     });
+     this.editor.on("cursorActivity", (...args) => {
+-      this.emit("cursorActivity", ...args);
++      this.emit("cursorActivity", this.editor.getText());
+     });
+ 
+     this.appended = this.editor.appendTo(this.elt);
+     this.appended.then(() => {
+       if (this.editor) {
+         this.editor.setupAutoCompletion();
+       }
+     });
+@@ -197,19 +197,20 @@ var TextEditor = Class({
+    *
+    * @param Resource resource
+    *        The single file / item to be saved
+    * @returns Promise
+    *          A promise that is resolved once the resource has been
+    *          saved.
+    */
+   save: function(resource) {
+-    return resource.save(this.editor.getText()).then(() => {
++    let text = this.editor.getText();
++    return resource.save(text).then(() => {
+       this.editor.setClean();
+-      this.emit("save", resource);
++      this.emit("save", text);
+     });
+   },
+ 
+   /**
+    * Give focus to the code editor.
+    *
+    * @returns Promise
+    *          A promise that is resolved once the editor has been focused.
 diff --git a/browser/devtools/projecteditor/lib/plugins/pairing/pairing.js b/browser/devtools/projecteditor/lib/plugins/pairing/pairing.js
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/projecteditor/lib/plugins/pairing/pairing.js
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,93 @@
 +/* -*- Mode: Javascript; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
@@ -162,10 +211,24 @@ new file mode 100644
 +  extends: Plugin,
 +
 +  init: function() {
-+    console.log("PAIRING INIT");
 +    this._onStyleSheetsCleared = this._onStyleSheetsCleared.bind(this);
 +    this._onNavigate = this._onNavigate.bind(this);
 +    this.resourceMap = new ResourceMap(this.host);
++  },
++
++  onEditorSave: function(host, resource, text) {
++    this.updatePageAssetsForResource(resource, text);
++  },
++  onEditorChange: function(host, resource, text) {
++    this.updatePageAssetsForResource(resource, text);
++  },
++  updatePageAssetsForResource: function (resource, text) {
++    let assets = this.resourceMap.getPageAssetsForResource(resource);
++    if (assets) {
++      assets.forEach(asset => {
++        asset.update(text, false);
++      });
++    }
 +  },
 +
 +  get target() {
@@ -227,7 +290,7 @@ diff --git a/browser/devtools/projecteditor/lib/plugins/pairing/resource-map.js 
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/projecteditor/lib/plugins/pairing/resource-map.js
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,285 @@
 +const { Class } = require("sdk/core/heritage");
 +const { emit } = require("sdk/event/core");
 +const { EventTarget } = require("sdk/event/target");
@@ -260,6 +323,9 @@ new file mode 100644
 +  },
 +  allResources: function() {
 +    return this.host.project.allResources();
++  },
++  getPageAssetsForResource: function(resource) {
++    return this.map.get(resource);
 +  },
 +
 +  setSheets: function(styleSheets) {
@@ -318,13 +384,16 @@ new file mode 100644
 +    console.log("foo",this.styleSheetMap, this.styleSheetMap.size,this.styleSheets);
 +
 +    let needUpdate = false;
-+    for (let stylesheet of this.styleSheetMap.keys()) {
-+      let resource = this._findBestResource(stylesheet);
++    for (let [path,stylesheet] of this.styleSheetMap.entries()) {
++      let resource = this._findBestResource(path);
 +      if (resource) {
-+        if (this.map.get(resource) !== stylesheet) {
-+          needUpdate = true;
++        if (!this.map.get(resource)) {
++          this.map.set(resource, [stylesheet]);
 +        }
-+        this.map.set(resource, stylesheet);
++        if (this.map.get(resource).indexOf(stylesheet) === -1) {
++          needUpdate = true;
++          this.map.get(resource).push(stylesheet);
++        }
 +      }
 +    }
 +
@@ -569,3 +638,27 @@ diff --git a/browser/devtools/projecteditor/lib/projecteditor.js b/browser/devto
    openResource: function(resource) {
      this.shells.open(resource);
      this.projectTree.selectResource(resource);
+diff --git a/toolkit/devtools/server/actors/stylesheets.js b/toolkit/devtools/server/actors/stylesheets.js
+--- a/toolkit/devtools/server/actors/stylesheets.js
++++ b/toolkit/devtools/server/actors/stylesheets.js
+@@ -955,16 +955,20 @@ let StyleSheetActor = protocol.ActorClas
+    */
+   _onTransitionEnd: function()
+   {
+     if (--this._transitionRefCount == 0) {
+       this.document.documentElement.classList.remove(TRANSITION_CLASS);
+       this.rawSheet.deleteRule(this.rawSheet.cssRules.length - 1);
+     }
+ 
++    this._notifyStyleApplied();
++  },
++
++  _notifyStyleApplied: function() {
+     events.emit(this, "style-applied");
+   }
+ })
+ 
+ /**
+  * Find the line/column for a rule.
+  * This is like DOMUtils.getRule[Line|Column] except for inline <style> sheets,
+  * the line number returned here is relative to the <style> tag rather than the
