@@ -1,6 +1,468 @@
 # HG changeset patch
-# Parent 5be519918f6509c7fe92e511fae3fc00c72bfdeb
+# Parent 6e4e98a7485d0baa8bfe7eb6e3e2cc265e3e1472
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 1026479 - Add a unified search across all tools in the toolbox
 
-
+diff --git a/browser/devtools/debugger/debugger-panes.js b/browser/devtools/debugger/debugger-panes.js
+--- a/browser/devtools/debugger/debugger-panes.js
++++ b/browser/devtools/debugger/debugger-panes.js
+@@ -2801,17 +2801,17 @@ GlobalSearchView.prototype = Heritage.ex
+       }
+     }
+ 
+     // Rebuild the results, then signal if there are any matches.
+     if (globalResults.matchCount) {
+       this.hidden = false;
+       this._currentlyFocusedMatch = -1;
+       this._createGlobalResultsUI(globalResults);
+-      window.emit(EVENTS.GLOBAL_SEARCH_MATCH_FOUND);
++      window.emit(EVENTS.GLOBAL_SEARCH_MATCH_FOUND, globalResults);
+     } else {
+       window.emit(EVENTS.GLOBAL_SEARCH_MATCH_NOT_FOUND);
+     }
+   },
+ 
+   /**
+    * Creates global search results entries and adds them to this container.
+    *
+diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/toolbox.js
+--- a/browser/devtools/framework/toolbox.js
++++ b/browser/devtools/framework/toolbox.js
+@@ -62,22 +62,23 @@ loader.lazyGetter(this, "InspectorFront"
+ function Toolbox(target, selectedTool, hostType, hostOptions) {
+   this._target = target;
+   this._toolPanels = new Map();
+   this._telemetry = new Telemetry();
+ 
+   this._toolRegistered = this._toolRegistered.bind(this);
+   this._toolUnregistered = this._toolUnregistered.bind(this);
+   this._refreshHostTitle = this._refreshHostTitle.bind(this);
+-  this._splitConsoleOnKeypress = this._splitConsoleOnKeypress.bind(this)
++  this._onDocKeypress = this._onDocKeypress.bind(this)
+   this.destroy = this.destroy.bind(this);
+   this.highlighterUtils = getHighlighterUtils(this);
+   this._highlighterReady = this._highlighterReady.bind(this);
+   this._highlighterHidden = this._highlighterHidden.bind(this);
+ 
++  this._finding = false;
+   this._target.on("close", this.destroy);
+ 
+   if (!hostType) {
+     hostType = Services.prefs.getCharPref(this._prefs.LAST_HOST);
+   }
+   if (!selectedTool) {
+     selectedTool = Services.prefs.getCharPref(this._prefs.LAST_TOOL);
+   }
+@@ -244,16 +245,17 @@ Toolbox.prototype = {
+         this._buildDockButtons();
+         this._buildOptions();
+         this._buildTabs();
+         let buttonsPromise = this._buildButtons();
+         this._addKeysToWindow();
+         this._addReloadKeys();
+         this._addToolSwitchingKeys();
+         this._addZoomKeys();
++        this._addFindKeys();
+         this._loadInitialZoom();
+ 
+         this._telemetry.toolOpened("toolbox");
+ 
+         this.selectTool(this._defaultToolId).then(panel => {
+           buttonsPromise.then(() => {
+             this.emit("ready");
+             deferred.resolve();
+@@ -285,19 +287,21 @@ Toolbox.prototype = {
+       let tab = this.target.tab;
+       let browserWindow = tab.ownerDocument.defaultView;
+       let responsiveUIManager = browserWindow.ResponsiveUI.ResponsiveUIManager;
+       responsiveModeActive = responsiveUIManager.isActiveForTab(tab);
+     }
+     return responsiveModeActive;
+   },
+ 
+-  _splitConsoleOnKeypress: function(e) {
++  _onDocKeypress: function(e) {
+     let responsiveModeActive = this._isResponsiveModeActive();
+-    if (e.keyCode === e.DOM_VK_ESCAPE && !responsiveModeActive) {
++    if (e.keyCode === e.DOM_VK_ESCAPE && this._finding) {
++      this.endFindAll();
++    } else if (e.keyCode === e.DOM_VK_ESCAPE && !responsiveModeActive) {
+       this.toggleSplitConsole();
+     }
+   },
+ 
+   _addReloadKeys: function() {
+     [
+       ["toolbox-reload-key", false],
+       ["toolbox-reload-key2", false],
+@@ -313,17 +317,17 @@ Toolbox.prototype = {
+   _addToolSwitchingKeys: function() {
+     let nextKey = this.doc.getElementById("toolbox-next-tool-key");
+     nextKey.addEventListener("command", this.selectNextTool.bind(this), true);
+     let prevKey = this.doc.getElementById("toolbox-previous-tool-key");
+     prevKey.addEventListener("command", this.selectPreviousTool.bind(this), true);
+ 
+     // Split console uses keypress instead of command so the event can be
+     // cancelled with stopPropagation on the keypress, and not preventDefault.
+-    this.doc.addEventListener("keypress", this._splitConsoleOnKeypress, false);
++    this.doc.addEventListener("keypress", this._onDocKeypress, false);
+   },
+ 
+   /**
+    * Make sure that the console is showing up properly based on all the
+    * possible conditions.
+    *   1) If the console tab is selected, then regardless of split state
+    *      it should take up the full height of the deck, and we should
+    *      hide the deck and splitter.
+@@ -368,16 +372,155 @@ Toolbox.prototype = {
+     let outKey = this.doc.getElementById("toolbox-zoom-out-key");
+     outKey.addEventListener("command", this.zoomOut.bind(this), true);
+ 
+     let resetKey = this.doc.getElementById("toolbox-zoom-reset-key");
+     resetKey.addEventListener("command", this.zoomReset.bind(this), true);
+   },
+ 
+   /**
++   * Wire up the listeners for the find keys.
++   */
++  _addFindKeys: function() {
++    let findAllKey = this.doc.getElementById("toolbox-find-all-key");
++    findAllKey.addEventListener("command", this.toggleFindAll.bind(this), true);
++
++    let findClose = this.doc.getElementById("find-close");
++    findClose.addEventListener("click", this.endFindAll.bind(this), false);
++
++    this._findButton = this.doc.getElementById("find-go");
++    this._findButton.addEventListener("click", this.findAll, false);
++
++    this._findTextBoxInput = this._findTextBoxInput.bind(this);
++    this._onFindKeyPress = this._onFindKeyPress.bind(this);
++    this._findTextBox = this.doc.getElementById("find-box");
++    // this._findTextBox.addEventListener("click", this._onClick, false);
++    this._findTextBox.addEventListener("select", this._findTextBoxInput, false);
++    this._findTextBox.addEventListener("input", this._findTextBoxInput, false);
++    this._findTextBox.addEventListener("keypress", this._onFindKeyPress, false);
++    // this._findTextBox.addEventListener("blur", this._onBlur, false);
++
++    this.selectedFindTools = this.doc.getElementById("selected-find-tools");
++    this.getAllFindableTools().forEach(([id, toolDefinition]) => {
++      let check = this.doc.createElement("checkbox");
++      console.log(toolDefinition);
++      check.setAttribute("label", id);
++      check.setAttribute("checked", "true");
++      this.selectedFindTools.appendChild(check);
++    });
++    this.on("options-selected", ()=> {
++      this.endFindAll();
++    });
++    console.log("findAllKey");
++  },
++
++  _onFindKeyPress: function(e) {
++    if (e.keyCode === e.DOM_VK_RETURN) {
++      this.findAll();
++    }
++  },
++
++  _findTextBoxInput: function() {
++  },
++
++  toggleFindAll: function() {
++    if (this._finding) {
++      this.endFindAll();
++    } else {
++      this.beginFindAll();
++    }
++  },
++  beginFindAll: function(e) {
++    if (this._finding) {
++      return;
++    }
++    this._finding = true;
++    this.openAllFindableTools();
++
++    let findBoxContainer = this.doc.getElementById("toolbox-find-box-container");
++    findBoxContainer.removeAttribute("collapsed");
++
++    let findSplitter = this.doc.getElementById("toolbox-find-splitter");
++    findSplitter.removeAttribute("hidden");
++
++    let findTextBox = this.doc.getElementById("find-box");
++    findTextBox.focus();
++  },
++  endFindAll: function() {
++    if (!this._finding) {
++      return;
++    }
++    this._finding = false;
++    console.log("ENDING ");
++    let findPanel = this.doc.getElementById("toolbox-find");
++    findPanel.setAttribute("collapsed", "true");
++
++    let findBoxContainer = this.doc.getElementById("toolbox-find-box-container");
++    findBoxContainer.setAttribute("collapsed", "true");
++
++    let findSplitter = this.doc.getElementById("toolbox-find-splitter");
++    findSplitter.setAttribute("hidden", "true");
++  },
++  findAll: function() {
++    this.openAllFindableTools().then(findableTools => {
++      let value = this._findTextBox.value;
++      console.log("FINDING ALL", value);
++      let findPanel = this.doc.getElementById("toolbox-find");
++      findPanel.removeAttribute("collapsed");
++
++      let findResultPanel = this.doc.getElementById("find-results");
++      findResultPanel.removeAttribute("hidden");
++      findResultPanel.innerHTML = "";
++
++      let results = [];
++      findableTools.forEach(([id, toolDefinition]) => {
++        console.log("ID", id, this.getPanel(id));
++        let p = toolDefinition.onToolboxFind(value, this.getPanel(id), this);
++        p.then(r => {
++          console.log("PROMISE IS READY", r);
++            r.forEach(result=> {
++              findResultPanel.appendChild(result);
++            });
++        });
++      });
++
++
++      for (let i = 0; i < 100; i++) {
++        let box = this.doc.createElement("box");
++        box.textContent = "Search result #" + i + ": " + value;
++        results.push(box);
++      }
++
++      results.forEach(result=> {
++        findResultPanel.appendChild(result);
++      });
++    });
++  },
++  getAllFindableTools: function() {
++    let findableTools = [];
++    for (let [id, toolDefinition] of gDevTools.getToolDefinitionMap()) {
++      if (toolDefinition.onToolboxFind) {
++      console.log("ADDING TO FINDABLE TOOLS", id);
++        findableTools.push([id, toolDefinition]);
++      }
++    }
++    return findableTools;
++  },
++  openAllFindableTools: function() {
++    let findableTools = this.getAllFindableTools();
++    let toolLoaders = findableTools.map(([id, toolDefinition]) => {
++      return this.loadTool(id);
++    });
++
++    return promise.all(toolLoaders).then(() => {
++      return findableTools;
++    });
++  },
++
++  /**
+    * Set zoom on toolbox to whatever the last setting was.
+    */
+   _loadInitialZoom: function() {
+     this.setZoom(this.zoomValue);
+   },
+ 
+   /**
+    * Increase zoom level of toolbox window - make things bigger.
+@@ -801,16 +944,17 @@ Toolbox.prototype = {
+       let built = definition.build(iframe.contentWindow, this);
+       promise.resolve(built).then((panel) => {
+         this._toolPanels.set(id, panel);
+         this.emit(id + "-ready", panel);
+         gDevTools.emit(id + "-ready", this, panel);
+         deferred.resolve(panel);
+       }, console.error);
+     };
++    console.log("LOADING!!!!",definition.url);
+ 
+     iframe.setAttribute("src", definition.url);
+ 
+     // Depending on the host, iframe.contentWindow is not always
+     // defined at this moment. If it is not defined, we use an
+     // event listener on the iframe DOM node. If it's defined,
+     // we use the chromeEventHandler. We can't use a listener
+     // on the DOM node every time because this won't work
+@@ -1221,17 +1365,17 @@ Toolbox.prototype = {
+ 
+   /**
+    * Destroy the current host, and remove event listeners from its frame.
+    *
+    * @return {promise} to be resolved when the host is destroyed.
+    */
+   destroyHost: function() {
+     this.doc.removeEventListener("keypress",
+-      this._splitConsoleOnKeypress, false);
++      this._onDocKeypress, false);
+     return this._host.destroy();
+   },
+ 
+   /**
+    * Remove all UI elements, detach from target and clear up
+    */
+   destroy: function() {
+     // If several things call destroy then we give them all the same
+diff --git a/browser/devtools/framework/toolbox.xul b/browser/devtools/framework/toolbox.xul
+--- a/browser/devtools/framework/toolbox.xul
++++ b/browser/devtools/framework/toolbox.xul
+@@ -58,16 +58,20 @@
+     <key id="toolbox-reload-key2"
+          keycode="VK_F5"
+          oncommand="void(0);"
+          modifiers=""/>
+     <key id="toolbox-force-reload-key2"
+          keycode="VK_F5"
+          oncommand="void(0);"
+          modifiers="accel"/>
++    <key id="toolbox-find-all-key"
++         key="&toolboxFindAll.key;"
++         oncommand="void(0);"
++         modifiers="accel alt"/>
+   </keyset>
+ 
+   <notificationbox id="toolbox-notificationbox" flex="1">
+     <toolbar class="devtools-tabbar">
+       <hbox id="toolbox-picker-container" />
+       <hbox id="toolbox-tabs" flex="1" />
+       <hbox id="toolbox-buttons" pack="end"/>
+       <vbox id="toolbox-controls-separator" class="devtools-separator"/>
+@@ -78,11 +82,37 @@
+                        class="devtools-closebutton"
+                        tooltiptext="&toolboxCloseButton.tooltip;"/>
+       </hbox>
+     </toolbar>
+     <vbox flex="1">
+       <deck id="toolbox-deck" flex="1" minheight="75" />
+       <splitter id="toolbox-console-splitter" class="devtools-horizontal-splitter" hidden="true" />
+       <box minheight="75" flex="1" id="toolbox-panel-webconsole" collapsed="true" />
++      <splitter id="toolbox-find-splitter" class="devtools-horizontal-splitter" hidden="true" />
++      <vbox id="toolbox-find"
++            collapsed="true"
++            flex="1"
++            class="theme-body"
++            style="overflow: auto;">
++        <scrollbox id="find-results"
++                   orient="vertical">
++        </scrollbox>
++      </vbox>
++      <toolbar id="toolbox-find-box-container"
++               collapsed="true"
++               class="devtools-toolbar"
++               style="max-height: 24px; min-height: 24px;">
++        <textbox id="find-box"
++                 class="devtools-searchinput" type="search"/>
++        <toolbarbutton id="find-go"
++                       label="Search"
++                       class="devtools-toolbarbutton" />
++        <hbox id="selected-find-tools">
++
++        </hbox>
++        <spacer flex="1" />
++        <toolbarbutton id="find-close"
++                       class="devtools-closebutton" />
++       </toolbar>
+     </vbox>
+   </notificationbox>
+ </window>
+diff --git a/browser/devtools/main.js b/browser/devtools/main.js
+--- a/browser/devtools/main.js
++++ b/browser/devtools/main.js
+@@ -156,16 +156,36 @@ Tools.jsdebugger = {
+   invertIconForLightTheme: true,
+   highlightedicon: "chrome://browser/skin/devtools/tool-debugger-paused.svg",
+   url: "chrome://browser/content/devtools/debugger.xul",
+   label: l10n("ToolboxDebugger.label", debuggerStrings),
+   tooltip: l10n("ToolboxDebugger.tooltip", debuggerStrings),
+   inMenu: true,
+   commands: "devtools/debugger/debugger-commands",
+ 
++  onToolboxFind: function(value, panel, toolbox) {
++    let def = promise.defer();
++    panel.panelWin.DebuggerView.GlobalSearch.scheduleSearch(value);
++
++    panel.panelWin.on(panel.panelWin.EVENTS.GLOBAL_SEARCH_MATCH_FOUND, function(e, globalResults) {
++      let container = toolbox.doc.createElement("box");
++      for (let lineResults of globalResults._store) {
++        lineResults.createView(container, {});
++      }
++      def.resolve([container]);
++    });
++
++    panel.panelWin.on(panel.panelWin.EVENTS.GLOBAL_SEARCH_MATCH_NOT_FOUND, () => {
++      def.resolve();
++    });
++
++    console.log("TOOLBOX FIND", value, panel, toolbox);
++    return def.promise;
++  },
++
+   isTargetSupported: function(target) {
+     return true;
+   },
+ 
+   build: function(iframeWindow, toolbox) {
+     let panel = new DebuggerPanel(iframeWindow, toolbox);
+     return panel.open();
+   }
+diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
+--- a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
++++ b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
+@@ -13,16 +13,17 @@
+ <!ENTITY toolboxPreviousTool.key       "[">
+ 
+ <!ENTITY toolboxZoomIn.key             "+">
+ <!ENTITY toolboxZoomIn.key2            "="> <!-- + is above this key on many keyboards -->
+ <!ENTITY toolboxZoomOut.key            "-">
+ <!ENTITY toolboxZoomReset.key          "0">
+ 
+ <!ENTITY toolboxReload.key             "r">
++<!ENTITY toolboxFindAll.key            "f">
+ 
+ <!-- LOCALIZATION NOTE (options.context.advancedSettings): This is the label for
+   -  the heading of the advanced settings group in the options panel. -->
+ <!ENTITY options.context.advancedSettings "Advanced settings">
+ 
+ <!-- LOCALIZATION NOTE (options.context.inspector): This is the label for
+   -  the heading of the Inspector group in the options panel. -->
+ <!ENTITY options.context.inspector "Inspector">
+diff --git a/browser/themes/shared/devtools/toolbars.inc.css b/browser/themes/shared/devtools/toolbars.inc.css
+--- a/browser/themes/shared/devtools/toolbars.inc.css
++++ b/browser/themes/shared/devtools/toolbars.inc.css
+@@ -20,16 +20,32 @@
+   line-height: 24px;
+   box-sizing: border-box;
+ }
+ 
+ .devtools-toolbar {
+   padding: 0 3px;
+ }
+ 
++#toolbox-find-box-container {
++  border-bottom-width: 0;
++}
++.devtools-toolbar checkbox {
++  margin: 0 2px;
++  padding: 0;
++}
++.devtools-toolbar checkbox .checkbox-check {
++  margin: 0 2px;
++  padding: 0;
++}
++.devtools-toolbar checkbox .checkbox-label-box .checkbox-label {
++  margin: 0 6px !important; /* overrides .checkbox-label */
++  padding: 0;
++}
++
+ /* Toolbar buttons */
+ .devtools-menulist,
+ .devtools-toolbarbutton {
+   -moz-appearance: none;
+   -moz-box-align: center;
+   background: transparent;
+   min-width: 78px;
+   min-height: 18px;
