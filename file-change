@@ -1,12 +1,12 @@
 # HG changeset patch
-# Parent d31f7a547ab0c7393e3a50c06c4b7ec248f5a654
+# Parent 86fbf924bf86d5bf48cfbc52bd2fdf75fbbc868e
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 1011031 - Itchpad: Reload file that has already been opened when changed on disk;r=harth
 
 diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.js b/browser/devtools/projecteditor/chrome/content/projecteditor-loader.js
 --- a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.js
 +++ b/browser/devtools/projecteditor/chrome/content/projecteditor-loader.js
-@@ -3,17 +3,17 @@ const {devtools} = Cu.import("resource:/
+@@ -3,58 +3,76 @@ const {devtools} = Cu.import("resource:/
  const {FileUtils} = Cu.import("resource://gre/modules/FileUtils.jsm", {});
  const {NetUtil} = Cu.import("resource://gre/modules/NetUtil.jsm", {});
  const require = devtools.require;
@@ -16,7 +16,7 @@ diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.
  const SAMPLE_PATH = buildTempDirectoryStructure();
  const SAMPLE_NAME = "DevTools Content Application Name";
 -const SAMPLE_PROJECT_URL = "http://mozilla.org";
-+const SAMPLE_PROJECT_URL = "data:text/html;charset=utf-8,<h1>Project Overview</h1>";
++const SAMPLE_PROJECT_URL = "data:text/html;charset=utf-8,<body><h1>Project Overview</h1></body>";
  const SAMPLE_ICON = "chrome://browser/skin/devtools/tool-debugger.svg";
  
  /**
@@ -24,7 +24,143 @@ diff --git a/browser/devtools/projecteditor/chrome/content/projecteditor-loader.
   * chrome://browser/content/devtools/projecteditor-loader.xul.
   * This emulates the integration points that the app manager uses.
   */
++let appManagerEditor;
++
++// Log a message to the project overview URL to make development easier
++function log(msg) {
++  if (!appManagerEditor) {
++    return;
++  }
++
++  let doc = appManagerEditor.iframe.contentDocument;
++  let el = doc.createElement("p");
++  el.textContent = msg;
++  doc.body.appendChild(el);
++}
++
  document.addEventListener("DOMContentLoaded", function onDOMReady(e) {
+   document.removeEventListener("DOMContentLoaded", onDOMReady, false);
+   let iframe = document.getElementById("projecteditor-iframe");
+   window.projecteditor = ProjectEditor.ProjectEditor(iframe);
+ 
+-  projecteditor.on("onEditorCreated", (editor) => {
+-    console.log("editor created: " + editor);
++  projecteditor.on("onEditorCreated", (editor, a) => {
++    log("editor created: " + editor);
++    if (editor.label === "app-manager") {
++      appManagerEditor = editor;
++      appManagerEditor.on("load", function foo() {
++        appManagerEditor.off("load", foo);
++        log("Working on: " + SAMPLE_PATH);
++      })
++    }
+   });
+   projecteditor.on("onEditorDestroyed", (editor) => {
+-    console.log("editor destroyed: " + editor);
++    log("editor destroyed: " + editor);
+   });
+   projecteditor.on("onEditorSave", (editor, resource) => {
+-    console.log("editor saved: " + editor, resource.path);
++    log("editor saved: " + editor, resource.path);
+   });
+   projecteditor.on("onTreeSelected", (resource) => {
+-    console.log("tree selected: " + resource.path);
++    log("tree selected: " + resource.path);
+   });
+   projecteditor.on("onEditorLoad", (editor) => {
+-    console.log("editor loaded: " + editor);
++    log("editor loaded: " + editor);
+   });
+   projecteditor.on("onEditorActivated", (editor) => {
+-    console.log("editor focused: " + editor);
++    log("editor focused: " + editor);
+   });
+   projecteditor.on("onEditorDeactivated", (editor) => {
+-    console.log("editor blur: " + editor);
++    log("editor blur: " + editor);
+   });
+   projecteditor.on("onEditorChange", (editor) => {
+-    console.log("editor changed: " + editor);
+-  });
+-  projecteditor.on("onEditorCursorActivity", (editor) => {
+-    console.log("editor cursor activity: " + editor);
++    log("editor changed: " + editor);
+   });
+   projecteditor.on("onCommand", (cmd) => {
+-    console.log("Command: " + cmd);
++    log("Command: " + cmd);
+   });
+ 
+   projecteditor.loaded.then(() => {
+     projecteditor.setProjectToAppPath(SAMPLE_PATH, {
+       name: SAMPLE_NAME,
+       iconUrl: SAMPLE_ICON,
+       projectOverviewURL: SAMPLE_PROJECT_URL,
+       validationStatus: "valid"
+diff --git a/browser/devtools/projecteditor/lib/plugins/app-manager/app-project-editor.js b/browser/devtools/projecteditor/lib/plugins/app-manager/app-project-editor.js
+--- a/browser/devtools/projecteditor/lib/plugins/app-manager/app-project-editor.js
++++ b/browser/devtools/projecteditor/lib/plugins/app-manager/app-project-editor.js
+@@ -3,16 +3,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ const { Cu } = require("chrome");
+ const { Class } = require("sdk/core/heritage");
+ const promise = require("projecteditor/helpers/promise");
+ const { ItchEditor } = require("projecteditor/editors");
++const { DOMHelpers } = Cu.import("resource:///modules/devtools/DOMHelpers.jsm");
+ 
+ var AppProjectEditor = Class({
+   extends: ItchEditor,
+ 
+   hidesToolbar: true,
+ 
+   initialize: function(document, host) {
+     ItchEditor.prototype.initialize.apply(this, arguments);
+@@ -22,23 +23,35 @@ var AppProjectEditor = Class({
+   },
+ 
+   destroy: function() {
+     this.elt.remove();
+     this.elt = null;
+   },
+ 
+   load: function(resource) {
+-    this.elt.textContent = "";
+     let {appManagerOpts} = this.host.project;
+-    let iframe = this.iframe = this.elt.ownerDocument.createElement("iframe");
+-    iframe.setAttribute("flex", "1");
+-    iframe.setAttribute("src", appManagerOpts.projectOverviewURL);
+-    this.elt.appendChild(iframe);
+ 
+-    // Wait for other `appended` listeners before emitting load.
+-    this.appended.then(() => {
++    // Only load the frame the first time it is selected
++    if (!this.iframe || this.iframe.getAttribute("src") !== appManagerOpts.projectOverviewURL) {
++
++      this.elt.textContent = "";
++      let iframe = this.iframe = this.elt.ownerDocument.createElement("iframe");
++      let iframeLoaded = this.iframeLoaded = promise.defer();
++
++      iframe.addEventListener("load", function onLoad() {
++        iframe.removeEventListener("load", onLoad);
++        iframeLoaded.resolve();
++      });
++
++      iframe.setAttribute("flex", "1");
++      iframe.setAttribute("src", appManagerOpts.projectOverviewURL);
++      this.elt.appendChild(iframe);
++
++    }
++
++    promise.all([this.iframeLoaded.promise, this.appended]).then(() => {
+       this.emit("load");
+     });
+   }
+ });
+ 
+ exports.AppProjectEditor = AppProjectEditor;
 diff --git a/browser/devtools/projecteditor/lib/shells.js b/browser/devtools/projecteditor/lib/shells.js
 --- a/browser/devtools/projecteditor/lib/shells.js
 +++ b/browser/devtools/projecteditor/lib/shells.js
@@ -60,11 +196,11 @@ diff --git a/browser/devtools/projecteditor/lib/shells.js b/browser/devtools/pro
    },
  
    /**
-    * Make sure the correct editor is selected for the resource.
-    * @returns Type:Editor
+    * Destroy the shell and its associated editor
     */
-   _editorTypeForResource: function() {
-@@ -160,16 +158,18 @@ var ShellDeck = Class({
+   destroy: function() {
+     this.editor.destroy();
+@@ -188,16 +186,18 @@ var ShellDeck = Class({
    selectShell: function(shell) {
      // Don't fire another activate if this is already the active shell
      if (this._activeShell != shell) {
