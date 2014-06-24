@@ -1,0 +1,431 @@
+# HG changeset patch
+# Parent 548249c2b864657441c00b5470fecd1a562c6dcf
+# User Brian Grinstead <bgrinstead@mozilla.com>
+Bug 1029511 - Project Editor: Add ability to reload editor preferences;r=vporof
+
+diff --git a/browser/devtools/projecteditor/lib/editors.js b/browser/devtools/projecteditor/lib/editors.js
+--- a/browser/devtools/projecteditor/lib/editors.js
++++ b/browser/devtools/projecteditor/lib/editors.js
+@@ -44,16 +44,20 @@ var ItchEditor = Class({
+     this.doc = document;
+     this.label = "";
+     this.elt = this.doc.createElement("vbox");
+     this.elt.setAttribute("flex", "1");
+     this.elt.editor = this;
+     this.toolbar = this.doc.querySelector("#projecteditor-toolbar");
+   },
+ 
++  reloadPrefs: function() {
++
++  },
++
+   /**
+    * Sets the visibility of the element that shows up above the editor
+    * based on the this.hidesToolbar property.
+    */
+   setToolbarVisibility: function() {
+     if (this.hidesToolbar) {
+       this.toolbar.setAttribute("hidden", "true");
+     } else {
+@@ -130,16 +134,25 @@ var TextEditor = Class({
+         let command = this.doc.querySelector("#" + key.getAttribute("command"));
+         command.dispatchEvent(event);
+       };
+     });
+ 
+     return extraKeys;
+   },
+ 
++  reloadPrefs: function() {
++    this.editor.resetIndentUnit();
++    this.appended.then(() => {
++      if (this.editor) {
++        this.editor.setOption("autocomplete", prefs.get("devtools.editor.autocomplete"));
++      }
++    });
++  },
++
+   initialize: function(document, mode=Editor.modes.text) {
+     ItchEditor.prototype.initialize.apply(this, arguments);
+     this.label = mode.name;
+     this.editor = new Editor({
+       mode: mode,
+       lineNumbers: true,
+       extraKeys: this.extraKeys,
+       themeSwitching: false,
+diff --git a/browser/devtools/projecteditor/lib/projecteditor.js b/browser/devtools/projecteditor/lib/projecteditor.js
+--- a/browser/devtools/projecteditor/lib/projecteditor.js
++++ b/browser/devtools/projecteditor/lib/projecteditor.js
+@@ -281,16 +281,22 @@ var ProjectEditor = Class({
+       // Otherwise, just ask for the root to be redrawn
+       let rootResource = this.project.localStores.get(path).root;
+       emit(rootResource, "label-change", rootResource);
+     }
+ 
+     return this.project.refresh();
+   },
+ 
++  reloadEditorPrefs: function() {
++    for (let [resource, shell] of this.shells.shells.entries()) {
++      shell.editor.reloadPrefs();
++    }
++  },
++
+   /**
+    * Open a resource in a particular shell.
+    *
+    * @param Resource resource
+    *                 The file to be opened.
+    */
+   openResource: function(resource) {
+     this.shells.open(resource);
+diff --git a/browser/devtools/sourceeditor/autocomplete.js b/browser/devtools/sourceeditor/autocomplete.js
+--- a/browser/devtools/sourceeditor/autocomplete.js
++++ b/browser/devtools/sourceeditor/autocomplete.js
+@@ -11,19 +11,21 @@ const CM_TERN_SCRIPTS = [
+   "chrome://browser/content/devtools/codemirror/show-hint.js"
+ ];
+ 
+ const privates = new WeakMap();
+ 
+ /**
+  * Prepares an editor instance for autocompletion.
+  */
+-function setupAutoCompletion(ctx, options) {
++function initializeAutoCompletion(ctx, options = {}) {
+   let { cm, ed, Editor } = ctx;
+-
++  if (privates.has(ed)) {
++    return;
++  }
+   let win = ed.container.contentWindow.wrappedJSObject;
+   let { CodeMirror, document } = win;
+ 
+   let completer = null;
+   let autocompleteKey = "Ctrl-" +
+                         Editor.keyFor("autocompletion", { noaccel: true });
+   if (ed.config.mode == Editor.modes.js) {
+     let defs = [
+@@ -54,38 +56,46 @@ function setupAutoCompletion(ctx, option
+           docLink.className = "theme-link";
+           docLink.setAttribute("target", "_blank");
+           tip.appendChild(docLink);
+         }
+ 
+         return tip;
+       }
+     });
+-    cm.on("cursorActivity", (cm) => {
+-      cm.tern.updateArgHints(cm);
+-    });
+ 
+     let keyMap = {};
++    let updateArgHintsCallback = cm.tern.updateArgHints.bind(cm.tern, cm);
++    cm.on("cursorActivity", updateArgHintsCallback);
+ 
+     keyMap[autocompleteKey] = (cm) => {
+       cm.tern.getHint(cm, (data) => {
+         CodeMirror.on(data, "shown", () => ed.emit("before-suggest"));
+         CodeMirror.on(data, "close", () => ed.emit("after-suggest"));
+         CodeMirror.on(data, "select", () => ed.emit("suggestion-entered"));
+         CodeMirror.showHint(cm, (cm, cb) => cb(data), { async: true });
+       });
+     };
+ 
+     keyMap[Editor.keyFor("showInformation", { noaccel: true })] = (cm) => {
+       cm.tern.showType(cm, null, () => {
+         ed.emit("show-information");
+       });
+     };
++    cm.addKeyMap(keyMap);
+ 
+-    cm.addKeyMap(keyMap);
++    function destroyTern() {
++      cm.off("cursorActivity", updateArgHintsCallback);
++      cm.removeKeyMap(keyMap);
++      win.tern = cm.tern = null;
++    }
++
++    privates.set(ed, {
++      destroy: destroyTern
++    });
+ 
+     // TODO: Integrate tern autocompletion with this autocomplete API.
+     return;
+   } else if (ed.config.mode == Editor.modes.css) {
+     completer = new cssAutoCompleter({walker: options.walker});
+   }
+ 
+   let popup = new AutocompletePopup(win.parent.document, {
+@@ -121,38 +131,58 @@ function setupAutoCompletion(ctx, option
+         // This event is used in tests
+         ed.emit("popup-hidden");
+         return;
+       }
+ 
+       return CodeMirror.Pass;
+     }
+   };
+-  keyMap[autocompleteKey] = cm => autoComplete(ctx);
++  let autoCompleteCallback = autoComplete.bind(null, ctx);
++  let keypressCallback = onEditorKeypress.bind(null, ctx);
++  keyMap[autocompleteKey] = autoCompleteCallback;
+   cm.addKeyMap(keyMap);
+ 
+-  cm.on("keydown", (cm, e) => onEditorKeypress(ctx, e));
+-  ed.on("change", () => autoComplete(ctx));
+-  ed.on("destroy", () => {
+-    cm.off("keydown", (cm, e) => onEditorKeypress(ctx, e));
+-    ed.off("change", () => autoComplete(ctx));
++  cm.on("keydown", keypressCallback);
++  ed.on("change", autoCompleteCallback);
++  ed.on("destroy", destroy);
++
++  function destroy() {
++    cm.off("keydown", keypressCallback);
++    ed.off("change", autoCompleteCallback);
++    cm.removeKeyMap(keyMap);
+     popup.destroy();
+-    popup = null;
+-    completer = null;
+-  });
++    keyMap = popup = completer = null;
++  }
+ 
+   privates.set(ed, {
+     popup: popup,
+     completer: completer,
++    keyMap: keyMap,
++    destroy: destroy,
+     insertingSuggestion: false,
+     suggestionInsertedOnce: false
+   });
+ }
+ 
+ /**
++ * Destroy autocompletion on an editor instance.
++ */
++function destroyAutoCompletion(ctx) {
++  let { ed } = ctx;
++  if (!privates.has(ed)) {
++    return;
++  }
++
++  let {destroy} = privates.get(ed);
++  destroy();
++  privates.delete(ed);
++}
++
++/**
+  * Provides suggestions to autocomplete the current token/word being typed.
+  */
+ function autoComplete({ ed, cm }) {
+   let private = privates.get(ed);
+   let { completer, popup } = private;
+   if (!completer || private.insertingSuggestion || private.doNotAutocomplete) {
+     private.insertingSuggestion = false;
+     return;
+@@ -221,17 +251,17 @@ function cycleSuggestions(ed, reverse) {
+   // This event is used in tests.
+   ed.emit("suggestion-entered");
+ }
+ 
+ /**
+  * onkeydown handler for the editor instance to prevent autocompleting on some
+  * keypresses.
+  */
+-function onEditorKeypress({ ed, Editor }, event) {
++function onEditorKeypress({ ed, Editor }, cm, event) {
+   let private = privates.get(ed);
+ 
+   // Do not try to autocomplete with multiple selections.
+   if (ed.hasMultipleSelections()) {
+     private.doNotAutocomplete = true;
+     private.popup.hidePopup();
+     return;
+   }
+@@ -295,11 +325,12 @@ function getInfoAt({ ed }, caret) {
+   if (completer && completer.getInfoAt)
+     return completer.getInfoAt(ed.getText(), caret);
+ 
+   return null;
+ }
+ 
+ // Export functions
+ 
+-module.exports.setupAutoCompletion = setupAutoCompletion;
++module.exports.initializeAutoCompletion = initializeAutoCompletion;
++module.exports.destroyAutoCompletion = destroyAutoCompletion;
+ module.exports.getAutocompletionPopup = getPopup;
+ module.exports.getInfoAt = getInfoAt;
+diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceeditor/editor.js
+--- a/browser/devtools/sourceeditor/editor.js
++++ b/browser/devtools/sourceeditor/editor.js
+@@ -93,19 +93,17 @@ const CM_MAPPING = [
+   "getSelection",
+   "replaceSelection",
+   "extendSelection",
+   "undo",
+   "redo",
+   "clearHistory",
+   "openDialog",
+   "refresh",
+-  "getScrollInfo",
+-  "getOption",
+-  "setOption"
++  "getScrollInfo"
+ ];
+ 
+ const { cssProperties, cssValues, cssColors } = getCSSKeywords();
+ 
+ const editors = new WeakMap();
+ 
+ Editor.modes = {
+   text: { name: "text" },
+@@ -351,20 +349,27 @@ Editor.prototype = {
+       throw new Error("Can't load a script until the editor is loaded.")
+     }
+     let win = this.container.contentWindow.wrappedJSObject;
+     Services.scriptloader.loadSubScript(url, win, "utf8");
+   },
+ 
+   /**
+    * Changes the value of a currently used highlighting mode.
+-   * See Editor.modes for the list of all suppoert modes.
++   * See Editor.modes for the list of all supported modes.
+    */
+   setMode: function (value) {
+     this.setOption("mode", value);
++
++    // If autocomplete was set up and the mode is changing, then
++    // turn it off and back on again so the proper mode can be used.
++    if (this.config.autocomplete) {
++      this.setOption("autocomplete", false);
++      this.setOption("autocomplete", true);
++    }
+   },
+ 
+   /**
+    * Returns text from the text area. If line argument is provided
+    * the method returns only that line.
+    */
+   getText: function (line) {
+     let cm = editors.get(this);
+@@ -857,25 +862,58 @@ Editor.prototype = {
+    */
+   setFontSize: function (size) {
+     let cm = editors.get(this);
+     cm.getWrapperElement().style.fontSize = parseInt(size, 10) + "px";
+     cm.refresh();
+   },
+ 
+   /**
++   * Sets an option for the editor.  For most options it just defers to
++   * CodeMirror.setOption, but certain ones are maintained within the editor
++   * instance.
++   */
++  setOption: function(o, v) {
++    let cm = editors.get(this);
++    if (o === "autocomplete") {
++      this.config.autocomplete = v;
++      this.setupAutoCompletion();
++    } else {
++      cm.setOption(o, v);
++    }
++  },
++
++  /**
++   * Gets an option for the editor.  For most options it just defers to
++   * CodeMirror.getOption, but certain ones are maintained within the editor
++   * instance.
++   */
++  getOption: function(o) {
++    let cm = editors.get(this);
++    if (o === "autocomplete") {
++      return this.config.autocomplete;
++    } else {
++      return cm.getOption(o);
++    }
++  },
++
++  /**
+    * Sets up autocompletion for the editor. Lazily imports the required
+    * dependencies because they vary by editor mode.
+    */
+   setupAutoCompletion: function (options = {}) {
++    // The autocomplete module will overwrite this.initializeAutoCompletion
++    // with a mode specific autocompletion handler.
++    if (!this.initializeAutoCompletion) {
++      this.extend(require("./autocomplete"));
++    }
+     if (this.config.autocomplete) {
+-      this.extend(require("./autocomplete"));
+-      // The autocomplete module will overwrite this.setupAutoCompletion with
+-      // a mode specific autocompletion handler.
+-      this.setupAutoCompletion(options);
++      this.initializeAutoCompletion(options);
++    } else {
++      this.destroyAutoCompletion();
+     }
+   },
+ 
+   /**
+    * Extends an instance of the Editor object with additional
+    * functions. Each function will be called with context as
+    * the first argument. Context is a {ed, cm} object where
+    * 'ed' is an instance of the Editor object and 'cm' is an
+diff --git a/browser/devtools/sourceeditor/test/browser.ini b/browser/devtools/sourceeditor/test/browser.ini
+--- a/browser/devtools/sourceeditor/test/browser.ini
++++ b/browser/devtools/sourceeditor/test/browser.ini
+@@ -15,16 +15,17 @@ support-files =
+   cm_vim_test.js
+   codemirror.html
+   css_statemachine_testcases.css
+   css_statemachine_tests.json
+   css_autocompletion_tests.json
+   vimemacs.html
+   head.js
+ 
++[browser_editor_autocompletion.js]
+ [browser_editor_basic.js]
+ [browser_editor_cursor.js]
+ [browser_editor_goto_line.js]
+ [browser_editor_history.js]
+ [browser_editor_markers.js]
+ [browser_editor_movelines.js]
+ [browser_editor_addons.js]
+ [browser_codemirror.js]
+diff --git a/browser/devtools/sourceeditor/test/browser_editor_autocompletion.js b/browser/devtools/sourceeditor/test/browser_editor_autocompletion.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/sourceeditor/test/browser_editor_autocompletion.js
+@@ -0,0 +1,29 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++function test() {
++  waitForExplicitFinish();
++  setup((ed, win2) => {
++    let edWin = ed.container.contentWindow.wrappedJSObject;
++
++    ok (!edWin.tern, "Tern is not defined on the window");
++    ok (!ed.getOption("autocomplete"), "Autocompletion is not set");
++
++    ed.setMode(Editor.modes.js);
++    ed.setText("document.");
++    ed.setOption("autocomplete", true);
++
++    ok (ed.getOption("autocomplete"), "Autocompletion is set");
++    ok (edWin.tern, "Tern is defined on the window");
++
++    ed.setOption("autocomplete", false);
++
++    ok (!ed.getOption("autocomplete"), "Autocompletion is no longer set");
++    ok (!edWin.tern, "Tern is not defined on the window");
++
++    teardown(ed, win2);
++  });
++}
