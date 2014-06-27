@@ -1,0 +1,569 @@
+# HG changeset patch
+# User Alexandre Poirot <poirot.alex@gmail.com>
+
+Bug 977043 - Add toolbox-level frame selection to change the currently targeted document. r=bgrins,past
+
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+index f3117d4..91aac2b 100644
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -1244,16 +1244,17 @@ pref("devtools.toolbox.sidebar.width", 500);
+ pref("devtools.toolbox.host", "bottom");
+ pref("devtools.toolbox.selectedTool", "webconsole");
+ pref("devtools.toolbox.toolbarSpec", '["splitconsole", "paintflashing toggle","tilt toggle","scratchpad","resize toggle","eyedropper","screenshot --fullpage"]');
+ pref("devtools.toolbox.sideEnabled", true);
+ pref("devtools.toolbox.zoomValue", "1");
+ 
+ // Toolbox Button preferences
+ pref("devtools.command-button-pick.enabled", true);
++pref("devtools.command-button-frames.enabled", true);
+ pref("devtools.command-button-splitconsole.enabled", true);
+ pref("devtools.command-button-paintflashing.enabled", false);
+ pref("devtools.command-button-tilt.enabled", false);
+ pref("devtools.command-button-scratchpad.enabled", false);
+ pref("devtools.command-button-responsive.enabled", true);
+ pref("devtools.command-button-eyedropper.enabled", false);
+ pref("devtools.command-button-screenshot.enabled", false);
+ 
+diff --git a/browser/devtools/framework/target.js b/browser/devtools/framework/target.js
+index dafc91f..cdb3578 100644
+--- a/browser/devtools/framework/target.js
++++ b/browser/devtools/framework/target.js
+@@ -378,25 +378,31 @@ TabTarget.prototype = {
+         this._navRequest = null;
+       } else {
+         event._navPayload = this._navWindow;
+         this.emit("navigate", event);
+         this._navWindow = null;
+       }
+     };
+     this.client.addListener("tabNavigated", this._onTabNavigated);
++
++    this._onFramesUpdate = (aType, aPacket) => {
++      this.emit("frames-update", aPacket);
++    };
++    this.client.addListener("framesUpdate", this._onFramesUpdate);
+   },
+ 
+   /**
+    * Teardown listeners for remote debugging.
+    */
+   _teardownRemoteListeners: function TabTarget__teardownRemoteListeners() {
+     this.client.removeListener("closed", this.destroy);
+     this.client.removeListener("tabNavigated", this._onTabNavigated);
+     this.client.removeListener("tabDetached", this._onTabDetached);
++    this.client.removeListener("framesUpdate", this._onFramesUpdate);
+   },
+ 
+   /**
+    * Handle tabs events.
+    */
+   handleEvent: function (event) {
+     switch (event.type) {
+       case "TabClose":
+diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/toolbox.js
+index b63794d..c8ee9a8 100644
+--- a/browser/devtools/framework/toolbox.js
++++ b/browser/devtools/framework/toolbox.js
+@@ -40,16 +40,33 @@ loader.lazyGetter(this, "toolboxStrings", () => {
+       return null;
+     }
+   };
+ });
+ 
+ loader.lazyGetter(this, "Selection", () => require("devtools/framework/selection").Selection);
+ loader.lazyGetter(this, "InspectorFront", () => require("devtools/server/actors/inspector").InspectorFront);
+ 
++// White-list buttons that can be toggled to prevent adding prefs for
++// addons that have manually inserted toolbarbuttons into DOM.
++// (By default, supported target is only local tab)
++const ToolboxButtons = [
++  { id: "command-button-frames",
++    isTargetSupported: target => (!target.isAddon && target.activeTab && target.activeTab.traits.frames) },
++  { id: "command-button-pick",
++    isTargetSupported: target => !target.isAddon },
++  { id: "command-button-splitconsole" },
++  { id: "command-button-responsive" },
++  { id: "command-button-paintflashing" },
++  { id: "command-button-tilt" },
++  { id: "command-button-scratchpad" },
++  { id: "command-button-eyedropper" },
++  { id: "command-button-screenshot" }
++];
++
+ /**
+  * A "Toolbox" is the component that holds all the tools for one specific
+  * target. Visually, it's a document that includes the tools tabs and all
+  * the iframes where the tool panels will be living in.
+  *
+  * @param {object} target
+  *        The object the toolbox is debugging.
+  * @param {string} selectedTool
+@@ -62,16 +79,18 @@ loader.lazyGetter(this, "InspectorFront", () => require("devtools/server/actors/
+ function Toolbox(target, selectedTool, hostType, hostOptions) {
+   this._target = target;
+   this._toolPanels = new Map();
+   this._telemetry = new Telemetry();
+ 
+   this._toolRegistered = this._toolRegistered.bind(this);
+   this._toolUnregistered = this._toolUnregistered.bind(this);
+   this._refreshHostTitle = this._refreshHostTitle.bind(this);
++  this.selectFrame = this.selectFrame.bind(this);
++  this._updateFrames = this._updateFrames.bind(this);
+   this._splitConsoleOnKeypress = this._splitConsoleOnKeypress.bind(this)
+   this.destroy = this.destroy.bind(this);
+   this.highlighterUtils = getHighlighterUtils(this);
+   this._highlighterReady = this._highlighterReady.bind(this);
+   this._highlighterHidden = this._highlighterHidden.bind(this);
+ 
+   this._target.on("close", this.destroy);
+ 
+@@ -86,16 +105,19 @@ function Toolbox(target, selectedTool, hostType, hostOptions) {
+   }
+   this._defaultToolId = selectedTool;
+ 
+   this._host = this._createHost(hostType, hostOptions);
+ 
+   EventEmitter.decorate(this);
+ 
+   this._target.on("navigate", this._refreshHostTitle);
++  this._target.on("frames-update", this._updateFrames);
++  this._framesEvents = [];
++
+   this.on("host-changed", this._refreshHostTitle);
+   this.on("select", this._refreshHostTitle);
+ 
+   gDevTools.on("tool-registered", this._toolRegistered);
+   gDevTools.on("tool-unregistered", this._toolUnregistered);
+ }
+ exports.Toolbox = Toolbox;
+ 
+@@ -232,20 +254,26 @@ Toolbox.prototype = {
+   open: function() {
+     let deferred = promise.defer();
+ 
+     return this._host.create().then(iframe => {
+       let deferred = promise.defer();
+ 
+       let domReady = () => {
+         this.isReady = true;
++        // Flush any event received while the toolbox was still loading...
++        this._framesEvents.forEach(data => this._updateFrames(null, data));
++        this._framesEvents = [];
+ 
+         let closeButton = this.doc.getElementById("toolbox-close");
+         closeButton.addEventListener("command", this.destroy, true);
+ 
++        let framesMenu = this.doc.getElementById("command-button-frames");
++        framesMenu.addEventListener("command", this.selectFrame, true);
++
+         this._buildDockButtons();
+         this._buildOptions();
+         this._buildTabs();
+         let buttonsPromise = this._buildButtons();
+         this._addKeysToWindow();
+         this._addReloadKeys();
+         this._addToolSwitchingKeys();
+         this._addZoomKeys();
+@@ -542,16 +570,17 @@ Toolbox.prototype = {
+    * Add buttons to the UI as specified in the devtools.toolbox.toolbarSpec pref
+    */
+   _buildButtons: function() {
+     if (!this.target.isAddon) {
+       this._buildPickerButton();
+     }
+ 
+     if (!this.target.isLocalTab) {
++      this.setToolboxButtonsVisibility();
+       return Promise.resolve();
+     }
+ 
+     let spec = CommandUtils.getCommandbarSpec("devtools.toolbox.toolbarSpec");
+     let environment = CommandUtils.createEnvironment(this, '_target');
+     return CommandUtils.createRequisition(environment).then(requisition => {
+       this._requisition = requisition;
+       return CommandUtils.createButtons(spec, this.target, this.doc,
+@@ -592,54 +621,47 @@ Toolbox.prototype = {
+     }
+   },
+ 
+   /**
+    * Return all toolbox buttons (command buttons, plus any others that were
+    * added manually).
+    */
+   get toolboxButtons() {
+-    // White-list buttons that can be toggled to prevent adding prefs for
+-    // addons that have manually inserted toolbarbuttons into DOM.
+-    return [
+-      "command-button-pick",
+-      "command-button-splitconsole",
+-      "command-button-responsive",
+-      "command-button-paintflashing",
+-      "command-button-tilt",
+-      "command-button-scratchpad",
+-      "command-button-eyedropper",
+-      "command-button-screenshot"
+-    ].map(id => {
+-      let button = this.doc.getElementById(id);
++    return ToolboxButtons.map(options => {
++      let button = this.doc.getElementById(options.id);
+       // Some buttons may not exist inside of Browser Toolbox
+       if (!button) {
+         return false;
+       }
+       return {
+-        id: id,
++        id: options.id,
+         button: button,
+         label: button.getAttribute("tooltiptext"),
+-        visibilityswitch: "devtools." + id + ".enabled"
++        visibilityswitch: "devtools." + options.id + ".enabled",
++        isTargetSupported: options.isTargetSupported ? options.isTargetSupported
++                                                     : () => this.target.isLocalTab
+       }
+     }).filter(button=>button);
+   },
+ 
+   /**
+    * Ensure the visibility of each toolbox button matches the
+    * preference value.  Simply hide buttons that are preffed off.
+    */
+   setToolboxButtonsVisibility: function() {
+     this.toolboxButtons.forEach(buttonSpec => {
+-      let {visibilityswitch, id, button}=buttonSpec;
++      let {visibilityswitch, id, button, isTargetSupported}=buttonSpec;
+       let on = true;
+       try {
+         on = Services.prefs.getBoolPref(visibilityswitch);
+       } catch (ex) { }
+ 
++      on = on && isTargetSupported(this.target);
++
+       if (button) {
+         if (on) {
+           button.removeAttribute("hidden");
+         } else {
+           button.setAttribute("hidden", "true");
+         }
+       }
+     });
+@@ -1016,16 +1038,90 @@ Toolbox.prototype = {
+       // no tool is selected
+       toolName = toolboxStrings("toolbox.defaultTitle");
+     }
+     let title = toolboxStrings("toolbox.titleTemplate",
+                                toolName, this.target.url || this.target.name);
+     this._host.setTitle(title);
+   },
+ 
++  selectFrame: function (event) {
++    let windowId = event.target.getAttribute("data-window-id");
++    let packet = {
++      to: this._target.form.actor,
++      type: "switchToFrame",
++      windowId: windowId
++    };
++    this._target.client.request(packet);
++    // Wait for framesUpdate event to update the UI
++  },
++
++  _updateFrames: function (event, data) {
++    if (!Services.prefs.getBoolPref("devtools.command-button-frames.enabled")) {
++      return;
++    }
++
++    // We may receive this event before the toolbox is ready,
++    // in such scenario save this event for later.
++    if (!this.isReady) {
++      this._framesEvents.push(data);
++      return;
++    }
++
++    let menu = this.doc.getElementById("command-button-frames");
++
++    if (data.destroyAll) {
++      let menupopup = menu.firstChild;
++      while (menupopup.firstChild) {
++        menupopup.firstChild.remove();
++      }
++      return;
++    } else if (data.selected) {
++      let item = menu.querySelector("menuitem[data-window-id=\"" + data.selected + "\"]");
++      if (!item) {
++        return;
++      }
++      // Toggle the toolbarbutton if we selected a non top-level frame
++      if (item.hasAttribute("data-parent-id")) {
++        menu.setAttribute("checked", "true");
++      } else {
++        menu.removeAttribute("checked");
++      }
++      // Uncheck the previously selected frame
++      let selected = menu.querySelector("menuitem[checked=true]")
++      if (selected) {
++        selected.removeAttribute("checked");
++      }
++      // Check the new one
++      item.setAttribute("checked", "true");
++    } else if (data.windows) {
++      data.windows.forEach(win => {
++        let item = menu.querySelector("menuitem[data-window-id=\"" + win.id + "\"]");
++        if (win.destroy) {
++          if (item)
++            item.remove();
++          return;
++        }
++        if (!item) {
++          item = this.doc.createElement("menuitem");
++          item.setAttribute("data-window-id", win.id);
++          if (win.parentID)
++            item.setAttribute("data-parent-id", win.parentID);
++          // If we register a root docshell and we don't have any selected,
++          // consider it as the currently targeted one.
++          if (!win.parentID && !menu.querySelector("menuitem[checked=true]")) {
++            item.setAttribute("checked", "true");
++          }
++          menu.firstChild.appendChild(item);
++        }
++        item.setAttribute("label", win.url);
++      });
++    }
++  },
++
+   /**
+    * Create a host object based on the given host type.
+    *
+    * Warning: some hosts require that the toolbox target provides a reference to
+    * the attached tab. Not all Targets have a tab property - make sure you correctly
+    * mix and match hosts and targets.
+    *
+    * @param {string} hostType
+@@ -1236,16 +1332,18 @@ Toolbox.prototype = {
+   destroy: function() {
+     // If several things call destroy then we give them all the same
+     // destruction promise so we're sure to destroy only once
+     if (this._destroyer) {
+       return this._destroyer;
+     }
+ 
+     this._target.off("navigate", this._refreshHostTitle);
++    this._target.off("frames-update", this._updateFrames);
++    this._framesEvents = null;
+     this.off("select", this._refreshHostTitle);
+     this.off("host-changed", this._refreshHostTitle);
+ 
+     gDevTools.off("tool-registered", this._toolRegistered);
+     gDevTools.off("tool-unregistered", this._toolUnregistered);
+ 
+     let outstanding = [];
+     for (let [id, panel] of this._toolPanels) {
+diff --git a/browser/devtools/framework/toolbox.xul b/browser/devtools/framework/toolbox.xul
+index b0ba959..90f6861 100644
+--- a/browser/devtools/framework/toolbox.xul
++++ b/browser/devtools/framework/toolbox.xul
+@@ -64,17 +64,21 @@
+          oncommand="void(0);"
+          modifiers="accel"/>
+   </keyset>
+ 
+   <notificationbox id="toolbox-notificationbox" flex="1">
+     <toolbar class="devtools-tabbar">
+       <hbox id="toolbox-picker-container" />
+       <hbox id="toolbox-tabs" flex="1" />
+-      <hbox id="toolbox-buttons" pack="end"/>
++      <hbox id="toolbox-buttons" pack="end">
++        <toolbarbutton class="devtools-toolbarbutton" text-as-image="true" id="command-button-frames" label="&toolboxFramesButton;" type="menu" hidden="true">
++          <menupopup position="bottomright topright"></menupopup>
++        </toolbarbutton>
++      </hbox>
+       <vbox id="toolbox-controls-separator" class="devtools-separator"/>
+       <hbox id="toolbox-option-container"/>
+       <hbox id="toolbox-controls">
+         <hbox id="toolbox-dock-buttons"/>
+         <toolbarbutton id="toolbox-close"
+                        class="devtools-closebutton"
+                        tooltiptext="&toolboxCloseButton.tooltip;"/>
+       </hbox>
+diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
+index b9e79e0..a73ed9d 100644
+--- a/browser/devtools/inspector/inspector-panel.js
++++ b/browser/devtools/inspector/inspector-panel.js
+@@ -204,17 +204,19 @@ InspectorPanel.prototype = {
+     }
+     let walker = this.walker;
+     let rootNode = null;
+ 
+     // If available, set either the previously selected node or the body
+     // as default selected, else set documentElement
+     return walker.getRootNode().then(aRootNode => {
+       rootNode = aRootNode;
+-      return walker.querySelector(rootNode, this.selectionCssSelector);
++      if (this.selectionCssSelector) {
++        return walker.querySelector(rootNode, this.selectionCssSelector);
++      }
+     }).then(front => {
+       if (front) {
+         return front;
+       }
+       return walker.querySelector(rootNode, "body");
+     }).then(front => {
+       if (front) {
+         return front;
+diff --git a/browser/devtools/inspector/test/browser.ini b/browser/devtools/inspector/test/browser.ini
+index a83a42c..e118cbf 100644
+--- a/browser/devtools/inspector/test/browser.ini
++++ b/browser/devtools/inspector/test/browser.ini
+@@ -47,8 +47,9 @@ support-files =
+ [browser_inspector_select_last_selected.js]
+ [browser_inspector_sidebarstate.js]
+ [browser_inspector_bug_848731_reset_selection_on_delete.js]
+ [browser_inspector_bug_922125_destroy_on_navigate.js]
+ [browser_inspector_bug_958456_highlight_comments.js]
+ [browser_inspector_bug_958169_switch_to_inspector_on_pick.js]
+ [browser_inspector_bug_961771_picker_stops_on_tool_select.js]
+ [browser_inspector_bug_962478_picker_stops_on_destroy.js]
++[browser_inspector_select_docshell.js]
+diff --git a/browser/devtools/inspector/test/browser_inspector_select_docshell.js b/browser/devtools/inspector/test/browser_inspector_select_docshell.js
+new file mode 100644
+index 0000000..258ff85
+--- /dev/null
++++ b/browser/devtools/inspector/test/browser_inspector_select_docshell.js
+@@ -0,0 +1,113 @@
++/* Any copyright is dedicated to the Public Domain.
++ * http://creativecommons.org/publicdomain/zero/1.0/ */
++
++// Test frame selection switching at toolbox level
++// when using the inspector
++
++let Toolbox = devtools.Toolbox;
++let TargetFactory = devtools.TargetFactory;
++
++function test() {
++  waitForExplicitFinish();
++
++  const FrameURL = "data:text/html;charset=UTF-8," + encodeURI("<div id=\"frame\">frame</div>");
++  const URL = "data:text/html;charset=UTF-8," + encodeURI("<iframe src=\"" + FrameURL + "\"></iframe><div id=\"top\">top</div>");
++
++  let toolbox, inspector;
++  Services.prefs.setBoolPref("devtools.command-button-frames.enabled", true);
++
++  // open tab, load URL, and wait for load to finish
++  let tab = gBrowser.selectedTab = gBrowser.addTab();
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++  let deferred = promise.defer();
++  let browser = gBrowser.getBrowserForTab(tab);
++
++  function onTabLoad() {
++    browser.removeEventListener("load", onTabLoad, true);
++    deferred.resolve(null);
++  }
++  browser.addEventListener("load", onTabLoad, true);
++  browser.loadURI(URL);
++
++  // open devtools panel
++  deferred.promise.then(() => {
++    return gDevTools.showToolbox(target, null, Toolbox.HostType.BOTTOM);
++  }).then(aToolbox => {
++    toolbox = aToolbox;
++  }).then(() => {
++    // select the inspector
++    return toolbox.selectTool("inspector").then(i => {
++      inspector = i;
++      // Verify we are on the top level document
++      let testNode = content.document.querySelector("#top");
++      ok(testNode, "We have the test node on the top level document");
++
++      assertMarkupViewIsLoaded();
++        // Verify that the frame list button is visible and populated
++        let btn = toolbox.doc.getElementById("command-button-frames");
++        ok(!btn.firstChild.getAttribute("hidden"), "The frame list button is visible");
++        let frameBtns = Array.slice(btn.firstChild.querySelectorAll("[data-window-id]"));
++        is(frameBtns.length, 2, "We have both frames in the list");
++        frameBtns.sort(function (a, b) {
++          return a.getAttribute("label").localeCompare(b.getAttribute("label"));
++        });
++        is(frameBtns[0].getAttribute("label"), FrameURL, "Got top level document in the list");
++        is(frameBtns[1].getAttribute("label"), URL, "Got iframe document in the list");
++
++        return frameBtns[0];
++    });
++  }).then((iframeBtn) => {
++    // navigate to URL_2
++    let deferred = promise.defer();
++
++    // Listen to will-navigate to check if the view is empty
++    target.on("will-navigate", () => {
++      info("Navigation to the iframe has started, the inspector should be empty");
++      assertMarkupViewIsEmpty();
++    });
++    inspector.once("new-root", () => {
++      info("Navigation to the iframe was done, the inspector should be back up");
++
++      // Verify we are on page one
++      let testNode = content.frames[0].document.querySelector("#frame");
++      ok(testNode, "We have the test node on the iframe");
++
++      // On page 2 load, verify we have the right content
++      assertMarkupViewIsLoaded();
++
++      inspector.once("inspector-updated", () => {
++        deferred.resolve();
++      });
++      inspector.selection.setNode(testNode, null);
++    });
++
++    inspector.selection.setNode(content.document.querySelector("#top"));
++    inspector.once("inspector-updated", () => {
++      // Select the iframe
++      iframeBtn.click();
++    });
++
++
++
++    return deferred.promise;
++  }).then(() => {
++    endTests();
++  });
++
++  function assertMarkupViewIsLoaded() {
++    let markupViewBox = inspector.panelDoc.getElementById("markup-box");
++    is(markupViewBox.childNodes.length, 1, "The markup-view is loaded");
++  }
++
++  function assertMarkupViewIsEmpty() {
++    let markupViewBox = inspector.panelDoc.getElementById("markup-box");
++    is(markupViewBox.childNodes.length, 0, "The markup-view is unloaded");
++  }
++
++  function endTests() {
++    target = browser = tab = inspector = TargetFactory = Toolbox = null;
++    gBrowser.removeCurrentTab();
++    Services.prefs.clearUserPref("devtools.command-button-frames.enabled");
++    finish();
++  }
++}
+diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
+index 6cff8ab..b9c6c5e 100644
+--- a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
++++ b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
+@@ -13,16 +13,20 @@
+ <!ENTITY toolboxPreviousTool.key       "[">
+ 
+ <!ENTITY toolboxZoomIn.key             "+">
+ <!ENTITY toolboxZoomIn.key2            "="> <!-- + is above this key on many keyboards -->
+ <!ENTITY toolboxZoomOut.key            "-">
+ <!ENTITY toolboxZoomReset.key          "0">
+ 
+ <!ENTITY toolboxReload.key             "r">
++<!-- LOCALIZATION NOTE (toolboxFramesButton): This is the label for
++  -  the iframes menu list that appears only when the document has some.
++  -  It allows you to switch the context of the whole toolbox. -->
++<!ENTITY toolboxFramesButton           "Frames">
+ 
+ <!-- LOCALIZATION NOTE (options.context.advancedSettings): This is the label for
+   -  the heading of the advanced settings group in the options panel. -->
+ <!ENTITY options.context.advancedSettings "Advanced settings">
+ 
+ <!-- LOCALIZATION NOTE (options.context.inspector): This is the label for
+   -  the heading of the Inspector group in the options panel. -->
+ <!ENTITY options.context.inspector "Inspector">
