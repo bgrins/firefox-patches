@@ -3,4 +3,860 @@
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 777674 - Add support for inspecting anonymous content
 
-
+diff --git a/browser/devtools/fontinspector/font-inspector.js b/browser/devtools/fontinspector/font-inspector.js
+--- a/browser/devtools/fontinspector/font-inspector.js
++++ b/browser/devtools/fontinspector/font-inspector.js
+@@ -88,17 +88,17 @@ FontInspector.prototype = {
+       return;
+     }
+ 
+     let node = this.inspector.selection.node;
+     let contentDocument = node.ownerDocument;
+ 
+     // We don't get fonts for a node, but for a range
+     let rng = contentDocument.createRange();
+-    rng.selectNode(node);
++    rng.selectNodeContents(node);
+     let fonts = DOMUtils.getUsedFontFaces(rng);
+     let fontsArray = [];
+     for (let i = 0; i < fonts.length; i++) {
+       fontsArray.push(fonts.item(i));
+     }
+     fontsArray = fontsArray.sort(function(a, b) {
+       return a.srcIndex < b.srcIndex;
+     });
+diff --git a/browser/devtools/framework/selection.js b/browser/devtools/framework/selection.js
+--- a/browser/devtools/framework/selection.js
++++ b/browser/devtools/framework/selection.js
+@@ -220,21 +220,35 @@ Selection.prototype = {
+     // accessing node.rawNode, this needs to stay.
+     let rawNode = null;
+     if (node.isLocal_toBeDeprecated()) {
+       rawNode = node.rawNode();
+     }
+     if (rawNode) {
+       try {
+         let doc = this.document;
+-        return (doc && doc.defaultView && doc.documentElement.contains(rawNode));
++        if (doc && doc.defaultView) {
++          let docEl = doc.documentElement;
++
++          if (docEl.contains(rawNode)) {
++            return true;
++          }
++
++          // Recurse up anonymous parent to see if it is in document
++          let bindingParent = rawNode;
++          while ((bindingParent = doc.getBindingParent(bindingParent))) {
++            if (docEl.contains(bindingParent)) {
++              return true;
++            }
++          }
++        }
+       } catch (e) {
+         // "can't access dead object" error
+-        return false;
+       }
++      return false;
+     }
+ 
+     while(node) {
+       if (node === this._walker.rootNode) {
+         return true;
+       }
+       node = node.parentNode();
+     };
+diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
+--- a/browser/devtools/inspector/inspector-panel.js
++++ b/browser/devtools/inspector/inspector-panel.js
+@@ -401,17 +401,19 @@ InspectorPanel.prototype = {
+     // client know.
+     let selection = this.selection.nodeFront;
+ 
+     // On any new selection made by the user, store the unique css selector
+     // of the selected node so it can be restored after reload of the same page
+     if (reason !== "navigateaway" &&
+         this.selection.node &&
+         this.selection.isElementNode()) {
+-      this.selectionCssSelector = CssLogic.findCssSelector(this.selection.node);
++      try {
++        this.selectionCssSelector = CssLogic.findCssSelector(this.selection.node);
++      } catch(e) { }
+     }
+ 
+     let selfUpdate = this.updating("inspector-panel");
+     Services.tm.mainThread.dispatch(() => {
+       try {
+         selfUpdate(selection);
+       } catch(ex) {
+         console.error(ex);
+diff --git a/browser/devtools/markupview/markup-view.css b/browser/devtools/markupview/markup-view.css
+--- a/browser/devtools/markupview/markup-view.css
++++ b/browser/devtools/markupview/markup-view.css
+@@ -83,16 +83,17 @@
+ }
+ 
+ .expander {
+   display: inline-block;
+   margin-left: -14px;
+   vertical-align: middle;
+ }
+ 
++.child.collapsed .children,
+ .child.collapsed .child {
+   display: none;
+ }
+ 
+ .child > .tag-line:first-child .close {
+   display: none;
+ }
+ 
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -272,17 +272,17 @@ MarkupView.prototype = {
+     while (parent !== this.doc.body) {
+       if (parent.container) {
+         container = parent.container;
+         break;
+       }
+       parent = parent.parentNode;
+     }
+ 
+-    if (container) {
++    if (container && container._isImagePreviewTarget) {
+       // With the newly found container, delegate the tooltip content creation
+       // and decision to show or not the tooltip
+       return container._isImagePreviewTarget(target, this.tooltip);
+     }
+   },
+ 
+   /**
+    * Given the known reason, should the current selection be briefly highlighted
+@@ -525,17 +525,17 @@ MarkupView.prototype = {
+     if (!aIgnoreFocus) {
+       aContainer.focus();
+     }
+   },
+ 
+   /**
+    * Make sure a node is included in the markup tool.
+    *
+-   * @param DOMNode aNode
++   * @param NodeFront aNode
+    *        The node in the content document.
+    * @param boolean aFlashNode
+    *        Whether the newly imported node should be flashed
+    * @returns MarkupContainer The MarkupContainer object for this element.
+    */
+   importNode: function(aNode, aFlashNode) {
+     if (!aNode) {
+       return null;
+@@ -914,17 +914,17 @@ MarkupView.prototype = {
+   _ensureVisible: function(node) {
+     while (node) {
+       let container = this.getContainer(node);
+       let parent = node.parentNode();
+       if (!container.elt.parentNode) {
+         let parentContainer = this.getContainer(parent);
+         if (parentContainer) {
+           parentContainer.childrenDirty = true;
+-          this._updateChildren(parentContainer, {expand: node});
++          this._updateChildren(parentContainer, {expand: true});
+         }
+       }
+ 
+       node = parent;
+     }
+     return this._waitForChildren();
+   },
+ 
+@@ -1059,17 +1059,22 @@ MarkupView.prototype = {
+                     "markupView.more.showAll",
+                     [aContainer.node.numChildren.toString()], 1),
+           allButtonClick: () => {
+             aContainer.maxChildren = -1;
+             aContainer.childrenDirty = true;
+             this._updateChildren(aContainer);
+           }
+         };
++        console.log("Node in update children", aContainer.node.nodeName, aContainer.node,
+ 
++          children.hasFirst,
++          children.hasLast
++
++          );
+         if (!children.hasFirst) {
+           let span = this.template("more-nodes", data);
+           fragment.insertBefore(span, fragment.firstChild);
+         }
+         if (!children.hasLast) {
+           let span = this.template("more-nodes", data);
+           fragment.appendChild(span);
+         }
+@@ -1266,17 +1271,17 @@ MarkupView.prototype = {
+ /**
+  * The main structure for storing a document node in the markup
+  * tree.  Manages creation of the editor for the node and
+  * a <ul> for placing child elements, and expansion/collapsing
+  * of the element.
+  *
+  * @param MarkupView aMarkupView
+  *        The markup view that owns this container.
+- * @param DOMNode aNode
++ * @param NodeFront aNode
+  *        The node to display.
+  * @param Inspector aInspector
+  *        The inspector tool container the markup-view
+  */
+ function MarkupContainer(aMarkupView, aNode, aInspector) {
+   this.markup = aMarkupView;
+   this.doc = this.markup.doc;
+   this.undo = this.markup.undo;
+@@ -1300,16 +1305,23 @@ function MarkupContainer(aMarkupView, aN
+   this.expander = null;
+   this.tagState = null;
+   this.tagLine = null;
+   this.children = null;
+   this.markup.template("container", this);
+   this.elt.container = this;
+   this.children.container = this;
+ 
++  if (aNode.isPseudoElement) {
++    this.expander.remove();
++  }
++  if (aNode.isAnonymous) {
++    this.elt.classList.add("anonymous");
++  }
++
+   // Expanding/collapsing the node on dblclick of the whole tag-line element
+   this._onToggle = this._onToggle.bind(this);
+   this.elt.addEventListener("dblclick", this._onToggle, false);
+   this.expander.addEventListener("click", this._onToggle, false);
+ 
+   // Appending the editor element and attaching event listeners
+   this.tagLine.appendChild(this.editor.elt);
+ 
+@@ -1806,16 +1818,27 @@ function ElementEditor(aContainer, aNode
+   // The templates will fill the following properties
+   this.elt = null;
+   this.tag = null;
+   this.closeTag = null;
+   this.attrList = null;
+   this.newAttr = null;
+   this.closeElt = null;
+ 
++  if (aNode.isPseudoElement) {
++    this.template("pseudoelement", this);
++    this.tag.textContent = aNode.isBeforePseudoElement ? "::before" : "::after";
++    // XXX: we should update functions to not access these in case
++    // of pseudo elements instead of faking them.
++    this.attrList = this.doc.createElement("span");
++    this.closeTag = this.doc.createElement("span");
++    this.newAttr = this.doc.createElement("span");
++    this.closeElt = this.doc.createElement("span");
++  } else {
++    // XXX: Don't indent yet so diff is easier to read.
+   // Create the main editor
+   this.template("element", this);
+ 
+   if (aNode.isLocal_toBeDeprecated()) {
+     this.rawNode = aNode.rawNode();
+   }
+ 
+   // Make the tag name editable (unless this is a remote node or
+@@ -1856,16 +1879,19 @@ function ElementEditor(aContainer, aNode
+       }
+     }
+   });
+ 
+   let tagName = this.node.nodeName.toLowerCase();
+   this.tag.textContent = tagName;
+   this.closeTag.textContent = tagName;
+ 
++  }
++
++
+   this.update();
+ }
+ 
+ ElementEditor.prototype = {
+   /**
+    * Update the state of the editor from the node.
+    */
+   update: function() {
+diff --git a/browser/devtools/markupview/markup-view.xhtml b/browser/devtools/markupview/markup-view.xhtml
+--- a/browser/devtools/markupview/markup-view.xhtml
++++ b/browser/devtools/markupview/markup-view.xhtml
+@@ -25,16 +25,18 @@
+       <li id="template-container" save="${elt}" class="child collapsed">
+         <div save="${tagLine}" class="tag-line"><span save="${tagState}" class="tag-state"></span><span save="${expander}" class="theme-twisty expander"></span></div>
+         <ul save="${children}" class="children"></ul>
+       </li>
+ 
+       <li id="template-more-nodes" class="more-nodes devtools-class-comment" save="${elt}"><span>${showing}</span> <button href="#" onclick="${allButtonClick}">${showAll}</button></li>
+     </ul>
+ 
++    <span id="template-pseudoelement" save="${elt}" class="editor"><span save="${tag}" class="tag theme-fg-color5" tabindex="0"></span></span>
++
+     <span id="template-element" save="${elt}" class="editor"><span class="open">&lt;<span save="${tag}" class="tag theme-fg-color3" tabindex="0"></span><span save="${attrList}"></span><span save="${newAttr}" class="newattr" tabindex="0"></span><span class="closing-bracket">&gt;</span></span><span class="close">&lt;/<span save="${closeTag}" class="tag theme-fg-color3"></span>&gt;</span></span>
+ 
+     <span id="template-attribute" save="${attr}" data-attr="${attrName}" class="attreditor" style="display:none"> <span class="editable" save="${inner}" tabindex="0"><span save="${name}" class="attr-name theme-fg-color2"></span>=&quot;<span save="${val}" class="attr-value theme-fg-color6"></span>&quot;</span></span>
+ 
+     <span id="template-text" save="${elt}" class="editor text">
+       <pre save="${value}" style="display:inline-block;" tabindex="0"></pre>
+     </span>
+ 
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -148,17 +148,19 @@ ElementStyle.prototype = {
+   dummyElement: null,
+ 
+   init: function()
+   {
+     // To figure out how shorthand properties are interpreted by the
+     // engine, we will set properties on a dummy element and observe
+     // how their .style attribute reflects them as computed values.
+     return this.dummyElementPromise = createDummyDocument().then(document => {
+-      this.dummyElement = document.createElementNS(this.element.namespaceURI,
++      // ::before and ::after do not have a namespaceURI
++      let namespaceURI = this.element.namespaceURI || document.documentElement.namespaceURI;
++      this.dummyElement = document.createElementNS(namespaceURI,
+                                                    this.element.tagName);
+       document.documentElement.appendChild(this.dummyElement);
+       return this.dummyElement;
+     }).then(null, promiseWarn);
+   },
+ 
+   destroy: function() {
+     this.dummyElement = null;
+diff --git a/browser/themes/shared/devtools/markup-view.css b/browser/themes/shared/devtools/markup-view.css
+--- a/browser/themes/shared/devtools/markup-view.css
++++ b/browser/themes/shared/devtools/markup-view.css
+@@ -10,16 +10,20 @@
+ .more-nodes {
+   padding-left: 16px;
+ }
+ 
+ .styleinspector-propertyeditor {
+   border: 1px solid #CCC;
+ }
+ 
++.anonymous .editor {
++  opacity: .8;
++  font-style: italic;
++}
+ 
+ /* Selected nodes in the tree should have light selected text.
+    theme-selected doesn't work in this case since the text is a
+    sibling of the class, not a child. */
+ .theme-selected ~ .editor,
+ .theme-selected ~ .editor .theme-fg-color1,
+ .theme-selected ~ .editor .theme-fg-color2,
+ .theme-selected ~ .editor .theme-fg-color3,
+diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/server/actors/highlighter.js
+--- a/toolkit/devtools/server/actors/highlighter.js
++++ b/toolkit/devtools/server/actors/highlighter.js
+@@ -953,26 +953,32 @@ BoxModelHighlighter.prototype = Heritage
+ 
+     let node = this.currentNode;
+     let info = this.nodeInfo;
+ 
+     // Update the tag, id, classes, pseudo-classes and dimensions only if they
+     // changed to avoid triggering paint events
+ 
+     let tagName = node.tagName;
++    let tagName = this.currentNode.tagName;
++    if (tagName === "_moz_generated_content_before") {
++      tagName = "::before";
++    } else if (tagName === "_moz_generated_content_after") {
++      tagName = "::after";
++    }
+     if (info.tagNameLabel.textContent !== tagName) {
+       info.tagNameLabel.textContent = tagName;
+     }
+ 
+     let id = node.id ? "#" + node.id : "";
+     if (info.idLabel.textContent !== id) {
+       info.idLabel.textContent = id;
+     }
+ 
+-    let classList = node.classList.length ? "." + [...node.classList].join(".") : "";
++    let classList = (node.classList || []).length ? "." + [...node.classList].join(".") : "";
+     if (info.classesBox.textContent !== classList) {
+       info.classesBox.textContent = classList;
+     }
+ 
+     let pseudos = PSEUDO_CLASSES.filter(pseudo => {
+       return DOMUtils.hasPseudoClassLock(node, pseudo);
+     }, this).join("");
+     if (info.pseudoClassesBox.textContent !== pseudos) {
+@@ -1300,19 +1306,21 @@ function isNodeValid(node) {
+     return false;
+   }
+ 
+   // Is it an element node
+   if (node.nodeType !== Ci.nsIDOMNode.ELEMENT_NODE) {
+     return false;
+   }
+ 
+-  // Is it connected to the document?
++  // Is it connected to the document? Using getBindingParent adds support for
++  // anonymous elements generated by a node in the document.
+   let doc = node.ownerDocument;
+-  if (!doc || !doc.defaultView || !doc.documentElement.contains(node)) {
++  let containedNode = doc.getBindingParent(node) || node;
++  if (!doc || !doc.defaultView || !doc.documentElement.contains(containedNode)) {
+     return false;
+   }
+ 
+   return true;
+ }
+ 
+ XPCOMUtils.defineLazyGetter(this, "DOMUtils", function () {
+   return Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils)
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -215,41 +215,59 @@ var NodeActor = exports.NodeActor = prot
+     // Estimate the number of children.
+     let numChildren = this.rawNode.childNodes.length;
+     if (numChildren === 0 &&
+         (this.rawNode.contentDocument || this.rawNode.getSVGDocument)) {
+       // This might be an iframe with virtual children.
+       numChildren = 1;
+     }
+ 
++    // The walker will automatically include these anonymous children, but
++    // we need to make sure that they are counted for the frontend.
++    // XXX: Should we use a walker method instead of special casing anonymous nodes?
++    if (this.rawNode.nodeType === Ci.nsIDOMNode.ELEMENT_NODE) {
++      let anonChildren = this.rawNode.ownerDocument.getAnonymousNodes(this.rawNode);
++      if (anonChildren) {
++        numChildren += anonChildren.length;
++      }
++    }
++
+     let form = {
+       actor: this.actorID,
+       baseURI: this.rawNode.baseURI,
+       parent: parentNode ? parentNode.actorID : undefined,
+       nodeType: this.rawNode.nodeType,
+       namespaceURI: this.rawNode.namespaceURI,
+       nodeName: this.rawNode.nodeName,
+       numChildren: numChildren,
+ 
+       // doctype attributes
+       name: this.rawNode.name,
+       publicId: this.rawNode.publicId,
+       systemId: this.rawNode.systemId,
+ 
+       attrs: this.writeAttrs(),
+-
++      isBeforePseudoElement: this.rawNode.nodeName === "_moz_generated_content_before",
++      isAfterPseudoElement: this.rawNode.nodeName === "_moz_generated_content_after",
+       pseudoClassLocks: this.writePseudoClassLocks(),
+ 
+       isDisplayed: this.isDisplayed,
+     };
+ 
+     if (this.isDocumentElement()) {
+       form.isDocumentElement = true;
+     }
+ 
++    if (this.rawNode.nodeType === Ci.nsIDOMNode.ELEMENT_NODE) {
++      let bindingParent = this.rawNode.ownerDocument.getBindingParent(this.rawNode);
++
++      // XXX: should we also include a reference to the binding parent?
++      form.isAnonymous = !!bindingParent;
++    }
++
+     if (this.rawNode.nodeValue) {
+       // We only include a short version of the value if it's longer than
+       // gValueSummaryLength
+       if (this.rawNode.nodeValue.length > gValueSummaryLength) {
+         form.shortValue = this.rawNode.nodeValue.substring(0, gValueSummaryLength);
+         form.incompleteValue = true;
+       } else {
+         form.shortValue = this.rawNode.nodeValue;
+@@ -546,16 +564,21 @@ let NodeFront = protocol.FrontClass(Node
+ 
+   get className() {
+     return this.getAttribute("class") || '';
+   },
+ 
+   get hasChildren() this._form.numChildren > 0,
+   get numChildren() this._form.numChildren,
+ 
++  get isBeforePseudoElement() this._form.isBeforePseudoElement,
++  get isAfterPseudoElement() this._form.isAfterPseudoElement,
++  get isPseudoElement() this.isBeforePseudoElement || this.isAfterPseudoElement,
++  get isAnonymous() this._form.isAnonymous,
++
+   get tagName() this.nodeType === Ci.nsIDOMNode.ELEMENT_NODE ? this.nodeName : null,
+   get shortValue() this._form.shortValue,
+   get incompleteValue() !!this._form.incompleteValue,
+ 
+   get isDocumentElement() !!this._form.isDocumentElement,
+ 
+   // doctype properties
+   get name() this._form.name,
+@@ -1252,19 +1275,21 @@ var WalkerActor = protocol.ActorClass({
+     // We're going to create a few document walkers with the same filter,
+     // make it easier.
+     let filteredWalker = (node) => {
+       return documentWalker(node, this.rootWin, options.whatToShow);
+     };
+ 
+     // Need to know the first and last child.
+     let rawNode = node.rawNode;
++
+     let firstChild = filteredWalker(rawNode).firstChild();
+     let lastChild = filteredWalker(rawNode).lastChild();
+ 
++    console.log("Detected children for", rawNode, "first: ", firstChild, "last: ", lastChild);
+     if (!firstChild) {
+       // No children, we're done.
+       return { hasFirst: true, hasLast: true, nodes: [] };
+     }
+ 
+     let start;
+     if (options.center) {
+       start = options.center.rawNode;
+@@ -2767,98 +2792,85 @@ exports._documentWalker = documentWalker
+ 
+ function nodeDocument(node) {
+   return node.ownerDocument || (node.nodeType == Ci.nsIDOMNode.DOCUMENT_NODE ? node : null);
+ }
+ 
+ /**
+  * Similar to a TreeWalker, except will dig in to iframes and it doesn't
+  * implement the good methods like previousNode and nextNode.
++ * XXX: if deep-tree-walker really does show subdocuments as it claims, this
++ * might be able to go away entirely.
+  *
+  * See TreeWalker documentation for explanations of the methods.
+  */
+ function DocumentWalker(aNode, aRootWin, aShow, aFilter, aExpandEntityReferences) {
+-  let doc = nodeDocument(aNode);
+-  this.layoutHelpers = new LayoutHelpers(aRootWin);
+-  this.walker = doc.createTreeWalker(doc,
+-    aShow, aFilter, aExpandEntityReferences);
++  let doc = aRootWin.document;
++
++  this.walker = Cc["@mozilla.org/inspector/deep-tree-walker;1"].createInstance(Ci.inIDeepTreeWalker);
++  this.walker.showAnonymousContent = true;
++  this.walker.showSubDocuments = true;
++  this.walker.init(doc, aShow);
+   this.walker.currentNode = aNode;
+   this.filter = aFilter;
+ }
+ 
+ DocumentWalker.prototype = {
+   get node() this.walker.node,
+   get whatToShow() this.walker.whatToShow,
+   get expandEntityReferences() this.walker.expandEntityReferences,
+   get currentNode() this.walker.currentNode,
+   set currentNode(aVal) this.walker.currentNode = aVal,
+ 
+-  /**
+-   * Called when the new node is in a different document than
+-   * the current node, creates a new treewalker for the document we've
+-   * run in to.
+-   */
+-  _reparentWalker: function(aNewNode) {
+-    if (!aNewNode) {
+-      return null;
+-    }
+-    let doc = nodeDocument(aNewNode);
+-    let walker = doc.createTreeWalker(doc,
+-      this.whatToShow, this.filter, this.expandEntityReferences);
+-    walker.currentNode = aNewNode;
+-    this.walker = walker;
+-    return aNewNode;
+-  },
+-
+   parentNode: function() {
+-    let currentNode = this.walker.currentNode;
+-    let parentNode = this.walker.parentNode();
+-
+-    if (!parentNode) {
+-      if (currentNode && currentNode.nodeType == Ci.nsIDOMNode.DOCUMENT_NODE
+-          && currentNode.defaultView) {
+-
+-        let window = currentNode.defaultView;
+-        let frame = this.layoutHelpers.getFrameElement(window);
+-        if (frame) {
+-          return this._reparentWalker(frame);
+-        }
+-      }
+-      return null;
+-    }
+-
+-    return parentNode;
++    return this.walker.parentNode();
+   },
+ 
+   firstChild: function() {
+     let node = this.walker.currentNode;
+     if (!node)
+       return null;
+-    if (node.contentDocument) {
+-      return this._reparentWalker(node.contentDocument);
+-    } else if (node.getSVGDocument) {
+-      return this._reparentWalker(node.getSVGDocument());
++
++    let firstChild = this.walker.firstChild();
++    console.log("Current node:", node, "First child: ", firstChild);
++    while (firstChild && this.filter(firstChild) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
++      firstChild = this.walker.nextSibling();
+     }
+-    return this.walker.firstChild();
++
++    return firstChild;
+   },
+ 
+   lastChild: function() {
+     let node = this.walker.currentNode;
+     if (!node)
+       return null;
+-    if (node.contentDocument) {
+-      return this._reparentWalker(node.contentDocument);
+-    } else if (node.getSVGDocument) {
+-      return this._reparentWalker(node.getSVGDocument());
++
++    let lastChild = this.walker.lastChild();
++    while (lastChild && this.filter(lastChild) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
++      lastChild = this.walker.previousSibling();
+     }
+-    return this.walker.lastChild();
++
++    return lastChild;
+   },
+ 
+-  previousSibling: function DW_previousSibling() this.walker.previousSibling(),
+-  nextSibling: function DW_nextSibling() this.walker.nextSibling()
++  previousSibling: function() {
++    let node = this.walker.previousSibling();
++    while (node && this.filter(node) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
++      node = this.walker.previousSibling();
++    }
++    return node;
++  },
++
++  nextSibling: function() {
++    let node = this.walker.nextSibling();
++    while (node && this.filter(node) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
++      node = this.walker.nextSibling();
++    }
++    return node;
++  }
+ };
+ 
+ /**
+  * A tree walker filter for avoiding empty whitespace text nodes.
+  */
+ function whitespaceTextFilter(aNode) {
+     if (aNode.nodeType == Ci.nsIDOMNode.TEXT_NODE &&
+         !/[^\s]/.exec(aNode.nodeValue)) {
+diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/actors/styles.js
+--- a/toolkit/devtools/server/actors/styles.js
++++ b/toolkit/devtools/server/actors/styles.js
+@@ -18,17 +18,17 @@ loader.lazyGetter(this, "CssLogic", () =
+ loader.lazyGetter(this, "DOMUtils", () => Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils));
+ 
+ // The PageStyle actor flattens the DOM CSS objects a little bit, merging
+ // Rules and their Styles into one actor.  For elements (which have a style
+ // but no associated rule) we fake a rule with the following style id.
+ const ELEMENT_STYLE = 100;
+ exports.ELEMENT_STYLE = ELEMENT_STYLE;
+ 
+-const PSEUDO_ELEMENTS = [":first-line", ":first-letter", ":before", ":after", ":-moz-selection"];
++const PSEUDO_ELEMENTS = [":first-line", ":first-letter", ":-moz-selection"];
+ exports.PSEUDO_ELEMENTS = PSEUDO_ELEMENTS;
+ 
+ // Predeclare the domnode actor type for use in requests.
+ types.addActorType("domnode");
+ 
+ /**
+  * DOM Nodes returned by the style actor will be owned by the DOM walker
+  * for the connection.
+@@ -352,35 +352,53 @@ var PageStyleActor = protocol.ActorClass
+   },
+ 
+   /**
+    * Helper function for getApplied, adds all the rules from a given
+    * element.
+    */
+   addElementRules: function(element, inherited, options, rules)
+   {
++    if (element.style) {
++      let elementStyle = this._styleRef(element);
++      if (!inherited || this._hasInheritedProps(element.style)) {
++        rules.push({
++          rule: elementStyle,
++          inherited: inherited,
++        });
++      }
++    }
++
++    let pseudoElements = inherited ? [null] : [null, ...PSEUDO_ELEMENTS];
++    let isBeforeOrAfter = false;
++
++    // If it is before or after, then we don't want to get styles for
++    // this element.  Want to get it for the parent, but with the corresponding
++    // pseudo.  Then we want to lie to the view and tell it that it isn't a pseudo
++    // style so that it shows up normally.
++    if (element.nodeName == "_moz_generated_content_before") {
++      pseudoElements = [":before"];
++      element = element.parentNode;
++      isBeforeOrAfter = true;
++    }
++
++    if (element.nodeName == "_moz_generated_content_after") {
++      pseudoElements = [":after"];
++      element = element.parentNode;
++      isBeforeOrAfter = true;
++    }
++
+     if (!element.style) {
+       return;
+     }
+ 
+-    let elementStyle = this._styleRef(element);
+-
+-    if (!inherited || this._hasInheritedProps(element.style)) {
+-      rules.push({
+-        rule: elementStyle,
+-        inherited: inherited,
+-      });
+-    }
+-
+-    let pseudoElements = inherited ? [null] : [null, ...PSEUDO_ELEMENTS];
+     for (let pseudo of pseudoElements) {
+ 
+       // Get the styles that apply to the element.
+       let domRules = DOMUtils.getCSSStyleRules(element, pseudo);
+-
+       if (!domRules) {
+         continue;
+       }
+ 
+       // getCSSStyleRules returns ordered from least-specific to
+       // most-specific.
+       for (let i = domRules.Count() - 1; i >= 0; i--) {
+         let domRule = domRules.GetElementAt(i);
+@@ -401,17 +419,17 @@ var PageStyleActor = protocol.ActorClass
+             continue;
+           }
+         }
+ 
+         let ruleActor = this._styleRef(domRule);
+         rules.push({
+           rule: ruleActor,
+           inherited: inherited,
+-          pseudoElement: pseudo,
++          pseudoElement: isBeforeOrAfter ? null : pseudo,
+           isSystem: isSystem
+         });
+       }
+ 
+     }
+   },
+ 
+   /**
+diff --git a/toolkit/devtools/styleinspector/css-logic.js b/toolkit/devtools/styleinspector/css-logic.js
+--- a/toolkit/devtools/styleinspector/css-logic.js
++++ b/toolkit/devtools/styleinspector/css-logic.js
+@@ -171,17 +171,30 @@ CssLogic.prototype = {
+     } else {
+       // Clear cached data in the CssPropertyInfo objects.
+       this._propertyInfos = {};
+     }
+ 
+     this._matchedRules = null;
+     this._matchedSelectors = null;
+     let win = this.viewedDocument.defaultView;
+-    this._computedStyle = win.getComputedStyle(this.viewedElement, "");
++
++    // Handle computed styles on pseudo by reading style rules
++    // on the parent node with proper pseudo arg to getCSSStyleRules.
++    let elementToRead = this.viewedElement;
++    let pseudoToRead = "";
++    if (this.viewedElement.nodeName == "_moz_generated_content_before") {
++      elementToRead = this.viewedElement.parentNode;
++      pseudoToRead = ":before";
++    } else if (this.viewedElement.nodeName == "_moz_generated_content_after") {
++      elementToRead = this.viewedElement.parentNode;
++      pseudoToRead = ":after";
++    }
++
++    this._computedStyle = win.getComputedStyle(elementToRead, pseudoToRead);
+   },
+ 
+   /**
+    * Get the source filter.
+    * @returns {string} The source filter being used.
+    */
+   get sourceFilter() {
+     return this._sourceFilter;
+@@ -582,24 +595,38 @@ CssLogic.prototype = {
+       return;
+     }
+ 
+     do {
+       let status = this.viewedElement === element ?
+                    CssLogic.STATUS.MATCHED : CssLogic.STATUS.PARENT_MATCH;
+ 
+       try {
+-        domRules = domUtils.getCSSStyleRules(element);
++        // Handle finding rules on pseudo by reading style rules
++        // on the parent node with proper pseudo arg to getCSSStyleRules.
++        let elementToRead = element;
++        let pseudoToRead = null;
++        if (element.nodeName == "_moz_generated_content_before") {
++          pseudoToRead = ":before";
++          elementToRead = element.parentNode;
++        } else if (element.nodeName == "_moz_generated_content_after") {
++          pseudoToRead = ":after";
++          elementToRead = element.parentNode;
++        }
++
++        domRules = domUtils.getCSSStyleRules(elementToRead, pseudoToRead);
+       } catch (ex) {
+         Services.console.
+           logStringMessage("CL__buildMatchedRules error: " + ex);
+         continue;
+       }
+ 
+-      for (let i = 0, n = domRules.Count(); i < n; i++) {
++      // getCSSStyleRules can return null with a shadow DOM element.
++      let numDomRules = domRules ? domRules.Count() : 0;
++      for (let i = 0; i < numDomRules; i++) {
+         let domRule = domRules.GetElementAt(i);
+         if (domRule.type !== Ci.nsIDOMCSSRule.STYLE_RULE) {
+           continue;
+         }
+ 
+         let sheet = this.getSheet(domRule.parentStyleSheet, -1);
+         if (sheet._passId !== this._passId) {
+           sheet.index = sheetIndex++;
+@@ -615,17 +642,16 @@ CssLogic.prototype = {
+           continue;
+         }
+ 
+         rule._matchId = this._matchId;
+         rule._passId = this._passId;
+         this._matchedRules.push([rule, status]);
+       }
+ 
+-
+       // Add element.style information.
+       if (element.style && element.style.length > 0) {
+         let rule = new CssRule(null, { style: element.style }, element);
+         rule._matchId = this._matchId;
+         rule._passId = this._passId;
+         this._matchedRules.push([rule, status]);
+       }
+     } while ((element = element.parentNode) &&
