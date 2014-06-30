@@ -1,0 +1,1452 @@
+# vim: se ft=diff :
+# HG changeset patch
+# Parent 98b130a5cd7312a4b2bfcc50b103ff1cb8798d32
+# User Michael Ratcliffe <mratcliffe@mozilla.com>
+# Date 1403785327 -3600
+Bug 736078 - Show which elements have listeners attached r=jwalker
+
+diff --git a/browser/devtools/markupview/markup-view.css b/browser/devtools/markupview/markup-view.css
+--- a/browser/devtools/markupview/markup-view.css
++++ b/browser/devtools/markupview/markup-view.css
+@@ -126,8 +126,13 @@
+ 
+ .tag-state.flash-out {
+   transition: background .5s;
+ }
+ 
+ .tag-line .open, .tag-line .close, .comment {
+   cursor: default;
+ }
++
++.markupview-events {
++  display: none;
++  cursor: pointer;
++}
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -83,59 +83,73 @@ function MarkupView(aInspector, aFrame, 
+   this._containers = new Map();
+ 
+   this._boundMutationObserver = this._mutationObserver.bind(this);
+   this.walker.on("mutations", this._boundMutationObserver);
+ 
+   this._boundOnDisplayChange = this._onDisplayChange.bind(this);
+   this.walker.on("display-change", this._boundOnDisplayChange);
+ 
++  this._onMouseClick = this._onMouseClick.bind(this);
++
+   this._boundOnNewSelection = this._onNewSelection.bind(this);
+   this._inspector.selection.on("new-node-front", this._boundOnNewSelection);
+   this._onNewSelection();
+ 
+   this._boundKeyDown = this._onKeyDown.bind(this);
+   this._frame.contentWindow.addEventListener("keydown", this._boundKeyDown, false);
+ 
+   this._boundFocus = this._onFocus.bind(this);
+   this._frame.addEventListener("focus", this._boundFocus, false);
+ 
++  this._makeTooltipPersistent = this._makeTooltipPersistent.bind(this);
++
+   this._initPreview();
+   this._initTooltips();
+   this._initHighlighter();
+ 
+   EventEmitter.decorate(this);
+ }
+ 
+ exports.MarkupView = MarkupView;
+ 
+ MarkupView.prototype = {
+   _selectedContainer: null,
+ 
+   _initTooltips: function() {
+     this.tooltip = new Tooltip(this._inspector.panelDoc);
+-    this.tooltip.startTogglingOnHover(this._elt,
+-      this._isImagePreviewTarget.bind(this));
++    this._makeTooltipPersistent(false);
++
++    this._elt.addEventListener("click", this._onMouseClick, false);
+   },
+ 
+   _initHighlighter: function() {
+     // Show the box model on markup-view mousemove
+     this._onMouseMove = this._onMouseMove.bind(this);
+     this._elt.addEventListener("mousemove", this._onMouseMove, false);
+     this._onMouseLeave = this._onMouseLeave.bind(this);
+     this._elt.addEventListener("mouseleave", this._onMouseLeave, false);
+ 
+     // Show markup-containers as hovered on toolbox "picker-node-hovered" event
+     // which happens when the "pick" button is pressed
+     this._onToolboxPickerHover = (event, nodeFront) => {
+       this.showNode(nodeFront, true).then(() => {
+         this._showContainerAsHovered(nodeFront);
+       });
++    };
++    this._inspector.toolbox.on("picker-node-hovered", this._onToolboxPickerHover);
++  },
++
++  _makeTooltipPersistent: function(state) {
++    if (state) {
++      this.tooltip.stopTogglingOnHover();
++    } else {
++      this.tooltip.startTogglingOnHover(this._elt,
++        this._isImagePreviewTarget.bind(this));
+     }
+-    this._inspector.toolbox.on("picker-node-hovered", this._onToolboxPickerHover);
+   },
+ 
+   _onMouseMove: function(event) {
+     let target = event.target;
+ 
+     // Search target for a markupContainer reference, if not found, walk up
+     while (!target.container) {
+       if (target.tagName.toLowerCase() === "body") {
+@@ -150,16 +164,36 @@ MarkupView.prototype = {
+         this._showBoxModel(container.node);
+       } else {
+         this._hideBoxModel();
+       }
+     }
+     this._showContainerAsHovered(container.node);
+   },
+ 
++  _onMouseClick: function(event) {
++    // From the target passed here, let's find the parent MarkupContainer
++    // and ask it if the tooltip should be shown
++    let parentNode = event.target;
++    let container;
++    while (parentNode !== this.doc.body) {
++      if (parentNode.container) {
++        container = parentNode.container;
++        break;
++      }
++      parentNode = parentNode.parentNode;
++    }
++
++    if (container) {
++      // With the newly found container, delegate the tooltip content creation
++      // and decision to show or not the tooltip
++      container._buildEventTooltipContent(event.target, this.tooltip);
++    }
++  },
++
+   _hoveredNode: null,
+ 
+   /**
+    * Show a NodeFront's container as being hovered
+    * @param {NodeFront} nodeFront The node to show as hovered
+    */
+   _showContainerAsHovered: function(nodeFront) {
+     if (this._hoveredNode === nodeFront) {
+@@ -1111,16 +1145,18 @@ MarkupView.prototype = {
+     if (this._destroyer) {
+       return this._destroyer;
+     }
+ 
+     // Note that if the toolbox is closed, this will work fine, but will fail
+     // in case the browser is closed and will trigger a noSuchActor message.
+     this._destroyer = this._hideBoxModel();
+ 
++    this._elt.removeEventListener("click", this._onMouseClick, false);
++
+     this._hoveredNode = null;
+     this._inspector.toolbox.off("picker-node-hovered", this._onToolboxPickerHover);
+ 
+     this.htmlEditor.destroy();
+     this.htmlEditor = null;
+ 
+     this.undo.destroy();
+     this.undo = null;
+@@ -1410,16 +1446,37 @@ MarkupContainer.prototype = {
+     // the tooltip, because we want the full-size image
+     this.node.getImageData().then(data => {
+       data.data.string().then(str => {
+         clipboardHelper.copyString(str, this.markup.doc);
+       });
+     });
+   },
+ 
++  _buildEventTooltipContent: function(target, tooltip) {
++    if (target.hasAttribute("data-event")) {
++      tooltip.hide(target);
++
++      this.node.getEventListenerInfo().then(listenerInfo => {
++        tooltip.setEventContent({
++          eventListenerInfos: listenerInfo,
++          toolbox: this._inspector.toolbox
++        });
++
++        this.markup._makeTooltipPersistent(true);
++        tooltip.once("hidden", () => {
++          this.markup._makeTooltipPersistent(false);
++        });
++
++        tooltip.show(target);
++      });
++      return true;
++    }
++  },
++
+   /**
+    * True if the current node has children.  The MarkupView
+    * will set this attribute for the MarkupContainer.
+    */
+   _hasChildren: false,
+ 
+   get hasChildren() {
+     return this._hasChildren;
+@@ -1855,16 +1912,17 @@ function ElementEditor(aContainer, aNode
+         console.error(x);
+       }
+     }
+   });
+ 
+   let tagName = this.node.nodeName.toLowerCase();
+   this.tag.textContent = tagName;
+   this.closeTag.textContent = tagName;
++  this.eventNode.style.display = this.node.hasEventListeners ? "inline-block" : "none";
+ 
+   this.update();
+ }
+ 
+ ElementEditor.prototype = {
+   /**
+    * Update the state of the editor from the node.
+    */
+diff --git a/browser/devtools/markupview/markup-view.xhtml b/browser/devtools/markupview/markup-view.xhtml
+--- a/browser/devtools/markupview/markup-view.xhtml
++++ b/browser/devtools/markupview/markup-view.xhtml
+@@ -11,41 +11,80 @@
+   <link rel="stylesheet" href="chrome://browser/skin/devtools/markup-view.css" type="text/css"/>
+   <link rel="stylesheet" href="chrome://browser/skin/devtools/common.css" type="text/css"/>
+ 
+   <script type="application/javascript;version=1.8"
+           src="chrome://browser/content/devtools/theme-switching.js"/>
+ 
+ </head>
+ <body class="theme-body devtools-monospace" role="application">
++
++<!-- NOTE THAT WE MAKE EXTENSIVE USE OF HTML COMMENTS IN THIS FILE IN ORDER -->
++<!-- TO MAKE SPANS READABLE WHILST AVOIDING SIGNIFICANT WHITESPACE          -->
++
+   <div id="root-wrapper">
+     <div id="root"></div>
+   </div>
+   <div id="templates" style="display:none">
+ 
+     <ul class="children">
+       <li id="template-container" save="${elt}" class="child collapsed">
+-        <div save="${tagLine}" class="tag-line"><span save="${tagState}" class="tag-state"></span><span save="${expander}" class="theme-twisty expander"></span></div>
++        <div save="${tagLine}" class="tag-line"><!--
++        --><span save="${tagState}" class="tag-state"></span><!--
++        --><span save="${expander}" class="theme-twisty expander"></span><!--
++     --></div>
+         <ul save="${children}" class="children"></ul>
+       </li>
+ 
+-      <li id="template-more-nodes" class="more-nodes devtools-class-comment" save="${elt}"><span>${showing}</span> <button href="#" onclick="${allButtonClick}">${showAll}</button></li>
++      <li id="template-more-nodes"
++          class="more-nodes devtools-class-comment"
++          save="${elt}"><!--
++      --><span>${showing}</span> <!--
++      --><button href="#" onclick="${allButtonClick}">${showAll}</button>
++      </li>
+     </ul>
+ 
+-    <span id="template-element" save="${elt}" class="editor"><span class="open">&lt;<span save="${tag}" class="tag theme-fg-color3" tabindex="0"></span><span save="${attrList}"></span><span save="${newAttr}" class="newattr" tabindex="0"></span><span class="closing-bracket">&gt;</span></span><span class="close">&lt;/<span save="${closeTag}" class="tag theme-fg-color3"></span>&gt;</span></span>
++    <span id="template-element" save="${elt}" class="editor"><!--
++   --><span class="open">&lt;<!--
++     --><span save="${tag}" class="tag theme-fg-color3" tabindex="0"></span><!--
++     --><span save="${attrList}"></span><!--
++     --><span save="${newAttr}" class="newattr" tabindex="0"></span><!--
++     --><span class="closing-bracket">&gt;</span><!--
++   --></span><!--
++   --><span class="close">&lt;/<!--
++     --><span save="${closeTag}" class="tag theme-fg-color3"></span><!--
++     -->&gt;<!--
++   --></span><!--
++     --><div save="${eventNode}" class="markupview-events" data-event="true">ev</div><!--
++ --></span>
+ 
+-    <span id="template-attribute" save="${attr}" data-attr="${attrName}" class="attreditor" style="display:none"> <span class="editable" save="${inner}" tabindex="0"><span save="${name}" class="attr-name theme-fg-color2"></span>=&quot;<span save="${val}" class="attr-value theme-fg-color6"></span>&quot;</span></span>
++    <span id="template-attribute"
++          save="${attr}"
++          data-attr="${attrName}"
++          class="attreditor"
++          style="display:none"> <!--
++   --><span class="editable" save="${inner}" tabindex="0"><!--
++     --><span save="${name}" class="attr-name theme-fg-color2"></span><!--
++     -->=&quot;<!--
++     --><span save="${val}" class="attr-value theme-fg-color6"></span><!--
++     -->&quot;<!--
++   --></span><!--
++ --></span>
+ 
+     <span id="template-text" save="${elt}" class="editor text">
+       <pre save="${value}" style="display:inline-block;" tabindex="0"></pre>
+     </span>
+ 
+-    <span id="template-comment" save="${elt}" class="editor comment theme-comment"><span>&lt;!--</span><pre save="${value}" style="display:inline-block;" tabindex="0"></pre><span>--&gt;</span></span>
+-
+-    <!-- span id="template-elementClose" save="${closeElt}">&lt;/<span save="${closeTag}" class="tagname theme-fg-color3"></span>&gt;</span -->
++    <span id="template-comment"
++          save="${elt}"
++          class="editor comment theme-comment"><!--
++   --><span>&lt;!--</span><!--
++   --><pre save="${value}" style="display:inline-block;" tabindex="0"></pre><!--
++   --><span>--&gt;</span><!--
++ --></span>
+ 
+   </div>
+   <div id="previewbar" class="disabled">
+      <div id="preview"/>
+      <div id="viewbox"/>
+   </div>
+ </body>
+ </html>
+diff --git a/browser/devtools/markupview/test/browser.ini b/browser/devtools/markupview/test/browser.ini
+--- a/browser/devtools/markupview/test/browser.ini
++++ b/browser/devtools/markupview/test/browser.ini
+@@ -1,28 +1,30 @@
+ [DEFAULT]
+ skip-if = e10s # Bug ?????? - devtools tests disabled with e10s
+ subsuite = devtools
+ support-files =
+   doc_markup_edit.html
++  doc_markup_events.html
+   doc_markup_flashing.html
+   doc_markup_mutation.html
+   doc_markup_navigation.html
+   doc_markup_not_displayed.html
+   doc_markup_pagesize_01.html
+   doc_markup_pagesize_02.html
+   doc_markup_search.html
+   doc_markup_toggle.html
+   doc_markup_tooltip.png
+   head.js
+   helper_attributes_test_runner.js
+   helper_outerhtml_test_runner.js
+ 
+ [browser_markupview_copy_image_data.js]
+ [browser_markupview_css_completion_style_attribute.js]
++[browser_markupview_events.js]
+ [browser_markupview_highlight_hover_01.js]
+ [browser_markupview_highlight_hover_02.js]
+ [browser_markupview_highlight_hover_03.js]
+ [browser_markupview_html_edit_01.js]
+ [browser_markupview_html_edit_02.js]
+ [browser_markupview_html_edit_03.js]
+ [browser_markupview_image_tooltip.js]
+ [browser_markupview_mutation_01.js]
+diff --git a/browser/devtools/markupview/test/browser_markupview_events.js b/browser/devtools/markupview/test/browser_markupview_events.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/markupview/test/browser_markupview_events.js
+@@ -0,0 +1,145 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++const TEST_URL = "http://example.com/browser/browser/devtools/" +
++                 "markupview/test/doc_markup_events.html";
++
++let test = asyncTest(function*() {
++  let {toolbox, inspector} = yield addTab(TEST_URL).then(openInspector);
++
++  yield inspector.markup.expandAll();
++
++  yield checkEventsForNode(content.document.documentElement, [
++    {
++      heading: "load > \u2026test/doc_markup_events.html (Bubbling, DOM0)",
++      handler: "init();"
++    }
++  ]);
++
++  yield checkEventsForNode(content.document.getElementById("container"), [
++    {
++      heading: "mouseover > \u2026t/doc_markup_events.html:62 (Capturing, DOM2)",
++      handler: 'function mouseoverHandler(event) {\n' +
++               '  if (event.target.id !== "container") {\n' +
++               '    let output = document.getElementById("output");\n' +
++               '    output.textContent = event.target.textContent;\n' +
++               '  }\n' +
++               '}'
++    }
++  ]);
++
++  yield checkEventsForNode(content.document.getElementById("multiple"), [
++    {
++      heading: "click > \u2026t/doc_markup_events.html:69 (Bubbling, DOM2)",
++      handler: 'function clickHandler(event) {\n' +
++               '  let output = document.getElementById("output");\n' +
++               '  output.textContent = "click";\n' +
++               '}'
++    },
++    {
++      heading: "mouseup > \u2026t/doc_markup_events.html:78 (Bubbling, DOM2)",
++      handler: 'function mouseupHandler(event) {\n' +
++               '  let output = document.getElementById("output");\n' +
++               '  output.textContent = "mouseup";\n' +
++               '}'
++    }
++  ]);
++
++
++  yield checkEventsForNode(content.document.getElementById("DOM0"), [
++    {
++      heading: "click > \u2026test/doc_markup_events.html (Bubbling, DOM0)",
++      handler: "alert('hi')"
++    }
++  ]);
++
++  yield checkEventsForNode(content.document.getElementById("handleevent"), [
++    {
++      heading: "click > \u2026t/doc_markup_events.html:89 (Bubbling, DOM2)",
++      handler: 'handleEvent: function(blah) {\n' +
++               '  alert("handleEvent clicked");\n' +
++               '}'
++    }
++  ]);
++
++  yield checkEventsForNode(content.document.getElementById("fatarrow"), [
++    {
++      heading: "click > \u2026t/doc_markup_events.html:57 (Bubbling, DOM2)",
++      handler: 'fatarrow.addEventListener("click", event = > {\n' +
++               '  alert("Yay for the fat arrow!");\n' +
++               '}'
++    }
++  ]);
++
++  yield checkEventsForNode(content.document.getElementById("boundhe"), [
++    {
++      heading: "click > \u2026/doc_markup_events.html:101 (Bubbling, DOM2)",
++      handler: 'handleEvent: function() {\n' +
++               '  alert("boundHandleEvent clicked");\n' +
++               '}'
++    }
++  ]);
++
++  yield checkEventsForNode(content.document.getElementById("bound"), [
++    {
++      heading: "click > \u2026t/doc_markup_events.html:74 (Bubbling, DOM2)",
++      handler: 'function boundClickHandler(event) {\n' +
++               '  alert("Bound event clicked");\n' +
++               '}'
++    }
++  ]);
++
++  gBrowser.removeCurrentTab();
++
++  function* checkEventsForNode(node, expected) {
++    let container = getContainerForRawNode(node, inspector);
++    let evHolder = container.elt.querySelector(".markupview-events");
++    let tooltip = inspector.markup.tooltip;
++
++    evHolder.scrollIntoView();
++
++    // Wait for scrollIntoView to complete.
++    yield promiseNextTick();
++
++    // Click button to show tooltip
++    EventUtils.synthesizeMouseAtCenter(evHolder, {}, inspector.markup.doc.defaultView);
++    yield tooltip.once("shown");
++
++    // Check values
++    let content = tooltip.content;
++    let result = content.querySelectorAll(".event-tooltip-header-label,.event-tooltip-content-box");
++    let selector = node.nodeName + "#" + node.id;
++
++    let out = [];
++
++    for (let i = 0; i < result.length; i+=2) {
++      let header = result[i];
++      let content = result[i + 1];
++
++      EventUtils.synthesizeMouseAtCenter(header, {}, header.ownerGlobal);
++
++      yield tooltip.once("event-tooltip-ready");
++
++      let editor = tooltip.eventEditors.get(content).editor;
++
++      out.push({
++        heading: header.getAttribute("value"),
++        handler: editor.getText()
++      });
++    }
++
++    for (let i = 0; i < out.length; i++) {
++      is(out[i].heading, expected[i].heading, "headings match for " + selector);
++      is(out[i].handler, expected[i].handler, "handlers match for " + selector);
++    }
++  }
++
++  function promiseNextTick() {
++    let deferred = promise.defer();
++    executeSoon(deferred.resolve);
++    return deferred.promise;
++  }
++});
+diff --git a/browser/devtools/markupview/test/doc_markup_events.html b/browser/devtools/markupview/test/doc_markup_events.html
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/markupview/test/doc_markup_events.html
+@@ -0,0 +1,135 @@
++<!DOCTYPE html>
++<html>
++  <head>
++    <meta charset="utf-8">
++    <style>
++    #container {
++      border: 1px solid #000;
++      width: 200px;
++      height: 85px;
++    }
++
++    #container > div {
++      border: 1px solid #000;
++      display: inline-block;
++      margin: 2px;
++    }
++
++    #output,
++    #noevents,
++    #DOM0,
++    #handleevent,
++    #fatarrow,
++    #bound,
++    #boundhe {
++      border: 1px solid #000;
++      width: 200px;
++      min-height: 1em;
++      cursor: pointer;
++    }
++
++    #output,
++    #noevents {
++      cursor: auto;
++    }
++
++    #output {
++      min-height: 1.5em;
++    }
++    </style>
++    <script type="application/javascript;version=1.8">
++      function init() {
++        let container = document.getElementById("container");
++        let multiple = document.getElementById("multiple");
++        let fatarrow = document.getElementById("fatarrow");
++
++        container.addEventListener("mouseover", mouseoverHandler, true);
++        multiple.addEventListener("click", clickHandler, false);
++        multiple.addEventListener("mouseup", mouseupHandler, false);
++
++        new handleEventClick();
++        new boundHandleEventClick();
++
++        let bound = document.getElementById("bound");
++        boundClickHandler = boundClickHandler.bind(this);
++        bound.addEventListener("click", boundClickHandler);
++
++        fatarrow.addEventListener("click", event => {
++          alert("Yay for the fat arrow!");
++        });
++      }
++
++      function mouseoverHandler(event) {
++        if (event.target.id !== "container") {
++          let output = document.getElementById("output");
++          output.textContent = event.target.textContent;
++        }
++      }
++
++      function clickHandler(event) {
++        let output = document.getElementById("output");
++        output.textContent = "click";
++      }
++
++      function boundClickHandler(event) {
++        alert("Bound event clicked");
++      }
++
++      function mouseupHandler(event) {
++        let output = document.getElementById("output");
++        output.textContent = "mouseup";
++      }
++
++      function handleEventClick(hehe) {
++        let handleevent = document.getElementById("handleevent");
++        handleevent.addEventListener("click", this);
++      }
++
++      handleEventClick.prototype = {
++        handleEvent: function(blah) {
++          alert("handleEvent clicked");
++        }
++      };
++
++      function boundHandleEventClick() {
++        let boundhe = document.getElementById("boundhe");
++        this.handleEvent = this.handleEvent.bind(this);
++        boundhe.addEventListener("click", this);
++      }
++
++      boundHandleEventClick.prototype = {
++        handleEvent: function() {
++          alert("boundHandleEvent clicked");
++        }
++      };
++    </script>
++  </head>
++  <body onload="init();">
++    <div id="container">
++      <div>1</div>
++      <div>2</div>
++      <div>3</div>
++      <div>4</div>
++      <div>5</div>
++      <div>6</div>
++      <div>7</div>
++      <div>8</div>
++      <div>9</div>
++      <div>10</div>
++      <div>11</div>
++      <div>12</div>
++      <div>13</div>
++      <div>14</div>
++      <div>15</div>
++      <div>16</div>
++      <div id="multiple">multiple</div>
++    </div>
++    <div id="output"></div>
++    <div id="noevents">No events here</div>
++    <div id="DOM0" onclick="alert('hi')">DOM0 event here</div>
++    <div id="handleevent">handleEvent event here</div>
++    <div id="fatarrow">Fat arrow event</div>
++    <div id="boundhe">Bound handleEvent</div>
++    <div id="bound">Bound event</div>
++  </body>
++</html>
+diff --git a/browser/devtools/shared/widgets/Tooltip.js b/browser/devtools/shared/widgets/Tooltip.js
+--- a/browser/devtools/shared/widgets/Tooltip.js
++++ b/browser/devtools/shared/widgets/Tooltip.js
+@@ -8,39 +8,43 @@ const {Cc, Cu, Ci} = require("chrome");
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const IOService = Cc["@mozilla.org/network/io-service;1"]
+   .getService(Ci.nsIIOService);
+ const {Spectrum} = require("devtools/shared/widgets/Spectrum");
+ const EventEmitter = require("devtools/toolkit/event-emitter");
+ const {colorUtils} = require("devtools/css-color");
+ const Heritage = require("sdk/core/heritage");
+ const {Eyedropper} = require("devtools/eyedropper/eyedropper");
++const Editor = require("devtools/sourceeditor/editor");
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "setNamedTimeout",
+   "resource:///modules/devtools/ViewHelpers.jsm");
+ XPCOMUtils.defineLazyModuleGetter(this, "clearNamedTimeout",
+   "resource:///modules/devtools/ViewHelpers.jsm");
+ XPCOMUtils.defineLazyModuleGetter(this, "VariablesView",
+   "resource:///modules/devtools/VariablesView.jsm");
+ XPCOMUtils.defineLazyModuleGetter(this, "VariablesViewController",
+   "resource:///modules/devtools/VariablesViewController.jsm");
+ XPCOMUtils.defineLazyModuleGetter(this, "Task",
+   "resource://gre/modules/Task.jsm");
+ 
++loader.lazyImporter(this, "js_beautify", "resource:///modules/devtools/Jsbeautify.jsm");
++
+ const GRADIENT_RE = /\b(repeating-)?(linear|radial)-gradient\(((rgb|hsl)a?\(.+?\)|[^\)])+\)/gi;
+ const BORDERCOLOR_RE = /^border-[-a-z]*color$/ig;
+ const BORDER_RE = /^border(-(top|bottom|left|right))?$/ig;
+ const XHTML_NS = "http://www.w3.org/1999/xhtml";
+ const SPECTRUM_FRAME = "chrome://browser/content/devtools/spectrum-frame.xhtml";
+ const ESCAPE_KEYCODE = Ci.nsIDOMKeyEvent.DOM_VK_ESCAPE;
+ const RETURN_KEYCODE = Ci.nsIDOMKeyEvent.DOM_VK_RETURN;
+ const POPUP_EVENTS = ["shown", "hidden", "showing", "hiding"];
++const MAX_EVENT_SCRIPT_LENGTH = 27;
+ 
+ /**
+  * Tooltip widget.
+  *
+  * This widget is intended at any tool that may need to show rich content in the
+  * form of floating panels.
+  * A common use case is image previewing in the CSS rule view, but more complex
+  * use cases may include color pickers, object inspection, etc...
+@@ -510,16 +514,29 @@ Tooltip.prototype = {
+       hbox.appendChild(vbox);
+       this.content = hbox;
+     } else {
+       this.content = vbox;
+     }
+   },
+ 
+   /**
++   * Sets some event listener info as the content of this tooltip.
++   *
++   * @param {Object} (destructuring assignment)
++   *          @0 {array} eventListenerInfos
++   *             A list of event listeners.
++   *          @1 {toolbox} toolbox
++   *             Toolbox used to select debugger panel.
++   */
++  setEventContent: function({ eventListenerInfos, toolbox }) {
++    new EventTooltip(this, eventListenerInfos, toolbox);
++  },
++
++  /**
+    * Fill the tooltip with a variables view, inspecting an object via its
+    * corresponding object actor, as specified in the remote debugging protocol.
+    *
+    * @param {object} objectActor
+    *        The value grip for the object actor.
+    * @param {object} viewOptions [optional]
+    *        Options for the variables view visualization.
+    * @param {object} controllerOptions [optional]
+@@ -1012,16 +1029,228 @@ SwatchColorPickerTooltip.prototype = Her
+     this.currentSwatchColor = null;
+     this.spectrum.then(spectrum => {
+       spectrum.off("changed", this._onSpectrumColorChange);
+       spectrum.destroy();
+     });
+   }
+ });
+ 
++function EventTooltip(tooltip, eventListenerInfos, toolbox) {
++  this._tooltip = tooltip;
++  this._eventListenerInfos = eventListenerInfos;
++  this._toolbox = toolbox;
++  this._tooltip.eventEditors = new WeakMap();
++
++  this._headerClicked = this._headerClicked.bind(this);
++  this._nodeClicked = this._nodeClicked.bind(this);
++  this.destroy = this.destroy.bind(this);
++
++  this._init();
++}
++
++EventTooltip.prototype = {
++  _init: function() {
++    let config = {
++      mode: Editor.modes.js,
++      lineNumbers: false,
++      lineWrapping: false,
++      readOnly: true,
++      styleActiveLine: true,
++      extraKeys: {},
++      underlineOnHover: true,
++      theme: "mozilla markup-view"
++    };
++
++    let doc = this._tooltip.doc;
++    let container = doc.createElement("vbox");
++    container.setAttribute("id", "devtools-tooltip-events-container");
++
++    for (let listener of this._eventListenerInfos) {
++      let phase = listener.capturing ? "Capturing" : "Bubbling";
++      let level = listener.DOM0 ? "DOM0" : "DOM2";
++      let uri;
++
++      if (listener.origin.length > MAX_EVENT_SCRIPT_LENGTH) {
++        uri = "\u2026" + listener.origin.substr(-MAX_EVENT_SCRIPT_LENGTH);
++      } else {
++        uri = listener.origin;
++      }
++
++      let heading = listener.type + " > " + uri + " (" + phase + ", " + level + ")";
++
++      // Header
++      let header = doc.createElement("hbox");
++      header.className = "event-header devtools-toolbar";
++      container.appendChild(header);
++
++      let arrow = doc.createElement("hbox");
++      arrow.className = "arrow";
++      header.appendChild(arrow);
++
++      let headerLabel = doc.createElement("label");
++      headerLabel.className = "event-tooltip-header-label";
++      headerLabel.setAttribute("value", heading);
++      headerLabel.setAttribute("tooltiptext", listener.origin);
++      header.appendChild(headerLabel);
++
++      // Content
++      let content = doc.createElement("box");
++      let editor = new Editor(config);
++      this._tooltip.eventEditors.set(content, {
++        editor: editor,
++        handler: listener.handler,
++        doc: doc,
++        searchString: listener.searchString,
++        lineCount: listener.lineCount,
++        uri: listener.origin,
++        dom0: listener.DOM0
++      });
++
++      content.className = "event-tooltip-content-box";
++      container.appendChild(content);
++
++      this._addContentListeners(header, arrow, content);
++    }
++
++    this._tooltip.content = container;
++    this._tooltip.panel.setAttribute("clamped-dimensions-no-min-height", "");
++
++    this._tooltip.panel.addEventListener("popuphiding", () => {
++      this.destroy(container);
++    }, false);
++  },
++
++  _addContentListeners: function(header, arrow, content) {
++    header.addEventListener("click", this._headerClicked);
++    content.addEventListener("click", this._nodeClicked);
++  },
++
++  _headerClicked: function(event) {
++    let header = event.target;
++
++    if (!header.classList.contains("event-header")) {
++      header = header.parentNode;
++    }
++
++    let arrow = header.querySelector(".arrow");
++    let content = header.nextElementSibling;
++
++    if (arrow.hasAttribute("open")) {
++      arrow.removeAttribute("open");
++      content.removeAttribute("open");
++    } else {
++      arrow.setAttribute("open", "");
++      content.setAttribute("open", "");
++
++      let {editor, handler, doc, lineCount} =
++        this._tooltip.eventEditors.get(content);
++
++      // This is an ugly hack to set the proper height of Codemirror's editor.
++      // Without this we have issues involving XUL panel sizing.
++      let style = doc.ownerGlobal.getComputedStyle(content);
++      let lineText = style.getPropertyCSSValue("line-height").cssText;
++      let lineHeight = parseFloat(lineText);
++
++      lineCount++;
++      lineCount = Math.min(lineCount * 2, 8);
++      let height = lineCount * lineHeight + "px";
++
++      let iframe = doc.createElement("iframe");
++      iframe.setAttribute("style", "width:100%; height: " + height);
++      // End of ugly hack.
++
++      editor.appendTo(content, iframe).then(() => {
++        let tidied = js_beautify(handler, { indent_size: 2 });
++
++        editor.setText(tidied);
++        this._tooltip.emit("event-tooltip-ready");
++      });
++    }
++  },
++
++  _nodeClicked: function(event) {
++    let {uri, searchString, dom0} =
++      this._tooltip.eventEditors.get(event.currentTarget);
++
++    if (uri && uri !== "?") {
++      // Save a copy of toolbox as it will be set to null when we hide the
++      // tooltip.
++      let toolbox = this._toolbox;
++
++      this._tooltip.hide();
++
++      uri = uri.replace(/"/g, "");
++
++      let showSource = ({ DebuggerView }) => {
++        let matches = uri.match(/(.*):(\d+$)/);
++        let line = 1;
++
++        if (matches) {
++          uri = matches[1];
++          line = matches[2];
++        }
++
++        if (DebuggerView.Sources.containsValue(uri)) {
++          DebuggerView.setEditorLocation(uri, line).then(() => {
++            if (dom0) {
++              let text = DebuggerView.editor.getText();
++              let index = text.indexOf(searchString);
++              let lastIndex = text.lastIndexOf(searchString);
++
++              // To avoid confusion we only search for DOM0 event handlers when
++              // there is only one possible match in the file.
++              if (index !== -1 && index === lastIndex) {
++                text = text.substr(0, index);
++                let matches = text.match(/\n/g);
++
++                if (matches) {
++                  DebuggerView.editor.setCursor({
++                    line: matches.length
++                  });
++                }
++              }
++            }
++          });
++        }
++      };
++
++      let debuggerAlreadyOpen = toolbox.getPanel("jsdebugger");
++      toolbox.selectTool("jsdebugger").then(({ panelWin: dbg }) => {
++        if (debuggerAlreadyOpen) {
++          showSource(dbg);
++        } else {
++          dbg.once(dbg.EVENTS.SOURCES_ADDED, () => showSource(dbg));
++        }
++      });
++    }
++  },
++
++  destroy: function(container) {
++    if (this._tooltip) {
++      this._tooltip.panel.removeEventListener("popuphiding", this.destroy, false);
++      this._tooltip.eventEditors.clear();
++      this._tooltip.eventEditors = null;
++    }
++
++    let headerNodes = container.querySelectorAll(".event-header");
++
++    for (let node of headerNodes) {
++      node.removeEventListener("click", this._headerClicked);
++    }
++
++    let sourceNodes = container.querySelectorAll(".event-tooltip-source");
++    for (let node of sourceNodes) {
++      node.removeEventListener("click", this._nodeClicked);
++    }
++
++    this._tooltip = this._eventListenerInfos =  this._toolbox = null;
++  }
++};
++
+ /**
+  * Internal util, checks whether a css declaration is a gradient
+  */
+ function isGradientRule(property, value) {
+   return (property === "background" || property === "background-image") &&
+     value.match(GRADIENT_RE);
+ }
+ 
+diff --git a/browser/devtools/sourceeditor/codemirror/mozilla.css b/browser/devtools/sourceeditor/codemirror/mozilla.css
+--- a/browser/devtools/sourceeditor/codemirror/mozilla.css
++++ b/browser/devtools/sourceeditor/codemirror/mozilla.css
+@@ -60,16 +60,24 @@
+       url("chrome://browser/skin/devtools/editor-breakpoint@2x.png");
+   }
+ }
+ 
+ .CodeMirror {
+   cursor: text;
+ }
+ 
++.theme-body[underlineonhover] span {
++  cursor: pointer;
++}
++
++.theme-body[underlineonhover] .CodeMirror-code:hover span {
++  text-decoration: underline;
++}
++
+ .CodeMirror-gutters {
+   cursor: default;
+ }
+ 
+ /* This is to avoid the fake horizontal scrollbar div of codemirror to go 0
+ height when floating scrollbars are active. Make sure that this value is equal
+ to the maximum of `min-height` specific to the `scrollbar[orient="horizontal"]`
+ selector in floating-scrollbar-light.css across all platforms. */
+diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceeditor/editor.js
+--- a/browser/devtools/sourceeditor/editor.js
++++ b/browser/devtools/sourceeditor/editor.js
+@@ -312,16 +312,20 @@ Editor.prototype = {
+ 
+         this.emit("gutterClick", line, ev.button);
+       });
+ 
+       win.CodeMirror.defineExtension("l10n", (name) => {
+         return L10N.GetStringFromName(name);
+       });
+ 
++      if (this.config.underlineOnHover) {
++        win.document.body.setAttribute("underlineonhover", "true");
++      }
++
+       cm.getInputField().controllers.insertControllerAt(0, controller(this));
+ 
+       this.container = env;
+       editors.set(this, cm);
+ 
+       this.resetIndentUnit();
+ 
+       def.resolve();
+diff --git a/browser/themes/shared/devtools/common.css b/browser/themes/shared/devtools/common.css
+--- a/browser/themes/shared/devtools/common.css
++++ b/browser/themes/shared/devtools/common.css
+@@ -158,17 +158,24 @@
+ }
+ 
+ .devtools-tooltip[clamped-dimensions] {
+   min-height: 100px;
+   max-height: 400px;
+   min-width: 100px;
+   max-width: 400px;
+ }
+-.devtools-tooltip[clamped-dimensions] .panel-arrowcontent {
++.devtools-tooltip[clamped-dimensions-no-min-height] {
++  min-height: 0;
++  max-height: 400px;
++  min-width: 100px;
++  max-width: 400px;
++}
++.devtools-tooltip[clamped-dimensions] .panel-arrowcontent,
++.devtools-tooltip[clamped-dimensions-no-min-height] .panel-arrowcontent {
+   overflow: hidden;
+ }
+ 
+ /* Tooltip: Simple Text */
+ 
+ .devtools-tooltip-simple-text {
+   max-width: 400px;
+   margin: 0 -4px; /* Compensate for the .panel-arrowcontent padding. */
+@@ -202,16 +209,60 @@
+ .devtools-tooltip-variables-view-box {
+   margin: -4px; /* Compensate for the .panel-arrowcontent padding. */
+ }
+ 
+ .devtools-tooltip-variables-view-box .variable-or-property > .title {
+   -moz-padding-end: 6px;
+ }
+ 
++/* Tooltip: Events */
++
++#devtools-tooltip-events-container {
++  margin: -4px; /* Compensate for the .panel-arrowcontent padding. */
++}
++
++.event-header {
++  cursor: pointer;
++}
++
++.event-tooltip-header-label {
++  -moz-margin-start: 0;
++  cursor: pointer;
++  margin-top: 5px;
++}
++
++.event-tooltip-content-box {
++  display: none;
++  overflow: auto;
++  -moz-margin-end: 0;
++}
++
++.event-tooltip-content-box[open] {
++  display: block;
++}
++
++.event-tooltip-source-container {
++  margin-top: 5px;
++  margin-bottom: 10px;
++  -moz-margin-start: 5px;
++  -moz-margin-end: 0;
++}
++
++.event-tooltip-source {
++  white-space: pre;
++  margin-bottom: 0;
++}
++
++.event-tooltip-source:hover[data-uri] {
++  text-decoration: underline;
++  -moz-text-decoration-style: dotted;
++  cursor: pointer;
++}
++
+ /* Tooltip: Tiles */
+ 
+ .devtools-tooltip-tiles {
+   background-color: #eee;
+   background-image: linear-gradient(45deg, #ccc 25%, transparent 25%, transparent 75%, #ccc 75%, #ccc),
+     linear-gradient(45deg, #ccc 25%, transparent 25%, transparent 75%, #ccc 75%, #ccc);
+   background-size: 20px 20px;
+   background-position: 0 0, 10px 10px;
+diff --git a/browser/themes/shared/devtools/dark-theme.css b/browser/themes/shared/devtools/dark-theme.css
+--- a/browser/themes/shared/devtools/dark-theme.css
++++ b/browser/themes/shared/devtools/dark-theme.css
+@@ -367,16 +367,25 @@ div.CodeMirror span.eval-text {
+ }
+ 
+ .devtools-textinput,
+ .devtools-searchinput {
+   background-color: rgba(24, 29, 32, 1);
+   color: rgba(184, 200, 217, 1);
+ }
+ 
++.markupview-events {
++  background-color: #667380;
++  color: #0F0F0F;
++}
++
++.event-tooltip-source-container {
++  color: #B6BABF;
++}
++
+ .CodeMirror-Tern-fname {
+   color: #f7f7f7;
+ }
+ 
+ .CodeMirror-hints,
+ .CodeMirror-Tern-tooltip {
+   box-shadow: 0 0 4px rgba(255, 255, 255, .3);
+   background-color: #0f171f;
+diff --git a/browser/themes/shared/devtools/light-theme.css b/browser/themes/shared/devtools/light-theme.css
+--- a/browser/themes/shared/devtools/light-theme.css
++++ b/browser/themes/shared/devtools/light-theme.css
+@@ -370,16 +370,25 @@ div.CodeMirror span.eval-text {
+   border-bottom: 1px solid #aaa;
+ }
+ 
+ .devtools-side-splitter {
+   -moz-border-end: 1px solid #aaa;
+   border-color: #aaa; /* Needed for responsive container at low width. */
+ }
+ 
++.markupview-events {
++  background-color: #667380;
++  color: #FFF;
++}
++
++.event-tooltip-source-container {
++  color: #191919;
++}
++
+ .CodeMirror-hints,
+ .CodeMirror-Tern-tooltip {
+   box-shadow: 0 0 4px rgba(128, 128, 128, .5);
+   background-color: #f7f7f7;
+ }
+ 
+ 
+ %include toolbars.inc.css
+diff --git a/browser/themes/shared/devtools/markup-view.css b/browser/themes/shared/devtools/markup-view.css
+--- a/browser/themes/shared/devtools/markup-view.css
++++ b/browser/themes/shared/devtools/markup-view.css
+@@ -35,16 +35,25 @@
+ .not-displayed .close {
+   opacity: .7;
+ }
+ 
+ .tag-line {
+   padding-left: 2px;
+ }
+ 
++.markupview-events {
++  font-size: 0.8em;
++  font-weight: bold;
++  line-height: 10px;
++  border-radius: 50%;
++  padding: 0px 2px;
++  -moz-margin-start: 5px;
++}
++
+ /* Preview */
+ 
+ #previewbar {
+   position: fixed;
+   top: 0;
+   right: 0;
+   width: 90px;
+   background: black;
+@@ -81,9 +90,9 @@
+ #viewbox {
+   position: absolute;
+   top: 0;
+   right: 5px;
+   width: 80px;
+   border: 1px dashed #888;
+   background: rgba(205,205,255,0.2);
+   outline: 1px solid transparent;
+-}
+\ No newline at end of file
++}
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -114,16 +114,30 @@ HELPER_SHEET += ":-moz-devtools-highligh
+ Cu.import("resource://gre/modules/devtools/LayoutHelpers.jsm");
+ 
+ loader.lazyImporter(this, "gDevTools", "resource:///modules/devtools/gDevTools.jsm");
+ 
+ loader.lazyGetter(this, "DOMParser", function() {
+   return Cc["@mozilla.org/xmlextras/domparser;1"].createInstance(Ci.nsIDOMParser);
+ });
+ 
++loader.lazyGetter(this, "Debugger", function() {
++  let JsDebugger = require("resource://gre/modules/jsdebugger.jsm");
++
++  let global = Cu.getGlobalForObject({});
++  JsDebugger.addDebuggerToGlobal(global);
++
++  return global.Debugger;
++});
++
++loader.lazyGetter(this, "eventListenerService", function() {
++  return Cc["@mozilla.org/eventlistenerservice;1"]
++           .getService(Ci.nsIEventListenerService);
++});
++
+ exports.register = function(handle) {
+   handle.addGlobalActor(InspectorActor, "inspectorActor");
+   handle.addTabActor(InspectorActor, "inspectorActor");
+ };
+ 
+ exports.unregister = function(handle) {
+   handle.removeGlobalActor(InspectorActor);
+   handle.removeTabActor(InspectorActor);
+@@ -234,16 +248,18 @@ var NodeActor = exports.NodeActor = prot
+       publicId: this.rawNode.publicId,
+       systemId: this.rawNode.systemId,
+ 
+       attrs: this.writeAttrs(),
+ 
+       pseudoClassLocks: this.writePseudoClassLocks(),
+ 
+       isDisplayed: this.isDisplayed,
++
++      hasEventListeners: this._hasEventListeners,
+     };
+ 
+     if (this.isDocumentElement()) {
+       form.isDocumentElement = true;
+     }
+ 
+     if (this.rawNode.nodeValue) {
+       // We only include a short version of the value if it's longer than
+@@ -277,16 +293,37 @@ var NodeActor = exports.NodeActor = prot
+     if (!style) {
+       // Consider all non-element nodes as displayed
+       return true;
+     } else {
+       return style.display !== "none";
+     }
+   },
+ 
++  /**
++   * Are event listeners that are listening on this node?
++   */
++  get _hasEventListeners() {
++    let listeners;
++
++    if (this.rawNode.nodeName.toLowerCase() === "html") {
++      listeners = eventListenerService.getListenerInfoFor(this.rawNode.ownerGlobal);
++    } else {
++      listeners = eventListenerService.getListenerInfoFor(this.rawNode) || [];
++    }
++
++    listeners = listeners.filter(listener => {
++      return listener.listenerObject && listener.type && listener.listenerObject;
++    });
++
++    let hasListeners = listeners.length > 0;
++
++    return hasListeners;
++  },
++
+   writeAttrs: function() {
+     if (!this.rawNode.attributes) {
+       return undefined;
+     }
+     return [{namespace: attr.namespace, name: attr.name, value: attr.value }
+             for (attr of this.rawNode.attributes)];
+   },
+ 
+@@ -300,16 +337,131 @@ var NodeActor = exports.NodeActor = prot
+         ret = ret || [];
+         ret.push(pseudo);
+       }
+     }
+     return ret;
+   },
+ 
+   /**
++   * Get event listeners attached to a node.
++   *
++   * @param  {Node} node
++   *         Node for which we are to get listeners.
++   * @return {Array}
++   *         An array of objects where a typical object looks like this:
++   *           {
++   *             type: "click",
++   *             DOM0: true,
++   *             capturing: true,
++   *             handler: "function() { doSomething() }",
++   *             origin: "http://www.mozilla.com",
++   *             searchString: 'onclick="doSomething()"',
++   *             lineCount: 3
++   *           }
++   */
++  getEventListeners: function(node) {
++    let dbg = new Debugger();
++    let handlers = eventListenerService.getListenerInfoFor(node);
++    let events = [];
++
++    for (let handler of handlers) {
++      let listener = handler.listenerObject;
++
++      // If there is no JS event listener skip this.
++      if (!listener) {
++        continue;
++      }
++
++      let global = Cu.getGlobalForObject(listener);
++      let globalDO = dbg.addDebuggee(global);
++      let listenerDO = globalDO.makeDebuggeeValue(listener);
++
++      // If the listener is an object with a 'handleEvent' method, use that.
++      if (listenerDO.class === "Object" || listenerDO.class === "XULElement") {
++        let desc;
++
++        while (!desc && listenerDO) {
++          desc = listenerDO.getOwnPropertyDescriptor("handleEvent");
++          listenerDO = listenerDO.proto;
++        }
++
++        if (desc && desc.value) {
++          listenerDO = desc.value;
++        }
++      }
++
++      if (listenerDO.isBoundFunction) {
++        listenerDO = listenerDO.boundTargetFunction;
++      }
++
++      let script = listenerDO.script;
++      let scriptSource = script.source.text;
++      let functionSource =
++        scriptSource.substr(script.sourceStart, script.sourceLength);
++
++      /*
++      The script returned is the whole script and
++      scriptSource.substr(script.sourceStart, script.sourceLength) returns
++      something like:
++        () { doSomething(); }
++
++      So we need to work back to the preceeding \n, ; or } so we can get the
++        appropriate function info e.g.:
++        () => { doSomething(); }
++        function doit() { doSomething(); }
++        doit: function() { doSomething(); }
++      */
++      let scriptBeforeFunc = scriptSource.substr(0, script.sourceStart);
++      let lastNewline = scriptBeforeFunc.lastIndexOf("\n");
++      let lastSemicolon = scriptBeforeFunc.lastIndexOf(";");
++      let lastClosingBrace = scriptBeforeFunc.lastIndexOf("}");
++      let lastEnding = Math.max(lastNewline, lastSemicolon, lastClosingBrace);
++
++      if (lastEnding !== -1) {
++        let functionPrefix = scriptBeforeFunc.substr(lastEnding + 1);
++        functionSource = functionPrefix + functionSource;
++      }
++
++      let type = handler.type;
++      let dom0 = false;
++
++      if (typeof node.hasAttribute !== "undefined") {
++        dom0 = !!node.hasAttribute("on" + type);
++      } else {
++        dom0 = !!node["on" + type];
++      }
++
++      let line = script.startLine;
++      let url = script.url;
++      let origin = url + (dom0 ? "" : ":" + line);
++      let searchString;
++
++      if (dom0) {
++        searchString = "on" + type + "=\"" + script.source.text + "\"";
++      } else {
++        scriptSource = "    " + scriptSource;
++      }
++
++      events.push({
++        type: type,
++        DOM0: dom0,
++        capturing: handler.capturing,
++        handler: functionSource.trim(),
++        origin: origin,
++        searchString: searchString,
++        lineCount: script.lineCount
++      });
++
++      dbg.removeDebuggee(globalDO);
++    }
++    return events;
++  },
++
++  /**
+    * Returns a LongStringActor with the node's value.
+    */
+   getNodeValue: method(function() {
+     return new LongStringActor(this.conn, this.rawNode.nodeValue || "");
+   }, {
+     request: {},
+     response: {
+       value: RetVal("longstring")
+@@ -349,16 +501,31 @@ var NodeActor = exports.NodeActor = prot
+       return promise.reject(new Error("Image not available"));
+     }
+   }, {
+     request: {maxDim: Arg(0, "nullable:number")},
+     response: RetVal("imageData")
+   }),
+ 
+   /**
++   * Get all event listeners that are listening on this node.
++   */
++  getEventListenerInfo: method(function() {
++    if (this.rawNode.nodeName.toLowerCase() === "html") {
++      return this.getEventListeners(this.rawNode.ownerGlobal);
++    }
++    return this.getEventListeners(this.rawNode);
++  }, {
++    request: {},
++    response: {
++      events: RetVal("json")
++    }
++  }),
++
++  /**
+    * Modify a node's attributes.  Passed an array of modifications
+    * similar in format to "attributes" mutations.
+    * {
+    *   attributeName: <string>
+    *   attributeNamespace: <optional string>
+    *   newValue: <optional string> - If null or undefined, the attribute
+    *     will be removed.
+    * }
+@@ -546,16 +713,18 @@ let NodeFront = protocol.FrontClass(Node
+ 
+   get className() {
+     return this.getAttribute("class") || '';
+   },
+ 
+   get hasChildren() this._form.numChildren > 0,
+   get numChildren() this._form.numChildren,
+ 
++  get hasEventListeners() this._form.hasEventListeners,
++
+   get tagName() this.nodeType === Ci.nsIDOMNode.ELEMENT_NODE ? this.nodeName : null,
+   get shortValue() this._form.shortValue,
+   get incompleteValue() !!this._form.incompleteValue,
+ 
+   get isDocumentElement() !!this._form.isDocumentElement,
+ 
+   // doctype properties
+   get name() this._form.name,
