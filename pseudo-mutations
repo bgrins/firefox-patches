@@ -1,0 +1,254 @@
+# HG changeset patch
+# Parent 8ea08ec9b7670c5e339520feebbf0654a7659b9a
+# User Brian Grinstead <bgrinstead@mozilla.com>
+simulating mutations for before/after
+
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_edit-selector_02.js b/browser/devtools/styleinspector/test/browser_ruleview_edit-selector_02.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_edit-selector_02.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_edit-selector_02.js
+@@ -35,21 +35,27 @@ let test = asyncTest(function*() {
+   yield selectNode(".testclass", inspector);
+   yield testEditSelector(view, "div:nth-child(2)");
+ 
+   info("Selecting the modified element");
+   yield selectNode("#testid", inspector);
+   yield checkModifiedElement(view, "div:nth-child(2)");
+ 
+   info("Selecting the test element");
+-  yield selectNode("#testid3", inspector);
++
++  let f = inspector.markup.walker.frontForRawNode(getNode("#testid3"));
++  let children = yield inspector.markup.walker.children(f);
++  yield selectNode(children.nodes[children.nodes.length-1], inspector);
+   yield testEditSelector(view, ".testclass2:after");
+ 
+   info("Selecting the modified element");
+-  yield selectNode(".testclass2", inspector);
++  let f = inspector.markup.walker.frontForRawNode(getNode(".testclass2"));
++  let children = yield inspector.markup.walker.children(f);
++  yield selectNode(children.nodes[children.nodes.length-1], inspector);
++  // yield selectNode(".testclass2", inspector);
+   yield checkModifiedElement(view, ".testclass2:after");
+ });
+ 
+ function* testEditSelector(view, name) {
+   info("Test editing existing selector fields");
+ 
+   let idRuleEditor = getRuleViewRuleEditor(view, 1);
+ 
+diff --git a/browser/devtools/styleinspector/test/head.js b/browser/devtools/styleinspector/test/head.js
+--- a/browser/devtools/styleinspector/test/head.js
++++ b/browser/devtools/styleinspector/test/head.js
+@@ -138,17 +138,21 @@ function getNode(nodeOrSelector) {
+  * @param {String} reason Defaults to "test" which instructs the inspector not to highlight the node upon selection
+  * @return a promise that resolves when the inspector is updated with the new
+  * node
+  */
+ function selectNode(nodeOrSelector, inspector, reason="test") {
+   info("Selecting the node " + nodeOrSelector);
+   let node = getNode(nodeOrSelector);
+   let updated = inspector.once("inspector-updated");
+-  inspector.selection.setNode(node, reason);
++  if (node._form) {
++    inspector.selection.setNodeFront(node, reason);
++  } else {
++    inspector.selection.setNode(node, reason);
++  }
+   return updated;
+ }
+ 
+ /**
+  * Set the inspector's current selection to null so that no node is selected
+  * @param {InspectorPanel} inspector The instance of InspectorPanel currently
+  * loaded in the toolbox
+  * @return a promise that resolves when the inspector is updated
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -906,16 +906,17 @@ var WalkerActor = protocol.ActorClass({
+    * @param DebuggerServerConnection conn
+    *    The server connection.
+    */
+   initialize: function(conn, tabActor, options) {
+     protocol.Actor.prototype.initialize.call(this, conn);
+     this.tabActor = tabActor;
+     this.rootWin = tabActor.window;
+     this.rootDoc = this.rootWin.document;
++    this.rootDoc.styleSheetChangeEventsEnabled = true;
+     this._refMap = new Map();
+     this._pendingMutations = [];
+     this._activePseudoClassLocks = new Set();
+ 
+     this.layoutHelpers = new LayoutHelpers(this.rootWin);
+ 
+     // Nodes which have been removed from the client's known
+     // ownership tree are considered "orphaned", and stored in
+@@ -925,29 +926,80 @@ var WalkerActor = protocol.ActorClass({
+     // The client can tell the walker that it is interested in a node
+     // even when it is orphaned with the `retainNode` method.  This
+     // list contains orphaned nodes that were so retained.
+     this._retainedOrphans = new Set();
+ 
+     this.onMutations = this.onMutations.bind(this);
+     this.onFrameLoad = this.onFrameLoad.bind(this);
+     this.onFrameUnload = this.onFrameUnload.bind(this);
++    this.onAnyStyleSheetChange = this.onAnyStyleSheetChange.bind(this);
++
++    this.tabActor.browser.addEventListener("StyleSheetRemoved", this.onAnyStyleSheetChange, true);
++    this.tabActor.browser.addEventListener("StyleSheetAdded", this.onAnyStyleSheetChange, true);
++    this.tabActor.browser.addEventListener("StyleRuleRemoved", this.onAnyStyleSheetChange, true);
++    this.tabActor.browser.addEventListener("StyleRuleAdded", this.onAnyStyleSheetChange, true);
++    this.tabActor.browser.addEventListener("StyleRuleChanged", this.onAnyStyleSheetChange, true);
++    this.tabActor.browser.addEventListener("StyleSheetApplicableStateChanged", this.onAnyStyleSheetChange, true);
++
++    // StyleSheetApplicableStateChanged
+ 
+     events.on(tabActor, "will-navigate", this.onFrameUnload);
+     events.on(tabActor, "navigate", this.onFrameLoad);
+ 
+     // Ensure that the root document node actor is ready and
+     // managed.
+     this.rootNode = this.document();
+ 
+     this.reflowObserver = getLayoutChangesObserver(this.tabActor);
+     this._onReflows = this._onReflows.bind(this);
+     this.reflowObserver.on("reflows", this._onReflows);
+   },
+ 
++  // Handle any style change event to repopulate children that may
++  // have matched pseudo elements
++  onAnyStyleSheetChange: function({rule, stylesheet, target}) {
++    if (rule) {
++      this.notifyRuleChange(rule, target);
++    } else {
++      [...stylesheet.cssRules].forEach((rule) => {
++        this.notifyRuleChange(rule, target);
++      })
++    }
++  },
++
++  // ::before and ::after elements do not fire the normal events with a
++  // MutationObserver.  So if we detect a style rule with one of these
++  // has changed, then simulate a mutation so the frontend can add /
++  // remove / modify the element.
++  notifyRuleChange: function(rule, document) {
++    // If this contains a pseudo element, then send a childList mutation
++    // so the frontend can reload the UI
++    if (rule.selectorText.contains(":before") || rule.selectorText.contains(":after")) {
++      let selectorText = rule.selectorText.replace(/::before/g, '')
++                                            .replace(/:before/g, '')
++                                            .replace(/::after/g, '')
++                                            .replace(/:after/g, '');
++      // XXX: escape the selector.
++      // XXX: Only need to qSA on the relevant portions of the selector
++      // So for `h1::before, div { }` we don't care about the div
++      [...document.querySelectorAll(selectorText)].forEach((node) => {
++        if (this._refMap.has(node)) {
++          this.queueMutation({
++            type: "childList",
++            target: this._refMap.get(node).actorID,
++            added: [],
++            removed: [],
++            numChildren: this._refMap.get(node).numChildren
++          });
++        }
++      });
++    }
++  },
++
+   // Returns the JSON representation of this object over the wire.
+   form: function() {
+     return {
+       actor: this.actorID,
+       root: this.rootNode.form()
+     }
+   },
+ 
+@@ -956,23 +1008,33 @@ var WalkerActor = protocol.ActorClass({
+   },
+ 
+   destroy: function() {
+     this._destroyed = true;
+ 
+     this.clearPseudoClassLocks();
+     this._activePseudoClassLocks = null;
+ 
++    if (this.rootDoc) {
++      this.rootDoc.styleSheetChangeEventsEnabled = false;
++    }
+     this._hoveredNode = null;
+     this.rootDoc = null;
+ 
+     this.reflowObserver.off("reflows", this._onReflows);
+     this.reflowObserver = null;
+     releaseLayoutChangesObserver(this.tabActor);
+ 
++    this.tabActor.browser.removeEventListener("StyleSheetRemoved", this.onAnyStyleSheetChange, true);
++    this.tabActor.browser.removeEventListener("StyleSheetAdded", this.onAnyStyleSheetChange, true);
++    this.tabActor.browser.removeEventListener("StyleRuleRemoved", this.onAnyStyleSheetChange, true);
++    this.tabActor.browser.removeEventListener("StyleRuleAdded", this.onAnyStyleSheetChange, true);
++    this.tabActor.browser.removeEventListener("StyleRuleChanged", this.onAnyStyleSheetChange, true);
++    this.tabActor.browser.removeEventListener("StyleRuleChanged", this.onAnyStyleSheetChange, true);
++
+     events.emit(this, "destroyed");
+     protocol.Actor.prototype.destroy.call(this);
+   },
+ 
+   release: method(function() {}, { release: true }),
+ 
+   unmanage: function(actor) {
+     if (actor instanceof NodeActor) {
+@@ -1972,16 +2034,17 @@ var WalkerActor = protocol.ActorClass({
+ 
+   /**
+    * Handles mutations from the DOM mutation observer API.
+    *
+    * @param array[MutationRecord] mutations
+    *    See https://developer.mozilla.org/en-US/docs/Web/API/MutationObserver#MutationRecord
+    */
+   onMutations: function(mutations) {
++    console.log("onmutations", mutations);
+     for (let change of mutations) {
+       let targetActor = this._refMap.get(change.target);
+       if (!targetActor) {
+         continue;
+       }
+       let targetNode = change.target;
+       let mutation = {
+         type: change.type,
+@@ -2034,16 +2097,17 @@ var WalkerActor = protocol.ActorClass({
+         mutation.removed = removedActors;
+         mutation.added = addedActors;
+       }
+       this.queueMutation(mutation);
+     }
+   },
+ 
+   onFrameLoad: function({ window, isTopLevel }) {
++    window.document.styleSheetChangeEventsEnabled = true;
+     if (!this.rootDoc && isTopLevel) {
+       this.rootDoc = window.document;
+       this.rootNode = this.document();
+       this.queueMutation({
+         type: "newRoot",
+         target: this.rootNode.form()
+       });
+     }
+@@ -2076,16 +2140,17 @@ var WalkerActor = protocol.ActorClass({
+         return true;
+       }
+       win = this.layoutHelpers.getFrameElement(win);
+     }
+     return false;
+   },
+ 
+   onFrameUnload: function({ window }) {
++    window.document.styleSheetChangeEventsEnabled = true;
+     // Any retained orphans that belong to this document
+     // or its children need to be released, and a mutation sent
+     // to notify of that.
+     let releasedOrphans = [];
+ 
+     for (let retained of this._retainedOrphans) {
+       if (Cu.isDeadWrapper(retained.rawNode) ||
+           this._childOfWindow(window, retained.rawNode)) {
