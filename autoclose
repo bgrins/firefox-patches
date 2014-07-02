@@ -1,12 +1,254 @@
 # HG changeset patch
-# Parent 5bc01fa51b243d41b15c316c3e8b2864ab91eb16
+# Parent dfe3a1df68e730cc44c848c2a635cf4e44351e2c
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 1031472 - Automatically reload all preferences in source editor;r=vporof
 
+diff --git a/browser/devtools/markupview/html-editor.js b/browser/devtools/markupview/html-editor.js
+--- a/browser/devtools/markupview/html-editor.js
++++ b/browser/devtools/markupview/html-editor.js
+@@ -176,11 +176,12 @@ HTMLEditor.prototype = {
+   destroy: function()
+   {
+     this.doc.defaultView.removeEventListener("resize",
+       this.refresh, true);
+     this.container.removeEventListener("click", this.hide, false);
+     this.editorInner.removeEventListener("click", stopPropagation, false);
+ 
+     this.hide(false);
+-    this.container.parentNode.removeChild(this.container);
++    this.container.remove();
++    this.editor.destroy();
+   }
+ };
+diff --git a/browser/devtools/sourceeditor/autocomplete.js b/browser/devtools/sourceeditor/autocomplete.js
+--- a/browser/devtools/sourceeditor/autocomplete.js
++++ b/browser/devtools/sourceeditor/autocomplete.js
+@@ -6,24 +6,24 @@
+ const cssAutoCompleter = require("devtools/sourceeditor/css-autocompleter");
+ const { AutocompletePopup } = require("devtools/shared/autocomplete-popup");
+ 
+ const CM_TERN_SCRIPTS = [
+   "chrome://browser/content/devtools/codemirror/tern.js",
+   "chrome://browser/content/devtools/codemirror/show-hint.js"
+ ];
+ 
+-const privates = new WeakMap();
++const autocompleteMap = new WeakMap();
+ 
+ /**
+  * Prepares an editor instance for autocompletion.
+  */
+ function initializeAutoCompletion(ctx, options = {}) {
+   let { cm, ed, Editor } = ctx;
+-  if (privates.has(ed)) {
++  if (autocompleteMap.has(ed)) {
+     return;
+   }
+ 
+   let win = ed.container.contentWindow.wrappedJSObject;
+   let { CodeMirror, document } = win;
+ 
+   let completer = null;
+   let autocompleteKey = "Ctrl-" +
+@@ -83,22 +83,22 @@ function initializeAutoCompletion(ctx, o
+     };
+     cm.addKeyMap(keyMap);
+ 
+     let destroyTern = function() {
+       ed.off("destroy", destroyTern);
+       cm.off("cursorActivity", updateArgHintsCallback);
+       cm.removeKeyMap(keyMap);
+       win.tern = cm.tern = null;
+-      privates.delete(ed);
++      autocompleteMap.delete(ed);
+     };
+ 
+     ed.on("destroy", destroyTern);
+ 
+-    privates.set(ed, {
++    autocompleteMap.set(ed, {
+       destroy: destroyTern
+     });
+ 
+     // TODO: Integrate tern autocompletion with this autocomplete API.
+     return;
+   } else if (ed.config.mode == Editor.modes.css) {
+     completer = new cssAutoCompleter({walker: options.walker});
+   }
+@@ -121,18 +121,18 @@ function initializeAutoCompletion(ctx, o
+ 
+   let keyMap = {
+     "Tab": cycle,
+     "Down": cycle,
+     "Shift-Tab": cycle.bind(null, true),
+     "Up": cycle.bind(null, true),
+     "Enter": () => {
+       if (popup && popup.isOpen) {
+-        if (!privates.get(ed).suggestionInsertedOnce) {
+-          privates.get(ed).insertingSuggestion = true;
++        if (!autocompleteMap.get(ed).suggestionInsertedOnce) {
++          autocompleteMap.get(ed).insertingSuggestion = true;
+           let {label, preLabel, text} = popup.getItemAtIndex(0);
+           let cur = ed.getCursor();
+           ed.replaceText(text.slice(preLabel.length), cur, cur);
+         }
+         popup.hidePopup();
+         // This event is used in tests
+         ed.emit("popup-hidden");
+         return;
+@@ -152,47 +152,47 @@ function initializeAutoCompletion(ctx, o
+ 
+   function destroy() {
+     ed.off("destroy", destroy);
+     cm.off("keydown", keypressCallback);
+     ed.off("change", autoCompleteCallback);
+     cm.removeKeyMap(keyMap);
+     popup.destroy();
+     keyMap = popup = completer = null;
+-    privates.delete(ed);
++    autocompleteMap.delete(ed);
+   }
+ 
+-  privates.set(ed, {
++  autocompleteMap.set(ed, {
+     popup: popup,
+     completer: completer,
+     keyMap: keyMap,
+     destroy: destroy,
+     insertingSuggestion: false,
+     suggestionInsertedOnce: false
+   });
+ }
+ 
+ /**
+  * Destroy autocompletion on an editor instance.
+  */
+ function destroyAutoCompletion(ctx) {
+   let { ed } = ctx;
+-  if (!privates.has(ed)) {
++  if (!autocompleteMap.has(ed)) {
+     return;
+   }
+ 
+-  let {destroy} = privates.get(ed);
++  let {destroy} = autocompleteMap.get(ed);
+   destroy();
+ }
+ 
+ /**
+  * Provides suggestions to autocomplete the current token/word being typed.
+  */
+ function autoComplete({ ed, cm }) {
+-  let private = privates.get(ed);
++  let private = autocompleteMap.get(ed);
+   let { completer, popup } = private;
+   if (!completer || private.insertingSuggestion || private.doNotAutocomplete) {
+     private.insertingSuggestion = false;
+     return;
+   }
+   let cur = ed.getCursor();
+   completer.complete(cm.getRange({line: 0, ch: 0}, cur), cur)
+     .then(suggestions => {
+@@ -218,17 +218,17 @@ function autoComplete({ ed, cm }) {
+   });
+ }
+ 
+ /**
+  * Cycles through provided suggestions by the popup in a top to bottom manner
+  * when `reverse` is not true. Opposite otherwise.
+  */
+ function cycleSuggestions(ed, reverse) {
+-  let private = privates.get(ed);
++  let private = autocompleteMap.get(ed);
+   let { popup, completer } = private;
+   let cur = ed.getCursor();
+   private.insertingSuggestion = true;
+   if (!private.suggestionInsertedOnce) {
+     private.suggestionInsertedOnce = true;
+     let firstItem;
+     if (reverse) {
+       firstItem = popup.getItemAtIndex(popup.itemCount - 1);
+@@ -258,17 +258,17 @@ function cycleSuggestions(ed, reverse) {
+   ed.emit("suggestion-entered");
+ }
+ 
+ /**
+  * onkeydown handler for the editor instance to prevent autocompleting on some
+  * keypresses.
+  */
+ function onEditorKeypress({ ed, Editor }, cm, event) {
+-  let private = privates.get(ed);
++  let private = autocompleteMap.get(ed);
+ 
+   // Do not try to autocomplete with multiple selections.
+   if (ed.hasMultipleSelections()) {
+     private.doNotAutocomplete = true;
+     private.popup.hidePopup();
+     return;
+   }
+ 
+@@ -314,32 +314,41 @@ function onEditorKeypress({ ed, Editor }
+       private.doNotAutocomplete = false;
+   }
+ }
+ 
+ /**
+  * Returns the private popup. This method is used by tests to test the feature.
+  */
+ function getPopup({ ed }) {
+-  if (privates.has(ed))
+-    return privates.get(ed).popup;
++  if (autocompleteMap.has(ed))
++    return autocompleteMap.get(ed).popup;
+ 
+   return null;
+ }
+ 
+ /**
+  * Returns contextual information about the token covered by the caret if the
+  * implementation of completer supports it.
+  */
+ function getInfoAt({ ed }, caret) {
+-  let completer = privates.get(ed).completer;
++  let completer = autocompleteMap.get(ed).completer;
+   if (completer && completer.getInfoAt)
+     return completer.getInfoAt(ed.getText(), caret);
+ 
+   return null;
+ }
+ 
++/**
++ * Returns whether autocompletion is enabled for this editor.
++ * Used for testing
++ */
++function isAutocompletionEnabled({ ed }) {
++  return autocompleteMap.has(ed);
++}
++
+ // Export functions
+ 
+ module.exports.initializeAutoCompletion = initializeAutoCompletion;
+ module.exports.destroyAutoCompletion = destroyAutoCompletion;
+ module.exports.getAutocompletionPopup = getPopup;
+ module.exports.getInfoAt = getInfoAt;
++module.exports.isAutocompletionEnabled = isAutocompletionEnabled;
 diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceeditor/editor.js
 --- a/browser/devtools/sourceeditor/editor.js
 +++ b/browser/devtools/sourceeditor/editor.js
-@@ -24,16 +24,17 @@ const MAX_VERTICAL_OFFSET = 3;
+@@ -12,28 +12,30 @@ const TAB_SIZE    = "devtools.editor.tab
+ const EXPAND_TAB  = "devtools.editor.expandtab";
+ const KEYMAP      = "devtools.editor.keymap";
+ const AUTO_CLOSE  = "devtools.editor.autoclosebrackets";
+ const AUTOCOMPLETE  = "devtools.editor.autocomplete";
+ const DETECT_INDENT = "devtools.editor.detectindentation";
+ const DETECT_INDENT_MAX_LINES = 500;
+ const L10N_BUNDLE = "chrome://browser/locale/devtools/sourceeditor.properties";
+ const XUL_NS      = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
++const VALID_KEYMAPS = new Set(["emacs", "vim", "sublime"]);
+ 
+ // Maximum allowed margin (in number of lines) from top or bottom of the editor
+ // while shifting to a line which was initially out of view.
+ const MAX_VERTICAL_OFFSET = 3;
  
  // Match @Scratchpad/N:LINE[:COLUMN] or (LINE[:COLUMN]) anywhere at an end of
  // line in text selection.
@@ -24,7 +266,7 @@ diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceed
  // JavaScript and CSS that is injected into an iframe in
  // order to initialize a CodeMirror instance.
  
-@@ -134,17 +135,16 @@ Editor.modes = {
+@@ -134,17 +136,16 @@ Editor.modes = {
   *
   * This object is also an event emitter.
   *
@@ -42,7 +284,7 @@ diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceed
      mode:              Editor.modes.text,
      indentUnit:        tabSize,
      tabSize:           tabSize,
-@@ -165,19 +165,16 @@ function Editor(config) {
+@@ -165,19 +166,16 @@ function Editor(config) {
    this.config.extraKeys[Editor.keyFor("moveLineUp", { noaccel: true })] = () => this.moveLineUp();
    this.config.extraKeys[Editor.keyFor("moveLineDown", { noaccel: true })] = () => this.moveLineDown();
    this.config.extraKeys[Editor.keyFor("toggleComment")] = "toggleComment";
@@ -62,7 +304,7 @@ diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceed
        return;
      }
  
-@@ -194,19 +191,18 @@ function Editor(config) {
+@@ -194,19 +192,18 @@ function Editor(config) {
      this.config.foldGutter = true;
  
      if (!this.config.gutters) {
@@ -84,7 +326,7 @@ diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceed
    this.config.extraKeys.Tab = (cm) => {
      if (cm.somethingSelected()) {
        cm.indentSelection("add");
-@@ -320,17 +316,26 @@ Editor.prototype = {
+@@ -320,18 +317,26 @@ Editor.prototype = {
          return L10N.GetStringFromName(name);
        });
  
@@ -94,8 +336,6 @@ diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceed
        editors.set(this, cm);
  
 -      this.resetIndentUnit();
-+      this.reloadPreferences();
-+
 +      this.reloadPreferences = this.reloadPreferences.bind(this);
 +      this._prefObserver = new PrefObserver("devtools.editor.");
 +      this._prefObserver.on(TAB_SIZE, this.reloadPreferences);
@@ -105,6 +345,7 @@ diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceed
 +      this._prefObserver.on(AUTOCOMPLETE, this.reloadPreferences);
 +      this._prefObserver.on(DETECT_INDENT, this.reloadPreferences);
  
++      this.reloadPreferences();
        def.resolve();
      };
  
@@ -112,7 +353,8 @@ diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceed
      env.setAttribute("src", CM_IFRAME);
      el.appendChild(env);
  
-@@ -393,16 +398,37 @@ Editor.prototype = {
+     this.once("destroy", () => el.removeChild(env));
+@@ -393,16 +398,38 @@ Editor.prototype = {
    setText: function (value) {
      let cm = editors.get(this);
      cm.setValue(value);
@@ -122,17 +364,18 @@ diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceed
  
    /**
 +   * Reload the state of the editor based on all current preferences.
-+   * This is called automatically when any of the specified preferences
++   * This is called automatically when any of the relevant preferences
 +   * change.
 +   */
 +  reloadPreferences: function() {
++    // Restore the saved autoCloseBrackets value if it is preffed on.
 +    let useAutoClose = Services.prefs.getBoolPref(AUTO_CLOSE);
 +    this.setOption("autoCloseBrackets",
 +      useAutoClose ? this.config.autoCloseBracketsSaved : false);
 +
 +    // If alternative keymap is provided, use it.
 +    const keyMap = Services.prefs.getCharPref(KEYMAP);
-+    if (keyMap === "emacs" || keyMap === "vim" || keyMap === "sublime")
++    if (VALID_KEYMAPS.has(keyMap))
 +      this.setOption("keyMap", keyMap)
 +    else
 +      this.setOption("keyMap", "default");
@@ -150,7 +393,7 @@ diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceed
  
      let indentWithTabs = !Services.prefs.getBoolPref(EXPAND_TAB);
      let indentUnit = Services.prefs.getIntPref(TAB_SIZE);
-@@ -873,16 +899,23 @@ Editor.prototype = {
+@@ -873,16 +900,23 @@ Editor.prototype = {
  
    /**
     * Sets an option for the editor.  For most options it just defers to
@@ -174,7 +417,7 @@ diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceed
      }
    },
  
-@@ -952,16 +985,25 @@ Editor.prototype = {
+@@ -952,16 +986,25 @@ Editor.prototype = {
        this[name] = funcs[name].bind(null, ctx);
      });
    },
@@ -225,7 +468,7 @@ diff --git a/browser/devtools/sourceeditor/test/browser_editor_prefs.js b/browse
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/sourceeditor/test/browser_editor_prefs.js
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,78 @@
 +/* vim: set ts=2 et sw=2 tw=80: */
 +/* Any copyright is dedicated to the Public Domain.
 +   http://creativecommons.org/publicdomain/zero/1.0/ */
@@ -247,6 +490,10 @@ new file mode 100644
 +
 +    ed.setText("Checking preferences.");
 +
++    info ("Turning prefs off");
++
++    ed.setOption("autocomplete", true);
++
 +    Services.prefs.setIntPref(TAB_SIZE, 2);
 +    Services.prefs.setBoolPref(EXPAND_TAB, false);
 +    Services.prefs.setCharPref(KEYMAP, "default");
@@ -254,22 +501,49 @@ new file mode 100644
 +    Services.prefs.setBoolPref(AUTOCOMPLETE, false);
 +    Services.prefs.setBoolPref(DETECT_INDENT, false);
 +
-+
-+
++    is(ed.getOption("tabSize"), 2, "tabSize is correct");
++    is(ed.getOption("indentUnit"), 2, "indentUnit is correct");
++    is(ed.getOption("indentWithTabs"), true, "indentWithTabs is correct");
 +    is(ed.getOption("keyMap"), "default", "keyMap is correct");
++    is(ed.getOption("autoCloseBrackets"), "", "autoCloseBrackets is correct");
++    is(ed.getOption("autocomplete"), true, "autocomplete is correct");
++    ok(!ed.isAutocompletionEnabled(), "Autocompletion is not enabled");
 +
++    info ("Turning prefs on");
 +
 +    Services.prefs.setIntPref(TAB_SIZE, 4);
 +    Services.prefs.setBoolPref(EXPAND_TAB, true);
 +    Services.prefs.setCharPref(KEYMAP, "sublime");
 +    Services.prefs.setBoolPref(AUTO_CLOSE, true);
 +    Services.prefs.setBoolPref(AUTOCOMPLETE, true);
++
++    is(ed.getOption("tabSize"), 4, "tabSize is correct");
++    is(ed.getOption("indentUnit"), 4, "indentUnit is correct");
++    is(ed.getOption("indentWithTabs"), false, "indentWithTabs is correct");
++    is(ed.getOption("keyMap"), "sublime", "keyMap is correct");
++    is(ed.getOption("autoCloseBrackets"), "()[]{}''\"\"", "autoCloseBrackets is correct");
++    is(ed.getOption("autocomplete"), true, "autocomplete is correct");
++    ok(ed.isAutocompletionEnabled(), "Autocompletion is enabled");
++
++    info ("Checking indentation detection");
++
 +    Services.prefs.setBoolPref(DETECT_INDENT, true);
 +
++    ed.setText("Detecting\n\tTabs");
++    is(ed.getOption("indentWithTabs"), true, "indentWithTabs is correct");
++    is(ed.getOption("indentUnit"), 4, "indentUnit is correct");
 +
-+    is(ed.getOption("keyMap"), "sublime", "keyMap is correct");
++    ed.setText("body {\n  color:red;\n  a:b;\n}");
++    is(ed.getOption("indentWithTabs"), false, "indentWithTabs is correct");
++    is(ed.getOption("indentUnit"), 2, "indentUnit is correct");
++
++    Services.prefs.clearUserPref(TAB_SIZE);
++    Services.prefs.clearUserPref(EXPAND_TAB);
++    Services.prefs.clearUserPref(KEYMAP);
++    Services.prefs.clearUserPref(AUTO_CLOSE);
++    Services.prefs.clearUserPref(AUTOCOMPLETE);
++    Services.prefs.clearUserPref(DETECT_INDENT);
 +
 +    teardown(ed, win);
 +  });
 +}
-\ No newline at end of file
