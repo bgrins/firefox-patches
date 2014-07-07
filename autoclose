@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 9ca6e87839f3bc428785466525cb5af8ea200fe6
+# Parent b7bab8b058cb4c3ace56b9b06a231e8845680326
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 1031472 - Automatically reload all preferences in source editor;r=vporof
 
@@ -23,8 +23,17 @@ diff --git a/browser/devtools/markupview/html-editor.js b/browser/devtools/marku
 diff --git a/browser/devtools/netmonitor/netmonitor-view.js b/browser/devtools/netmonitor/netmonitor-view.js
 --- a/browser/devtools/netmonitor/netmonitor-view.js
 +++ b/browser/devtools/netmonitor/netmonitor-view.js
-@@ -121,16 +121,21 @@ let NetMonitorView = {
-   _destroyPanes: function() {
+@@ -113,25 +113,30 @@ let NetMonitorView = {
+       $("#requests-menu-network-summary-button").hidden = true;
+       $("#requests-menu-network-summary-label").hidden = true;
+     }
+   },
+ 
+   /**
+    * Destroys the UI for all the displayed panes.
+    */
+-  _destroyPanes: function() {
++  _destroyPanes: Task.async(function*() {
      dumpn("Destroying the NetMonitorView panes");
  
      Prefs.networkDetailsWidth = this._detailsPane.getAttribute("width");
@@ -32,12 +41,13 @@ diff --git a/browser/devtools/netmonitor/netmonitor-view.js b/browser/devtools/n
  
      this._detailsPane = null;
      this._detailsPaneToggleButton = null;
+-  },
 +
-+    for (let ed of this._editors.values()) {
-+      ed.destroy();
++    for (let p of this._editorPromises.values()) {
++      let editor = yield p;
++      editor.destroy();
 +    }
-+    this._editors.clear();
-   },
++  }),
  
    /**
     * Gets the visibility state of the network details pane.
@@ -45,36 +55,7 @@ diff --git a/browser/devtools/netmonitor/netmonitor-view.js b/browser/devtools/n
     */
    get detailsPaneHidden() {
      return this._detailsPane.hasAttribute("pane-collapsed");
-@@ -250,26 +255,28 @@ let NetMonitorView = {
- 
-     let deferred = promise.defer();
-     this._editorPromises.set(aId, deferred.promise);
- 
-     // Initialize the source editor and store the newly created instance
-     // in the ether of a resolved promise's value.
-     let editor = new Editor(DEFAULT_EDITOR_CONFIG);
-     editor.appendTo($(aId)).then(() => deferred.resolve(editor));
-+    this._editors.set(aId, editor);
- 
-     return deferred.promise;
    },
- 
-   _body: null,
-   _detailsPane: null,
-   _detailsPaneToggleButton: null,
-   _collapsePaneString: "",
-   _expandPaneString: "",
--  _editorPromises: new Map()
-+  _editorPromises: new Map(),
-+  _editors: new Map()
- };
- 
- /**
-  * Functions handling the toolbar view: expand/collapse button etc.
-  */
- function ToolbarView() {
-   dumpn("ToolbarView was instantiated");
- 
 diff --git a/browser/devtools/projecteditor/lib/editors.js b/browser/devtools/projecteditor/lib/editors.js
 --- a/browser/devtools/projecteditor/lib/editors.js
 +++ b/browser/devtools/projecteditor/lib/editors.js
@@ -147,17 +128,7 @@ diff --git a/browser/devtools/scratchpad/scratchpad.js b/browser/devtools/scratc
 diff --git a/browser/devtools/shadereditor/shadereditor.js b/browser/devtools/shadereditor/shadereditor.js
 --- a/browser/devtools/shadereditor/shadereditor.js
 +++ b/browser/devtools/shadereditor/shadereditor.js
-@@ -345,27 +345,32 @@ let ShadersListView = Heritage.extend(Wi
-  * Functions handling the editors displaying the vertex and fragment shaders.
-  */
- let ShadersEditorsView = {
-   /**
-    * Initialization function, called when the tool is started.
-    */
-   initialize: function() {
-     XPCOMUtils.defineLazyGetter(this, "_editorPromises", () => new Map());
-+    XPCOMUtils.defineLazyGetter(this, "_editors", () => new Map());
-     this._vsFocused = this._onFocused.bind(this, "vs", "fs");
+@@ -354,19 +354,24 @@ let ShadersEditorsView = {
      this._fsFocused = this._onFocused.bind(this, "fs", "vs");
      this._vsChanged = this._onChanged.bind(this, "vs");
      this._fsChanged = this._onChanged.bind(this, "fs");
@@ -166,13 +137,17 @@ diff --git a/browser/devtools/shadereditor/shadereditor.js b/browser/devtools/sh
    /**
     * Destruction function, called when the tool is closed.
     */
-   destroy: function() {
-     this._toggleListeners("off");
-+    for (let ed of this._editors.values()) {
-+      ed.destroy();
+-  destroy: function() {
+-    this._toggleListeners("off");
+-  },
++  destroy: Task.async(function*() {
++    this._destroyed = true;
++    yield this._toggleListeners("off");
++    for (let p of this._editorPromises.values()) {
++      let editor = yield p;
++      editor.destroy();
 +    }
-+    this._editors.clear();
-   },
++  }),
  
    /**
     * Sets the text displayed in the vertex and fragment shader editors.
@@ -180,7 +155,9 @@ diff --git a/browser/devtools/shadereditor/shadereditor.js b/browser/devtools/sh
     * @param object sources
     *        An object containing the following properties
     *          - vs: the vertex shader source code
-@@ -411,16 +416,17 @@ let ShadersEditorsView = {
+    *          - fs: the fragment shader source code
+@@ -410,17 +415,22 @@ let ShadersEditorsView = {
+     let deferred = promise.defer();
      this._editorPromises.set(type, deferred.promise);
  
      // Initialize the source editor and store the newly created instance
@@ -188,8 +165,13 @@ diff --git a/browser/devtools/shadereditor/shadereditor.js b/browser/devtools/sh
      let parent = $("#" + type +"-editor");
      let editor = new Editor(DEFAULT_EDITOR_CONFIG);
      editor.config.mode = Editor.modes[type];
-     editor.appendTo(parent).then(() => deferred.resolve(editor));
-+    this._editors.set(type, editor);
+-    editor.appendTo(parent).then(() => deferred.resolve(editor));
++
++    if (this._destroyed) {
++      deferred.resolve(editor);
++    } else {
++      editor.appendTo(parent).then(() => deferred.resolve(editor));
++    }
  
      return deferred.promise;
    },
@@ -792,7 +774,26 @@ new file mode 100644
 diff --git a/browser/devtools/styleeditor/StyleSheetEditor.jsm b/browser/devtools/styleeditor/StyleSheetEditor.jsm
 --- a/browser/devtools/styleeditor/StyleSheetEditor.jsm
 +++ b/browser/devtools/styleeditor/StyleSheetEditor.jsm
-@@ -342,25 +342,24 @@ StyleSheetEditor.prototype = {
+@@ -89,16 +89,18 @@ function StyleSheetEditor(styleSheet, wi
+   }
+ 
+   this._onPropertyChange = this._onPropertyChange.bind(this);
+   this._onError = this._onError.bind(this);
+   this._onMediaRuleMatchesChange = this._onMediaRuleMatchesChange.bind(this);
+   this._onMediaRulesChanged = this._onMediaRulesChanged.bind(this)
+   this.checkLinkedFileForChanges = this.checkLinkedFileForChanges.bind(this);
+   this.markLinkedFileBroken = this.markLinkedFileBroken.bind(this);
++  this.saveToFile = this.saveToFile.bind(this);
++  this.updateStyleSheet = this.updateStyleSheet.bind(this);
+ 
+   this._focusOnSourceEditorReady = false;
+   this.cssSheet.on("property-change", this._onPropertyChange);
+   this.styleSheet.on("error", this._onError);
+   this.mediaRules = [];
+   if (this.cssSheet.getMediaRules) {
+     this.cssSheet.getMediaRules().then(this._onMediaRulesChanged);
+   }
+@@ -342,33 +344,28 @@ StyleSheetEditor.prototype = {
      let config = {
        value: this._state.text,
        lineNumbers: true,
@@ -805,18 +806,53 @@ diff --git a/browser/devtools/styleeditor/StyleSheetEditor.jsm b/browser/devtool
 +      autocomplete: Services.prefs.getBoolPref(AUTOCOMPLETION_PREF),
 +      autocompleteOpts: { walker: this.walker }
      };
-     let sourceEditor = new Editor(config);
+-    let sourceEditor = new Editor(config);
++    let sourceEditor = this._sourceEditor = new Editor(config);
  
      sourceEditor.on("dirty-change", this._onPropertyChange);
  
      return sourceEditor.appendTo(inputElement).then(() => {
 -      sourceEditor.setupAutoCompletion({ walker: this.walker });
 -
-       sourceEditor.on("save", () => {
-         this.saveToFile();
-       });
+-      sourceEditor.on("save", () => {
+-        this.saveToFile();
+-      });
++      sourceEditor.on("save", this.saveToFile);
  
        if (this.styleSheet.update) {
-         sourceEditor.on("change", () => {
-           this.updateStyleSheet();
-         });
+-        sourceEditor.on("change", () => {
+-          this.updateStyleSheet();
+-        });
++        sourceEditor.on("change", this.updateStyleSheet);
+       }
+ 
+       this.sourceEditor = sourceEditor;
+ 
+       if (this._focusOnSourceEditorReady) {
+         this._focusOnSourceEditorReady = false;
+         sourceEditor.focus();
+       }
+@@ -626,18 +623,21 @@ StyleSheetEditor.prototype = {
+ 
+     return bindings;
+   },
+ 
+   /**
+    * Clean up for this editor.
+    */
+   destroy: function() {
+-    if (this.sourceEditor) {
+-      this.sourceEditor.destroy();
++    if (this._sourceEditor) {
++      this._sourceEditor.off("dirty-change", this._onPropertyChange);
++      this._sourceEditor.off("save", this.saveToFile);
++      this._sourceEditor.off("change", this.updateStyleSheet);
++      this._sourceEditor.destroy();
+     }
+     this.cssSheet.off("property-change", this._onPropertyChange);
+     this.cssSheet.off("media-rules-changed", this._onMediaRulesChanged);
+     this.styleSheet.off("error", this._onError);
+   }
+ }
+ 
+ /**
