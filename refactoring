@@ -1,0 +1,261 @@
+# HG changeset patch
+# Parent 7534cd0f1b49842d2fba9336ac281f22aea8620e
+# User Brian Grinstead <bgrinstead@mozilla.com>
+refactoring for anon-content based on feedback
+
+diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/actors/styles.js
+--- a/toolkit/devtools/server/actors/styles.js
++++ b/toolkit/devtools/server/actors/styles.js
+@@ -287,22 +287,22 @@ var PageStyleActor = protocol.ActorClass
+    *     Default value is 'ua'
+    *   `inherited`: Include styles inherited from parent nodes.
+    *   `matchedSeletors`: Include an array of specific selectors that
+    *     caused this rule to match its node.
+    */
+   getApplied: method(function(node, options) {
+     let entries = [];
+ 
+-    this.addElementRules(node, undefined, options, entries);
++    entries = entries.concat(this._getAllElementRules(node, undefined, options));
+ 
+     if (options.inherited) {
+       let parent = this.walker.parentNode(node);
+       while (parent && parent.rawNode.nodeType != Ci.nsIDOMNode.DOCUMENT_NODE) {
+-        this.addElementRules(parent, parent, options, entries);
++        entries = entries.concat(this._getAllElementRules(parent, parent, options));
+         parent = this.walker.parentNode(parent);
+       }
+     }
+ 
+     if (options.matchedSelectors) {
+       for (let entry of entries) {
+         if (entry.rule.type === ELEMENT_STYLE) {
+           continue;
+@@ -354,90 +354,121 @@ var PageStyleActor = protocol.ActorClass
+   /**
+    * Helper function for getApplied, adds all the rules from a given
+    * element. See getApplied for documentation on parameters.
+    * @param NodeActor node
+    * @param bool inherited
+    * @param object options
+    * @param Array rules (modifies this instead of returning)
+    */
+-  addElementRules: function(node, inherited, options, rules)
++  _getAllElementRules: function(node, inherited, options)
+   {
+-    let element = node.rawNode;
+-    let pseudoElements = inherited ? [null] : [null, ...PSEUDO_ELEMENTS];
+-    let form = node.form();
+-    let isBeforeOrAfter = form.isBeforePseudoElement ||
+-                          form.isAfterPseudoElement;
++    let {elementToRead, pseudoToRead} = this.cssLogic.getStyleableElementAndPseudo(node.rawNode);
++    let rules = [];
+ 
+-    // If it is before or after, then we don't want to get styles for
+-    // this element.  Want to get it for the parent with the corresponding
+-    // pseudo.  Then we want to lie to the view and tell it that it isn't a pseudo
+-    // style so that it shows up normally.
+-    if (isBeforeOrAfter) {
+-      element = element.parentNode;
+-      pseudoElements = [form.isBeforePseudoElement ? ":before" : ":after"];
++    if (!elementToRead || !elementToRead.style) {
++      return rules;
+     }
+ 
+-    if (!element || !element.style) {
+-      return;
+-    }
++    let elementStyle = this._styleRef(elementToRead);
++    let showElementStyles = !inherited && !pseudoToRead;
++    let showInheritedStyles = inherited && this._hasInheritedProps(elementToRead.style);
+ 
+-    let elementStyle = this._styleRef(element);
+-    let showInlineStyles = !inherited && !isBeforeOrAfter;
+-    let showInheritedStyles = inherited && this._hasInheritedProps(element.style);
+-
+-    if (showInlineStyles || showInheritedStyles) {
++    // First any inline styles
++    if (showElementStyles) {
+       rules.push({
+         rule: elementStyle,
+-        inherited: inherited,
+       });
+     }
+ 
+-    for (let pseudo of pseudoElements) {
++    // Now any inherited styles
++    if (showInheritedStyles) {
++      rules.push({
++        rule: elementStyle,
++        inherited: true
++      });
++    }
+ 
+-      // Get the styles that apply to the element.
+-      let domRules = DOMUtils.getCSSStyleRules(element, pseudo);
+-      if (!domRules) {
++    // Add normal rules.  Typically this is passing in the node passed into the
++    // function, unless if that node was ::before/::after.  In which case,
++    // it will pass in the parentNode along with "::before"/"::after".
++    this._getElementRules(elementToRead, pseudoToRead, inherited, options).forEach((rule) => {
++      // The only case when there would be a pseudo here is ::before/::after,
++      // and in this case we want to tell the view that it belongs to the
++      // element (which is a _moz_generated_content native anonymous element).
++      rule.pseudoElement = null;
++      rules.push(rule);
++    });
++
++    // Now any pseudos (except for ::before / ::after, which was handled as
++    // a 'normal rule' above.
++    if (showElementStyles) {
++      for (let pseudo of PSEUDO_ELEMENTS) {
++        this._getElementRules(elementToRead, pseudo, inherited, options).forEach((rule) => {
++          rules.push(rule);
++        });
++      }
++    }
++
++    return rules;
++  },
++
++  /**
++   * Helper function for _getAllElementRules, returns the rules from a given
++   * element. See getApplied for documentation on parameters.
++   * @param DOMNode elementToRead
++   * @param string pseudoToRead
++   * @param DOMNode inherited
++   * @param object options
++   *
++   * @returns Array rules
++   */
++  _getElementRules: function (elementToRead, pseudoToRead, inherited, options) {
++    let domRules = DOMUtils.getCSSStyleRules(elementToRead, pseudoToRead);
++    if (!domRules) {
++      return [];
++    }
++
++    let rules = [];
++
++    // getCSSStyleRules returns ordered from least-specific to
++    // most-specific.
++    for (let i = domRules.Count() - 1; i >= 0; i--) {
++      let domRule = domRules.GetElementAt(i);
++
++      let isSystem = !CssLogic.isContentStylesheet(domRule.parentStyleSheet);
++
++      if (isSystem && options.filter != CssLogic.FILTER.UA) {
+         continue;
+       }
+ 
+-      // getCSSStyleRules returns ordered from least-specific to
+-      // most-specific.
+-      for (let i = domRules.Count() - 1; i >= 0; i--) {
+-        let domRule = domRules.GetElementAt(i);
+-
+-        let isSystem = !CssLogic.isContentStylesheet(domRule.parentStyleSheet);
+-
+-        if (isSystem && options.filter != CssLogic.FILTER.UA) {
++      if (inherited) {
++        // Don't include inherited rules if none of its properties
++        // are inheritable.
++        let hasInherited = Array.prototype.some.call(domRule.style, prop => {
++          return DOMUtils.isInheritedProperty(prop);
++        });
++        if (!hasInherited) {
+           continue;
+         }
+-
+-        if (inherited) {
+-          // Don't include inherited rules if none of its properties
+-          // are inheritable.
+-          let hasInherited = Array.prototype.some.call(domRule.style, prop => {
+-            return DOMUtils.isInheritedProperty(prop);
+-          });
+-          if (!hasInherited) {
+-            continue;
+-          }
+-        }
+-
+-        let ruleActor = this._styleRef(domRule);
+-        rules.push({
+-          rule: ruleActor,
+-          inherited: inherited,
+-          pseudoElement: isBeforeOrAfter ? null : pseudo,
+-          isSystem: isSystem
+-        });
+       }
+ 
++      let ruleActor = this._styleRef(domRule);
++      rules.push({
++        rule: ruleActor,
++        inherited: inherited,
++        isSystem: isSystem,
++        pseudoElement: pseudoToRead
++      });
+     }
++
++    return rules;
+   },
+ 
++
+   /**
+    * Expand Sets of rules and sheets to include all parent rules and sheets.
+    */
+   expandSets: function(ruleSet, sheetSet) {
+     // Sets include new items in their iteration
+     for (let rule of ruleSet) {
+       if (rule.rawRule.parentRule) {
+         let parent = this._styleRef(rule.rawRule.parentRule);
+diff --git a/toolkit/devtools/styleinspector/css-logic.js b/toolkit/devtools/styleinspector/css-logic.js
+--- a/toolkit/devtools/styleinspector/css-logic.js
++++ b/toolkit/devtools/styleinspector/css-logic.js
+@@ -174,28 +174,28 @@ CssLogic.prototype = {
+     }
+ 
+     this._matchedRules = null;
+     this._matchedSelectors = null;
+     let win = this.viewedDocument.defaultView;
+ 
+     // Handle computed styles on pseudo by reading style rules
+     // on the parent node with proper pseudo arg to getComputedStyle.
+-    let {elementToRead, pseudoToRead} = this.getStyleAndPseudoElements(this.viewedElement);
++    let {elementToRead, pseudoToRead} = this.getStyleableElementAndPseudo(this.viewedElement);
+ 
+     this._computedStyle = win.getComputedStyle(elementToRead, pseudoToRead);
+   },
+ 
+   /**
+    * XXX
+    * @returns {Object}
+    *            - elementToRead
+    *            - pseudoToRead
+    */
+-  getStyleAndPseudoElements: function(node) {
++  getStyleableElementAndPseudo: function(node) {
+     let elementToRead = node;
+     let pseudoToRead = null;
+     if (node.nodeName == "_moz_generated_content_before") {
+       elementToRead = node.parentNode;
+       pseudoToRead = ":before";
+     } else if (node.nodeName == "_moz_generated_content_after") {
+       elementToRead = node.parentNode;
+       pseudoToRead = ":after";
+@@ -611,17 +611,17 @@ CssLogic.prototype = {
+ 
+     do {
+       let status = this.viewedElement === element ?
+                    CssLogic.STATUS.MATCHED : CssLogic.STATUS.PARENT_MATCH;
+ 
+       try {
+         // Handle finding rules on pseudo by reading style rules
+         // on the parent node with proper pseudo arg to getCSSStyleRules.
+-        let {elementToRead, pseudoToRead} = this.getStyleAndPseudoElements(element);
++        let {elementToRead, pseudoToRead} = this.getStyleableElementAndPseudo(element);
+         domRules = domUtils.getCSSStyleRules(elementToRead, pseudoToRead);
+       } catch (ex) {
+         Services.console.
+           logStringMessage("CL__buildMatchedRules error: " + ex);
+         continue;
+       }
+ 
+       // getCSSStyleRules can return null with a shadow DOM element.
