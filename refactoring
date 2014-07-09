@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 37df972d05ca6ee96f79171b5e8659343e43e45a
+# Parent 2874f8a14cfa4e6fe49d1006eef7cc3d5e82d8c8
 # User Brian Grinstead <bgrinstead@mozilla.com>
 refactoring for anon-content based on feedback
 
@@ -61,6 +61,67 @@ diff --git a/browser/devtools/styleinspector/test/head.js b/browser/devtools/sty
    }
    return updated;
  }
+diff --git a/toolkit/devtools/server/actors/highlighter.js b/toolkit/devtools/server/actors/highlighter.js
+--- a/toolkit/devtools/server/actors/highlighter.js
++++ b/toolkit/devtools/server/actors/highlighter.js
+@@ -951,24 +951,30 @@ BoxModelHighlighter.prototype = Heritage
+   _updateInfobar: function() {
+     if (!this.currentNode) {
+       return;
+     }
+ 
+     let node = this.currentNode;
+     let info = this.nodeInfo;
+ 
++    // If this is a ::before or ::after, then reset node to the
++    // parent and append ::before/::after onto the pseudoClassesBox.
++    let pseudoElement = null;
++    if (node.tagName === "_moz_generated_content_before") {
++      pseudoElement = "::before";
++      node = this.layoutHelpers.getRootBindingParent(node);
++    } else if (node.tagName === "_moz_generated_content_after") {
++      pseudoElement = "::after";
++      node = this.layoutHelpers.getRootBindingParent(node);
++    }
++
+     // Update the tag, id, classes, pseudo-classes and dimensions only if they
+     // changed to avoid triggering paint events
+     let tagName = node.tagName;
+-    if (tagName === "_moz_generated_content_before") {
+-      tagName = "::before";
+-    } else if (tagName === "_moz_generated_content_after") {
+-      tagName = "::after";
+-    }
+     if (info.tagNameLabel.textContent !== tagName) {
+       info.tagNameLabel.textContent = tagName;
+     }
+ 
+     let id = node.id ? "#" + node.id : "";
+     if (info.idLabel.textContent !== id) {
+       info.idLabel.textContent = id;
+     }
+@@ -976,16 +982,21 @@ BoxModelHighlighter.prototype = Heritage
+     let classList = (node.classList || []).length ? "." + [...node.classList].join(".") : "";
+     if (info.classesBox.textContent !== classList) {
+       info.classesBox.textContent = classList;
+     }
+ 
+     let pseudos = PSEUDO_CLASSES.filter(pseudo => {
+       return DOMUtils.hasPseudoClassLock(node, pseudo);
+     }, this).join("");
++
++    if (pseudoElement) {
++      pseudos += pseudoElement;
++    }
++
+     if (info.pseudoClassesBox.textContent !== pseudos) {
+       info.pseudoClassesBox.textContent = pseudos;
+     }
+ 
+     let rect = node.getBoundingClientRect();
+     let dim = Math.ceil(rect.width) + " x " + Math.ceil(rect.height);
+     if (info.dimensionBox.textContent !== dim) {
+       info.dimensionBox.textContent = dim;
 diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/actors/styles.js
 --- a/toolkit/devtools/server/actors/styles.js
 +++ b/toolkit/devtools/server/actors/styles.js
@@ -83,11 +144,12 @@ diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/
  // Predeclare the domnode actor type for use in requests.
  types.addActorType("domnode");
  
+ // Predeclare the domstylerule actor type
+ types.addActorType("domstylerule");
+ 
  /**
-  * DOM Nodes returned by the style actor will be owned by the DOM walker
-  * for the connection.
-   */
-@@ -287,22 +290,22 @@ var PageStyleActor = protocol.ActorClass
+@@ -297,17 +300,17 @@ var PageStyleActor = protocol.ActorClass
+    *     'ua': Include properties from user and user-agent sheets.
     *     Default value is 'ua'
     *   `inherited`: Include styles inherited from parent nodes.
     *   `matchedSeletors`: Include an array of specific selectors that
@@ -95,24 +157,17 @@ diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/
     */
    getApplied: method(function(node, options) {
      let entries = [];
- 
 -    this.addElementRules(node, undefined, options, entries);
 +    entries = entries.concat(this._getAllElementRules(node, undefined, options));
- 
-     if (options.inherited) {
-       let parent = this.walker.parentNode(node);
-       while (parent && parent.rawNode.nodeType != Ci.nsIDOMNode.DOCUMENT_NODE) {
--        this.addElementRules(parent, parent, options, entries);
-+        entries = entries.concat(this._getAllElementRules(parent, parent, options));
-         parent = this.walker.parentNode(parent);
-       }
-     }
- 
-     if (options.matchedSelectors) {
-       for (let entry of entries) {
-         if (entry.rule.type === ELEMENT_STYLE) {
-           continue;
-@@ -354,90 +357,121 @@ var PageStyleActor = protocol.ActorClass
+     return this.getAppliedProps(node, entries, options);
+   }, {
+     request: {
+       node: Arg(0, "domnode"),
+       inherited: Option(1, "boolean"),
+       matchedSelectors: Option(1, "boolean"),
+       filter: Option(1, "string")
+     },
+@@ -323,90 +326,121 @@ var PageStyleActor = protocol.ActorClass
    /**
     * Helper function for getApplied, adds all the rules from a given
     * element. See getApplied for documentation on parameters.
@@ -280,13 +335,32 @@ diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/
  
 +
    /**
-    * Expand Sets of rules and sheets to include all parent rules and sheets.
+    * Helper function for getApplied and addNewRule that fetches a set of
+    * style properties that apply to the given node and associated rules
+    * @param NodeActor node
+    * @param object options
+    *   `filter`: A string filter that affects the "matched" handling.
+    *     'user': Include properties from user style sheets.
+    *     'ua': Include properties from user and user-agent sheets.
+@@ -422,17 +456,17 @@ var PageStyleActor = protocol.ActorClass
+    * @returns Object containing the list of rule entries, rule actors and
+    *   stylesheet actors that applies to the given node and its associated
+    *   rules.
     */
-   expandSets: function(ruleSet, sheetSet) {
-     // Sets include new items in their iteration
-     for (let rule of ruleSet) {
-       if (rule.rawRule.parentRule) {
-         let parent = this._styleRef(rule.rawRule.parentRule);
+   getAppliedProps: function(node, entries, options) {
+     if (options.inherited) {
+       let parent = this.walker.parentNode(node);
+       while (parent && parent.rawNode.nodeType != Ci.nsIDOMNode.DOCUMENT_NODE) {
+-        this.addElementRules(parent, parent, options, entries);
++        entries = entries.concat(this._getAllElementRules(parent, parent, options));
+         parent = this.walker.parentNode(parent);
+       }
+     }
+ 
+     if (options.matchedSelectors) {
+       for (let entry of entries) {
+         if (entry.rule.type === ELEMENT_STYLE) {
+           continue;
 diff --git a/toolkit/devtools/styleinspector/css-logic.js b/toolkit/devtools/styleinspector/css-logic.js
 --- a/toolkit/devtools/styleinspector/css-logic.js
 +++ b/toolkit/devtools/styleinspector/css-logic.js
