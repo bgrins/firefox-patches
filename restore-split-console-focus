@@ -1,0 +1,142 @@
+# HG changeset patch
+# Parent 273d6c900fb19c47f363e17dbb8a58783aa80dd2
+# User Brian Grinstead <bgrinstead@mozilla.com>
+Bug 1050439 - Focus should be restored to previously active element after split console is closed;r=jwalker
+
+diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/toolbox.js
+--- a/browser/devtools/framework/toolbox.js
++++ b/browser/devtools/framework/toolbox.js
+@@ -71,16 +71,17 @@ function Toolbox(target, selectedTool, h
+   this._refreshHostTitle = this._refreshHostTitle.bind(this);
+   this._splitConsoleOnKeypress = this._splitConsoleOnKeypress.bind(this);
+   this.destroy = this.destroy.bind(this);
+   this.highlighterUtils = getHighlighterUtils(this);
+   this._highlighterReady = this._highlighterReady.bind(this);
+   this._highlighterHidden = this._highlighterHidden.bind(this);
+   this._prefChanged = this._prefChanged.bind(this);
+   this._saveSplitConsoleHeight = this._saveSplitConsoleHeight.bind(this);
++  this._onFocus = this._onFocus.bind(this);
+ 
+   this._target.on("close", this.destroy);
+ 
+   if (!hostType) {
+     hostType = Services.prefs.getCharPref(this._prefs.LAST_HOST);
+   }
+   if (!selectedTool) {
+     selectedTool = Services.prefs.getCharPref(this._prefs.LAST_TOOL);
+@@ -349,16 +350,20 @@ Toolbox.prototype = {
+     let nextKey = this.doc.getElementById("toolbox-next-tool-key");
+     nextKey.addEventListener("command", this.selectNextTool.bind(this), true);
+     let prevKey = this.doc.getElementById("toolbox-previous-tool-key");
+     prevKey.addEventListener("command", this.selectPreviousTool.bind(this), true);
+ 
+     // Split console uses keypress instead of command so the event can be
+     // cancelled with stopPropagation on the keypress, and not preventDefault.
+     this.doc.addEventListener("keypress", this._splitConsoleOnKeypress, false);
++
++    // XXX: Should probably rename this function since it does more than just key events,
++    // or move this binding somewhere else
++    this.doc.addEventListener("focus", this._onFocus, true);
+   },
+ 
+   _saveSplitConsoleHeight: function() {
+     Services.prefs.setIntPref(SPLITCONSOLE_HEIGHT_PREF,
+       this.webconsolePanel.height);
+   },
+ 
+   /**
+@@ -985,35 +990,76 @@ Toolbox.prototype = {
+   /**
+    * Opens the split console.
+    *
+    * @returns {Promise} a promise that resolves once the tool has been
+    *          loaded and focused.
+    */
+   openSplitConsole: function() {
+     this._splitConsole = true;
++
++    this._savedActiveElement = this.getActiveElement();
++
+     Services.prefs.setBoolPref(SPLITCONSOLE_ENABLED_PREF, true);
+     this._refreshConsoleDisplay();
+     this.emit("split-console");
+     return this.loadTool("webconsole").then(() => {
+       this.focusConsoleInput();
+     });
+   },
+ 
++  _onFocus: function({originalTarget}) {
++    // If the console is split and we are focusing an element outside
++    // of the console, then store the newly focused element, so that it
++    // can be restored once the split console closes.
++    // For instance -> open split console, select a text box, focus console
++    // again, then close the console.  The text box should be refocused.
++    if (this.splitConsole && originalTarget.nodeType === 1) {
++      let webconsolePanel = this.getPanel("webconsole");
++      if (webconsolePanel) {
++        let activeElementWindow =
++          originalTarget.ownerDocument.defaultView;
++
++        // Only track elements if it doesn't belong to the web console
++        if (webconsolePanel._frameWindow != activeElementWindow) {
++          this._savedActiveElement = originalTarget;
++        }
++      }
++    }
++  },
++
++  /**
++   * Find the currently activeElement, traversing document boundaries
++   *
++   * @returns {DOMNode} the activeElement in the toolbox
++   */
++  getActiveElement: function() {
++    let activeElement = this.doc.activeElement;
++    while (activeElement && activeElement.contentDocument) {
++      activeElement = activeElement.contentDocument.activeElement;
++    }
++    return activeElement;
++  },
++
+   /**
+    * Closes the split console.
+    *
+    * @returns {Promise} a promise that resolves once the tool has been
+    *          closed.
+    */
+   closeSplitConsole: function() {
+     this._splitConsole = false;
+     Services.prefs.setBoolPref(SPLITCONSOLE_ENABLED_PREF, false);
+     this._refreshConsoleDisplay();
+     this.emit("split-console");
++
++    console.log("Console has been closed... restoring focus", this._savedActiveElement);
++    if (this._savedActiveElement) {
++      this._savedActiveElement.focus();
++    }
+     return promise.resolve();
+   },
+ 
+   /**
+    * Toggles the split state of the webconsole.  If the webconsole panel
+    * is already selected then this command is ignored.
+    *
+    * @returns {Promise} a promise that resolves once the tool has been
+@@ -1307,16 +1353,17 @@ Toolbox.prototype = {
+   /**
+    * Destroy the current host, and remove event listeners from its frame.
+    *
+    * @return {promise} to be resolved when the host is destroyed.
+    */
+   destroyHost: function() {
+     this.doc.removeEventListener("keypress",
+       this._splitConsoleOnKeypress, false);
++    this.doc.removeEventListener("focus", this._onFocus , true);
+     return this._host.destroy();
+   },
+ 
+   /**
+    * Remove all UI elements, detach from target and clear up
+    */
+   destroy: function() {
+     // If several things call destroy then we give them all the same
