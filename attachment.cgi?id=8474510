@@ -1,0 +1,752 @@
+# HG changeset patch
+# User Jan Odvarko <odvarko@gmail.com>
+# Date 1408364714 -7200
+#      Mon Aug 18 14:25:14 2014 +0200
+# Node ID 23c70738cf8362f63cf84f7ea424924877a30a72
+# Parent  37ac55a2601427374cf281b732852d94a9040111
+Bug 1038562 - Add API to register a new devtools theme; r=bgrins
+
+diff --git a/browser/devtools/framework/gDevTools.jsm b/browser/devtools/framework/gDevTools.jsm
+--- a/browser/devtools/framework/gDevTools.jsm
++++ b/browser/devtools/framework/gDevTools.jsm
+@@ -17,23 +17,23 @@ XPCOMUtils.defineLazyModuleGetter(this, 
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "console",
+                                   "resource://gre/modules/devtools/Console.jsm");
+ 
+ const EventEmitter = devtools.require("devtools/toolkit/event-emitter");
+ const FORBIDDEN_IDS = new Set(["toolbox", ""]);
+ const MAX_ORDINAL = 99;
+ 
+-
+ /**
+  * DevTools is a class that represents a set of developer tools, it holds a
+  * set of tools and keeps track of open toolboxes in the browser.
+  */
+ this.DevTools = function DevTools() {
+   this._tools = new Map();     // Map<toolId, tool>
++  this._themes = new Map();    // Map<themeId, theme>
+   this._toolboxes = new Map(); // Map<target, toolbox>
+ 
+   // destroy() is an observer's handler so we need to preserve context.
+   this.destroy = this.destroy.bind(this);
+   this._teardown = this._teardown.bind(this);
+ 
+   this._testing = false;
+ 
+@@ -225,16 +225,146 @@ DevTools.prototype = {
+         definitions.push(definition);
+       }
+     }
+ 
+     return definitions.sort(this.ordinalSort);
+   },
+ 
+   /**
++   * Register a new theme for developer tools toolbox.
++   *
++   * A definition is a light object that holds various information about a
++   * theme.
++   *
++   * Each themeDefinition has the following properties:
++   * - id: Unique identifier for this theme (string|required)
++   * - label: Localized name for the theme to be displayed to the user
++   *          (string|required)
++   * - stylesheets: Array of URLs pointing to a CSS document(s) containing
++   *                the theme style rules (array|required)
++   * - classList: Array of class names identifying the theme within a document.
++   *              These names are set to document element when applying
++   *              the theme (array|required)
++   * - onApply: Function that is executed by the framework when the theme
++   *            is applied. The function takes the current iframe window
++   *            and the previous theme id as arguments (function)
++   * - onUnapply: Function that is executed by the framework when the theme
++   *            is unapplied. The function takes the current iframe window
++   *            and the new theme id as arguments (function)
++   */
++  registerTheme: function DT_registerTheme(themeDefinition) {
++    let themeId = themeDefinition.id;
++
++    if (!themeId) {
++      throw new Error("Invalid theme id");
++    }
++
++    if (this._themes.get(themeId)) {
++      throw new Error("Theme with the same id is already registered");
++    }
++
++    this._themes.set(themeId, themeDefinition);
++
++    this.emit("theme-registered", themeId);
++  },
++
++  /**
++   * Removes an existing theme from the list of registered themes.
++   * Needed so that add-ons can remove themselves when they are deactivated
++   *
++   * @param {string|object} theme
++   *        Definition or the id of the theme to unregister.
++   */
++  unregisterTheme: function DT_unregisterTheme(theme) {
++    let themeId = null;
++    if (typeof theme == "string") {
++      themeId = theme;
++      theme = this._themes.get(theme);
++    }
++    else {
++      themeId = theme.id;
++    }
++
++    let currTheme = Services.prefs.getCharPref("devtools.theme");
++
++    // Change the current theme if it's being dynamically removed together
++    // with the owner (bootstrapped) extension.
++    // But, do not change it if the application is just shutting down.
++    if (!Services.startup.shuttingDown && theme.id == currTheme) {
++      Services.prefs.setCharPref("devtools.theme", "light");
++
++      let data = {
++        pref: "devtools.theme",
++        newValue: "light",
++        oldValue: currTheme
++      };
++
++      gDevTools.emit("pref-changed", data);
++
++      this.emit("theme-unregistered", theme);
++    }
++
++    this._themes.delete(themeId);
++  },
++
++  /**
++   * Get a theme definition if it exists.
++   *
++   * @param {string} themeId
++   *        The id of the theme
++   *
++   * @return {ThemeDefinition|null} theme
++   *         The ThemeDefinition for the id or null.
++   */
++  getThemeDefinition: function DT_getThemeDefinition(themeId) {
++    let theme = this._themes.get(themeId);
++    if (!theme) {
++      return null;
++    }
++    return theme;
++  },
++
++  /**
++   * Get map of registered themes.
++   *
++   * @return {Map} themes
++   *         A map of the the theme definitions registered in this instance
++   */
++  getThemeDefinitionMap: function DT_getThemeDefinitionMap() {
++    let themes = new Map();
++
++    for (let [id, definition] of this._themes) {
++      if (this.getThemeDefinition(id)) {
++        themes.set(id, definition);
++      }
++    }
++
++    return themes;
++  },
++
++  /**
++   * Get registered themes definitions sorted by ordinal value.
++   *
++   * @return {Array} themes
++   *         A sorted array of the theme definitions registered in this instance
++   */
++  getThemeDefinitionArray: function DT_getThemeDefinitionArray() {
++    let definitions = [];
++
++    for (let [id, definition] of this._themes) {
++      if (this.getThemeDefinition(id)) {
++        definitions.push(definition);
++      }
++    }
++
++    return definitions.sort(this.ordinalSort);
++  },
++
++  /**
+    * Show a Toolbox for a target (either by creating a new one, or if a toolbox
+    * already exists for the target, by bring to the front the existing one)
+    * If |toolId| is specified then the displayed toolbox will have the
+    * specified tool selected.
+    * If |hostType| is specified then the toolbox will be displayed using the
+    * specified HostType.
+    *
+    * @param {Target} target
+diff --git a/browser/devtools/framework/test/browser.ini b/browser/devtools/framework/test/browser.ini
+--- a/browser/devtools/framework/test/browser.ini
++++ b/browser/devtools/framework/test/browser.ini
+@@ -1,15 +1,16 @@
+ [DEFAULT]
+ subsuite = devtools
+ support-files =
+   browser_toolbox_options_disable_js.html
+   browser_toolbox_options_disable_js_iframe.html
+   browser_toolbox_options_disable_cache.sjs
+   head.js
++  doc_theme.css
+ 
+ [browser_devtools_api.js]
+ [browser_dynamic_tool_enabling.js]
+ [browser_keybindings.js]
+ [browser_new_activation_workflow.js]
+ [browser_target_events.js]
+ [browser_target_remote.js]
+ [browser_toolbox_dynamic_registration.js]
+@@ -27,12 +28,13 @@ skip-if = e10s # Bug 1030318
+ [browser_toolbox_sidebar.js]
+ [browser_toolbox_tabsswitch_shortcuts.js]
+ [browser_toolbox_tool_ready.js]
+ [browser_toolbox_window_reload_target.js]
+ [browser_toolbox_window_shortcuts.js]
+ [browser_toolbox_window_title_changes.js]
+ [browser_toolbox_zoom.js]
+ [browser_toolbox_custom_host.js]
++[browser_toolbox_theme_registration.js]
+ 
+ # We want this test to run for mochitest-dt as well, so we include it here:
+ [../../../base/content/test/general/browser_parsable_css.js]
+ 
+diff --git a/browser/devtools/framework/test/browser_toolbox_theme_registration.js b/browser/devtools/framework/test/browser_toolbox_theme_registration.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/framework/test/browser_toolbox_theme_registration.js
+@@ -0,0 +1,113 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++const CHROME_URL = "chrome://mochitests/content/browser/browser/devtools/framework/test/";
++
++let toolbox;
++
++function test()
++{
++  gBrowser.selectedTab = gBrowser.addTab();
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++
++  gBrowser.selectedBrowser.addEventListener("load", function onLoad(evt) {
++    gBrowser.selectedBrowser.removeEventListener(evt.type, onLoad, true);
++    gDevTools.showToolbox(target).then(testRegister);
++  }, true);
++
++  content.location = "data:text/html,test for dynamically registering and unregistering themes";
++}
++
++function testRegister(aToolbox)
++{
++  toolbox = aToolbox
++  gDevTools.once("theme-registered", themeRegistered);
++
++  gDevTools.registerTheme({
++    id: "test-theme",
++    label: "Test theme",
++    stylesheets: [CHROME_URL + "doc_theme.css"],
++    classList: ["theme-test"],
++  });
++}
++
++function themeRegistered(event, themeId)
++{
++  is(themeId, "test-theme", "theme-registered event handler sent theme id");
++
++  ok(gDevTools.getThemeDefinitionMap().has(themeId), "theme added to map");
++
++  // Test that new theme appears in the Options panel
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++  gDevTools.showToolbox(target, "options").then(() => {
++    let panel = toolbox.getCurrentPanel();
++    let doc = panel.panelWin.frameElement.contentDocument;
++    let themeOption = doc.querySelector("#devtools-theme-box > radio[value=test-theme]");
++
++    ok(themeOption, "new theme exists in the Options panel");
++
++    // Apply the new theme.
++    applyTheme();
++  });
++}
++
++function applyTheme()
++{
++  let panelWin = toolbox.getCurrentPanel().panelWin;
++  let doc = panelWin.frameElement.contentDocument;
++  let testThemeOption = doc.querySelector("#devtools-theme-box > radio[value=test-theme]");
++  let lightThemeOption = doc.querySelector("#devtools-theme-box > radio[value=light]");
++
++  let color = panelWin.getComputedStyle(testThemeOption).color;
++  isnot(color, "rgb(255, 0, 0)", "style unapplied");
++
++  // Select test theme.
++  testThemeOption.click();
++
++  let color = panelWin.getComputedStyle(testThemeOption).color;
++  is(color, "rgb(255, 0, 0)", "style applied");
++
++  // Select light theme
++  lightThemeOption.click();
++
++  let color = panelWin.getComputedStyle(testThemeOption).color;
++  isnot(color, "rgb(255, 0, 0)", "style unapplied");
++
++  // Select test theme again.
++  testThemeOption.click();
++
++  // Then unregister the test theme.
++  testUnregister();
++}
++
++function testUnregister()
++{
++  gDevTools.unregisterTheme("test-theme");
++
++  ok(!gDevTools.getThemeDefinitionMap().has("test-theme"), "theme removed from map");
++
++  let panelWin = toolbox.getCurrentPanel().panelWin;
++  let doc = panelWin.frameElement.contentDocument;
++  let themeBox = doc.querySelector("#devtools-theme-box");
++
++  // The default light theme must be selected now.
++  is(themeBox.selectedItem, themeBox.querySelector("[value=light]"),
++    "theme light must be selected");
++
++  // Make sure the tab-attaching process is done before we destroy the toolbox.
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++  let actor = target.activeTab.actor;
++  target.client.attachTab(actor, (response) => {
++    cleanup();
++  });
++}
++
++function cleanup()
++{
++  toolbox.destroy().then(function() {
++    toolbox = null;
++    gBrowser.removeCurrentTab();
++    finish();
++  });
++}
+diff --git a/browser/devtools/framework/test/doc_theme.css b/browser/devtools/framework/test/doc_theme.css
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/framework/test/doc_theme.css
+@@ -0,0 +1,3 @@
++.theme-test #devtools-theme-box radio {
++  color: red !important;
++}
+diff --git a/browser/devtools/framework/toolbox-options.js b/browser/devtools/framework/toolbox-options.js
+--- a/browser/devtools/framework/toolbox-options.js
++++ b/browser/devtools/framework/toolbox-options.js
+@@ -70,16 +70,18 @@ function InfallibleGetBoolPref(key) {
+  */
+ function OptionsPanel(iframeWindow, toolbox) {
+   this.panelDoc = iframeWindow.document;
+   this.panelWin = iframeWindow;
+   this.toolbox = toolbox;
+   this.isReady = false;
+ 
+   this._prefChanged = this._prefChanged.bind(this);
++  this._themeRegistered = this._themeRegistered.bind(this);
++  this._themeUnregistered = this._themeUnregistered.bind(this);
+ 
+   this._addListeners();
+ 
+   const EventEmitter = require("devtools/toolkit/event-emitter");
+   EventEmitter.decorate(this);
+ }
+ 
+ OptionsPanel.prototype = {
+@@ -96,17 +98,19 @@ OptionsPanel.prototype = {
+       targetPromise = this.target.makeRemote();
+     } else {
+       targetPromise = promise.resolve(this.target);
+     }
+ 
+     return targetPromise.then(() => {
+       this.setupToolsList();
+       this.setupToolbarButtonsList();
++      this.setupThemeList();
+       this.populatePreferences();
++      this.updateDefaultTheme();
+ 
+       this._disableJSClicked = this._disableJSClicked.bind(this);
+ 
+       let disableJSNode = this.panelDoc.getElementById("devtools-disable-javascript");
+       disableJSNode.addEventListener("click", this._disableJSClicked, false);
+     }).then(() => {
+       this.isReady = true;
+       this.emit("ready");
+@@ -114,29 +118,49 @@ OptionsPanel.prototype = {
+     }).then(null, function onError(aReason) {
+       Cu.reportError("OptionsPanel open failed. " +
+                      aReason.error + ": " + aReason.message);
+     });
+   },
+ 
+   _addListeners: function() {
+     gDevTools.on("pref-changed", this._prefChanged);
++    gDevTools.on("theme-registered", this._themeRegistered);
++    gDevTools.on("theme-unregistered", this._themeUnregistered);
+   },
+ 
+   _removeListeners: function() {
+     gDevTools.off("pref-changed", this._prefChanged);
++    gDevTools.off("theme-registered", this._themeRegistered);
++    gDevTools.off("theme-unregistered", this._themeUnregistered);
+   },
+ 
+   _prefChanged: function(event, data) {
+     if (data.pref === "devtools.cache.disabled") {
+       let cacheDisabled = data.newValue;
+       let cbx = this.panelDoc.getElementById("devtools-disable-cache");
+ 
+       cbx.checked = cacheDisabled;
+     }
++    else if (data.pref === "devtools.theme") {
++      this.updateCurrentTheme();
++    }
++  },
++
++  _themeRegistered: function(event, themeId) {
++    this.setupThemeList();
++  },
++
++  _themeUnregistered: function(event, theme) {
++    let themeBox = this.panelDoc.getElementById("devtools-theme-box");
++    let themeOption = themeBox.querySelector("[value=" + theme.id + "]");
++
++    if (themeOption) {
++      themeBox.removeChild(themeOption);
++    }
+   },
+ 
+   setupToolbarButtonsList: function() {
+     let enabledToolbarButtonsBox = this.panelDoc.getElementById("enabled-toolbox-buttons-box");
+     enabledToolbarButtonsBox.textContent = "";
+ 
+     let toggleableButtons = this.toolbox.toolboxButtons;
+     let setToolboxButtonsVisibility =
+@@ -224,16 +248,36 @@ OptionsPanel.prototype = {
+ 
+     if (!atleastOneToolNotSupported) {
+       toolsNotSupportedLabel.style.display = "none";
+     }
+ 
+     this.panelWin.focus();
+   },
+ 
++  setupThemeList: function() {
++    let themeBox = this.panelDoc.getElementById("devtools-theme-box");
++    themeBox.textContent = "";
++
++    let createThemeOption = theme => {
++      let radio = this.panelDoc.createElement("radio");
++      radio.setAttribute("value", theme.id);
++      radio.setAttribute("label", theme.label);
++      return radio;
++    };
++
++    // Populating the default theme list
++    let themes = gDevTools.getThemeDefinitionArray();
++    for (let theme of themes) {
++      themeBox.appendChild(createThemeOption(theme));
++    }
++
++    this.updateCurrentTheme();
++  },
++
+   populatePreferences: function() {
+     let prefCheckboxes = this.panelDoc.querySelectorAll("checkbox[data-pref]");
+     for (let checkbox of prefCheckboxes) {
+       checkbox.checked = GetPref(checkbox.getAttribute("data-pref"));
+       checkbox.addEventListener("command", function() {
+         let data = {
+           pref: this.getAttribute("data-pref"),
+           newValue: this.checked
+@@ -253,19 +297,23 @@ OptionsPanel.prototype = {
+           break;
+         }
+       }
+       radiogroup.addEventListener("select", function() {
+         let data = {
+           pref: this.getAttribute("data-pref"),
+           newValue: this.selectedItem.getAttribute("value")
+         };
++
+         data.oldValue = GetPref(data.pref);
+         SetPref(data.pref, data.newValue);
+-        gDevTools.emit("pref-changed", data);
++
++        if (data.newValue != data.oldValue) {
++          gDevTools.emit("pref-changed", data);
++        }
+       }.bind(radiogroup));
+     }
+     let prefMenulists = this.panelDoc.querySelectorAll("menulist[data-pref]");
+     for (let menulist of prefMenulists) {
+       let pref = GetPref(menulist.getAttribute("data-pref"));
+       let menuitems = menulist.querySelectorAll("menuitem");
+       for (let menuitem of menuitems) {
+         let value = menuitem.value;
+@@ -287,16 +335,35 @@ OptionsPanel.prototype = {
+ 
+     this.target.client.attachTab(this.target.activeTab._actor, (response) => {
+       this._origJavascriptEnabled = response.javascriptEnabled;
+ 
+       this._populateDisableJSCheckbox();
+     });
+   },
+ 
++  updateDefaultTheme: function() {
++    // Make sure a theme is set in case the previous one coming from
++    // an extension isn't available anymore.
++    let themeBox = this.panelDoc.getElementById("devtools-theme-box");
++    if (themeBox.selectedIndex == -1) {
++      themeBox.selectedItem = themeBox.querySelector("[value=light]");
++    }
++  },
++
++  updateCurrentTheme: function() {
++    let currentTheme = GetPref("devtools.theme");
++    let themeBox = this.panelDoc.getElementById("devtools-theme-box");
++    let themeOption = themeBox.querySelector("[value=" + currentTheme + "]");
++
++    if (themeOption) {
++      themeBox.selectedItem = themeOption;
++    }
++  },
++
+   _populateDisableJSCheckbox: function() {
+     let cbx = this.panelDoc.getElementById("devtools-disable-javascript");
+     cbx.checked = !this._origJavascriptEnabled;
+   },
+ 
+   /**
+    * Disables JavaScript for the currently loaded tab. We force a page refresh
+    * here because setting docShell.allowJavascript to true fails to block JS
+diff --git a/browser/devtools/framework/toolbox-options.xul b/browser/devtools/framework/toolbox-options.xul
+--- a/browser/devtools/framework/toolbox-options.xul
++++ b/browser/devtools/framework/toolbox-options.xul
+@@ -28,18 +28,16 @@
+ 
+       </vbox>
+       <vbox class="options-vertical-pane" flex="1">
+         <label>&options.selectDevToolsTheme.label;</label>
+         <radiogroup id="devtools-theme-box"
+                     class="options-groupbox"
+                     data-pref="devtools.theme"
+                     orient="horizontal">
+-          <radio value="light" label="&options.lightTheme.label;"/>
+-          <radio value="dark" label="&options.darkTheme.label;"/>
+         </radiogroup>
+         <label>&options.commonPrefs.label;</label>
+         <vbox id="commonprefs-options" class="options-groupbox">
+           <checkbox label="&options.enablePersistentLogs.label;"
+                     tooltiptext="&options.enablePersistentLogs.tooltip;"
+                     data-pref="devtools.webconsole.persistlog"/>
+         </vbox>
+         <label>&options.context.inspector;</label>
+diff --git a/browser/devtools/main.js b/browser/devtools/main.js
+--- a/browser/devtools/main.js
++++ b/browser/devtools/main.js
+@@ -352,23 +352,51 @@ let defaultTools = [
+ ];
+ 
+ exports.defaultTools = defaultTools;
+ 
+ for (let definition of defaultTools) {
+   gDevTools.registerTool(definition);
+ }
+ 
++Tools.darkTheme = {
++  id: "dark",
++  label: l10n("options.darkTheme.label", toolboxStrings),
++  ordinal: 1,
++  stylesheets: ["chrome://browser/skin/devtools/dark-theme.css"],
++  classList: ["theme-dark"],
++};
++
++Tools.lightTheme = {
++  id: "light",
++  label: l10n("options.lightTheme.label", toolboxStrings),
++  ordinal: 2,
++  stylesheets: ["chrome://browser/skin/devtools/light-theme.css"],
++  classList: ["theme-light"],
++};
++
++let defaultThemes = [
++  Tools.darkTheme,
++  Tools.lightTheme,
++];
++
++for (let definition of defaultThemes) {
++  gDevTools.registerTheme(definition);
++}
++
+ var unloadObserver = {
+   observe: function(subject, topic, data) {
+     if (subject.wrappedJSObject === require("@loader/unload")) {
+       Services.obs.removeObserver(unloadObserver, "sdk:loader:destroy");
+       for (let definition of gDevTools.getToolDefinitionArray()) {
+         gDevTools.unregisterTool(definition.id);
+       }
++      for (let definition of gDevTools.getThemeDefinitionArray()) {
++        gDevTools.unregisterTheme(definition.id);
++      }
+     }
+   }
+ };
+ Services.obs.addObserver(unloadObserver, "sdk:loader:destroy", false);
+ 
+ events.emit("devtools-loaded", {});
+ 
+ /**
+diff --git a/browser/devtools/shared/theme-switching.js b/browser/devtools/shared/theme-switching.js
+--- a/browser/devtools/shared/theme-switching.js
++++ b/browser/devtools/shared/theme-switching.js
+@@ -19,34 +19,45 @@
+     documentElement.style.display = display; // Restore
+   }
+ 
+   function switchTheme(newTheme, oldTheme) {
+     if (newTheme === oldTheme) {
+       return;
+     }
+ 
+-    if (oldTheme && newTheme != oldTheme) {
+-      StylesheetUtils.removeSheet(
+-        window,
+-        DEVTOOLS_SKIN_URL + oldTheme + "-theme.css",
+-        "author"
+-      );
++    let oldThemeDef = gDevTools.getThemeDefinition(oldTheme);
++    let newThemeDef = gDevTools.getThemeDefinition(newTheme);
++
++    // Unload all theme stylesheets related to the old theme.
++    if (oldThemeDef) {
++      for (let url of oldThemeDef.stylesheets) {
++        StylesheetUtils.removeSheet(window, url, "author");
++      }
+     }
+ 
+-    StylesheetUtils.loadSheet(
+-      window,
+-      DEVTOOLS_SKIN_URL + newTheme + "-theme.css",
+-      "author"
+-    );
++    // Load all stylesheets associated with the new theme.
++    let newThemeDef = gDevTools.getThemeDefinition(newTheme);
+ 
+-    // Floating scrollbars à la osx
++    // The theme might not be available anymore (e.g. uninstalled)
++    // Use the default one.
++    if (!newThemeDef) {
++      newThemeDef = gDevTools.getThemeDefinition("light");
++    }
++
++    for (let url of newThemeDef.stylesheets) {
++      StylesheetUtils.loadSheet(window, url, "author");
++    }
++
++    // Floating scroll-bars like in OSX
+     let hiddenDOMWindow = Cc["@mozilla.org/appshell/appShellService;1"]
+                  .getService(Ci.nsIAppShellService)
+                  .hiddenDOMWindow;
++
++    // TODO: extensions might want to customize scrollbar styles too.
+     if (!hiddenDOMWindow.matchMedia("(-moz-overlay-scrollbars)").matches) {
+       let scrollbarsUrl = Services.io.newURI(
+         DEVTOOLS_SKIN_URL + "floating-scrollbars-light.css", null, null);
+ 
+       if (newTheme == "dark") {
+         StylesheetUtils.loadSheet(
+           window,
+           scrollbarsUrl,
+@@ -57,18 +68,36 @@
+           window,
+           scrollbarsUrl,
+           "agent"
+         );
+       }
+       forceStyle();
+     }
+ 
+-    documentElement.classList.remove("theme-" + oldTheme);
+-    documentElement.classList.add("theme-" + newTheme);
++    if (oldThemeDef) {
++      for (let name of oldThemeDef.classList) {
++        documentElement.classList.remove(name);
++      }
++
++      if (oldThemeDef.onUnapply) {
++        oldThemeDef.onUnapply(window, newTheme);
++      }
++    }
++
++    for (let name of newThemeDef.classList) {
++      documentElement.classList.add(name);
++    }
++
++    if (newThemeDef.onApply) {
++      newThemeDef.onApply(window, oldTheme);
++    }
++
++    // Final notification for further theme-switching related logic.
++    gDevTools.emit("theme-switched", window, newTheme, oldTheme);
+   }
+ 
+   function handlePrefChange(event, data) {
+     if (data.pref == "devtools.theme") {
+       switchTheme(data.newValue, data.oldValue);
+     }
+   }
+ 
+diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
+--- a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
++++ b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
+@@ -109,18 +109,16 @@
+   -  the explanation of the * marker on a tool which is currently not supported
+   -  for the target of the toolbox. -->
+ <!ENTITY options.toolNotSupported.label  "* Not supported for current toolbox target">
+ 
+ <!-- LOCALIZATION NOTE (options.selectDevToolsTheme.label): This is the label for
+   -  the heading of the radiobox corresponding to the theme of the developer
+   -  tools. -->
+ <!ENTITY options.selectDevToolsTheme.label   "Choose DevTools theme:">
+-<!ENTITY options.darkTheme.label             "Dark theme">
+-<!ENTITY options.lightTheme.label            "Light theme">
+ 
+ <!-- LOCALIZATION NOTE (options.webconsole.label): This is the label for the
+   -  heading of the group of Web Console preferences in the options panel. -->
+ <!ENTITY options.webconsole.label            "Web Console">
+ 
+ <!-- LOCALIZATION NOTE (options.timestampMessages.label): This is the
+    - label for the checkbox that toggles timestamps in the Web Console -->
+ <!ENTITY options.timestampMessages.label      "Enable timestamps">
+diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.properties b/browser/locales/en-US/chrome/browser/devtools/toolbox.properties
+--- a/browser/locales/en-US/chrome/browser/devtools/toolbox.properties
++++ b/browser/locales/en-US/chrome/browser/devtools/toolbox.properties
+@@ -65,8 +65,16 @@ scratchpad.keycode=VK_F4
+ # LOCALIZATION NOTE (browserConsoleCmd.commandkey)
+ # Used for toggling the browser console from the detached toolbox window
+ # Needs to match browserConsoleCmd.commandkey from browser.dtd
+ browserConsoleCmd.commandkey=j
+ 
+ # LOCALIZATION NOTE (pickButton.tooltip)
+ # This is the tooltip of the pick button in the toolbox toolbar
+ pickButton.tooltip=Pick an element from the page
++
++# LOCALIZATION NOTE (options.darkTheme.label)
++# Used as a label for dark theme
++options.darkTheme.label=Dark theme
++
++# LOCALIZATION NOTE (options.lightTheme.label)
++# Used as a label for light theme
++options.lightTheme.label=Light theme
