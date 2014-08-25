@@ -1,0 +1,348 @@
+# HG changeset patch
+# User Gijs Kruitbosch <gijskruitbosch@gmail.com>
+# Date 1408041899 -7200
+#      Thu Aug 14 20:44:59 2014 +0200
+# Node ID 01179bfccabeb03e531eb2faa4a9d57f63196e43
+# Parent  f7d6385d2d69f1b1ebb14a72619ee1360c380cb8
+Bug 991757 - add telemetry for the context menu, r?mconley,msucan,f=bwinton
+
+diff --git a/browser/base/content/browser-context.inc b/browser/base/content/browser-context.inc
+--- a/browser/base/content/browser-context.inc
++++ b/browser/base/content/browser-context.inc
+@@ -1,15 +1,18 @@
+ # -*- Mode: Java; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
++# NB: IF YOU ADD ITEMS TO THIS FILE, PLEASE UPDATE THE WHITELIST IN
++# BrowserUITelemetry.jsm. SEE BUG 991757 FOR DETAILS.
++
+       <menugroup id="context-navigation">
+         <menuitem id="context-back"
+                   class="menuitem-iconic"
+                   tooltiptext="&backButton.tooltip;"
+                   aria-label="&backCmd.label;"
+                   command="Browser:BackOrBackDuplicate"
+                   onclick="checkForMiddleClick(this, event);"/>
+         <menuitem id="context-forward"
+                   class="menuitem-iconic"
+                   tooltiptext="&forwardButton.tooltip;"
+diff --git a/browser/base/content/nsContextMenu.js b/browser/base/content/nsContextMenu.js
+--- a/browser/base/content/nsContextMenu.js
++++ b/browser/base/content/nsContextMenu.js
+@@ -31,27 +31,35 @@ nsContextMenu.prototype = {
+     try {
+       this.ellipsis = gPrefService.getComplexValue("intl.ellipsis",
+                                                    Ci.nsIPrefLocalizedString).data;
+     } catch (e) { }
+ 
+     this.isContentSelected = this.isContentSelection();
+     this.onPlainTextLink = false;
+ 
+     // Initialize (disable/remove) menu items.
+     this.initItems();
++
++    // Register this opening of the menu with telemetry:
++    this._checkTelemetryForMenu(aXulMenu);
+   },
+ 
+   hiding: function CM_hiding() {
+     gContextMenuContentData = null;
+     InlineSpellCheckerUI.clearSuggestionsFromMenu();
+     InlineSpellCheckerUI.clearDictionaryListFromMenu();
+     InlineSpellCheckerUI.uninit();
++
++    // This handler self-deletes, only run it if it is still there:
++    if (this._onPopupHiding) {
++      this._onPopupHiding();
++    }
+   },
+ 
+   initItems: function CM_initItems() {
+     this.initPageMenuSeparator();
+     this.initOpenItems();
+     this.initNavigationItems();
+     this.initViewItems();
+     this.initMiscItems();
+     this.initSpellingItems();
+     this.initSaveItems();
+@@ -1696,12 +1704,83 @@ nsContextMenu.prototype = {
+       engineName = ss.currentEngine.name;
+     else
+       engineName = ss.defaultEngine.name;
+ 
+     // format "Search <engine> for <selection>" string to show in menu
+     var menuLabel = gNavigatorBundle.getFormattedString("contextMenuSearch",
+                                                         [engineName,
+                                                          selectedText]);
+     menuItem.label = menuLabel;
+     menuItem.accessKey = gNavigatorBundle.getString("contextMenuSearch.accesskey");
+-  }
++  },
++
++  _getTelemetryClickInfo: function(aXulMenu) {
++    this._onPopupHiding = () => {
++      aXulMenu.ownerDocument.removeEventListener("command", activationHandler, true);
++      aXulMenu.removeEventListener("popuphiding", this._onPopupHiding, true);
++      delete this._onPopupHiding;
++
++      let eventKey = [
++          this._telemetryPageContext,
++          this._telemetryHadCustomItems ? "withcustom" : "withoutcustom"
++      ];
++      let target = this._telemetryClickID || "close-without-interaction";
++      BrowserUITelemetry.registerContextMenuInteraction(eventKey, target);
++    };
++    let activationHandler = (e) => {
++      // Deal with command events being routed to command elements; figure out
++      // what triggered the event (which will have the right e.target)
++      if (e.sourceEvent) {
++        e = e.sourceEvent;
++      }
++      // Target should be in the menu (this catches using shortcuts for items
++      // not in the menu while the menu is up)
++      if (!aXulMenu.contains(e.target)) {
++        return;
++      }
++
++      // Check if this is a page menu item:
++      if (e.target.hasAttribute(PageMenu.GENERATEDITEMID_ATTR)) {
++        this._telemetryClickID = "custom-page-item";
++      } else {
++        this._telemetryClickID = (e.target.id || "unknown").replace(/^context-/i, "");
++      }
++    };
++    aXulMenu.ownerDocument.addEventListener("command", activationHandler, true);
++    aXulMenu.addEventListener("popuphiding", this._onPopupHiding, true);
++  },
++
++  _getTelemetryPageContextInfo: function() {
++    if (this.isContentSelected) {
++      return "selection";
++    }
++    if (this.onLink) {
++      if (this.onImage || this.onCanvas) {
++        return "image-link";
++      }
++      return "link";
++    }
++    if (this.onImage) {
++      return "image"
++    }
++    if (this.onCanvas) {
++      return "canvas";
++    }
++    if (this.onVideo || this.onAudio) {
++      return "media";
++    }
++    if (this.onTextInput) {
++      return "input";
++    }
++    if (this.onSocial) {
++      return "social";
++    }
++    return "other";
++  },
++
++  _checkTelemetryForMenu: function(aXulMenu) {
++    this._telemetryClickID = null;
++    this._telemetryPageContext = this._getTelemetryPageContextInfo();
++    this._telemetryHadCustomItems = this.hasPageMenu;
++    this._getTelemetryClickInfo(aXulMenu);
++  },
+ };
+diff --git a/browser/devtools/inspector/test/browser_inspector_initialization.js b/browser/devtools/inspector/test/browser_inspector_initialization.js
+--- a/browser/devtools/inspector/test/browser_inspector_initialization.js
++++ b/browser/devtools/inspector/test/browser_inspector_initialization.js
+@@ -112,13 +112,16 @@ function testBreadcrumbs(node, inspector
+ 
+ function* clickOnInspectMenuItem(node) {
+   info("Clicking on 'Inspect Element' context menu item of " + node);
+   document.popupNode = node;
+   var contentAreaContextMenu = getNode("#contentAreaContextMenu", { document });
+   var contextMenu = new nsContextMenu(contentAreaContextMenu);
+ 
+   info("Triggering inspect action.");
+   yield contextMenu.inspectNode();
+ 
++  // Clean up context menu:
++  contextMenu.hiding();
++
+   info("Waiting for inspector to update.");
+   yield getActiveInspector().once("inspector-updated");
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_content_02.js b/browser/devtools/styleinspector/test/browser_ruleview_content_02.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_content_02.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_content_02.js
+@@ -24,20 +24,24 @@ let test = asyncTest(function*() {
+   info("Getting the test element");
+   let element = getNode("span");
+ 
+   info("Opening the inspector using the content context-menu");
+   let onInspectorReady = gDevTools.once("inspector-ready");
+ 
+   document.popupNode = element;
+   let contentAreaContextMenu = document.getElementById("contentAreaContextMenu");
+   let contextMenu = new nsContextMenu(contentAreaContextMenu);
+   yield contextMenu.inspectNode();
++
++  // Clean up context menu:
++  contextMenu.hiding();
++
+   yield onInspectorReady;
+ 
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+   let toolbox = gDevTools.getToolbox(target);
+ 
+   info("Getting the inspector and making sure it is fully updated");
+   let inspector = toolbox.getPanel("inspector");
+   yield inspector.once("inspector-updated");
+ 
+   let view = inspector.sidebar.getWindowForTab("ruleview")["ruleview"].view;
+diff --git a/browser/modules/BrowserUITelemetry.jsm b/browser/modules/BrowserUITelemetry.jsm
+--- a/browser/modules/BrowserUITelemetry.jsm
++++ b/browser/modules/BrowserUITelemetry.jsm
+@@ -163,20 +163,22 @@ const BUCKET_DEFAULT = "__DEFAULT__";
+ // Bucket prefix, for named buckets.
+ const BUCKET_PREFIX = "bucket_";
+ // Standard separator to use between different parts of a bucket name, such
+ // as primary name and the time step string.
+ const BUCKET_SEPARATOR = "|";
+ 
+ this.BrowserUITelemetry = {
+   init: function() {
+     UITelemetry.addSimpleMeasureFunction("toolbars",
+                                          this.getToolbarMeasures.bind(this));
++    UITelemetry.addSimpleMeasureFunction("contextmenu",
++                                         this.getContextMenuInfo.bind(this));
+     // Ensure that UITour.jsm remains lazy-loaded, yet always registers its
+     // simple measure function with UITelemetry.
+     UITelemetry.addSimpleMeasureFunction("UITour",
+                                          () => UITour.getTelemetry());
+ 
+     Services.obs.addObserver(this, "sessionstore-windows-restored", false);
+     Services.obs.addObserver(this, "browser-delayed-startup-finished", false);
+     CustomizableUI.addListener(this);
+   },
+ 
+@@ -213,44 +215,46 @@ this.BrowserUITelemetry = {
+    *
+    * let example = this._ensureObjectChain([a, b, c], 0);
+    * example["c"]++;
+    *
+    * Subsequent repetitions of these last two lines would
+    * simply result in the c value being incremented again
+    * and again.
+    *
+    * @param aKeys the Array of keys to chain Objects together with.
+    * @param aEndWith the value to assign to the last key.
++   * @param aRoot the root object onto which we create/get the object chain
++   *              designated by aKeys.
+    * @returns a reference to the second last object in the chain -
+    *          so in our example, that'd be "b".
+    */
+-  _ensureObjectChain: function(aKeys, aEndWith) {
+-    let current = this._countableEvents;
++  _ensureObjectChain: function(aKeys, aEndWith, aRoot) {
++    let current = aRoot;
+     let parent = null;
+     aKeys.unshift(this._bucket);
+     for (let [i, key] of Iterator(aKeys)) {
+       if (!(key in current)) {
+         if (i == aKeys.length - 1) {
+           current[key] = aEndWith;
+         } else {
+           current[key] = {};
+         }
+       }
+       parent = current;
+       current = current[key];
+     }
+     return parent;
+   },
+ 
+   _countableEvents: {},
+-  _countEvent: function(aKeyArray) {
+-    let countObject = this._ensureObjectChain(aKeyArray, 0);
++  _countEvent: function(aKeyArray, root=this._countableEvents) {
++    let countObject = this._ensureObjectChain(aKeyArray, 0, root);
+     let lastItemKey = aKeyArray[aKeyArray.length - 1];
+     countObject[lastItemKey]++;
+   },
+ 
+   _countMouseUpEvent: function(aCategory, aAction, aButton) {
+     const BUTTONS = ["left", "middle", "right"];
+     let buttonKey = BUTTONS[aButton];
+     if (buttonKey) {
+       this._countEvent([aCategory, aAction, buttonKey]);
+     }
+@@ -580,20 +584,68 @@ this.BrowserUITelemetry = {
+     if (durationMap && "customization" in durationMap) {
+       let duration = aWindow.performance.now() - durationMap.customization.start;
+       this._durations.customization.push({
+         duration: duration,
+         bucket: durationMap.customization.bucket,
+       });
+       delete durationMap.customization;
+     }
+   },
+ 
++  _contextMenuItemWhitelist: new Set([
++    "close-without-interaction", // for closing the menu without clicking it.
++    "custom-page-item", // The ID we use for page-provided items
++    "unknown", // The bucket for stuff with no id.
++    // Everything we know of so far (which will exclude add-on items):
++    "navigation", "back", "forward", "reload", "stop", "bookmarkpage",
++    "spell-no-suggestions", "spell-add-to-dictionary",
++    "spell-undo-add-to-dictionary", "openlinkincurrent", "openlinkintab",
++    "openlink", "openlinkprivate", "bookmarklink", "sharelink", "savelink",
++    "marklinkMenu", "copyemail", "copylink", "media-play", "media-pause",
++    "media-mute", "media-unmute", "media-playbackrate",
++    "media-playbackrate-050x", "media-playbackrate-100x",
++    "media-playbackrate-150x", "media-playbackrate-200x",
++    "media-showcontrols", "media-hidecontrols", "video-showstats",
++    "video-hidestats", "video-fullscreen", "leave-dom-fullscreen",
++    "reloadimage", "viewimage", "viewvideo", "copyimage-contents", "copyimage",
++    "copyvideourl", "copyaudiourl", "saveimage", "shareimage", "sendimage",
++    "setDesktopBackground", "viewimageinfo", "viewimagedesc", "savevideo",
++    "sharevideo", "saveaudio", "video-saveimage", "sendvideo", "sendaudio",
++    "ctp-play", "ctp-hide", "sharepage", "savepage", "markpageMenu",
++    "viewbgimage", "undo", "cut", "copy", "paste", "delete", "selectall",
++    "keywordfield", "searchselect", "shareselect", "frame", "showonlythisframe",
++    "openframeintab", "openframe", "reloadframe", "bookmarkframe", "saveframe",
++    "printframe", "viewframesource", "viewframeinfo",
++    "viewpartialsource-selection", "viewpartialsource-mathml",
++    "viewsource", "viewinfo", "spell-check-enabled",
++    "spell-add-dictionaries-main", "spell-dictionaries",
++    "spell-dictionaries-menu", "spell-add-dictionaries",
++    "bidi-text-direction-toggle", "bidi-page-direction-toggle", "inspect",
++  ]),
++
++  _contextMenuInteractions: {},
++
++  registerContextMenuInteraction: function(keys, itemID) {
++    if (itemID) {
++      if (!this._contextMenuItemWhitelist.has(itemID)) {
++        itemID = "other-item";
++      }
++      keys.push(itemID);
++    }
++
++    this._countEvent(keys, this._contextMenuInteractions);
++  },
++
++  getContextMenuInfo: function() {
++    return this._contextMenuInteractions;
++  },
++
+   _bucket: BUCKET_DEFAULT,
+   _bucketTimer: null,
+ 
+   /**
+    * Default bucket name, when no other bucket is active.
+    */
+   get BUCKET_DEFAULT() BUCKET_DEFAULT,
+ 
+   /**
+    * Bucket prefix, for named buckets.

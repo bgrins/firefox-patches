@@ -1,0 +1,159 @@
+# HG changeset patch
+# User Alexandre Poirot <poirot.alex@gmail.com>
+
+Bug 977043 - Fix inspector and add test for frame selection. r=pbrosset
+
+diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
+index dd4e0f9..db74257 100644
+--- a/browser/devtools/inspector/inspector-panel.js
++++ b/browser/devtools/inspector/inspector-panel.js
+@@ -214,17 +214,19 @@ InspectorPanel.prototype = {
+     // If available, set either the previously selected node or the body
+     // as default selected, else set documentElement
+     return walker.getRootNode().then(aRootNode => {
+       if (hasNavigated()) {
+         return promise.reject("navigated; resolution of _defaultNode aborted");
+       }
+ 
+       rootNode = aRootNode;
+-      return walker.querySelector(rootNode, this.selectionCssSelector);
++      if (this.selectionCssSelector) {
++        return walker.querySelector(rootNode, this.selectionCssSelector);
++      }
+     }).then(front => {
+       if (hasNavigated()) {
+         return promise.reject("navigated; resolution of _defaultNode aborted");
+       }
+ 
+       if (front) {
+         return front;
+       }
+diff --git a/browser/devtools/inspector/test/browser.ini b/browser/devtools/inspector/test/browser.ini
+index 72a41b6..59037ec 100644
+--- a/browser/devtools/inspector/test/browser.ini
++++ b/browser/devtools/inspector/test/browser.ini
+@@ -46,13 +46,15 @@ support-files =
+ [browser_inspector_pseudoclass-menu.js]
+ [browser_inspector_reload-01.js]
+ [browser_inspector_reload-02.js]
+ [browser_inspector_remove-iframe-during-load.js]
+ [browser_inspector_scrolling.js]
+ [browser_inspector_search-01.js]
+ [browser_inspector_search-02.js]
+ [browser_inspector_search-03.js]
++[browser_inspector_select-docshell.js]
+ [browser_inspector_select-last-selected.js]
+ [browser_inspector_search-navigation.js]
+ [browser_inspector_sidebarstate.js]
+ [browser_inspector_switch-to-inspector-on-pick.js]
+ [browser_inspector_update-on-navigation.js]
++
+diff --git a/browser/devtools/inspector/test/browser_inspector_select-docshell.js b/browser/devtools/inspector/test/browser_inspector_select-docshell.js
+new file mode 100644
+index 0000000..7810434
+--- /dev/null
++++ b/browser/devtools/inspector/test/browser_inspector_select-docshell.js
+@@ -0,0 +1,81 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++// Test frame selection switching at toolbox level
++// when using the inspector
++
++let test = asyncTest(function*() {
++  const FrameURL = "data:text/html;charset=UTF-8," + encodeURI("<div id=\"frame\">frame</div>");
++  const URL = "data:text/html;charset=UTF-8," + encodeURI("<iframe src=\"" + FrameURL + "\"></iframe><div id=\"top\">top</div>");
++
++  Services.prefs.setBoolPref("devtools.command-button-frames.enabled", true);
++
++  let {toolbox, inspector} = yield openInspectorForURL(URL);
++
++  // Verify we are on the top level document
++  let testNode = content.document.querySelector("#top");
++  ok(testNode, "We have the test node on the top level document");
++
++  assertMarkupViewIsLoaded();
++
++  // Verify that the frame list button is visible and populated
++  let btn = toolbox.doc.getElementById("command-button-frames");
++  ok(!btn.firstChild.getAttribute("hidden"), "The frame list button is visible");
++  let frameBtns = Array.slice(btn.firstChild.querySelectorAll("[data-window-id]"));
++  is(frameBtns.length, 2, "We have both frames in the list");
++  frameBtns.sort(function (a, b) {
++    return a.getAttribute("label").localeCompare(b.getAttribute("label"));
++  });
++  is(frameBtns[0].getAttribute("label"), FrameURL, "Got top level document in the list");
++  is(frameBtns[1].getAttribute("label"), URL, "Got iframe document in the list");
++
++  // Listen to will-navigate to check if the view is empty
++  let willNavigate = toolbox.target.on("will-navigate", () => {
++    info("Navigation to the iframe has started, the inspector should be empty");
++    assertMarkupViewIsEmpty();
++  });
++  let newRoot = inspector.once("new-root", () => {
++    info("Navigation to the iframe is done, the inspector should be back up");
++
++    // Verify we are on page one
++    //let testNode = content.frames[0].document.querySelector("#frame");
++    let testNode = getNode("#frame", { document: content.frames[0].document});
++    ok(testNode, "We have the test node on the iframe");
++
++    // On page 2 load, verify we have the right content
++    assertMarkupViewIsLoaded();
++
++    inspector.once("inspector-updated", () => {
++      deferred.resolve();
++    });
++    selectNode(testNode, inspector);
++  });
++
++  // select the iframe once we were able to select an element from the
++  // top level document
++  selectNode("#top", inspector);
++  inspector.once("inspector-updated", () => {
++    // Select the iframe
++    frameBtns[0].click();
++  });
++
++  yield willNavigate;
++  yield newRoot;
++
++//  gBrowser.removeCurrentTab();
++  Services.prefs.clearUserPref("devtools.command-button-frames.enabled");
++
++  function assertMarkupViewIsLoaded() {
++    let markupViewBox = inspector.panelDoc.getElementById("markup-box");
++    is(markupViewBox.childNodes.length, 1, "The markup-view is loaded");
++  }
++
++  function assertMarkupViewIsEmpty() {
++    let markupViewBox = inspector.panelDoc.getElementById("markup-box");
++    is(markupViewBox.childNodes.length, 0, "The markup-view is unloaded");
++  }
++});
++
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+index ce860b3..0ac359a 100644
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -2188,16 +2188,17 @@ var WalkerActor = protocol.ActorClass({
+   onFrameLoad: function({ window, isTopLevel }) {
+     if (!this.rootDoc && isTopLevel) {
+       this.rootDoc = window.document;
+       this.rootNode = this.document();
+       this.queueMutation({
+         type: "newRoot",
+         target: this.rootNode.form()
+       });
++      return;
+     }
+     let frame = this.layoutHelpers.getFrameElement(window);
+     let frameActor = this._refMap.get(frame);
+     if (!frameActor) {
+       return;
+     }
+ 
+     this.queueMutation({
