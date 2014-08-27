@@ -3,7 +3,6 @@
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Keep separate list of items to destroy
 
-
 diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webconsole/webconsole.js
 --- a/browser/devtools/webconsole/webconsole.js
 +++ b/browser/devtools/webconsole/webconsole.js
@@ -32,7 +31,7 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  const MIN_FONT_SIZE = 10;
  
  const PREF_CONNECTION_TIMEOUT = "devtools.debugger.remote-timeout";
-@@ -184,16 +184,17 @@ const PREF_MESSAGE_TIMESTAMP = "devtools
+@@ -184,16 +184,18 @@ const PREF_MESSAGE_TIMESTAMP = "devtools
  function WebConsoleFrame(aWebConsoleOwner)
  {
    this.owner = aWebConsoleOwner;
@@ -41,7 +40,8 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  
    this._repeatNodes = {};
    this._outputQueue = [];
-+  this._cleanupQueue = [];
++  this._itemDestroyQueue = [];
++  this._nodeDestroyQueue = [];
    this._pruneCategoriesQueue = {};
    this._networkRequests = {};
    this.filterPrefs = {};
@@ -50,7 +50,7 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  
    this._toggleFilter = this._toggleFilter.bind(this);
    this._onPanelSelected = this._onPanelSelected.bind(this);
-@@ -2056,34 +2057,45 @@ WebConsoleFrame.prototype = {
+@@ -2056,34 +2058,66 @@ WebConsoleFrame.prototype = {
     */
    _flushMessageQueue: function WCF__flushMessageQueue()
    {
@@ -59,7 +59,7 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
      }
  
      let timeSinceFlush = Date.now() - this._lastOutputFlush;
-+    console.log("Flushing message queue", this._outputQueue.length, MESSAGES_IN_INTERVAL);
++    // console.log("Flushing message queue", this._outputQueue.length, MESSAGES_IN_INTERVAL, new Date());
      if (this._outputQueue.length > MESSAGES_IN_INTERVAL &&
          timeSinceFlush < THROTTLE_UPDATES) {
        this._initOutputTimer();
@@ -68,20 +68,41 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  
      // Determine how many messages we can display now.
      let toDisplay = Math.min(this._outputQueue.length, MESSAGES_IN_INTERVAL);
-+    console.log("To display?", toDisplay);
++
++    // If there aren't any messages to display, then take care of some cleanup.
++    // Work through:
++    //   1) items that were pruned from the outputQueue before being displayed
++    //   2) nodes that were once part of the output.
      if (toDisplay < 1) {
-+      // Handle any backlogged messages.
-+      console.time("Time to cleanup!");
-+      console.log("Have ", this._cleanupQueue.length, "items");
-+      for (let i = Math.min(100,this._cleanupQueue.length - 1); i >= 0; i--) {
-+        this._destroyItem(this._cleanupQueue[i]);
-+        this._cleanupQueue.splice(i, 1);
++      let startTime = new Date().getTime();
++      for (let i = this._itemDestroyQueue.length - 1; i >= 0; i--) {
++        // Stop cleaning if it's been too long, want to keep the output responsive
++        if (((new Date().getTime()) - startTime) > OUTPUT_INTERVAL) {
++          break;
++        }
++        this._destroyItem(this._itemDestroyQueue[i]);
++        this._itemDestroyQueue.splice(i, 1);
 +      }
-+      console.timeEnd("Time to cleanup!");
++
++      for (let i = this._nodeDestroyQueue.length - 1; i >= 0; i--) {
++        // Stop cleaning if it's been too long, want to keep the output responsive
++        if (((new Date().getTime()) - startTime) > OUTPUT_INTERVAL) {
++          break;
++        }
++        this._destroyNode(this._nodeDestroyQueue[i]);
++        this._nodeDestroyQueue.splice(i, 1);
++      }
++
        this._outputTimerInitialized = false;
++      if (this._itemDestroyQueue.length || this._nodeDestroyQueue.length) {
++        this._initOutputTimer();
++      }
++
        return;
      }
  
++    console.time("_flushMessageQueue");
++
      // Try to prune the message queue.
      let shouldPrune = false;
      if (this._outputQueue.length > toDisplay && this._pruneOutputQueue()) {
@@ -96,7 +117,35 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
        return;
      }
  
-@@ -2146,17 +2158,17 @@ WebConsoleFrame.prototype = {
+@@ -2110,20 +2144,25 @@ WebConsoleFrame.prototype = {
+         }
+       }
+     }
+ 
+     let oldScrollHeight = 0;
+ 
+     // Prune messages if needed. We do not do this for every flush call to
+     // improve performance.
++    // XXX: measure this - it is probably the next thing to move out of band
+     let removedNodes = 0;
+     if (shouldPrune || !this._outputQueue.length) {
++      console.time("Scroll height");
+       oldScrollHeight = scrollNode.scrollHeight;
+-
++      console.timeEnd("Scroll height");
++
++      // XXX: MOVING removeOutputMessage into a queue saves around 50ms inside
++      // pruneOutputIfNecessary - is it worth it to add the extra code?
+       let categories = Object.keys(this._pruneCategoriesQueue);
+       categories.forEach(function _pruneOutput(aCategory) {
+         removedNodes += this.pruneOutputIfNecessary(aCategory);
+       }, this);
+       this._pruneCategoriesQueue = {};
+     }
+ 
+     let isInputOutput = lastVisibleNode &&
+@@ -2145,26 +2184,29 @@ WebConsoleFrame.prototype = {
+ 
      if (newMessages.size) {
        this.emit("messages-added", newMessages);
      }
@@ -104,9 +153,12 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
        this.emit("messages-updated", updatedMessages);
      }
  
-     // If the queue is not empty, schedule another flush.
+-    // If the queue is not empty, schedule another flush.
 -    if (this._outputQueue.length > 0) {
-+    if (this._outputQueue.length > 0 || this._cleanupQueue.length > 0) {
++    // If any queue is not empty, schedule another flush.
++    if (this._outputQueue.length > 0 ||
++        this._itemDestroyQueue.length > 0 ||
++        this._nodeDestroyQueue.length > 0) {
        this._initOutputTimer();
      }
      else {
@@ -115,7 +167,16 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
          this._flushCallback = null;
        }
      }
-@@ -2262,39 +2274,44 @@ WebConsoleFrame.prototype = {
++    console.timeEnd("_flushMessageQueue");
+ 
+     this._lastOutputFlush = Date.now();
+   },
+ 
+   /**
+    * Initialize the output timer.
+    * @private
+    */
+@@ -2262,34 +2304,37 @@ WebConsoleFrame.prototype = {
  
      // Loop through the categories we found and prune if needed.
      for (let category in nodes) {
@@ -128,9 +189,8 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
 +        // without a loop.
          for (let i = n - 1; i >= 0; i--) {
 -          this._pruneItemFromQueue(this._outputQueue[indexes[i]]);
-+          // this._destroyItem(this._outputQueue[indexes[i]]);
            this._outputQueue.splice(indexes[i], 1);
-+          this._cleanupQueue.push(this._outputQueue[indexes[i]]);
++          this._itemDestroyQueue.push(this._outputQueue[indexes[i]]);
          }
        }
      }
@@ -155,16 +215,121 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
      // messages use the new API - bug 778766.
  
      let [category, methodOrNode, args] = aItem;
-+    console.log("Pruning item", aItem);
      if (typeof methodOrNode != "function" && methodOrNode._objectActors) {
        for (let actor of methodOrNode._objectActors) {
          this._releaseObject(actor);
-       }
-       methodOrNode._objectActors.clear();
-     }
+@@ -2359,64 +2404,73 @@ WebConsoleFrame.prototype = {
+    *         The number of removed nodes.
+    */
+   pruneOutputIfNecessary: function WCF_pruneOutputIfNecessary(aCategory)
+   {
+     let logLimit = Utils.logLimitForCategory(aCategory);
+     let messageNodes = this.outputNode.querySelectorAll(".message[category=" +
+                        CATEGORY_CLASS_FRAGMENTS[aCategory] + "]");
+     let n = Math.max(0, messageNodes.length - logLimit);
+-    let toRemove = Array.prototype.slice.call(messageNodes, 0, n);
+-    toRemove.forEach(this.removeOutputMessage, this);
+-
++    [...messageNodes].slice(0, n).forEach(this.removeOutputMessage, this);
+     return n;
+   },
  
-     if (methodOrNode == this.output._flushMessageQueue &&
-@@ -2887,16 +2904,17 @@ WebConsoleFrame.prototype = {
+   /**
+    * Remove a given message from the output.
+    *
+    * @param nsIDOMNode aNode
+    *        The message node you want to remove.
+    */
++  _destroyNode: function WCF_destroyNode(aNode)
++  {
++    console.time("Destroy node");
++    if (aNode._messageObject) {
++      aNode._messageObject.destroy();
++    }
++
++    if (aNode._objectActors) {
++      for (let actor of aNode._objectActors) {
++        this._releaseObject(actor);
++      }
++      aNode._objectActors.clear();
++    }
++
++    if (aNode.category == CATEGORY_CSS ||
++        aNode.category == CATEGORY_SECURITY) {
++      let repeatNode = aNode.getElementsByClassName("message-repeats")[0];
++      if (repeatNode && repeatNode._uid) {
++        delete this._repeatNodes[repeatNode._uid];
++      }
++    }
++    else if (aNode._connectionId &&
++             aNode.category == CATEGORY_NETWORK) {
++      delete this._networkRequests[aNode._connectionId];
++      this._releaseObject(aNode._connectionId);
++    }
++    else if (aNode.classList.contains("inlined-variables-view")) {
++      let view = aNode._variablesView;
++      if (view) {
++        view.controller.releaseActors();
++      }
++      aNode._variablesView = null;
++    }
++    console.timeEnd("Destroy node");
++  },
++
++  /**
++   * Remove a given message from the output.
++   *
++   * @param nsIDOMNode aNode
++   *        The message node you want to remove.
++   */
+   removeOutputMessage: function WCF_removeOutputMessage(aNode)
+   {
+-    if (aNode._messageObject) {
+-      aNode._messageObject.destroy();
+-    }
+-
+-    if (aNode._objectActors) {
+-      for (let actor of aNode._objectActors) {
+-        this._releaseObject(actor);
+-      }
+-      aNode._objectActors.clear();
+-    }
+-
+-    if (aNode.category == CATEGORY_CSS ||
+-        aNode.category == CATEGORY_SECURITY) {
+-      let repeatNode = aNode.getElementsByClassName("message-repeats")[0];
+-      if (repeatNode && repeatNode._uid) {
+-        delete this._repeatNodes[repeatNode._uid];
+-      }
+-    }
+-    else if (aNode._connectionId &&
+-             aNode.category == CATEGORY_NETWORK) {
+-      delete this._networkRequests[aNode._connectionId];
+-      this._releaseObject(aNode._connectionId);
+-    }
+-    else if (aNode.classList.contains("inlined-variables-view")) {
+-      let view = aNode._variablesView;
+-      if (view) {
+-        view.controller.releaseActors();
+-      }
+-      aNode._variablesView = null;
+-    }
+-
+-    if (aNode.parentNode) {
+-      aNode.parentNode.removeChild(aNode);
+-    }
++    // this._nodeDestroyQueue.push(aNode);
++    this._destroyNode(aNode);
++    aNode.remove();
+   },
+ 
+   /**
+    * Given a category and message body, creates a DOM node to represent an
+    * incoming message. The timestamp is automatically added.
+    *
+    * @param number aCategory
+    *        The category of the message: one of the CATEGORY_* constants.
+@@ -2887,25 +2941,26 @@ WebConsoleFrame.prototype = {
      if (toolbox) {
        toolbox.off("webconsole-selected", this._onPanelSelected);
      }
@@ -173,7 +338,8 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  
      this._repeatNodes = {};
      this._outputQueue = [];
-+    this._cleanupQueue = [];
++    this._itemDestroyQueue = [];
++    this._nodeDestroyQueue = [];
      this._pruneCategoriesQueue = {};
      this._networkRequests = {};
  
@@ -182,7 +348,16 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
        this._outputTimer.cancel();
      }
      this._outputTimer = null;
-@@ -3776,17 +3794,17 @@ JSTerm.prototype = {
+-
+     if (this.jsterm) {
+       this.jsterm.destroy();
+       this.jsterm = null;
+     }
+     this.output.destroy();
+     this.output = null;
+ 
+     if (this._contextMenuHandler) {
+@@ -3776,17 +3831,17 @@ JSTerm.prototype = {
      let hud = this.hud;
      let outputNode = hud.outputNode;
      let node;
