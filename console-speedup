@@ -1,0 +1,203 @@
+# HG changeset patch
+# Parent 76a272052164c6fce9b8f37f1750525bd72938ab
+# User Brian Grinstead <bgrinstead@mozilla.com>
+Keep separate list of items to destroy
+
+
+diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webconsole/webconsole.js
+--- a/browser/devtools/webconsole/webconsole.js
++++ b/browser/devtools/webconsole/webconsole.js
+@@ -147,22 +147,22 @@ const GROUP_INDENT = 12;
+ 
+ // The number of messages to display in a single display update. If we display
+ // too many messages at once we slow the Firefox UI too much.
+ const MESSAGES_IN_INTERVAL = DEFAULT_LOG_LIMIT;
+ 
+ // The delay between display updates - tells how often we should *try* to push
+ // new messages to screen. This value is optimistic, updates won't always
+ // happen. Keep this low so the Web Console output feels live.
+-const OUTPUT_INTERVAL = 50; // milliseconds
++const OUTPUT_INTERVAL = 17; // milliseconds
+ 
+ // When the output queue has more than MESSAGES_IN_INTERVAL items we throttle
+ // output updates to this number of milliseconds. So during a lot of output we
+ // update every N milliseconds given here.
+-const THROTTLE_UPDATES = 1000; // milliseconds
++const THROTTLE_UPDATES = 500; // milliseconds
+ 
+ // The preference prefix for all of the Web Console filters.
+ const FILTER_PREFS_PREFIX = "devtools.webconsole.filter.";
+ 
+ // The minimum font size.
+ const MIN_FONT_SIZE = 10;
+ 
+ const PREF_CONNECTION_TIMEOUT = "devtools.debugger.remote-timeout";
+@@ -184,16 +184,17 @@ const PREF_MESSAGE_TIMESTAMP = "devtools
+ function WebConsoleFrame(aWebConsoleOwner)
+ {
+   this.owner = aWebConsoleOwner;
+   this.hudId = this.owner.hudId;
+   this.window = this.owner.iframeWindow;
+ 
+   this._repeatNodes = {};
+   this._outputQueue = [];
++  this._cleanupQueue = [];
+   this._pruneCategoriesQueue = {};
+   this._networkRequests = {};
+   this.filterPrefs = {};
+ 
+   this.output = new ConsoleOutput(this);
+ 
+   this._toggleFilter = this._toggleFilter.bind(this);
+   this._onPanelSelected = this._onPanelSelected.bind(this);
+@@ -2056,34 +2057,45 @@ WebConsoleFrame.prototype = {
+    */
+   _flushMessageQueue: function WCF__flushMessageQueue()
+   {
+     if (!this._outputTimer) {
+       return;
+     }
+ 
+     let timeSinceFlush = Date.now() - this._lastOutputFlush;
++    console.log("Flushing message queue", this._outputQueue.length, MESSAGES_IN_INTERVAL);
+     if (this._outputQueue.length > MESSAGES_IN_INTERVAL &&
+         timeSinceFlush < THROTTLE_UPDATES) {
+       this._initOutputTimer();
+       return;
+     }
+ 
+     // Determine how many messages we can display now.
+     let toDisplay = Math.min(this._outputQueue.length, MESSAGES_IN_INTERVAL);
++    console.log("To display?", toDisplay);
+     if (toDisplay < 1) {
++      // Handle any backlogged messages.
++      console.time("Time to cleanup!");
++      console.log("Have ", this._cleanupQueue.length, "items");
++      for (let i = Math.min(100,this._cleanupQueue.length - 1); i >= 0; i--) {
++        this._destroyItem(this._cleanupQueue[i]);
++        this._cleanupQueue.splice(i, 1);
++      }
++      console.timeEnd("Time to cleanup!");
+       this._outputTimerInitialized = false;
+       return;
+     }
+ 
+     // Try to prune the message queue.
+     let shouldPrune = false;
+     if (this._outputQueue.length > toDisplay && this._pruneOutputQueue()) {
+       toDisplay = Math.min(this._outputQueue.length, toDisplay);
+       shouldPrune = true;
++      this._initOutputTimer();
+     }
+ 
+     let batch = this._outputQueue.splice(0, toDisplay);
+     if (!batch.length) {
+       this._outputTimerInitialized = false;
+       return;
+     }
+ 
+@@ -2146,17 +2158,17 @@ WebConsoleFrame.prototype = {
+     if (newMessages.size) {
+       this.emit("messages-added", newMessages);
+     }
+     if (updatedMessages.size) {
+       this.emit("messages-updated", updatedMessages);
+     }
+ 
+     // If the queue is not empty, schedule another flush.
+-    if (this._outputQueue.length > 0) {
++    if (this._outputQueue.length > 0 || this._cleanupQueue.length > 0) {
+       this._initOutputTimer();
+     }
+     else {
+       this._outputTimerInitialized = false;
+       if (this._flushCallback && this._flushCallback() === false) {
+         this._flushCallback = null;
+       }
+     }
+@@ -2262,39 +2274,44 @@ WebConsoleFrame.prototype = {
+ 
+     // Loop through the categories we found and prune if needed.
+     for (let category in nodes) {
+       let limit = Utils.logLimitForCategory(category);
+       let indexes = nodes[category];
+       if (indexes.length > limit) {
+         let n = Math.max(0, indexes.length - limit);
+         pruned += n;
++        // XXX: Can probably splice this in and out of the two arrays
++        // without a loop.
+         for (let i = n - 1; i >= 0; i--) {
+-          this._pruneItemFromQueue(this._outputQueue[indexes[i]]);
++          // this._destroyItem(this._outputQueue[indexes[i]]);
+           this._outputQueue.splice(indexes[i], 1);
++          this._cleanupQueue.push(this._outputQueue[indexes[i]]);
+         }
+       }
+     }
+ 
+     return pruned;
+   },
+ 
+   /**
+-   * Prune an item from the output queue.
++   * Destroy an item from the output queue.
+    *
+    * @private
+    * @param array aItem
+-   *        The item you want to remove from the output queue.
++   *        The item you want to destroy.  Does not remove it from the output
++   *        queue.
+    */
+-  _pruneItemFromQueue: function WCF__pruneItemFromQueue(aItem)
++  _destroyItem: function WCF__destroyItem(aItem)
+   {
+     // TODO: handle object releasing in a more elegant way once all console
+     // messages use the new API - bug 778766.
+ 
+     let [category, methodOrNode, args] = aItem;
++    console.log("Pruning item", aItem);
+     if (typeof methodOrNode != "function" && methodOrNode._objectActors) {
+       for (let actor of methodOrNode._objectActors) {
+         this._releaseObject(actor);
+       }
+       methodOrNode._objectActors.clear();
+     }
+ 
+     if (methodOrNode == this.output._flushMessageQueue &&
+@@ -2887,16 +2904,17 @@ WebConsoleFrame.prototype = {
+     if (toolbox) {
+       toolbox.off("webconsole-selected", this._onPanelSelected);
+     }
+ 
+     gDevTools.off("pref-changed", this._onToolboxPrefChanged);
+ 
+     this._repeatNodes = {};
+     this._outputQueue = [];
++    this._cleanupQueue = [];
+     this._pruneCategoriesQueue = {};
+     this._networkRequests = {};
+ 
+     if (this._outputTimerInitialized) {
+       this._outputTimerInitialized = false;
+       this._outputTimer.cancel();
+     }
+     this._outputTimer = null;
+@@ -3776,17 +3794,17 @@ JSTerm.prototype = {
+     let hud = this.hud;
+     let outputNode = hud.outputNode;
+     let node;
+     while ((node = outputNode.firstChild)) {
+       hud.removeOutputMessage(node);
+     }
+ 
+     hud.groupDepth = 0;
+-    hud._outputQueue.forEach(hud._pruneItemFromQueue, hud);
++    hud._outputQueue.forEach(hud._destroyItem, hud);
+     hud._outputQueue = [];
+     hud._networkRequests = {};
+     hud._repeatNodes = {};
+ 
+     if (aClearStorage) {
+       this.webConsoleClient.clearMessagesCache();
+     }
+ 
