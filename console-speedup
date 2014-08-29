@@ -1,12 +1,12 @@
 # HG changeset patch
-# Parent 9add1ec0251d962f7ef1002213553064f8e5f359
+# Parent 8f49394f80690a8b605e9363b19b12450e11da47
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Keep separate list of items to destroy
 
 diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webconsole/webconsole.js
 --- a/browser/devtools/webconsole/webconsole.js
 +++ b/browser/devtools/webconsole/webconsole.js
-@@ -148,22 +148,22 @@ const GROUP_INDENT = 12;
+@@ -148,22 +148,27 @@ const GROUP_INDENT = 12;
  
  // The number of messages to display in a single display update. If we display
  // too many messages at once we slow the Firefox UI too much.
@@ -16,7 +16,12 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  // new messages to screen. This value is optimistic, updates won't always
  // happen. Keep this low so the Web Console output feels live.
 -const OUTPUT_INTERVAL = 50; // milliseconds
-+const OUTPUT_INTERVAL = 17; // milliseconds
++const OUTPUT_INTERVAL = 30; // milliseconds
++
++// How long max can we spend inside of the flush output callback doing cleanup?
++// If things don't get cleaned up in this time, then it will start again after
++// OUTPUT_INTERVAL, as long as there aren't messages to display.
++const MAX_CLEANUP_TIME = 10; // milliseconds
  
  // When the output queue has more than MESSAGES_IN_INTERVAL items we throttle
  // output updates to this number of milliseconds. So during a lot of output we
@@ -31,7 +36,7 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  const MIN_FONT_SIZE = 10;
  
  const PREF_CONNECTION_TIMEOUT = "devtools.debugger.remote-timeout";
-@@ -185,16 +185,18 @@ const PREF_MESSAGE_TIMESTAMP = "devtools
+@@ -185,16 +190,17 @@ const PREF_MESSAGE_TIMESTAMP = "devtools
  function WebConsoleFrame(aWebConsoleOwner)
  {
    this.owner = aWebConsoleOwner;
@@ -41,7 +46,6 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
    this._repeatNodes = {};
    this._outputQueue = [];
 +  this._itemDestroyQueue = [];
-+  this._nodeDestroyQueue = [];
    this._pruneCategoriesQueue = {};
    this._networkRequests = {};
    this.filterPrefs = {};
@@ -50,59 +54,73 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  
    this._toggleFilter = this._toggleFilter.bind(this);
    this._onPanelSelected = this._onPanelSelected.bind(this);
-@@ -2062,29 +2064,60 @@ WebConsoleFrame.prototype = {
+@@ -2043,99 +2049,126 @@ WebConsoleFrame.prototype = {
+     if (!this._outputQueue.length) {
+       // If the queue is empty we consider that now was the last output flush.
+       // This avoid an immediate output flush when the timer executes.
+       this._lastOutputFlush = Date.now();
+     }
+ 
+     this._outputQueue.push([aCategory, aMethodOrNode, aArguments]);
+ 
+-    if (!this._outputTimerInitialized) {
+-      this._initOutputTimer();
+-    }
++    this._initOutputTimer();
+   },
+ 
+   /**
+    * Try to flush the output message queue. This takes the messages in the
+    * output queue and displays them. Outputting stops at MESSAGES_IN_INTERVAL.
+    * Further output is queued to happen later - see OUTPUT_INTERVAL.
+    *
+    * @private
     */
    _flushMessageQueue: function WCF__flushMessageQueue()
    {
++    this._outputTimerInitialized = false;
      if (!this._outputTimer) {
        return;
      }
  
-     let timeSinceFlush = Date.now() - this._lastOutputFlush;
+-    let timeSinceFlush = Date.now() - this._lastOutputFlush;
+-    if (this._outputQueue.length > MESSAGES_IN_INTERVAL &&
+-        timeSinceFlush < THROTTLE_UPDATES) {
+-      this._initOutputTimer();
+-      return;
+-    }
++    let startTime = Date.now();
++    let timeSinceFlush = startTime - this._lastOutputFlush;
++    let shouldThrottle = this._outputQueue.length > MESSAGES_IN_INTERVAL &&
++        timeSinceFlush < THROTTLE_UPDATES;
 +    // console.log("Flushing message queue", this._outputQueue.length, MESSAGES_IN_INTERVAL, new Date());
-     if (this._outputQueue.length > MESSAGES_IN_INTERVAL &&
-         timeSinceFlush < THROTTLE_UPDATES) {
-       this._initOutputTimer();
-       return;
-     }
  
      // Determine how many messages we can display now.
      let toDisplay = Math.min(this._outputQueue.length, MESSAGES_IN_INTERVAL);
+-    if (toDisplay < 1) {
+-      this._outputTimerInitialized = false;
 +
-+    // If there aren't any messages to display, then take care of some cleanup.
-+    // Work through:
-+    //   1) items that were pruned from the outputQueue before being displayed
-+    //   2) nodes that were once part of the output.
-     if (toDisplay < 1) {
-+      let startTime = new Date().getTime();
++    // If there aren't any messages to display right now, then take care of some
++    // cleanup. Work through items that were pruned from the outputQueue before
++    // being displayed, and need to be destroyed.
++    if (shouldThrottle || toDisplay < 1) {
 +      for (let i = this._itemDestroyQueue.length - 1; i >= 0; i--) {
 +        // Stop cleaning if it's been too long, want to keep the output responsive
-+        if (((new Date().getTime()) - startTime) > OUTPUT_INTERVAL) {
++        if (((new Date().getTime()) - startTime) > MAX_CLEANUP_TIME) {
 +          break;
 +        }
 +        this._destroyItem(this._itemDestroyQueue[i]);
 +        this._itemDestroyQueue.splice(i, 1);
 +      }
 +
-+      for (let i = this._nodeDestroyQueue.length - 1; i >= 0; i--) {
-+        // Stop cleaning if it's been too long, want to keep the output responsive
-+        if (((new Date().getTime()) - startTime) > OUTPUT_INTERVAL) {
-+          break;
-+        }
-+        this._destroyNode(this._nodeDestroyQueue[i]);
-+        this._nodeDestroyQueue.splice(i, 1);
-+      }
-+
-       this._outputTimerInitialized = false;
-+      if (this._itemDestroyQueue.length || this._nodeDestroyQueue.length) {
-+        this._initOutputTimer();
-+      }
++      this._initOutputTimer();
 +
        return;
      }
  
 +    // console.time("_flushMessageQueue");
 +
++    // console.time("_flushMessageQueueB");
      // Try to prune the message queue.
      let shouldPrune = false;
      if (this._outputQueue.length > toDisplay && this._pruneOutputQueue()) {
@@ -111,15 +129,50 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
      }
  
      let batch = this._outputQueue.splice(0, toDisplay);
-@@ -2116,20 +2149,25 @@ WebConsoleFrame.prototype = {
+     if (!batch.length) {
+-      this._outputTimerInitialized = false;
+       return;
+     }
+ 
+     let outputNode = this.outputNode;
+     let lastVisibleNode = null;
+     let scrollNode = outputNode.parentNode;
+     let scrolledToBottom = Utils.isOutputScrolledToBottom(outputNode);
+     let hudIdSupportsString = WebConsoleUtils.supportsString(this.hudId);
+ 
++    // console.timeEnd("_flushMessageQueueB");
++
++    // console.time("_flushMessageQueueC");
+     // Output the current batch of messages.
+     let newMessages = new Set();
+     let updatedMessages = new Set();
+-    for (let item of batch) {
++    for (let i = 0; i < batch.length; i++) {
++      let item = batch[i];
++      // console.time("_flushMessageQueueC_indiv");
+       let result = this._outputMessageFromQueue(hudIdSupportsString, item);
+       if (result) {
+         if (result.isRepeated) {
+           updatedMessages.add(result.isRepeated);
+         }
+         else {
+           newMessages.add(result.node);
+         }
+         if (result.visible && result.node == this.outputNode.lastChild) {
+           lastVisibleNode = result.node;
          }
        }
-     }
+-    }
++      // console.timeEnd("_flushMessageQueueC_indiv");
++    }
++    // console.timeEnd("_flushMessageQueueC");
  
      let oldScrollHeight = 0;
  
-     // Prune messages if needed. We do not do this for every flush call to
-     // improve performance.
+-    // Prune messages if needed. We do not do this for every flush call to
+-    // improve performance.
++    // console.time("_flushMessageQueueD");
++    // Prune messages from DOM if needed
 +    // XXX: measure this - it is probably the next thing to move out of band
      let removedNodes = 0;
      if (shouldPrune || !this._outputQueue.length) {
@@ -136,9 +189,16 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
        }, this);
        this._pruneCategoriesQueue = {};
      }
++    // console.timeEnd("_flushMessageQueueD");
  
      let isInputOutput = lastVisibleNode &&
-@@ -2151,26 +2189,29 @@ WebConsoleFrame.prototype = {
+                         (lastVisibleNode.category == CATEGORY_INPUT ||
+                          lastVisibleNode.category == CATEGORY_OUTPUT);
+ 
+     // Scroll to the new node if it is not filtered, and if the output node is
+     // scrolled at the bottom or if the new node is a jsterm input/output
+     // message.
+@@ -2151,37 +2184,43 @@ WebConsoleFrame.prototype = {
  
      if (newMessages.size) {
        this.emit("messages-added", newMessages);
@@ -149,20 +209,20 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  
 -    // If the queue is not empty, schedule another flush.
 -    if (this._outputQueue.length > 0) {
-+    // If any queue is not empty, schedule another flush.
-+    if (this._outputQueue.length > 0 ||
-+        this._itemDestroyQueue.length > 0 ||
-+        this._nodeDestroyQueue.length > 0) {
-       this._initOutputTimer();
-     }
-     else {
-       this._outputTimerInitialized = false;
+-      this._initOutputTimer();
+-    }
+-    else {
+-      this._outputTimerInitialized = false;
++    // If the output queue is empty, then run the _flushCallback.
++    if (this._outputQueue.length === 0) {
        if (this._flushCallback && this._flushCallback() === false) {
          this._flushCallback = null;
        }
      }
-+    // console.timeEnd("_flushMessageQueue");
  
++    this._initOutputTimer();
++    // console.timeEnd("_flushMessageQueue");
++
      this._lastOutputFlush = Date.now();
    },
  
@@ -170,7 +230,26 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
     * Initialize the output timer.
     * @private
     */
-@@ -2269,33 +2310,34 @@ WebConsoleFrame.prototype = {
+   _initOutputTimer: function WCF__initOutputTimer()
+   {
+-    if (!this._outputTimer) {
++    // If we are already waiting for a callback to fire, or if the panel
++    // has been destroyed, don't schedule.
++    if (!this._outputTimer || this._outputTimerInitialized) {
++      return;
++    }
++
++    // If there is nothing to do, then don't schedule.
++    if (!this._itemDestroyQueue.length && !this._outputQueue.length) {
+       return;
+     }
+ 
+     this._outputTimerInitialized = true;
+     this._outputTimer.initWithCallback(this._flushMessageQueue,
+                                        OUTPUT_INTERVAL,
+                                        Ci.nsITimer.TYPE_ONE_SHOT);
+   },
+@@ -2269,37 +2308,37 @@ WebConsoleFrame.prototype = {
      // Loop through the categories we found and prune if needed.
      for (let category in nodes) {
        let limit = Utils.logLimitForCategory(category);
@@ -204,12 +283,16 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
    {
      // TODO: handle object releasing in a more elegant way once all console
      // messages use the new API - bug 778766.
- 
+-
      let [category, methodOrNode, args] = aItem;
      if (typeof methodOrNode != "function" && methodOrNode._objectActors) {
        for (let actor of methodOrNode._objectActors) {
          this._releaseObject(actor);
-@@ -2365,64 +2407,71 @@ WebConsoleFrame.prototype = {
+       }
+       methodOrNode._objectActors.clear();
+     }
+ 
+@@ -2365,19 +2404,17 @@ WebConsoleFrame.prototype = {
     *         The number of removed nodes.
     */
    pruneOutputIfNecessary: function WCF_pruneOutputIfNecessary(aCategory)
@@ -230,85 +313,18 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
     *
     * @param nsIDOMNode aNode
     *        The message node you want to remove.
-    */
-+  _destroyNode: function WCF_destroyNode(aNode)
-+  {
-+    if (aNode._messageObject) {
-+      aNode._messageObject.destroy();
-+    }
-+
-+    if (aNode._objectActors) {
-+      for (let actor of aNode._objectActors) {
-+        this._releaseObject(actor);
-+      }
-+      aNode._objectActors.clear();
-+    }
-+
-+    if (aNode.category == CATEGORY_CSS ||
-+        aNode.category == CATEGORY_SECURITY) {
-+      let repeatNode = aNode.getElementsByClassName("message-repeats")[0];
-+      if (repeatNode && repeatNode._uid) {
-+        delete this._repeatNodes[repeatNode._uid];
-+      }
-+    }
-+    else if (aNode._connectionId &&
-+             aNode.category == CATEGORY_NETWORK) {
-+      delete this._networkRequests[aNode._connectionId];
-+      this._releaseObject(aNode._connectionId);
-+    }
-+    else if (aNode.classList.contains("inlined-variables-view")) {
-+      let view = aNode._variablesView;
-+      if (view) {
-+        view.controller.releaseActors();
-+      }
-+      aNode._variablesView = null;
-+    }
-+  },
-+
-+  /**
-+   * Remove a given message from the output.
-+   *
-+   * @param nsIDOMNode aNode
-+   *        The message node you want to remove.
-+   */
-   removeOutputMessage: function WCF_removeOutputMessage(aNode)
-   {
--    if (aNode._messageObject) {
--      aNode._messageObject.destroy();
--    }
--
--    if (aNode._objectActors) {
--      for (let actor of aNode._objectActors) {
--        this._releaseObject(actor);
--      }
--      aNode._objectActors.clear();
--    }
--
--    if (aNode.category == CATEGORY_CSS ||
--        aNode.category == CATEGORY_SECURITY) {
--      let repeatNode = aNode.getElementsByClassName("message-repeats")[0];
--      if (repeatNode && repeatNode._uid) {
--        delete this._repeatNodes[repeatNode._uid];
--      }
--    }
--    else if (aNode._connectionId &&
--             aNode.category == CATEGORY_NETWORK) {
--      delete this._networkRequests[aNode._connectionId];
--      this._releaseObject(aNode._connectionId);
--    }
--    else if (aNode.classList.contains("inlined-variables-view")) {
--      let view = aNode._variablesView;
--      if (view) {
--        view.controller.releaseActors();
--      }
--      aNode._variablesView = null;
--    }
--
+@@ -2410,19 +2447,17 @@ WebConsoleFrame.prototype = {
+     else if (aNode.classList.contains("inlined-variables-view")) {
+       let view = aNode._variablesView;
+       if (view) {
+         view.controller.releaseActors();
+       }
+       aNode._variablesView = null;
+     }
+ 
 -    if (aNode.parentNode) {
 -      aNode.parentNode.removeChild(aNode);
 -    }
-+    // this._nodeDestroyQueue.push(aNode);
-+    this._destroyNode(aNode);
 +    aNode.remove();
    },
  
@@ -318,7 +334,7 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
     *
     * @param number aCategory
     *        The category of the message: one of the CATEGORY_* constants.
-@@ -2893,25 +2942,26 @@ WebConsoleFrame.prototype = {
+@@ -2893,25 +2928,25 @@ WebConsoleFrame.prototype = {
      if (toolbox) {
        toolbox.off("webconsole-selected", this._onPanelSelected);
      }
@@ -328,7 +344,6 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
      this._repeatNodes = {};
      this._outputQueue = [];
 +    this._itemDestroyQueue = [];
-+    this._nodeDestroyQueue = [];
      this._pruneCategoriesQueue = {};
      this._networkRequests = {};
  
@@ -346,7 +361,7 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
      this.output = null;
  
      if (this._contextMenuHandler) {
-@@ -3782,17 +3832,17 @@ JSTerm.prototype = {
+@@ -3782,17 +3817,17 @@ JSTerm.prototype = {
      let hud = this.hud;
      let outputNode = hud.outputNode;
      let node;
