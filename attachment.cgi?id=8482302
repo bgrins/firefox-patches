@@ -1,0 +1,353 @@
+# HG changeset patch
+# User Jan Odvarko <odvarko@gmail.com>
+# Date 1409582646 -7200
+#      Mon Sep 01 16:44:06 2014 +0200
+# Node ID 36fd694dd26dc9b66accf4030264b14da3d1d2ef
+# Parent  0b31ce3ca299bb92677e03a96cacac4b3bb083a6
+Bug 1059727 - Add API to fire a new Toolbox panel initialization events; r=bgrins
+
+diff --git a/browser/devtools/framework/test/browser_devtools_api.js b/browser/devtools/framework/test/browser_devtools_api.js
+--- a/browser/devtools/framework/test/browser_devtools_api.js
++++ b/browser/devtools/framework/test/browser_devtools_api.js
+@@ -17,18 +17,17 @@ function test() {
+ function runTests(aTab) {
+   let toolDefinition = {
+     id: toolId,
+     isTargetSupported: function() true,
+     visibilityswitch: "devtools.test-tool.enabled",
+     url: "about:blank",
+     label: "someLabel",
+     build: function(iframeWindow, toolbox) {
+-      let panel = new DevToolPanel(iframeWindow, toolbox);
+-      return panel.open();
++      return new DevToolPanel(iframeWindow, toolbox);
+     },
+   };
+ 
+   ok(gDevTools, "gDevTools exists");
+   is(gDevTools.getToolDefinitionMap().has(toolId), false,
+     "The tool is not registered");
+ 
+   gDevTools.registerTool(toolDefinition);
+diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/toolbox.js
+--- a/browser/devtools/framework/toolbox.js
++++ b/browser/devtools/framework/toolbox.js
+@@ -870,28 +870,60 @@ Toolbox.prototype = {
+     iframe = this.doc.createElement("iframe");
+     iframe.className = "toolbox-panel-iframe";
+     iframe.id = "toolbox-panel-iframe-" + id;
+     iframe.setAttribute("flex", 1);
+     iframe.setAttribute("forceOwnRefreshDriver", "");
+     iframe.tooltip = "aHTMLTooltip";
+     iframe.style.visibility = "hidden";
+ 
+-    let vbox = this.doc.getElementById("toolbox-panel-" + id);
+-    vbox.appendChild(iframe);
++    this.emit(id + "-init", iframe);
++    gDevTools.emit(id + "-init", this, iframe);
++
++    // If no parent yet, append the frame into default location.
++    if (!iframe.parentNode) {
++      let vbox = this.doc.getElementById("toolbox-panel-" + id);
++      vbox.appendChild(iframe);
++    }
+ 
+     let onLoad = () => {
+       // Prevent flicker while loading by waiting to make visible until now.
+       iframe.style.visibility = "visible";
+ 
++      // The build method should return panel instance, so events can
++      // be fired with the panel as an argument. However, in order too keep
++      // backward compatibility with existing extensions do a check
++      // for a promise return value.
+       let built = definition.build(iframe.contentWindow, this);
++      if (!isPromise(built)) {
++        let panel = built;
++        iframe.panel = panel;
++
++        this.emit(id + "-build", panel);
++        gDevTools.emit(id + "-build", this, panel, iframe);
++
++        // The panel can implement an 'open' method for asynchronous
++        // initialization sequence.
++        if (typeof panel.open == "function") {
++          built = panel.open();
++        }
++        else {
++          let deferred = promise.defer();
++          deferred.resolve(panel);
++          built = deferred.promise;
++        }
++      }
++
++      // Wait till the panel is fully ready and fire 'ready' events.
+       promise.resolve(built).then((panel) => {
+         this._toolPanels.set(id, panel);
++
+         this.emit(id + "-ready", panel);
+         gDevTools.emit(id + "-ready", this, panel);
++
+         deferred.resolve(panel);
+       }, console.error);
+     };
+ 
+     iframe.setAttribute("src", definition.url);
+     if (definition.panelLabel) {
+       iframe.setAttribute("aria-label", definition.panelLabel);
+     }
+@@ -1557,8 +1589,12 @@ Toolbox.prototype = {
+   _highlighterReady: function() {
+     this.emit("highlighter-ready");
+   },
+ 
+   _highlighterHidden: function() {
+     this.emit("highlighter-hide");
+   }
+ };
++
++function isPromise(value) {
++  return value && typeof(value.then) === 'function';
++}
+diff --git a/browser/devtools/main.js b/browser/devtools/main.js
+--- a/browser/devtools/main.js
++++ b/browser/devtools/main.js
+@@ -77,18 +77,17 @@ Tools.options = {
+   iconOnly: true,
+   panelLabel: l10n("options.panelLabel", toolboxStrings),
+   tooltip: l10n("optionsButton.tooltip", toolboxStrings),
+   inMenu: false,
+   isTargetSupported: function(target) {
+     return true;
+   },
+   build: function(iframeWindow, toolbox) {
+-    let panel = new OptionsPanel(iframeWindow, toolbox);
+-    return panel.open();
++    return new OptionsPanel(iframeWindow, toolbox);
+   }
+ }
+ 
+ Tools.webConsole = {
+   id: "webconsole",
+   key: l10n("cmd.commandkey", webConsoleStrings),
+   accesskey: l10n("webConsoleCmd.accesskey", webConsoleStrings),
+   modifiers: Services.appinfo.OS == "Darwin" ? "accel,alt" : "accel,shift",
+@@ -110,18 +109,17 @@ Tools.webConsole = {
+ 
+     panel.focusInput();
+   },
+ 
+   isTargetSupported: function(target) {
+     return true;
+   },
+   build: function(iframeWindow, toolbox) {
+-    let panel = new WebConsolePanel(iframeWindow, toolbox);
+-    return panel.open();
++    return new WebConsolePanel(iframeWindow, toolbox);
+   }
+ };
+ 
+ Tools.inspector = {
+   id: "inspector",
+   accesskey: l10n("inspector.accesskey", inspectorStrings),
+   key: l10n("inspector.commandkey", inspectorStrings),
+   ordinal: 1,
+@@ -144,18 +142,17 @@ Tools.inspector = {
+     panel.toolbox.highlighterUtils.togglePicker();
+   },
+ 
+   isTargetSupported: function(target) {
+     return !target.isAddon;
+   },
+ 
+   build: function(iframeWindow, toolbox) {
+-    let panel = new InspectorPanel(iframeWindow, toolbox);
+-    return panel.open();
++    return new InspectorPanel(iframeWindow, toolbox);
+   }
+ };
+ 
+ Tools.jsdebugger = {
+   id: "jsdebugger",
+   key: l10n("debuggerMenu.commandkey", debuggerStrings),
+   accesskey: l10n("debuggerMenu.accesskey", debuggerStrings),
+   modifiers: osString == "Darwin" ? "accel,alt" : "accel,shift",
+@@ -170,18 +167,17 @@ Tools.jsdebugger = {
+   inMenu: true,
+   commands: "devtools/debugger/debugger-commands",
+ 
+   isTargetSupported: function(target) {
+     return true;
+   },
+ 
+   build: function(iframeWindow, toolbox) {
+-    let panel = new DebuggerPanel(iframeWindow, toolbox);
+-    return panel.open();
++    return new DebuggerPanel(iframeWindow, toolbox);
+   }
+ };
+ 
+ Tools.styleEditor = {
+   id: "styleeditor",
+   key: l10n("open.commandkey", styleEditorStrings),
+   ordinal: 4,
+   accesskey: l10n("open.accesskey", styleEditorStrings),
+@@ -195,18 +191,17 @@ Tools.styleEditor = {
+   inMenu: true,
+   commands: "devtools/styleeditor/styleeditor-commands",
+ 
+   isTargetSupported: function(target) {
+     return !target.isAddon;
+   },
+ 
+   build: function(iframeWindow, toolbox) {
+-    let panel = new StyleEditorPanel(iframeWindow, toolbox);
+-    return panel.open();
++    return new StyleEditorPanel(iframeWindow, toolbox);
+   }
+ };
+ 
+ Tools.shaderEditor = {
+   id: "shadereditor",
+   ordinal: 5,
+   visibilityswitch: "devtools.shadereditor.enabled",
+   icon: "chrome://browser/skin/devtools/tool-styleeditor.svg",
+@@ -216,18 +211,17 @@ Tools.shaderEditor = {
+   panelLabel: l10n("ToolboxShaderEditor.panelLabel", shaderEditorStrings),
+   tooltip: l10n("ToolboxShaderEditor.tooltip", shaderEditorStrings),
+ 
+   isTargetSupported: function(target) {
+     return !target.isAddon;
+   },
+ 
+   build: function(iframeWindow, toolbox) {
+-    let panel = new ShaderEditorPanel(iframeWindow, toolbox);
+-    return panel.open();
++    return new ShaderEditorPanel(iframeWindow, toolbox);
+   }
+ };
+ 
+ Tools.canvasDebugger = {
+   id: "canvasdebugger",
+   ordinal: 6,
+   visibilityswitch: "devtools.canvasdebugger.enabled",
+   icon: "chrome://browser/skin/devtools/tool-styleeditor.svg",
+@@ -237,18 +231,17 @@ Tools.canvasDebugger = {
+   panelLabel: l10n("ToolboxCanvasDebugger.panelLabel", canvasDebuggerStrings),
+   tooltip: l10n("ToolboxCanvasDebugger.tooltip", canvasDebuggerStrings),
+   // Hide the Canvas Debugger in the Add-on Debugger and Browser Toolbox
+   // (bug 1047520).
+   isTargetSupported: function(target) {
+     return !target.isAddon && !target.chrome;
+   },
+   build: function (iframeWindow, toolbox) {
+-    let panel = new CanvasDebuggerPanel(iframeWindow, toolbox);
+-    return panel.open();
++    return new CanvasDebuggerPanel(iframeWindow, toolbox);
+   }
+ };
+ 
+ Tools.webAudioEditor = {
+   id: "webaudioeditor",
+   ordinal: 10,
+   visibilityswitch: "devtools.webaudioeditor.enabled",
+   icon: "chrome://browser/skin/devtools/tool-webaudio.svg",
+@@ -256,18 +249,17 @@ Tools.webAudioEditor = {
+   url: "chrome://browser/content/devtools/webaudioeditor.xul",
+   label: l10n("ToolboxWebAudioEditor1.label", webAudioEditorStrings),
+   panelLabel: l10n("ToolboxWebAudioEditor1.panelLabel", webAudioEditorStrings),
+   tooltip: l10n("ToolboxWebAudioEditor1.tooltip", webAudioEditorStrings),
+   isTargetSupported: function(target) {
+     return !target.isAddon;
+   },
+   build: function(iframeWindow, toolbox) {
+-    let panel = new WebAudioEditorPanel(iframeWindow, toolbox);
+-    return panel.open();
++    return new WebAudioEditorPanel(iframeWindow, toolbox);
+   }
+ };
+ 
+ Tools.jsprofiler = {
+   id: "jsprofiler",
+   accesskey: l10n("profiler.accesskey", profilerStrings),
+   key: l10n("profiler.commandkey2", profilerStrings),
+   ordinal: 7,
+@@ -283,18 +275,17 @@ Tools.jsprofiler = {
+ 
+   isTargetSupported: function (target) {
+     // Hide the profiler when debugging devices pre bug 1046394,
+     // that don't expose profiler actor in content processes.
+     return !target.isAddon && (!target.isApp || target.form.profilerActor);
+   },
+ 
+   build: function (frame, target) {
+-    let panel = new ProfilerPanel(frame, target);
+-    return panel.open();
++    return new ProfilerPanel(frame, target);
+   }
+ };
+ 
+ Tools.netMonitor = {
+   id: "netmonitor",
+   accesskey: l10n("netmonitor.accesskey", netMonitorStrings),
+   key: l10n("netmonitor.commandkey", netMonitorStrings),
+   ordinal: 8,
+@@ -309,18 +300,17 @@ Tools.netMonitor = {
+   inMenu: true,
+ 
+   isTargetSupported: function(target) {
+     let root = target.client.mainRoot;
+     return !target.isAddon && (root.traits.networkMonitor || !target.isApp);
+   },
+ 
+   build: function(iframeWindow, toolbox) {
+-    let panel = new NetMonitorPanel(iframeWindow, toolbox);
+-    return panel.open();
++    return new NetMonitorPanel(iframeWindow, toolbox);
+   }
+ };
+ 
+ Tools.storage = {
+   id: "storage",
+   key: l10n("storage.commandkey", storageStrings),
+   ordinal: 9,
+   accesskey: l10n("storage.accesskey", storageStrings),
+@@ -336,18 +326,17 @@ Tools.storage = {
+   inMenu: true,
+ 
+   isTargetSupported: function(target) {
+     return target.isLocalTab ||
+            (target.client.traits.storageInspector && !target.isAddon);
+   },
+ 
+   build: function(iframeWindow, toolbox) {
+-    let panel = new StoragePanel(iframeWindow, toolbox);
+-    return panel.open();
++    return new StoragePanel(iframeWindow, toolbox);
+   }
+ };
+ 
+ Tools.scratchpad = {
+   id: "scratchpad",
+   ordinal: 10,
+   visibilityswitch: "devtools.scratchpad.enabled",
+   icon: "chrome://browser/skin/devtools/tool-scratchpad.svg",
+@@ -359,18 +348,17 @@ Tools.scratchpad = {
+   inMenu: false,
+   commands: "devtools/scratchpad/scratchpad-commands",
+ 
+   isTargetSupported: function(target) {
+     return target.isRemote;
+   },
+ 
+   build: function(iframeWindow, toolbox) {
+-    let panel = new ScratchpadPanel(iframeWindow, toolbox);
+-    return panel.open();
++    return new ScratchpadPanel(iframeWindow, toolbox);
+   }
+ };
+ 
+ let defaultTools = [
+   Tools.options,
+   Tools.webConsole,
+   Tools.inspector,
+   Tools.jsdebugger,
