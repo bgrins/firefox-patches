@@ -1,12 +1,12 @@
 # HG changeset patch
-# Parent f2e8982acbf03ff2bba72bdd804913911f91b3fb
+# Parent a404daa686f8b719a040c6281280e5b6bd6697c0
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 1026479 - Add a unified search across all tools in the toolbox
 
 diff --git a/browser/devtools/debugger/debugger-panes.js b/browser/devtools/debugger/debugger-panes.js
 --- a/browser/devtools/debugger/debugger-panes.js
 +++ b/browser/devtools/debugger/debugger-panes.js
-@@ -2801,17 +2801,17 @@ GlobalSearchView.prototype = Heritage.ex
+@@ -2807,17 +2807,17 @@ GlobalSearchView.prototype = Heritage.ex
        }
      }
  
@@ -25,11 +25,30 @@ diff --git a/browser/devtools/debugger/debugger-panes.js b/browser/devtools/debu
    /**
     * Creates global search results entries and adds them to this container.
     *
+diff --git a/browser/devtools/framework/moz.build b/browser/devtools/framework/moz.build
+--- a/browser/devtools/framework/moz.build
++++ b/browser/devtools/framework/moz.build
+@@ -10,14 +10,15 @@ EXTRA_JS_MODULES.devtools += [
+     'gDevTools.jsm',
+     'ToolboxProcess.jsm',
+ ]
+ 
+ EXTRA_JS_MODULES.devtools.framework += [
+     'selection.js',
+     'sidebar.js',
+     'target.js',
++    'toolbox-find.js',
+     'toolbox-highlighter-utils.js',
+     'toolbox-hosts.js',
+     'toolbox-options.js',
+     'toolbox-process-window.js',
+     'toolbox.js',
+ ]
 diff --git a/browser/devtools/framework/toolbox-find.js b/browser/devtools/framework/toolbox-find.js
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/framework/toolbox-find.js
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,249 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -151,7 +170,7 @@ new file mode 100644
 +      return this.toolbox.loadTool(id);
 +    });
 +
-+    return promise.all(toolLoaders).then(() => {
++    return Promise.all(toolLoaders).then(() => {
 +      return findableTools;
 +    });
 +  },
@@ -230,6 +249,7 @@ new file mode 100644
 +      });
 +
 +
++      // XXX: populating with fake data
 +      // for (let i = 0; i < 100; i++) {
 +      //   let box = this.doc.createElement("box");
 +      //   box.textContent = "Search result #" + i + ": " + value;
@@ -247,10 +267,11 @@ new file mode 100644
 +  },
 +
 +  _onResultClicked: function(e) {
-+    console.log(e.target, e.originalTarget);
++    console.log("Result has been clicked", e.target, e.originalTarget);
 +    let el = closest(e.originalTarget, ".find-result");
 +    if (el) {
-+      console.log("BINGO");
++      // XXX: an element matched, need to notify the panel or somehow
++      // deep link into it to highlight the result
 +    }
 +  },
 +
@@ -280,7 +301,7 @@ new file mode 100644
 diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/toolbox.js
 --- a/browser/devtools/framework/toolbox.js
 +++ b/browser/devtools/framework/toolbox.js
-@@ -10,16 +10,17 @@ const MIN_ZOOM = 0.5;
+@@ -12,16 +12,17 @@ const MIN_ZOOM = 0.5;
  const MAX_ZOOM = 2;
  
  let {Cc, Ci, Cu} = require("chrome");
@@ -298,69 +319,71 @@ diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/
  Cu.import("resource:///modules/devtools/DOMHelpers.jsm");
  Cu.import("resource://gre/modules/Task.jsm");
  
-@@ -62,17 +63,17 @@ loader.lazyGetter(this, "InspectorFront"
- function Toolbox(target, selectedTool, hostType, hostOptions) {
-   this._target = target;
+@@ -87,17 +88,17 @@ function Toolbox(target, selectedTool, h
    this._toolPanels = new Map();
    this._telemetry = new Telemetry();
  
    this._toolRegistered = this._toolRegistered.bind(this);
    this._toolUnregistered = this._toolUnregistered.bind(this);
    this._refreshHostTitle = this._refreshHostTitle.bind(this);
--  this._splitConsoleOnKeypress = this._splitConsoleOnKeypress.bind(this)
-+  this._onDocKeypress = this._onDocKeypress.bind(this)
+   this.selectFrame = this.selectFrame.bind(this);
+   this._updateFrames = this._updateFrames.bind(this);
+-  this._splitConsoleOnKeypress = this._splitConsoleOnKeypress.bind(this);
++  this._onDocKeypress = this._onDocKeypress.bind(this);
    this.destroy = this.destroy.bind(this);
    this.highlighterUtils = getHighlighterUtils(this);
    this._highlighterReady = this._highlighterReady.bind(this);
    this._highlighterHidden = this._highlighterHidden.bind(this);
+   this._prefChanged = this._prefChanged.bind(this);
+   this._saveSplitConsoleHeight = this._saveSplitConsoleHeight.bind(this);
+   this._onFocus = this._onFocus.bind(this);
  
-   this._target.on("close", this.destroy);
- 
-   if (!hostType) {
-@@ -245,16 +246,17 @@ Toolbox.prototype = {
+@@ -282,16 +283,17 @@ Toolbox.prototype = {
          this._buildOptions();
          this._buildTabs();
-         let buttonsPromise = this._buildButtons();
+         this._applyCacheSettings();
          this._addKeysToWindow();
          this._addReloadKeys();
-         this._addToolSwitchingKeys();
+         this._addHostListeners();
          this._addZoomKeys();
          this._loadInitialZoom();
 +        this.findPane = new FindPane(this);
  
-         this._telemetry.toolOpened("toolbox");
+         this.webconsolePanel = this.doc.querySelector("#toolbox-panel-webconsole");
+         this.webconsolePanel.height =
+           Services.prefs.getIntPref(SPLITCONSOLE_HEIGHT_PREF);
+         this.webconsolePanel.addEventListener("resize",
+           this._saveSplitConsoleHeight);
  
-         this.selectTool(this._defaultToolId).then(panel => {
-           buttonsPromise.then(() => {
-             this.emit("ready");
-             deferred.resolve();
-           }, deferred.reject);
-@@ -285,19 +287,21 @@ Toolbox.prototype = {
-       let tab = this.target.tab;
-       let browserWindow = tab.ownerDocument.defaultView;
-       let responsiveUIManager = browserWindow.ResponsiveUI.ResponsiveUIManager;
-       responsiveModeActive = responsiveUIManager.isActiveForTab(tab);
-     }
-     return responsiveModeActive;
+         let buttonsPromise = this._buildButtons();
+@@ -349,18 +351,24 @@ Toolbox.prototype = {
+ 
+   _buildOptions: function() {
+     let key = this.doc.getElementById("toolbox-options-key");
+     key.addEventListener("command", () => {
+       this.selectTool("options");
+     }, true);
    },
  
 -  _splitConsoleOnKeypress: function(e) {
 +  _onDocKeypress: function(e) {
-     let responsiveModeActive = this._isResponsiveModeActive();
--    if (e.keyCode === e.DOM_VK_ESCAPE && !responsiveModeActive) {
-+    if (e.keyCode === e.DOM_VK_ESCAPE && this.findPane.finding) {
-+      this.endFindAll();
-+    } else if (e.keyCode === e.DOM_VK_ESCAPE && !responsiveModeActive) {
+     if (e.keyCode === e.DOM_VK_ESCAPE) {
++
++      if (this.findPane.finding) {
++        this.endFindAll();
++        return;
++      }
++
        this.toggleSplitConsole();
+       // If the debugger is paused, don't let the ESC key stop any pending
+       // navigation.
+       let jsdebugger = this.getPanel("jsdebugger");
+       if (jsdebugger && jsdebugger.panelWin.gThreadClient.state == "paused") {
+         e.preventDefault();
+       }
      }
-   },
- 
-   _addReloadKeys: function() {
-     [
-       ["toolbox-reload-key", false],
-       ["toolbox-reload-key2", false],
-@@ -313,17 +317,17 @@ Toolbox.prototype = {
-   _addToolSwitchingKeys: function() {
+@@ -382,17 +390,17 @@ Toolbox.prototype = {
+   _addHostListeners: function() {
      let nextKey = this.doc.getElementById("toolbox-next-tool-key");
      nextKey.addEventListener("command", this.selectNextTool.bind(this), true);
      let prevKey = this.doc.getElementById("toolbox-previous-tool-key");
@@ -370,15 +393,15 @@ diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/
      // cancelled with stopPropagation on the keypress, and not preventDefault.
 -    this.doc.addEventListener("keypress", this._splitConsoleOnKeypress, false);
 +    this.doc.addEventListener("keypress", this._onDocKeypress, false);
+ 
+     this.doc.addEventListener("focus", this._onFocus, true);
    },
  
-   /**
-    * Make sure that the console is showing up properly based on all the
-    * possible conditions.
-    *   1) If the console tab is selected, then regardless of split state
-    *      it should take up the full height of the deck, and we should
-    *      hide the deck and splitter.
-@@ -1221,17 +1225,17 @@ Toolbox.prototype = {
+   _saveSplitConsoleHeight: function() {
+     Services.prefs.setIntPref(SPLITCONSOLE_HEIGHT_PREF,
+       this.webconsolePanel.height);
+   },
+@@ -1479,17 +1487,17 @@ Toolbox.prototype = {
  
    /**
     * Destroy the current host, and remove event listeners from its frame.
@@ -389,6 +412,7 @@ diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/
      this.doc.removeEventListener("keypress",
 -      this._splitConsoleOnKeypress, false);
 +      this._onDocKeypress, false);
+     this.doc.removeEventListener("focus", this._onFocus, true);
      return this._host.destroy();
    },
  
@@ -396,26 +420,25 @@ diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/
     * Remove all UI elements, detach from target and clear up
     */
    destroy: function() {
-     // If several things call destroy then we give them all the same
-@@ -1242,16 +1246,18 @@ Toolbox.prototype = {
- 
-     this._target.off("navigate", this._refreshHostTitle);
+@@ -1504,16 +1512,18 @@ Toolbox.prototype = {
      this.off("select", this._refreshHostTitle);
      this.off("host-changed", this._refreshHostTitle);
  
      gDevTools.off("tool-registered", this._toolRegistered);
      gDevTools.off("tool-unregistered", this._toolUnregistered);
  
+     gDevTools.off("pref-changed", this._prefChanged);
+ 
 +    this.findPane.destroy();
 +
-     let outstanding = [];
-     for (let [id, panel] of this._toolPanels) {
-       try {
-         outstanding.push(panel.destroy());
-       } catch (e) {
-         // We don't want to stop here if any panel fail to close.
-         console.error("Panel " + id + ":", e);
-       }
+     this._lastFocusedElement = null;
+     if (this.webconsolePanel) {
+       this._saveSplitConsoleHeight();
+       this.webconsolePanel.removeEventListener("resize",
+         this._saveSplitConsoleHeight);
+     }
+     this.closeButton.removeEventListener("command", this.destroy, true);
+ 
 diff --git a/browser/devtools/framework/toolbox.xul b/browser/devtools/framework/toolbox.xul
 --- a/browser/devtools/framework/toolbox.xul
 +++ b/browser/devtools/framework/toolbox.xul
@@ -437,16 +460,16 @@ diff --git a/browser/devtools/framework/toolbox.xul b/browser/devtools/framework
    <notificationbox id="toolbox-notificationbox" flex="1">
      <toolbar class="devtools-tabbar">
        <hbox id="toolbox-picker-container" />
-       <hbox id="toolbox-tabs" flex="1" />
-       <hbox id="toolbox-buttons" pack="end"/>
-       <vbox id="toolbox-controls-separator" class="devtools-separator"/>
-@@ -78,11 +82,37 @@
-                        class="devtools-closebutton"
-                        tooltiptext="&toolboxCloseButton.tooltip;"/>
-       </hbox>
-     </toolbar>
+       <hbox id="toolbox-tabs" flex="1" role="tablist" />
+       <hbox id="toolbox-buttons" pack="end">
+         <toolbarbutton id="command-button-frames"
+@@ -90,11 +94,37 @@
      <vbox flex="1">
-       <deck id="toolbox-deck" flex="1" minheight="75" />
+       <!-- Set large flex to allow the toolbox-panel-webconsole to have a
+            height set to a small value without flexing to fill up extra
+            space. There must be a flex on both to ensure that the console
+            panel itself is sized properly -->
+       <deck id="toolbox-deck" flex="1000" minheight="75" />
        <splitter id="toolbox-console-splitter" class="devtools-horizontal-splitter" hidden="true" />
        <box minheight="75" flex="1" id="toolbox-panel-webconsole" collapsed="true" />
 +      <splitter id="toolbox-find-splitter" class="devtools-horizontal-splitter" hidden="true" />
@@ -481,7 +504,7 @@ diff --git a/browser/devtools/framework/toolbox.xul b/browser/devtools/framework
 diff --git a/browser/devtools/jar.mn b/browser/devtools/jar.mn
 --- a/browser/devtools/jar.mn
 +++ b/browser/devtools/jar.mn
-@@ -95,16 +95,17 @@ browser.jar:
+@@ -85,16 +85,17 @@ browser.jar:
      content/browser/devtools/responsivedesign/resize-commands.js       (responsivedesign/resize-commands.js)
      content/browser/devtools/commandline.css                           (commandline/commandline.css)
      content/browser/devtools/commandlineoutput.xhtml                   (commandline/commandlineoutput.xhtml)
@@ -502,19 +525,21 @@ diff --git a/browser/devtools/jar.mn b/browser/devtools/jar.mn
 diff --git a/browser/devtools/main.js b/browser/devtools/main.js
 --- a/browser/devtools/main.js
 +++ b/browser/devtools/main.js
-@@ -120,16 +120,31 @@ Tools.inspector = {
-   ordinal: 1,
+@@ -99,16 +99,41 @@ Tools.inspector = {
    modifiers: osString == "Darwin" ? "accel,alt" : "accel,shift",
    icon: "chrome://browser/skin/devtools/tool-inspector.svg",
    invertIconForLightTheme: true,
    url: "chrome://browser/content/devtools/inspector/inspector.xul",
    label: l10n("inspector.label", inspectorStrings),
+   panelLabel: l10n("inspector.panelLabel", inspectorStrings),
    tooltip: l10n("inspector.tooltip", inspectorStrings),
    inMenu: true,
 +  searchable: true,
 +  onsearch: function(value, panel, toolbox) {
-+    let def = promise.defer();
-+    let result = { // new SearchResult();
++
++    // XXX: This is the API that we will want to proved to panels.
++    let def = Promise.defer();
++    let result = { // maybe `new SearchResult()` instead?
 +      label: "body",
 +      render: function() {
 +        let b = toolbox.doc.createElement("box");
@@ -522,8 +547,16 @@ diff --git a/browser/devtools/main.js b/browser/devtools/main.js
 +        return b
 +      }
 +    }
++    let result2 = { // maybe `new SearchResult()` instead?
++      label: "html -> Some fake result",
++      render: function() {
++        let b = toolbox.doc.createElement("box");
++        b.textContent = this.label;
++        return b
++      }
++    }
 +
-+    def.resolve([result]);
++    def.resolve([result, result2]);
 +    return def.promise;
 +  },
    commands: [
@@ -534,22 +567,24 @@ diff --git a/browser/devtools/main.js b/browser/devtools/main.js
  
    preventClosingOnKey: true,
    onkey: function(panel) {
-@@ -155,16 +170,39 @@ Tools.jsdebugger = {
-   icon: "chrome://browser/skin/devtools/tool-debugger.svg",
+@@ -167,16 +192,40 @@ Tools.jsdebugger = {
    invertIconForLightTheme: true,
    highlightedicon: "chrome://browser/skin/devtools/tool-debugger-paused.svg",
    url: "chrome://browser/content/devtools/debugger.xul",
    label: l10n("ToolboxDebugger.label", debuggerStrings),
+   panelLabel: l10n("ToolboxDebugger.panelLabel", debuggerStrings),
    tooltip: l10n("ToolboxDebugger.tooltip", debuggerStrings),
    inMenu: true,
    commands: "devtools/debugger/debugger-commands",
 +  searchable: true,
 +  onsearch: function(value, panel, toolbox) {
-+    let def = promise.defer();
-+console.log("LISTENING FOR RESULTS");
++    let def = Promise.defer();
++
++    // XXX: this is bridging the existing debugger search events into the new
++    // search API
++
 +    panel.panelWin.on(panel.panelWin.EVENTS.GLOBAL_SEARCH_MATCH_FOUND, function(e, globalResults) {
 +      let containers = [];
-+      console.log("MATCHES FOUND", globalResults._store);
 +      for (let lineResults of globalResults._store) {
 +        let container = toolbox.doc.createElement("box");
 +        lineResults.createView(container, {});
@@ -559,7 +594,6 @@ diff --git a/browser/devtools/main.js b/browser/devtools/main.js
 +    });
 +
 +    panel.panelWin.on(panel.panelWin.EVENTS.GLOBAL_SEARCH_MATCH_NOT_FOUND, () => {
-+      console.log("NO MATCH FOUND");
 +      def.resolve();
 +    });
 +
@@ -572,8 +606,8 @@ diff --git a/browser/devtools/main.js b/browser/devtools/main.js
    },
  
    build: function(iframeWindow, toolbox) {
-     let panel = new DebuggerPanel(iframeWindow, toolbox);
-     return panel.open();
+     return new DebuggerPanel(iframeWindow, toolbox);
+   }
 diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
 --- a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
 +++ b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
@@ -587,20 +621,20 @@ diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser
  
  <!ENTITY toolboxReload.key             "r">
 +<!ENTITY toolboxFindAll.key            "f">
+ <!-- LOCALIZATION NOTE (toolboxFramesButton): This is the label for
+   -  the iframes menu list that appears only when the document has some.
+   -  It allows you to switch the context of the whole toolbox. -->
+ <!ENTITY toolboxFramesTooltip          "Select an iframe as the currently targeted document">
  
  <!-- LOCALIZATION NOTE (options.context.advancedSettings): This is the label for
    -  the heading of the advanced settings group in the options panel. -->
  <!ENTITY options.context.advancedSettings "Advanced settings">
- 
- <!-- LOCALIZATION NOTE (options.context.inspector): This is the label for
-   -  the heading of the Inspector group in the options panel. -->
- <!ENTITY options.context.inspector "Inspector">
 diff --git a/browser/themes/shared/devtools/toolbars.inc.css b/browser/themes/shared/devtools/toolbars.inc.css
 --- a/browser/themes/shared/devtools/toolbars.inc.css
 +++ b/browser/themes/shared/devtools/toolbars.inc.css
-@@ -33,16 +33,20 @@
-   margin: 0;
-   padding: 0;
+@@ -37,16 +37,20 @@
+ .devtools-toolbar checkbox .checkbox-label-box {
+   border: none !important; /* overrides .checkbox-label-box from checkbox.css */
  }
  .devtools-toolbar checkbox .checkbox-label-box .checkbox-label {
    margin: 0 6px !important; /* overrides .checkbox-label from checkbox.css */
