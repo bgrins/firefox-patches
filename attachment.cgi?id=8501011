@@ -1,0 +1,721 @@
+# HG changeset patch
+# Parent 4af29b25a7bff2e9b52ec704c47836855aad265c
+# User Patrick Brosset <pbrosset@mozilla.com>
+Bug 917696 - Makes markup-view tag name edition go through the protocol; r=bgrins
+
+diff --git a/browser/devtools/inspector/test/browser_inspector_menu.js b/browser/devtools/inspector/test/browser_inspector_menu.js
+--- a/browser/devtools/inspector/test/browser_inspector_menu.js
++++ b/browser/devtools/inspector/test/browser_inspector_menu.js
+@@ -180,29 +180,32 @@ let test = asyncTest(function* () {
+     info("Testing that 'Paste Outer HTML' menu item works.");
+     clipboard.set("this was pasted");
+ 
+     let node = getNode("h1");
+     yield selectNode(node, inspector);
+ 
+     contextMenuClick(getContainerForRawNode(inspector.markup, node).tagLine);
+ 
++    let onNodeReselected = inspector.markup.once("reselectedonremoved");
+     let menu = inspector.panelDoc.getElementById("node-menu-pasteouterhtml");
+     dispatchCommandEvent(menu);
+ 
+     info("Waiting for inspector selection to update");
+-    yield inspector.selection.once("new-node");
++    yield onNodeReselected;
+ 
+     ok(content.document.body.outerHTML.contains(clipboard.get()),
+        "Clipboard content was pasted into the node's outer HTML.");
+     ok(!getNode("h1", { expectNoMatch: true }), "The original node was removed.");
+   }
+ 
+   function* testDeleteNode() {
+     info("Testing 'Delete Node' menu item for normal elements.");
++
++    yield selectNode("p", inspector);
+     let deleteNode = inspector.panelDoc.getElementById("node-menu-delete");
+     ok(deleteNode, "the popup menu has a delete menu item");
+ 
+     let updated = inspector.once("inspector-updated");
+ 
+     info("Triggering 'Delete Node' and waiting for inspector to update");
+     dispatchCommandEvent(deleteNode);
+     yield updated;
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -615,18 +615,16 @@ MarkupView.prototype = {
+     return container;
+   },
+ 
+   /**
+    * Mutation observer used for included nodes.
+    */
+   _mutationObserver: function(aMutations) {
+     let requiresLayoutChange = false;
+-    let reselectParent;
+-    let reselectChildIndex;
+ 
+     for (let mutation of aMutations) {
+       let type = mutation.type;
+       let target = mutation.target;
+ 
+       if (mutation.type === "documentUnload") {
+         // Treat this as a childList change of the child (maybe the protocol
+         // should do this).
+@@ -646,61 +644,32 @@ MarkupView.prototype = {
+       if (type === "attributes" || type === "characterData") {
+         container.update();
+ 
+         // Auto refresh style properties on selected node when they change.
+         if (type === "attributes" && container.selected) {
+           requiresLayoutChange = true;
+         }
+       } else if (type === "childList") {
+-        let isFromOuterHTML = mutation.removed.some((n) => {
+-          return n === this._outerHTMLNode;
+-        });
+-
+-        // Keep track of which node should be reselected after mutations.
+-        if (isFromOuterHTML) {
+-          reselectParent = target;
+-          reselectChildIndex = this._outerHTMLChildIndex;
+-
+-          delete this._outerHTMLNode;
+-          delete this._outerHTMLChildIndex;
+-        }
+-
+         container.childrenDirty = true;
+         // Update the children to take care of changes in the markup view DOM.
+-        this._updateChildren(container, {flash: !isFromOuterHTML});
++        this._updateChildren(container, {flash: true});
+       }
+     }
+ 
+     if (requiresLayoutChange) {
+       this._inspector.immediateLayoutChange();
+     }
+     this._waitForChildren().then((nodes) => {
+       this._flashMutatedNodes(aMutations);
+       this._inspector.emit("markupmutation", aMutations);
+ 
+       // Since the htmlEditor is absolutely positioned, a mutation may change
+       // the location in which it should be shown.
+       this.htmlEditor.refresh();
+-
+-      // If a node has had its outerHTML set, the parent node will be selected.
+-      // Reselect the original node immediately.
+-      if (this._inspector.selection.nodeFront === reselectParent) {
+-        this.walker.children(reselectParent).then((o) => {
+-          let node = o.nodes[reselectChildIndex];
+-          let container = this.getContainer(node);
+-          if (node && container) {
+-            this.markNodeAsSelected(node, "outerhtml");
+-            if (container.hasChildren) {
+-              this.expandNode(node);
+-            }
+-          }
+-        });
+-
+-      }
+     });
+   },
+ 
+   /**
+    * React to display-change events from the walker
+    * @param {Array} nodes An array of nodeFronts
+    */
+   _onDisplayChange: function(nodes) {
+@@ -842,66 +811,102 @@ MarkupView.prototype = {
+         longstr.release().then(null, console.error);
+         def.resolve(outerHTML);
+       });
+     });
+     return def.promise;
+   },
+ 
+   /**
+-   * Retrieve the index of a child within its parent's children list.
+-   * @param aNode The NodeFront to find the index of.
+-   * @returns A promise that will be resolved with the integer index.
+-   *          If the child cannot be found, returns -1
++   * Listen to mutations, expect a given node to be removed and try and select
++   * the node that sits at the same place instead.
++   * This is useful when changing the outerHTML or the tag name so that the
++   * newly inserted node gets selected instead of the one that just got removed.
+    */
+-  getNodeChildIndex: function(aNode) {
+-    let def = promise.defer();
+-    let parentNode = aNode.parentNode();
++  reselectOnRemoved: function(removedNode, reason) {
++    // Only allow one removed node reselection at a time, so that when there are
++    // more than 1 request in parallel, the last one wins.
++    this.cancelReselectOnRemoved();
+ 
+-    // Node may have been removed from the DOM, instead of throwing an error,
+-    // return -1 indicating that it isn't inside of its parent children list.
+-    if (!parentNode) {
+-      def.resolve(-1);
+-    } else {
+-      this.walker.children(parentNode).then(children => {
+-        def.resolve(children.nodes.indexOf(aNode));
+-      });
++    // Get the removedNode index in its parent node to reselect the right node.
++    let isHTMLTag = removedNode.tagName.toLowerCase() === "html";
++    let oldContainer = this.getContainer(removedNode);
++    let parentContainer = this.getContainer(removedNode.parentNode());
++    let childIndex = parentContainer.getChildContainers().indexOf(oldContainer);
++
++    let onMutations = this._removedNodeObserver = (e, mutations) => {
++      let isNodeRemovalMutation = false;
++      for (let mutation of mutations) {
++        let containsRemovedNode = mutation.removed &&
++                                  mutation.removed.some(n => n === removedNode);
++        if (mutation.type === "childList" && (containsRemovedNode || isHTMLTag)) {
++          isNodeRemovalMutation = true;
++          break;
++        }
++      }
++      if (!isNodeRemovalMutation) {
++        return;
++      }
++
++      this._inspector.off("markupmutation", onMutations);
++      this._removedNodeObserver = null;
++
++      // Don't select the new node if the user has already changed the current
++      // selection.
++      if (this._inspector.selection.nodeFront === parentContainer.node ||
++          (this._inspector.selection.nodeFront === removedNode && isHTMLTag)) {
++        let childContainers = parentContainer.getChildContainers();
++        if (childContainers && childContainers[childIndex]) {
++          this.markNodeAsSelected(childContainers[childIndex].node, reason);
++          if (childContainers[childIndex].hasChildren) {
++            this.expandNode(childContainers[childIndex].node);
++          }
++          this.emit("reselectedonremoved");
++        }
++      }
++    };
++
++    // Start listening for mutations until we find a childList change that has
++    // removedNode removed.
++    this._inspector.on("markupmutation", onMutations);
++  },
++
++  /**
++   * Make sure to stop listening for node removal markupmutations and not
++   * reselect the corresponding node when that happens.
++   * Useful when the outerHTML/tagname edition failed.
++   */
++  cancelReselectOnRemoved: function() {
++    if (this._removedNodeObserver) {
++      this._inspector.off("markupmutation", this._removedNodeObserver);
++      this._removedNodeObserver = null;
++      this.emit("canceledreselectonremoved");
+     }
+-
+-    return def.promise;
+   },
+ 
+   /**
+    * Replace the outerHTML of any node displayed in the inspector with
+    * some other HTML code
+    * @param aNode node which outerHTML will be replaced.
+    * @param newValue The new outerHTML to set on the node.
+    * @param oldValue The old outerHTML that will be used if the user undos the update.
+    * @returns A promise that will resolve when the outer HTML has been updated.
+    */
+   updateNodeOuterHTML: function(aNode, newValue, oldValue) {
+     let container = this._containers.get(aNode);
+     if (!container) {
+       return promise.reject();
+     }
+ 
+-    let def = promise.defer();
+-
+-    this.getNodeChildIndex(aNode).then((i) => {
+-      this._outerHTMLChildIndex = i;
+-      this._outerHTMLNode = aNode;
+-
+-      container.undo.do(() => {
+-        this.walker.setOuterHTML(aNode, newValue).then(def.resolve, def.reject);
+-      }, () => {
+-        this.walker.setOuterHTML(aNode, oldValue).then(def.resolve, def.reject);
+-      });
++    // Changing the outerHTML removes the node which outerHTML was changed.
++    // Listen to this removal to reselect the right node afterwards.
++    this.reselectOnRemoved(aNode, "outerhtml");
++    return this.walker.setOuterHTML(aNode, newValue).then(null, () => {
++      this.cancelReselectOnRemoved();
+     });
+-
+-    return def.promise;
+   },
+ 
+   /**
+    * Open an editor in the UI to allow editing of a node's outerHTML.
+    * @param aNode The NodeFront to edit.
+    */
+   beginEditingOuterHTML: function(aNode) {
+     this.getNodeOuterHTML(aNode).then((oldValue)=> {
+@@ -1422,16 +1427,28 @@ MarkupContainer.prototype = {
+     if (aValue) {
+       this.expander.style.visibility = "visible";
+     } else {
+       this.expander.style.visibility = "hidden";
+     }
+   },
+ 
+   /**
++   * If the node has children, return the list of containers for all these
++   * children.
++   */
++  getChildContainers: function() {
++    if (!this.hasChildren) {
++      return null;
++    }
++
++    return [...this.children.children].map(node => node.container);
++  },
++
++  /**
+    * True if the node has been visually expanded in the tree.
+    */
+   get expanded() {
+     return !this.elt.classList.contains("collapsed");
+   },
+ 
+   set expanded(aValue) {
+     if (!this.expander) {
+@@ -1823,17 +1840,25 @@ function RootContainer(aMarkupView, aNod
+   this.node = aNode;
+   this.toString = () => "[root container]";
+ }
+ 
+ RootContainer.prototype = {
+   hasChildren: true,
+   expanded: true,
+   update: function() {},
+-  destroy: function() {}
++  destroy: function() {},
++
++  /**
++   * If the node has children, return the list of containers for all these
++   * children.
++   */
++  getChildContainers: function() {
++    return [...this.children.children].map(node => node.container);
++  }
+ };
+ 
+ /**
+  * Creates an editor for non-editable nodes.
+  */
+ function GenericEditor(aContainer, aNode) {
+   this.container = aContainer;
+   this.markup = this.container.markup;
+@@ -1964,23 +1989,19 @@ function ElementEditor(aContainer, aNode
+   this.closeTag = null;
+   this.attrList = null;
+   this.newAttr = null;
+   this.closeElt = null;
+ 
+   // Create the main editor
+   this.template("element", this);
+ 
+-  if (aNode.isLocal_toBeDeprecated()) {
+-    this.rawNode = aNode.rawNode();
+-  }
+-
+   // Make the tag name editable (unless this is a remote node or
+   // a document element)
+-  if (this.rawNode && !aNode.isDocumentElement) {
++  if (!aNode.isDocumentElement) {
+     this.tag.setAttribute("tabindex", "0");
+     editableField({
+       element: this.tag,
+       trigger: "dblclick",
+       stopOnReturn: true,
+       done: this.onTagEdit.bind(this),
+     });
+   }
+@@ -2202,67 +2223,29 @@ ElementEditor.prototype = {
+     } else {
+       aUndoMods.removeAttribute(aName);
+     }
+   },
+ 
+   /**
+    * Called when the tag name editor has is done editing.
+    */
+-  onTagEdit: function(aVal, aCommit) {
+-    if (!aCommit || aVal == this.rawNode.tagName) {
++  onTagEdit: function(newTagName, isCommit) {
++    if (!isCommit || newTagName == this.node.tagName ||
++        !("editTagName" in this.markup.walker)) {
+       return;
+     }
+ 
+-    // Create a new element with the same attributes as the
+-    // current element and prepare to replace the current node
+-    // with it.
+-    try {
+-      var newElt = nodeDocument(this.rawNode).createElement(aVal);
+-    } catch(x) {
+-      // Failed to create a new element with that tag name, ignore
+-      // the change.
+-      return;
+-    }
+-
+-    let attrs = this.rawNode.attributes;
+-
+-    for (let i = 0 ; i < attrs.length; i++) {
+-      newElt.setAttribute(attrs[i].name, attrs[i].value);
+-    }
+-    let newFront = this.markup.walker.frontForRawNode(newElt);
+-    let newContainer = this.markup.importNode(newFront);
+-
+-    // Retain the two nodes we care about here so we can undo.
+-    let walker = this.markup.walker;
+-    promise.all([
+-      walker.retainNode(newFront), walker.retainNode(this.node)
+-    ]).then(() => {
+-      function swapNodes(aOld, aNew) {
+-        aOld.parentNode.insertBefore(aNew, aOld);
+-        while (aOld.firstChild) {
+-          aNew.appendChild(aOld.firstChild);
+-        }
+-        aOld.parentNode.removeChild(aOld);
+-      }
+-
+-      this.container.undo.do(() => {
+-        swapNodes(this.rawNode, newElt);
+-        this.markup.setNodeExpanded(newFront, this.container.expanded);
+-        if (this.container.selected) {
+-          this.markup.navigate(newContainer);
+-        }
+-      }, () => {
+-        swapNodes(newElt, this.rawNode);
+-        this.markup.setNodeExpanded(this.node, newContainer.expanded);
+-        if (newContainer.selected) {
+-          this.markup.navigate(this.container);
+-        }
+-      });
+-    }).then(null, console.error);
++    // Changing the tagName removes the node. Make sure the replacing node gets
++    // selected afterwards.
++    this.markup.reselectOnRemoved(this.node, "edittagname");
++    this.markup.walker.editTagName(this.node, newTagName).then(null, () => {
++      // Failed to edit the tag name, cancel the reselection.
++      this.markup.cancelReselectOnRemoved();
++    });
+   },
+ 
+   destroy: function() {}
+ };
+ 
+ function nodeDocument(node) {
+   return node.ownerDocument ||
+     (node.nodeType == Ci.nsIDOMNode.DOCUMENT_NODE ? node : null);
+diff --git a/browser/devtools/markupview/test/browser.ini b/browser/devtools/markupview/test/browser.ini
+--- a/browser/devtools/markupview/test/browser.ini
++++ b/browser/devtools/markupview/test/browser.ini
+@@ -75,19 +75,19 @@ skip-if = e10s # Bug 1040751 - CodeMirro
+ [browser_markupview_node_not_displayed_02.js]
+ [browser_markupview_pagesize_01.js]
+ [browser_markupview_pagesize_02.js]
+ skip-if = e10s # Bug 1036409 - The last selected node isn't reselected
+ [browser_markupview_search_01.js]
+ [browser_markupview_tag_edit_01.js]
+ [browser_markupview_tag_edit_02.js]
+ [browser_markupview_tag_edit_03.js]
+-skip-if = e10s # Bug 1036421 - Tag editing isn't remote-safe
+ [browser_markupview_tag_edit_04.js]
+ [browser_markupview_tag_edit_05.js]
+ [browser_markupview_tag_edit_06.js]
+ [browser_markupview_tag_edit_07.js]
+ [browser_markupview_tag_edit_08.js]
+ [browser_markupview_tag_edit_09.js]
++[browser_markupview_tag_edit_10.js]
+ [browser_markupview_textcontent_edit_01.js]
+ [browser_markupview_toggle_01.js]
+ [browser_markupview_toggle_02.js]
+ [browser_markupview_toggle_03.js]
+diff --git a/browser/devtools/markupview/test/browser_markupview_html_edit_03.js b/browser/devtools/markupview/test/browser_markupview_html_edit_03.js
+--- a/browser/devtools/markupview/test/browser_markupview_html_edit_03.js
++++ b/browser/devtools/markupview/test/browser_markupview_html_edit_03.js
+@@ -102,56 +102,55 @@ function testF2Commits(inspector) {
+ }
+ 
+ function* testBody(inspector) {
+   let body = getNode("body");
+   let bodyHTML = '<body id="updated"><p></p></body>';
+   let bodyFront = yield getNodeFront("body", inspector);
+   let doc = content.document;
+ 
+-  let mutated = inspector.once("markupmutation");
+-  inspector.markup.updateNodeOuterHTML(bodyFront, bodyHTML, body.outerHTML);
+-
+-  let mutations = yield mutated;
++  let onReselected = inspector.markup.once("reselectedonremoved");
++  yield inspector.markup.updateNodeOuterHTML(bodyFront, bodyHTML, body.outerHTML);
++  yield onReselected;
+ 
+   is(getNode("body").outerHTML, bodyHTML, "<body> HTML has been updated");
+   is(doc.querySelectorAll("head").length, 1, "no extra <head>s have been added");
+ 
+   yield inspector.once("inspector-updated");
+ }
+ 
+ function* testHead(inspector) {
+   let head = getNode("head");
++  yield selectNode("head", inspector);
++
+   let headHTML = '<head id="updated"><title>New Title</title><script>window.foo="bar";</script></head>';
+   let headFront = yield getNodeFront("head", inspector);
+   let doc = content.document;
+ 
+-  let mutated = inspector.once("markupmutation");
+-  inspector.markup.updateNodeOuterHTML(headFront, headHTML, head.outerHTML);
+-
+-  let mutations = yield mutated;
++  let onReselected = inspector.markup.once("reselectedonremoved");
++  yield inspector.markup.updateNodeOuterHTML(headFront, headHTML, head.outerHTML);
++  yield onReselected;
+ 
+   is(doc.title, "New Title", "New title has been added");
+   is(doc.defaultView.foo, undefined, "Script has not been executed");
+   is(doc.querySelector("head").outerHTML, headHTML, "<head> HTML has been updated");
+   is(doc.querySelectorAll("body").length, 1, "no extra <body>s have been added");
+ 
+   yield inspector.once("inspector-updated");
+ }
+ 
+ function* testDocumentElement(inspector) {
+   let doc = content.document;
+   let docElement = doc.documentElement;
+   let docElementHTML = '<html id="updated" foo="bar"><head><title>Updated from document element</title><script>window.foo="bar";</script></head><body><p>Hello</p></body></html>';
+   let docElementFront = yield inspector.markup.walker.documentElement();
+ 
+-  let mutated = inspector.once("markupmutation");
+-  inspector.markup.updateNodeOuterHTML(docElementFront, docElementHTML, docElement.outerHTML);
+-
+-  let mutations = yield mutated;
++  let onReselected = inspector.markup.once("reselectedonremoved");
++  yield inspector.markup.updateNodeOuterHTML(docElementFront, docElementHTML, docElement.outerHTML);
++  yield onReselected;
+ 
+   is(doc.title, "Updated from document element", "New title has been added");
+   is(doc.defaultView.foo, undefined, "Script has not been executed");
+   is(doc.documentElement.id, "updated", "<html> ID has been updated");
+   is(doc.documentElement.className, "", "<html> class has been updated");
+   is(doc.documentElement.getAttribute("foo"), "bar", "<html> attribute has been updated");
+   is(doc.documentElement.outerHTML, docElementHTML, "<html> HTML has been updated");
+   is(doc.querySelectorAll("head").length, 1, "no extra <head>s have been added");
+@@ -160,20 +159,19 @@ function* testDocumentElement(inspector)
+ }
+ 
+ function* testDocumentElement2(inspector) {
+   let doc = content.document;
+   let docElement = doc.documentElement;
+   let docElementHTML = '<html class="updated" id="somethingelse"><head><title>Updated again from document element</title><script>window.foo="bar";</script></head><body><p>Hello again</p></body></html>';
+   let docElementFront = yield inspector.markup.walker.documentElement();
+ 
+-  let mutated = inspector.once("markupmutation");
++  let onReselected = inspector.markup.once("reselectedonremoved");
+   inspector.markup.updateNodeOuterHTML(docElementFront, docElementHTML, docElement.outerHTML);
+-
+-  let mutations = yield mutated;
++  yield onReselected;
+ 
+   is(doc.title, "Updated again from document element", "New title has been added");
+   is(doc.defaultView.foo, undefined, "Script has not been executed");
+   is(doc.documentElement.id, "somethingelse", "<html> ID has been updated");
+   is(doc.documentElement.className, "updated", "<html> class has been updated");
+   is(doc.documentElement.getAttribute("foo"), null, "<html> attribute has been removed");
+   is(doc.documentElement.outerHTML, docElementHTML, "<html> HTML has been updated");
+   is(doc.querySelectorAll("head").length, 1, "no extra <head>s have been added");
+diff --git a/browser/devtools/markupview/test/browser_markupview_tag_edit_03.js b/browser/devtools/markupview/test/browser_markupview_tag_edit_03.js
+--- a/browser/devtools/markupview/test/browser_markupview_tag_edit_03.js
++++ b/browser/devtools/markupview/test/browser_markupview_tag_edit_03.js
+@@ -1,17 +1,17 @@
+ /* vim: set ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+ // Tests that a node's tagname can be edited in the markup-view
+ 
+-const TEST_URL = "data:text/html,<div id='retag-me'><div id='retag-me-2'></div></div>";
++const TEST_URL = "data:text/html;charset=utf-8,<div id='retag-me'><div id='retag-me-2'></div></div>";
+ 
+ let test = asyncTest(function*() {
+   let {toolbox, inspector} = yield addTab(TEST_URL).then(openInspector);
+ 
+   yield inspector.markup.expandAll();
+ 
+   info("Selecting the test node");
+   let node = content.document.querySelector("#retag-me");
+diff --git a/browser/devtools/markupview/test/browser_markupview_tag_edit_10.js b/browser/devtools/markupview/test/browser_markupview_tag_edit_10.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/markupview/test/browser_markupview_tag_edit_10.js
+@@ -0,0 +1,33 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that invalid tagname updates are handled correctly
++
++const TEST_URL = "data:text/html;charset=utf-8,<div></div>";
++
++let test = asyncTest(function*() {
++  let {toolbox, inspector} = yield addTab(TEST_URL).then(openInspector);
++  yield inspector.markup.expandAll();
++  yield selectNode("div", inspector);
++
++  info("Updating the DIV tagname to an invalid value");
++  let container = yield getContainerForSelector("div", inspector);
++  let onCancelReselect = inspector.markup.once("canceledreselectonremoved");
++  let tagEditor = container.editor.tag;
++  setEditableFieldValue(tagEditor, "<<<", inspector);
++  yield onCancelReselect;
++  ok(true, "The markup-view emitted the canceledreselectonremoved event");
++  is(inspector.selection.nodeFront, container.node, "The test DIV is still selected");
++
++  info("Updating the DIV tagname to a valid value this time");
++  let onReselect = inspector.markup.once("reselectedonremoved");
++  setEditableFieldValue(tagEditor, "span", inspector);
++  yield onReselect;
++  ok(true, "The markup-view emitted the reselectedonremoved event");
++
++  let spanFront = yield getNodeFront("span", inspector);
++  is(inspector.selection.nodeFront, spanFront, "The seelected node is now the SPAN");
++});
+diff --git a/browser/devtools/markupview/test/helper_outerhtml_test_runner.js b/browser/devtools/markupview/test/helper_outerhtml_test_runner.js
+--- a/browser/devtools/markupview/test/helper_outerhtml_test_runner.js
++++ b/browser/devtools/markupview/test/helper_outerhtml_test_runner.js
+@@ -39,35 +39,21 @@ function runEditOuterHTMLTests(tests, in
+  */
+ function* runEditOuterHTMLTest(test, inspector) {
+   info("Running an edit outerHTML test on '" + test.selector + "'");
+   yield selectNode(test.selector, inspector);
+   let oldNodeFront = inspector.selection.nodeFront;
+ 
+   let onUpdated = inspector.once("inspector-updated");
+ 
+-  info("Listening for the markupmutation event");
+-  // This event fires once the outerHTML is set, with a target as the parent node and a type of "childList".
+-  let mutated = inspector.once("markupmutation");
+-  info("Editing the outerHTML");
+-  inspector.markup.updateNodeOuterHTML(inspector.selection.nodeFront, test.newHTML, test.oldHTML);
+-  let mutations = yield mutated;
+-  ok(true, "The markupmutation event has fired, mutation done");
+-
+-  info("Check to make the sure the correct mutation event was fired, and that the parent is selected");
+-  let nodeFront = inspector.selection.nodeFront;
+-  let mutation = mutations[0];
+-  let isFromOuterHTML = mutation.removed.some(n => n === oldNodeFront);
+-
+-  ok(isFromOuterHTML, "The node is in the 'removed' list of the mutation");
+-  is(mutation.type, "childList", "Mutation is a childList after updating outerHTML");
+-  is(mutation.target, nodeFront, "Parent node is selected immediately after setting outerHTML");
+-
+-  // Wait for node to be reselected after outerHTML has been set
+-  yield inspector.selection.once("new-node-front");
++  info("Listen for reselectedonremoved and edit the outerHTML");
++  let onReselected = inspector.markup.once("reselectedonremoved");
++  yield inspector.markup.updateNodeOuterHTML(inspector.selection.nodeFront,
++                                             test.newHTML, test.oldHTML);
++  yield onReselected;
+ 
+   // Typically selectedNode will === pageNode, but if a new element has been injected in front
+   // of it, this will not be the case.  If this happens.
+   let selectedNodeFront = inspector.selection.nodeFront;
+   let pageNodeFront = yield inspector.walker.querySelector(inspector.walker.rootNode, test.selector);
+   let pageNode = getNode(test.selector);
+ 
+   if (test.validate) {
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -2101,18 +2101,17 @@ var WalkerActor = protocol.ActorClass({
+     } else {
+       rawNode.outerHTML = value;
+     }
+   }, {
+     request: {
+       node: Arg(0, "domnode"),
+       value: Arg(1),
+     },
+-    response: {
+-    }
++    response: {}
+   }),
+ 
+   /**
+    * Removes a node from its parent node.
+    *
+    * @returns The node's nextSibling before it was removed.
+    */
+   removeNode: method(function(node) {
+@@ -2146,16 +2145,56 @@ var WalkerActor = protocol.ActorClass({
+       node: Arg(0, "domnode"),
+       parent: Arg(1, "domnode"),
+       sibling: Arg(2, "nullable:domnode")
+     },
+     response: {}
+   }),
+ 
+   /**
++   * Editing a node's tagname actually means creating a new node with the same
++   * attributes, removing the node and inserting the new one instead.
++   * This method does not return anything as mutation events are taking care of
++   * informing the consumers about changes.
++   */
++  editTagName: method(function(node, tagName) {
++    let oldNode = node.rawNode;
++
++    // Create a new element with the same attributes as the current element and
++    // prepare to replace the current node with it.
++    let newNode;
++    try {
++      newNode = nodeDocument(oldNode).createElement(tagName);
++    } catch(x) {
++      // Failed to create a new element with that tag name, ignore the change,
++      // and signal the error to the front.
++      return Promise.reject(new Error("Could not change node's tagName to " + tagName));
++    }
++
++    let attrs = oldNode.attributes;
++    for (let i = 0; i < attrs.length; i ++) {
++      newNode.setAttribute(attrs[i].name, attrs[i].value);
++    }
++
++    // Insert the new node, and transfer the old node's children.
++    oldNode.parentNode.insertBefore(newNode, oldNode);
++    while (oldNode.firstChild) {
++      newNode.appendChild(oldNode.firstChild);
++    }
++
++    oldNode.remove();
++  }, {
++    request: {
++      node: Arg(0, "domnode"),
++      tagName: Arg(1, "string")
++    },
++    response: {}
++  }),
++
++  /**
+    * Get any pending mutation records.  Must be called by the client after
+    * the `new-mutations` notification is received.  Returns an array of
+    * mutation records.
+    *
+    * Mutation records have a basic structure:
+    *
+    * {
+    *   type: attributes|characterData|childList,
