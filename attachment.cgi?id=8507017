@@ -1,0 +1,320 @@
+# HG changeset patch
+# Parent 3dd4ea3459055a48085e27d16df839a8b39753fe
+# User Markus Stange <mstange@themasta.com>
+Bug 1018845 - Make the fullscreen button easier to see on dark backgrounds.
+
+diff --git a/content/xul/content/src/nsXULElement.cpp b/content/xul/content/src/nsXULElement.cpp
+--- a/content/xul/content/src/nsXULElement.cpp
++++ b/content/xul/content/src/nsXULElement.cpp
+@@ -1154,16 +1154,17 @@ nsXULElement::AfterSetAttr(int32_t aName
+                     }
+                 }
+                 else if (aName == nsGkAtoms::lwtheme ||
+                          aName == nsGkAtoms::lwthemetextcolor) {
+                     // if the lwtheme changed, make sure to reset the document lwtheme cache
+                     nsCOMPtr<nsIXULDocument> xuldoc = do_QueryInterface(document);
+                     if (xuldoc) {
+                         xuldoc->ResetDocumentLWTheme();
++                        SetBrightTitlebarForeground(document->GetDocumentLWTheme() == nsIDocument::Doc_Theme_Bright);
+                     }
+                 }
+             }
+     
+             if (aName == nsGkAtoms::src && document) {
+                 LoadSrc();
+             }
+         } else  {
+@@ -1191,16 +1192,17 @@ nsXULElement::AfterSetAttr(int32_t aName
+                     }
+                 }
+                 else if ((aName == nsGkAtoms::lwtheme ||
+                           aName == nsGkAtoms::lwthemetextcolor)) {
+                     // if the lwtheme changed, make sure to restyle appropriately
+                     nsCOMPtr<nsIXULDocument> xuldoc = do_QueryInterface(doc);
+                     if (xuldoc) {
+                         xuldoc->ResetDocumentLWTheme();
++                        SetBrightTitlebarForeground(doc->GetDocumentLWTheme() == nsIDocument::Doc_Theme_Bright);
+                     }
+                 }
+                 else if (aName == nsGkAtoms::drawintitlebar) {
+                     SetDrawsInTitlebar(false);
+                 }
+                 else if (aName == nsGkAtoms::drawtitle) {
+                     SetDrawsTitle(false);
+                 }
+@@ -1980,16 +1982,27 @@ nsXULElement::SetDrawsTitle(bool aState)
+     nsIWidget* mainWidget = GetWindowWidget();
+     if (mainWidget) {
+         // We can do this synchronously because SetDrawsTitle doesn't have any
+         // synchronous effects apart from a harmless invalidation.
+         mainWidget->SetDrawsTitle(aState);
+     }
+ }
+ 
++void
++nsXULElement::SetBrightTitlebarForeground(bool aState)
++{
++    nsIWidget* mainWidget = GetWindowWidget();
++    if (mainWidget) {
++        // We can do this synchronously because SetBrightTitlebarForeground doesn't have any
++        // synchronous effects apart from a harmless invalidation.
++        mainWidget->SetUseBrightTitlebarForeground(aState);
++    }
++}
++
+ class MarginSetter : public nsRunnable
+ {
+ public:
+     explicit MarginSetter(nsIWidget* aWidget) :
+         mWidget(aWidget), mMargin(-1, -1, -1, -1)
+     {}
+     MarginSetter(nsIWidget *aWidget, const nsIntMargin& aMargin) :
+         mWidget(aWidget), mMargin(aMargin)
+diff --git a/content/xul/content/src/nsXULElement.h b/content/xul/content/src/nsXULElement.h
+--- a/content/xul/content/src/nsXULElement.h
++++ b/content/xul/content/src/nsXULElement.h
+@@ -687,19 +687,19 @@ protected:
+ 
+     nsIWidget* GetWindowWidget();
+ 
+     // attribute setters for widget
+     nsresult HideWindowChrome(bool aShouldHide);
+     void SetChromeMargins(const nsAttrValue* aValue);
+     void ResetChromeMargins();
+     void SetTitlebarColor(nscolor aColor, bool aActive);
+-
+     void SetDrawsInTitlebar(bool aState);
+     void SetDrawsTitle(bool aState);
++    void SetBrightTitlebarForeground(bool aState);
+ 
+     void RemoveBroadcaster(const nsAString & broadcasterId);
+ 
+ protected:
+     // Internal accessor. This shadows the 'Slots', and returns
+     // appropriate value.
+     nsIControllers *Controllers() {
+       nsDOMSlots* slots = GetExistingDOMSlots();
+diff --git a/widget/cocoa/nsChildView.mm b/widget/cocoa/nsChildView.mm
+--- a/widget/cocoa/nsChildView.mm
++++ b/widget/cocoa/nsChildView.mm
+@@ -2425,17 +2425,37 @@ nsChildView::UpdateTitlebarCGContext()
+ 
+     if ([context isFlipped] != [view isFlipped]) {
+       CGContextTranslateCTM(ctx, 0, viewFrame.size.height);
+       CGContextScaleCTM(ctx, 1, -1);
+     }
+ 
+     [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithGraphicsPort:ctx flipped:[view isFlipped]]];
+ 
+-    [cell drawWithFrame:[button bounds] inView:button];
++    if ([window useBrightTitlebarForeground] && !nsCocoaFeatures::OnYosemiteOrLater() &&
++        view == [window standardWindowButton:NSWindowFullScreenButton]) {
++      // Make the fullscreen button visible on dark titlebar backgrounds by
++      // drawing it into a new transparency layer and turning it white.
++      CGRect r = NSRectToCGRect([view bounds]);
++      CGContextBeginTransparencyLayerWithRect(ctx, r, nullptr);
++
++      // Draw twice for double opacity.
++      [cell drawWithFrame:[button bounds] inView:button];
++      [cell drawWithFrame:[button bounds] inView:button];
++
++      // Make it white.
++      CGContextSetBlendMode(ctx, kCGBlendModeSourceIn);
++      CGContextSetRGBFillColor(ctx, 1, 1, 1, 1);
++      CGContextFillRect(ctx, r);
++      CGContextSetBlendMode(ctx, kCGBlendModeNormal);
++
++      CGContextEndTransparencyLayer(ctx);
++    } else {
++      [cell drawWithFrame:[button bounds] inView:button];
++    }
+ 
+     [NSGraphicsContext setCurrentContext:context];
+     CGContextRestoreGState(ctx);
+   }
+ 
+   CGContextRestoreGState(ctx);
+ 
+   DrawTitlebarHighlight([frameView bounds].size, [(ChildView*)mView cornerRadius],
+diff --git a/widget/cocoa/nsCocoaWindow.h b/widget/cocoa/nsCocoaWindow.h
+--- a/widget/cocoa/nsCocoaWindow.h
++++ b/widget/cocoa/nsCocoaWindow.h
+@@ -74,16 +74,17 @@ typedef struct _nsCocoaWindowList {
+   // is ridiculously slow, so we cache it in the toplevel window for all
+   // descendants to use.
+   float mDPI;
+ 
+   NSTrackingArea* mTrackingArea;
+ 
+   BOOL mBeingShown;
+   BOOL mDrawTitle;
++  BOOL mBrightTitlebarForeground;
+ }
+ 
+ - (void)importState:(NSDictionary*)aState;
+ - (NSMutableDictionary*)exportState;
+ - (void)setDrawsContentsIntoWindowFrame:(BOOL)aState;
+ - (BOOL)drawsContentsIntoWindowFrame;
+ - (void)setTitlebarColor:(NSColor*)aColor forActiveWindow:(BOOL)aActive;
+ - (NSColor*)titlebarColorForActiveWindow:(BOOL)aActive;
+@@ -104,16 +105,19 @@ typedef struct _nsCocoaWindowList {
+ 
+ - (ChildView*)mainChildView;
+ 
+ - (NSArray*)titlebarControls;
+ 
+ - (void)setWantsTitleDrawn:(BOOL)aDrawTitle;
+ - (BOOL)wantsTitleDrawn;
+ 
++- (void)setUseBrightTitlebarForeground:(BOOL)aBrightForeground;
++- (BOOL)useBrightTitlebarForeground;
++
+ - (void)disableSetNeedsDisplay;
+ - (void)enableSetNeedsDisplay;
+ 
+ @end
+ 
+ @interface NSWindow (Undocumented)
+ 
+ // If a window has been explicitly removed from the "window cache" (to
+@@ -297,16 +301,17 @@ public:
+     virtual bool HasPendingInputEvent();
+     virtual nsTransparencyMode GetTransparencyMode();
+     virtual void SetTransparencyMode(nsTransparencyMode aMode);
+     NS_IMETHOD SetWindowShadowStyle(int32_t aStyle);
+     virtual void SetShowsToolbarButton(bool aShow);
+     virtual void SetShowsFullScreenButton(bool aShow);
+     virtual void SetWindowAnimationType(WindowAnimationType aType);
+     virtual void SetDrawsTitle(bool aDrawTitle);
++    virtual void SetUseBrightTitlebarForeground(bool aBrightForeground) MOZ_OVERRIDE;
+     NS_IMETHOD SetNonClientMargins(nsIntMargin &margins);
+     NS_IMETHOD SetWindowTitlebarColor(nscolor aColor, bool aActive);
+     virtual void SetDrawsInTitlebar(bool aState);
+     virtual nsresult SynthesizeNativeMouseEvent(nsIntPoint aPoint,
+                                                 uint32_t aNativeMessage,
+                                                 uint32_t aModifierFlags);
+ 
+     void DispatchSizeModeEvent();
+diff --git a/widget/cocoa/nsCocoaWindow.mm b/widget/cocoa/nsCocoaWindow.mm
+--- a/widget/cocoa/nsCocoaWindow.mm
++++ b/widget/cocoa/nsCocoaWindow.mm
+@@ -1995,16 +1995,26 @@ nsCocoaWindow::SetDrawsTitle(bool aDrawT
+ {
+   NS_OBJC_BEGIN_TRY_ABORT_BLOCK;
+ 
+   [mWindow setWantsTitleDrawn:aDrawTitle];
+ 
+   NS_OBJC_END_TRY_ABORT_BLOCK;
+ }
+ 
++void
++nsCocoaWindow::SetUseBrightTitlebarForeground(bool aBrightForeground)
++{
++  NS_OBJC_BEGIN_TRY_ABORT_BLOCK;
++
++  [mWindow setUseBrightTitlebarForeground:aBrightForeground];
++
++  NS_OBJC_END_TRY_ABORT_BLOCK;
++}
++
+ NS_IMETHODIMP nsCocoaWindow::SetNonClientMargins(nsIntMargin &margins)
+ {
+   NS_OBJC_BEGIN_TRY_ABORT_BLOCK_NSRESULT;
+ 
+   SetDrawsInTitlebar(margins.top == 0);
+ 
+   NS_OBJC_END_TRY_ABORT_BLOCK_NSRESULT;
+ }
+@@ -2627,16 +2637,17 @@ static NSMutableSet *gSwizzledFrameViewC
+   mActiveTitlebarColor = nil;
+   mInactiveTitlebarColor = nil;
+   mScheduledShadowInvalidation = NO;
+   mDisabledNeedsDisplay = NO;
+   mDPI = GetDPI(self);
+   mTrackingArea = nil;
+   mBeingShown = NO;
+   mDrawTitle = NO;
++  mBrightTitlebarForeground = NO;
+   [self updateTrackingArea];
+ 
+   return self;
+ }
+ 
+ - (void)setBeingShown:(BOOL)aValue
+ {
+   mBeingShown = aValue;
+@@ -2725,16 +2736,27 @@ static const NSString* kStateShowsToolba
+   mDrawTitle = aDrawTitle;
+ }
+ 
+ - (BOOL)wantsTitleDrawn
+ {
+   return mDrawTitle;
+ }
+ 
++- (void)setUseBrightTitlebarForeground:(BOOL)aBrightForeground
++{
++  mBrightTitlebarForeground = aBrightForeground;
++  [[self standardWindowButton:NSWindowFullScreenButton] setNeedsDisplay:YES];
++}
++
++- (BOOL)useBrightTitlebarForeground
++{
++  return mBrightTitlebarForeground;
++}
++
+ // Pass nil here to get the default appearance.
+ - (void)setTitlebarColor:(NSColor*)aColor forActiveWindow:(BOOL)aActive
+ {
+   [aColor retain];
+   if (aActive) {
+     [mActiveTitlebarColor release];
+     mActiveTitlebarColor = aColor;
+   } else {
+diff --git a/widget/nsIWidget.h b/widget/nsIWidget.h
+--- a/widget/nsIWidget.h
++++ b/widget/nsIWidget.h
+@@ -93,18 +93,18 @@ typedef void* nsNativeWidget;
+ #ifdef XP_WIN
+ #define NS_NATIVE_TSF_THREAD_MGR       100
+ #define NS_NATIVE_TSF_CATEGORY_MGR     101
+ #define NS_NATIVE_TSF_DISPLAY_ATTR_MGR 102
+ #define NS_NATIVE_ICOREWINDOW          103 // winrt specific
+ #endif
+ 
+ #define NS_IWIDGET_IID \
+-{ 0x5b27abd6, 0x9e53, 0x4a0a, \
+-  { 0x86, 0xf, 0x77, 0x5c, 0xc5, 0x69, 0x35, 0xf } };
++{ 0xcfe7543b, 0x8c0e, 0x40c3, \
++  { 0x9a, 0x6d, 0x77, 0x6e, 0x84, 0x8a, 0x7c, 0xfc } };
+ 
+ /*
+  * Window shadow styles
+  * Also used for the -moz-window-shadow CSS property
+  */
+ 
+ #define NS_STYLE_WINDOW_SHADOW_NONE             0
+ #define NS_STYLE_WINDOW_SHADOW_DEFAULT          1
+@@ -1361,16 +1361,22 @@ class nsIWidget : public nsISupports {
+ 
+     /**
+      * Specifies whether the window title should be drawn even if the window
+      * contents extend into the titlebar. Ignored on windows that don't draw
+      * in the titlebar. Only implemented on OS X.
+      */
+     virtual void SetDrawsTitle(bool aDrawTitle) {}
+ 
++    /**
++     * Indicates whether the widget should attempt to make titlebar controls
++     * easier to see on dark titlebar backgrounds.
++     */
++    virtual void SetUseBrightTitlebarForeground(bool aBrightForeground) {}
++
+     /** 
+      * Hide window chrome (borders, buttons) for this widget.
+      *
+      */
+     NS_IMETHOD HideWindowChrome(bool aShouldHide) = 0;
+ 
+     /**
+      * Put the toplevel window into or out of fullscreen mode.
