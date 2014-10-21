@@ -1,0 +1,1061 @@
+# HG changeset patch
+# Parent f2e6554750681528b0aff8a11af81f71d6aad46b
+# User Heather Arthur <fayearthur@gmail.com>
+Bug 886041 - Make the font inspector remotable; r=bgrins
+
+diff --git a/browser/devtools/fontinspector/font-inspector.css b/browser/devtools/fontinspector/font-inspector.css
+--- a/browser/devtools/fontinspector/font-inspector.css
++++ b/browser/devtools/fontinspector/font-inspector.css
+@@ -10,8 +10,16 @@
+ #template {
+   display: none;
+ }
+ 
+ .font.is-remote .font-is-remote,
+ .font.is-local .font-is-local {
+   display: inline;
+ }
++
++.font-format::before {
++  content: "(";
++}
++
++.font-format::after {
++  content: ")";
++}
+diff --git a/browser/devtools/fontinspector/font-inspector.js b/browser/devtools/fontinspector/font-inspector.js
+--- a/browser/devtools/fontinspector/font-inspector.js
++++ b/browser/devtools/fontinspector/font-inspector.js
+@@ -4,19 +4,24 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const {classes: Cc, interfaces: Ci, utils: Cu} = Components;
+ const DOMUtils = Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils);
+ 
++Cu.import("resource://gre/modules/XPCOMUtils.jsm");
++XPCOMUtils.defineLazyModuleGetter(this, "Task",
++  "resource://gre/modules/Task.jsm");
++
+ function FontInspector(inspector, window)
+ {
+   this.inspector = inspector;
++  this.pageStyle = this.inspector.pageStyle;
+   this.chromeDoc = window.document;
+   this.init();
+ }
+ 
+ FontInspector.prototype = {
+   init: function FI_init() {
+     this.update = this.update.bind(this);
+     this.onNewNode = this.onNewNode.bind(this);
+@@ -36,27 +41,26 @@ FontInspector.prototype = {
+            this.inspector.sidebar.getCurrentTabID() == "fontinspector";
+   },
+ 
+   /**
+    * Remove listeners.
+    */
+   destroy: function FI_destroy() {
+     this.chromeDoc = null;
+-    this.inspector.sidebar.off("layoutview-selected", this.onNewNode);
++    this.inspector.sidebar.off("fontinspector-selected", this.onNewNode);
+     this.inspector.selection.off("new-node", this.onNewNode);
+     this.showAllButton.removeEventListener("click", this.showAll);
+   },
+ 
+   /**
+    * Selection 'new-node' event handler.
+    */
+   onNewNode: function FI_onNewNode() {
+     if (this.isActive() &&
+-        this.inspector.selection.isLocal() &&
+         this.inspector.selection.isConnected() &&
+         this.inspector.selection.isElementNode()) {
+       this.undim();
+       this.update();
+     } else {
+       this.dim();
+     }
+   },
+@@ -71,130 +75,89 @@ FontInspector.prototype = {
+ 
+   /**
+    * Show the font list. A node is selected.
+    */
+   undim: function FI_undim() {
+     this.chromeDoc.body.classList.remove("dim");
+   },
+ 
+-  /**
+-   * Retrieve all the font related info we have for the selected
+-   * node and display them.
+-   */
+-  update: function FI_update() {
++ /**
++  * Retrieve all the font info for the selected node and display it.
++  */
++  update: Task.async(function*() {
+     if (!this.isActive() ||
+         !this.inspector.selection.isConnected() ||
+         !this.inspector.selection.isElementNode() ||
+         this.chromeDoc.body.classList.contains("dim")) {
+       return;
+     }
++    this.chromeDoc.querySelector("#all-fonts").innerHTML = "";
+ 
+-    let node = this.inspector.selection.node;
+-    let contentDocument = node.ownerDocument;
++    let node = this.inspector.selection.nodeFront;
++    let options = {
++      includePreviews: true
++    }
+ 
+-    // We don't get fonts for a node, but for a range
+-    let rng = contentDocument.createRange();
+-    rng.selectNodeContents(node);
+-    let fonts = DOMUtils.getUsedFontFaces(rng);
+-    let fontsArray = [];
+-    for (let i = 0; i < fonts.length; i++) {
+-      fontsArray.push(fonts.item(i));
++    let fonts = yield this.pageStyle.getUsedFontFaces(node, options);
++
++    for (let font of fonts) {
++      font.previewUrl = yield font.preview.data.string();
+     }
+-    fontsArray = fontsArray.sort(function(a, b) {
+-      return a.srcIndex < b.srcIndex;
+-    });
++
++    // clear again in case an update got in right before us
+     this.chromeDoc.querySelector("#all-fonts").innerHTML = "";
+-    for (let f of fontsArray) {
+-      this.render(f, contentDocument);
++
++    for (let font of fonts) {
++      this.render(font);
+     }
+-  },
++
++    this.inspector.emit("fontinspector-updated");
++  }),
+ 
+   /**
+    * Display the information of one font.
+    */
+-  render: function FI_render(font, document) {
++  render: function FI_render(font) {
+     let s = this.chromeDoc.querySelector("#template > section");
+     s = s.cloneNode(true);
+ 
+     s.querySelector(".font-name").textContent = font.name;
+     s.querySelector(".font-css-name").textContent = font.CSSFamilyName;
+-    s.querySelector(".font-format").textContent = font.format;
+ 
+-    if (font.srcIndex == -1) {
++    if (font.URI) {
++      s.classList.add("is-remote");
++    } else {
+       s.classList.add("is-local");
+-    } else {
+-      s.classList.add("is-remote");
++    }
++
++    let formatElem = s.querySelector(".font-format");
++    if (font.format) {
++      formatElem.textContent = font.format;
++    }
++    else {
++      formatElem.hidden = true;
+     }
+ 
+     s.querySelector(".font-url").value = font.URI;
+ 
+-    let iframe = s.querySelector(".font-preview");
+     if (font.rule) {
+       // This is the @font-face{…} code.
+-      let cssText = font.rule.style.parentRule.cssText;
++      let cssText = font.ruleText;
+ 
+       s.classList.add("has-code");
+       s.querySelector(".font-css-code").textContent = cssText;
+-
+-      // We guess the base URL of the stylesheet to make
+-      // sure the font will be accessible in the preview.
+-      // If the font-face is in an inline <style>, we get
+-      // the location of the page.
+-      let origin = font.rule.style.parentRule.parentStyleSheet.href;
+-      if (!origin) { // Inline stylesheet
+-        origin = document.location.href;
+-      }
+-      // We remove the last part of the URL to get a correct base.
+-      let base = origin.replace(/\/[^\/]*$/,"/")
+-
+-      // From all this information, we build a preview.
+-      this.buildPreview(iframe, font.CSSFamilyName, cssText, base);
+-    } else {
+-      this.buildPreview(iframe, font.CSSFamilyName, "", "");
+     }
++    let preview = s.querySelector(".font-preview");
++    preview.src = font.previewUrl;
+ 
+     this.chromeDoc.querySelector("#all-fonts").appendChild(s);
+   },
+ 
+   /**
+-   * Show a preview of the font in an iframe.
+-   */
+-  buildPreview: function FI_buildPreview(iframe, name, cssCode, base) {
+-    /* The HTML code of the preview is:
+-     *   <!DOCTYPE HTML>
+-     *   <head>
+-     *    <base href="{base}"></base>
+-     *   </head>
+-     *   <style>
+-     *   p {font-family: {name};}
+-     *   * {font-size: 40px;line-height:60px;padding:0 10px;margin:0};
+-     *   </style>
+-     *   <p contenteditable spellcheck='false'>Abc</p>
+-     */
+-    let extraCSS = "* {padding:0;margin:0}";
+-    extraCSS += ".theme-dark {color: white}";
+-    extraCSS += "p {font-size: 40px;line-height:60px;padding:0 10px;margin:0;}";
+-    cssCode += extraCSS;
+-    let src = "data:text/html;charset=utf-8,<!DOCTYPE HTML><head><base></base></head><style></style><p contenteditable spellcheck='false'>Abc</p>";
+-    iframe.addEventListener("load", function onload() {
+-      iframe.removeEventListener("load", onload, true);
+-      let doc = iframe.contentWindow.document;
+-      // We could have done that earlier, but we want to avoid any URL-encoding
+-      // nightmare.
+-      doc.querySelector("base").href = base;
+-      doc.querySelector("style").textContent = cssCode;
+-      doc.querySelector("p").style.fontFamily = name;
+-      // Forward theme
+-      doc.documentElement.className = document.documentElement.className;
+-    }, true);
+-    iframe.src = src;
+-  },
+-
+-  /**
+    * Select the <body> to show all the fonts included in the document.
+    */
+   showAll: function FI_showAll() {
+     if (!this.isActive() ||
+         !this.inspector.selection.isConnected() ||
+         !this.inspector.selection.isElementNode()) {
+       return;
+     }
+diff --git a/browser/devtools/fontinspector/font-inspector.xhtml b/browser/devtools/fontinspector/font-inspector.xhtml
+--- a/browser/devtools/fontinspector/font-inspector.xhtml
++++ b/browser/devtools/fontinspector/font-inspector.xhtml
+@@ -19,24 +19,24 @@
+   <body class="theme-sidebar devtools-monospace" role="application">
+     <script type="application/javascript;version=1.8" src="font-inspector.js"></script>
+     <div id="root">
+       <ul id="all-fonts"></ul>
+       <button id="showall">&showAllFonts;</button>
+     </div>
+     <div id="template">
+       <section class="font">
+-        <iframe sandbox="" class="font-preview"></iframe>
++        <img class="font-preview"></img>
+         <div class="font-info">
+           <h1 class="font-name"></h1>
+           <span class="font-is-local">&system;</span>
+           <span class="font-is-remote">&remote;</span>
+           <p class="font-format-url">
+             <input readonly="readonly" class="font-url"></input>
+-            (<span class="font-format"></span>)
++            <span class="font-format"></span>
+           </p>
+           <p class="font-css">&usedAs; "<span class="font-css-name"></span>"</p>
+           <pre class="font-css-code"></pre>
+         </div>
+       </section>
+     </div>
+   </body>
+ </html>
+diff --git a/browser/devtools/fontinspector/test/browser.ini b/browser/devtools/fontinspector/test/browser.ini
+--- a/browser/devtools/fontinspector/test/browser.ini
++++ b/browser/devtools/fontinspector/test/browser.ini
+@@ -1,10 +1,8 @@
+ [DEFAULT]
+-skip-if = e10s # Bug ?????? - devtools tests disabled with e10s
+ subsuite = devtools
+ support-files =
+   browser_font.woff
+   browser_fontinspector.html
++  head.js
+ 
+ [browser_fontinspector.js]
+-skip-if = e10s # Bug ?????? - devtools tests disabled with e10s
+-
+diff --git a/browser/devtools/fontinspector/test/browser_fontinspector.js b/browser/devtools/fontinspector/test/browser_fontinspector.js
+--- a/browser/devtools/fontinspector/test/browser_fontinspector.js
++++ b/browser/devtools/fontinspector/test/browser_fontinspector.js
+@@ -1,130 +1,89 @@
+ /* Any copyright is dedicated to the Public Domain.
+    http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ let tempScope = {};
+ let {gDevTools} = Cu.import("resource:///modules/devtools/gDevTools.jsm", {});
+ let {devtools} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
+ let TargetFactory = devtools.TargetFactory;
+ 
+-let DOMUtils = Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils);
++let TEST_URI = "http://mochi.test:8888/browser/browser/devtools/fontinspector/test/browser_fontinspector.html";
+ 
+-function test() {
+-  waitForExplicitFinish();
++let view, viewDoc;
+ 
+-  let doc;
+-  let view;
+-  let viewDoc;
+-  let inspector;
++let test = asyncTest(function*() {
++  yield loadTab(TEST_URI);
++  let {toolbox, inspector} = yield openInspector();
+ 
+-  gDevTools.testing = true;
+-  SimpleTest.registerCleanupFunction(() => {
+-    gDevTools.testing = false;
+-  });
++  info("Selecting the test node");
++  yield selectNode("body", inspector);
+ 
+-  gBrowser.selectedTab = gBrowser.addTab();
+-  gBrowser.selectedBrowser.addEventListener("load", function onload() {
+-    gBrowser.selectedBrowser.removeEventListener("load", onload, true);
+-    doc = content.document;
+-    waitForFocus(setupTest, content);
+-  }, true);
++  let updated = inspector.once("fontinspector-updated");
++  inspector.sidebar.select("fontinspector");
++  yield updated;
+ 
+-  content.location = "http://mochi.test:8888/browser/browser/devtools/fontinspector/test/browser_fontinspector.html";
++  info("Font Inspector ready");
+ 
+-  function setupTest() {
+-    let rng = doc.createRange();
+-    rng.selectNode(doc.body);
+-    let fonts = DOMUtils.getUsedFontFaces(rng);
+-    if (fonts.length != 2) {
+-      // Fonts are not loaded yet.
+-      // Let try again in a couple of milliseconds (hacky, but
+-      // there's not better way to do it. See bug 835247).
+-      setTimeout(setupTest, 500);
+-    } else {
+-      let target = TargetFactory.forTab(gBrowser.selectedTab);
+-      gDevTools.showToolbox(target, "inspector").then(function(toolbox) {
+-        openFontInspector(toolbox.getCurrentPanel());
+-      });
+-    }
+-  }
++  view = inspector.sidebar.getWindowForTab("fontinspector");
++  viewDoc = view.document;
+ 
+-  function openFontInspector(aInspector) {
+-    info("Inspector open");
+-    inspector = aInspector;
++  ok(!!view.fontInspector, "Font inspector document is alive.");
+ 
+-    inspector.selection.setNode(doc.body);
+-    inspector.sidebar.select("fontinspector");
+-    inspector.sidebar.once("fontinspector-ready", testBodyFonts);
+-  }
++  yield testBodyFonts(inspector);
+ 
+-  function testBodyFonts() {
+-    info("Font Inspector ready");
++  yield testDivFonts(inspector);
+ 
+-    view = inspector.sidebar.getWindowForTab("fontinspector");
+-    viewDoc = view.document;
++  yield testShowAllFonts(inspector);
+ 
+-    ok(!!view.fontInspector, "Font inspector document is alive.");
++  view = viewDoc = null;
++});
+ 
+-    let s = viewDoc.querySelectorAll("#all-fonts > section");
+-    is(s.length, 2, "Found 2 fonts");
++function* testBodyFonts(inspector) {
++  let s = viewDoc.querySelectorAll("#all-fonts > section");
++  is(s.length, 2, "Found 2 fonts");
+ 
+-    is(s[0].querySelector(".font-name").textContent,
+-       "DeLarge Bold", "font 0: Right font name");
+-    ok(s[0].classList.contains("is-remote"),
+-       "font 0: is remote");
+-    is(s[0].querySelector(".font-url").value,
+-       "http://mochi.test:8888/browser/browser/devtools/fontinspector/test/browser_font.woff",
+-       "font 0: right url");
+-    is(s[0].querySelector(".font-format").textContent,
+-       "woff", "font 0: right font format");
+-    is(s[0].querySelector(".font-css-name").textContent,
+-       "bar", "font 0: right css name");
++  is(s[0].querySelector(".font-name").textContent,
++     "DeLarge Bold", "font 0: Right font name");
++  ok(s[0].classList.contains("is-remote"),
++     "font 0: is remote");
++  is(s[0].querySelector(".font-url").value,
++     "http://mochi.test:8888/browser/browser/devtools/fontinspector/test/browser_font.woff",
++     "font 0: right url");
++  is(s[0].querySelector(".font-format").textContent,
++     "woff", "font 0: right font format");
++  is(s[0].querySelector(".font-css-name").textContent,
++     "bar", "font 0: right css name");
+ 
+-    let font1Name = s[1].querySelector(".font-name").textContent;
+-    let font1CssName = s[1].querySelector(".font-css-name").textContent;
++  let font1Name = s[1].querySelector(".font-name").textContent;
++  let font1CssName = s[1].querySelector(".font-css-name").textContent;
+ 
+-    // On Linux test machines, the Arial font doesn't exist.
+-    // The fallback is "Liberation Sans"
++  // On Linux test machines, the Arial font doesn't exist.
++  // The fallback is "Liberation Sans"
++  ok((font1Name == "Arial") || (font1Name == "Liberation Sans"),
++     "font 1: Right font name");
++  ok(s[1].classList.contains("is-local"), "font 1: is local");
++  ok((font1CssName == "Arial") || (font1CssName == "Liberation Sans"),
++     "Arial", "font 1: right css name");
++}
+ 
+-    ok((font1Name == "Arial") || (font1Name == "Liberation Sans"),
+-       "font 1: Right font name");
+-    ok(s[1].classList.contains("is-local"), "font 1: is local");
+-    ok((font1CssName == "Arial") || (font1CssName == "Liberation Sans"),
+-       "Arial", "font 1: right css name");
++function* testDivFonts(inspector) {
++  let updated = inspector.once("fontinspector-updated");
++  yield selectNode("div", inspector);
++  yield updated;
+ 
+-    testDivFonts();
+-  }
++  let sections1 = viewDoc.querySelectorAll("#all-fonts > section");
++  is(sections1.length, 1, "Found 1 font on DIV");
++  is(sections1[0].querySelector(".font-name").textContent, "DeLarge Bold",
++    "The DIV font has the right name");
++}
+ 
+-  function testDivFonts() {
+-    inspector.selection.setNode(doc.querySelector("div"));
+-    inspector.once("inspector-updated", () => {
+-      let s = viewDoc.querySelectorAll("#all-fonts > section");
+-      is(s.length, 1, "Found 1 font on DIV");
+-      is(s[0].querySelector(".font-name").textContent, "DeLarge Bold",
+-        "The DIV font has the right name");
++function* testShowAllFonts(inspector) {
++  info("testing showing all fonts");
+ 
+-      testShowAllFonts();
+-    });
+-  }
++  let updated = inspector.once("fontinspector-updated");
++  viewDoc.querySelector("#showall").click();
++  yield updated;
+ 
+-  function testShowAllFonts() {
+-    viewDoc.querySelector("#showall").click();
+-    inspector.once("inspector-updated", () => {
+-      is(inspector.selection.node, doc.body, "Show all fonts selected the body node");
+-      let s = viewDoc.querySelectorAll("#all-fonts > section");
+-      is(s.length, 2, "And font-inspector still shows 2 fonts for body");
+-
+-      finishUp();
+-    });
+-  }
+-
+-  function finishUp() {
+-    executeSoon(function() {
+-      gDevTools.once("toolbox-destroyed", () => {
+-        doc = view = viewDoc = inspector = null;
+-        gBrowser.removeCurrentTab();
+-        finish();
+-      });
+-      inspector._toolbox.destroy();
+-    });
+-  }
++  is(inspector.selection.nodeFront.nodeName, "BODY", "Show all fonts selected the body node");
++  let sections = viewDoc.querySelectorAll("#all-fonts > section");
++  is(sections.length, 2, "And font-inspector still shows 2 fonts for body");
+ }
+diff --git a/browser/devtools/fontinspector/test/head.js b/browser/devtools/fontinspector/test/head.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/fontinspector/test/head.js
+@@ -0,0 +1,144 @@
++ /* vim: set ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++"use strict";
++
++const Cu = Components.utils;
++const Ci = Components.interfaces;
++const Cc = Components.classes;
++
++const { Promise: promise } = Cu.import("resource://gre/modules/Promise.jsm", {});
++
++let {devtools} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
++let TargetFactory = devtools.TargetFactory;
++
++// All test are asynchronous
++waitForExplicitFinish();
++
++gDevTools.testing = true;
++SimpleTest.registerCleanupFunction(() => {
++  gDevTools.testing = false;
++});
++
++registerCleanupFunction(function*() {
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++  yield gDevTools.closeToolbox(target);
++
++  while (gBrowser.tabs.length > 1) {
++    gBrowser.removeCurrentTab();
++  }
++});
++
++/**
++ * Define an async test based on a generator function
++ */
++function asyncTest(generator) {
++  return () => Task.spawn(generator).then(null, ok.bind(null, false)).then(finish);
++}
++
++/**
++ * Add a new test tab in the browser and load the given url.
++ * @param {String} url The url to be loaded in the new tab
++ * @return a promise that resolves to the tab object when the url is loaded
++ */
++function loadTab(url) {
++  let deferred = promise.defer();
++
++  let tab = gBrowser.selectedTab = gBrowser.addTab(url);
++  let browser = gBrowser.getBrowserForTab(tab);
++
++  browser.addEventListener("load", function onLoad() {
++    browser.removeEventListener("load", onLoad, true);
++    deferred.resolve({tab: tab, browser: browser});
++  }, true);
++
++  return deferred.promise;
++}
++
++/**
++ * Open the toolbox, with the inspector tool visible.
++ * @param {Function} cb Optional callback, if you don't want to use the returned
++ * promise
++ * @return a promise that resolves when the inspector is ready
++ */
++let openInspector = Task.async(function*(cb) {
++  info("Opening the inspector");
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++
++  let inspector, toolbox;
++
++  // Checking if the toolbox and the inspector are already loaded
++  // The inspector-updated event should only be waited for if the inspector
++  // isn't loaded yet
++  toolbox = gDevTools.getToolbox(target);
++  if (toolbox) {
++    inspector = toolbox.getPanel("inspector");
++    if (inspector) {
++      info("Toolbox and inspector already open");
++      if (cb) {
++        return cb(inspector, toolbox);
++      } else {
++        return {
++          toolbox: toolbox,
++          inspector: inspector
++        };
++      }
++    }
++  }
++
++  info("Opening the toolbox");
++  toolbox = yield gDevTools.showToolbox(target, "inspector");
++  yield waitForToolboxFrameFocus(toolbox);
++  inspector = toolbox.getPanel("inspector");
++
++  info("Waiting for the inspector to update");
++  yield inspector.once("inspector-updated");
++
++  if (cb) {
++    return cb(inspector, toolbox);
++  } else {
++    return {
++      toolbox: toolbox,
++      inspector: inspector
++    };
++  }
++});
++
++/**
++ * Select a node in the inspector given its selector.
++ */
++let selectNode = Task.async(function*(selector, inspector, reason="test") {
++  info("Selecting the node for '" + selector + "'");
++  let nodeFront = yield getNodeFront(selector, inspector);
++  let updated = inspector.once("inspector-updated");
++  inspector.selection.setNodeFront(nodeFront, reason);
++  yield updated;
++});
++
++/**
++ * Get the NodeFront for a given css selector, via the protocol
++ * @param {String|NodeFront} selector
++ * @param {InspectorPanel} inspector The instance of InspectorPanel currently
++ * loaded in the toolbox
++ * @return {Promise} Resolves to the NodeFront instance
++ */
++function getNodeFront(selector, {walker}) {
++  if (selector._form) {
++    return selector;
++  }
++  return walker.querySelector(walker.rootNode, selector);
++}
++
++/**
++ * Wait for the toolbox frame to receive focus after it loads
++ * @param {Toolbox} toolbox
++ * @return a promise that resolves when focus has been received
++ */
++function waitForToolboxFrameFocus(toolbox) {
++  info("Making sure that the toolbox's frame is focused");
++  let def = promise.defer();
++  let win = toolbox.frame.contentWindow;
++  waitForFocus(def.resolve, win);
++  return def.promise;
++}
+diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
+--- a/browser/devtools/inspector/inspector-panel.js
++++ b/browser/devtools/inspector/inspector-panel.js
+@@ -101,16 +101,20 @@ InspectorPanel.prototype = {
+   get isOuterHTMLEditable() {
+     return this._target.client.traits.editOuterHTML;
+   },
+ 
+   get hasUrlToImageDataResolver() {
+     return this._target.client.traits.urlToImageDataResolver;
+   },
+ 
++  get canGetUsedFontFaces() {
++    return this._target.client.traits.getUsedFontFaces;
++  },
++
+   _deferredOpen: function(defaultSelection) {
+     let deferred = promise.defer();
+ 
+     this.onNewRoot = this.onNewRoot.bind(this);
+     this.walker.on("new-root", this.onNewRoot);
+ 
+     this.nodemenu = this.panelDoc.getElementById("inspector-node-popup");
+     this.lastNodemenuItem = this.nodemenu.lastChild;
+@@ -310,17 +314,17 @@ InspectorPanel.prototype = {
+     this.sidebar.addTab("ruleview",
+                         "chrome://browser/content/devtools/cssruleview.xhtml",
+                         "ruleview" == defaultTab);
+ 
+     this.sidebar.addTab("computedview",
+                         "chrome://browser/content/devtools/computedview.xhtml",
+                         "computedview" == defaultTab);
+ 
+-    if (Services.prefs.getBoolPref("devtools.fontinspector.enabled") && !this.target.isRemote) {
++    if (Services.prefs.getBoolPref("devtools.fontinspector.enabled") && this.canGetUsedFontFaces) {
+       this.sidebar.addTab("fontinspector",
+                           "chrome://browser/content/devtools/fontinspector/font-inspector.xhtml",
+                           "fontinspector" == defaultTab);
+     }
+ 
+     this.sidebar.addTab("layoutview",
+                         "chrome://browser/content/devtools/layoutview/view.xhtml",
+                         "layoutview" == defaultTab);
+diff --git a/browser/themes/shared/devtools/font-inspector.css b/browser/themes/shared/devtools/font-inspector.css
+--- a/browser/themes/shared/devtools/font-inspector.css
++++ b/browser/themes/shared/devtools/font-inspector.css
+@@ -38,19 +38,18 @@ body {
+   border-bottom: 0;
+ }
+ 
+ .theme-light .font:nth-child(even) {
+   background: #F4F4F4;
+ }
+ 
+ .font-preview {
++  margin-left: -4px;
+   height: 60px;
+-  width: 100%;
+-  border: 0;
+   display: block;
+ }
+ 
+ .font-info {
+   display: block;
+ }
+ 
+ .font-name {
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -55,17 +55,17 @@ const Services = require("Services");
+ const protocol = require("devtools/server/protocol");
+ const {Arg, Option, method, RetVal, types} = protocol;
+ const {LongStringActor, ShortLongString} = require("devtools/server/actors/string");
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const object = require("sdk/util/object");
+ const events = require("sdk/event/core");
+ const {Unknown} = require("sdk/platform/xpcom");
+ const {Class} = require("sdk/core/heritage");
+-const {PageStyleActor} = require("devtools/server/actors/styles");
++const {PageStyleActor, getFontPreviewData} = require("devtools/server/actors/styles");
+ const {
+   HighlighterActor,
+   CustomHighlighterActor,
+   HIGHLIGHTER_CLASSES
+ } = require("devtools/server/actors/highlighter");
+ const {getLayoutChangesObserver, releaseLayoutChangesObserver} =
+   require("devtools/server/actors/layout");
+ 
+@@ -645,38 +645,24 @@ var NodeActor = exports.NodeActor = prot
+    * Given the font and fill style, get the image data of a canvas with the
+    * preview text and font.
+    * Returns an imageData object with the actual data being a LongStringActor
+    * and the width of the text as a string.
+    * The image data is transmitted as a base64 encoded png data-uri.
+    */
+   getFontFamilyDataURL: method(function(font, fillStyle="black") {
+     let doc = this.rawNode.ownerDocument;
+-    let canvas = doc.createElementNS(XHTML_NS, "canvas");
+-    let ctx = canvas.getContext("2d");
+-    let fontValue = FONT_FAMILY_PREVIEW_TEXT_SIZE + "px " + font + ", serif";
+-
+-    // Get the correct preview text measurements and set the canvas dimensions
+-    ctx.font = fontValue;
+-    let textWidth = ctx.measureText(FONT_FAMILY_PREVIEW_TEXT).width;
+-    canvas.width = textWidth * 2;
+-    canvas.height = FONT_FAMILY_PREVIEW_TEXT_SIZE * 3;
+-
+-    ctx.font = fontValue;
+-    ctx.fillStyle = fillStyle;
+-
+-    // Align the text to be vertically center in the tooltip and
+-    // oversample the canvas for better text quality
+-    ctx.textBaseline = "top";
+-    ctx.scale(2, 2);
+-    ctx.fillText(FONT_FAMILY_PREVIEW_TEXT, 0, Math.round(FONT_FAMILY_PREVIEW_TEXT_SIZE / 3));
+-
+-    let dataURL = canvas.toDataURL("image/png");
+-
+-    return { data: LongStringActor(this.conn, dataURL), size: textWidth };
++    let options = {
++      previewText: FONT_FAMILY_PREVIEW_TEXT,
++      previewFontSize: FONT_FAMILY_PREVIEW_TEXT_SIZE,
++      fillStyle: fillStyle
++    }
++    let { dataURL, size } = getFontPreviewData(font, doc, options);
++
++    return { data: LongStringActor(this.conn, dataURL), size: size };
+   }, {
+     request: {font: Arg(0, "string"), fillStyle: Arg(1, "nullable:string")},
+     response: RetVal("imageData")
+   })
+ });
+ 
+ /**
+  * Client side of the node actor.
+diff --git a/toolkit/devtools/server/actors/root.js b/toolkit/devtools/server/actors/root.js
+--- a/toolkit/devtools/server/actors/root.js
++++ b/toolkit/devtools/server/actors/root.js
+@@ -138,17 +138,20 @@ RootActor.prototype = {
+     // Whether conditional breakpoints are supported
+     conditionalBreakpoints: true,
+     bulk: true,
+     // Whether the style rule actor implements the modifySelector method
+     // that modifies the rule's selector
+     selectorEditable: true,
+     // Whether the page style actor implements the addNewRule method that
+     // adds new rules to the page
+-    addNewRule: true
++    addNewRule: true,
++    // Whether the page style actor implements the getUsedFontFaces method
++    // that returns the font faces used on a node
++    getUsedFontFaces: true
+   },
+ 
+   /**
+    * Return a 'hello' packet as specified by the Remote Debugging Protocol.
+    */
+   sayHello: function() {
+     return {
+       from: this.actorID,
+diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/actors/styles.js
+--- a/toolkit/devtools/server/actors/styles.js
++++ b/toolkit/devtools/server/actors/styles.js
+@@ -6,17 +6,19 @@
+ 
+ const {Cc, Ci, Cu} = require("chrome");
+ const Services = require("Services");
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const protocol = require("devtools/server/protocol");
+ const {Arg, Option, method, RetVal, types} = protocol;
+ const events = require("sdk/event/core");
+ const object = require("sdk/util/object");
+-const { Class } = require("sdk/core/heritage");
++const {Class} = require("sdk/core/heritage");
++const {LongStringActor} = require("devtools/server/actors/string");
++
+ 
+ // This will add the "stylesheet" actor type for protocol.js to recognize
+ require("devtools/server/actors/stylesheets");
+ 
+ loader.lazyGetter(this, "CssLogic", () => require("devtools/styleinspector/css-logic").CssLogic);
+ loader.lazyGetter(this, "DOMUtils", () => Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils));
+ 
+ // The PageStyle actor flattens the DOM CSS objects a little bit, merging
+@@ -29,16 +31,35 @@ const PSEUDO_ELEMENTS = [":first-line", 
+ exports.PSEUDO_ELEMENTS = PSEUDO_ELEMENTS;
+ 
+ // When gathering rules to read for pseudo elements, we will skip
+ // :before and :after, which are handled as a special case.
+ const PSEUDO_ELEMENTS_TO_READ = PSEUDO_ELEMENTS.filter(pseudo => {
+   return pseudo !== ":before" && pseudo !== ":after";
+ });
+ 
++const XHTML_NS = "http://www.w3.org/1999/xhtml";
++const FONT_PREVIEW_TEXT = "Abc";
++const FONT_PREVIEW_FONT_SIZE = 40;
++const FONT_PREVIEW_FILLSTYLE = "black";
++
++// fudgy list of common font weight names
++const FONT_WEIGHTS = {
++  "ultralight": 100,
++  "thin": 100,
++  "extralight": 200,
++  "light": 300,
++  "medium": 500,
++  "demibold": 600,
++  "semibold": 600,
++  "bold": 700,
++  "extrabold": 800,
++  "black": 900
++}
++
+ // Predeclare the domnode actor type for use in requests.
+ types.addActorType("domnode");
+ 
+ // Predeclare the domstylerule actor type
+ types.addActorType("domstylerule");
+ 
+ /**
+  * DOM Nodes returned by the style actor will be owned by the DOM walker
+@@ -65,16 +86,33 @@ types.addDictType("matchedselector", {
+ });
+ 
+ types.addDictType("appliedStylesReturn", {
+   entries: "array:appliedstyle",
+   rules: "array:domstylerule",
+   sheets: "array:stylesheet"
+ });
+ 
++types.addDictType("fontpreview", {
++  data: "nullable:longstring",
++  size: "json"
++});
++
++types.addDictType("fontface", {
++  name: "string",
++  CSSFamilyName: "string",
++  rule: "nullable:domstylerule",
++  srcIndex: "number",
++  URI: "string",
++  format: "string",
++  preview: "nullable:fontpreview",
++  localName: "string",
++  metadata: "string"
++});
++
+ /**
+  * The PageStyle actor lets the client look at the styles on a page, as
+  * they are applied to a given node.
+  */
+ var PageStyleActor = protocol.ActorClass({
+   typeName: "pagestyle",
+ 
+   /**
+@@ -191,16 +229,110 @@ var PageStyleActor = protocol.ActorClass
+       filter: Option(1, "string"),
+     },
+     response: {
+       computed: RetVal("json")
+     }
+   }),
+ 
+   /**
++   * Get the font faces used in an element.
++   *
++   * @param NodeActor node
++   *    The node to get fonts from.
++   * @param object options
++   *   `includePreviews`: Whether to also return image previews of the fonts.
++   *   `previewText`: The text to display in the previews.
++   *   `previewFontSize`: The font size of the text in the previews.
++   *
++   * @returns object
++   *   object with 'fontFaces', a list of fonts that apply to this node.
++   */
++  getUsedFontFaces: method(function(node, options) {
++    let contentDocument = node.rawNode.ownerDocument;
++
++    // We don't get fonts for a node, but for a range
++    let rng = contentDocument.createRange();
++    rng.selectNodeContents(node.rawNode);
++    let fonts = DOMUtils.getUsedFontFaces(rng);
++    let fontsArray = [];
++
++    for (let i = 0; i < fonts.length; i++) {
++      let font = fonts.item(i);
++      let fontFace = {
++        name: font.name,
++        CSSFamilyName: font.CSSFamilyName,
++        srcIndex: font.srcIndex,
++        URI: font.URI,
++        format: font.format,
++        localName: font.localName,
++        metadata: font.metadata
++      }
++
++      if (font.rule) {
++        fontFace.rule = StyleRuleActor(this, font.rule);
++        fontFace.ruleText = font.rule.cssText;
++      }
++
++      if (options.includePreviews) {
++        // figure out if it's italic or bold for the preview
++        let fontStyle = "";
++        if (font.rule) {
++          fontStyle += font.rule.style.getPropertyValue("font-style") + " " +
++                       font.rule.style.getPropertyValue("font-weight");
++        }
++        else {
++          let name = font.name.toLowerCase();
++          for (let weight in FONT_WEIGHTS) {
++            if (name.contains(" " + weight)) {
++              fontStyle += " " + FONT_WEIGHTS[weight];
++              break;
++            }
++          }
++
++          if (name.contains("italic")) {
++            fontStyle += " italic";
++          }
++          else if (name.contains("oblique")) {
++            fontStyle += " oblique";
++          }
++        }
++        let opts = {
++          previewText: options.previewText,
++          previewFontSize: options.previewFontSize,
++          fontStyle: fontStyle
++        }
++        let { dataURL, size } = getFontPreviewData(font.CSSFamilyName,
++                                                   contentDocument, opts);
++        fontFace.preview = {
++          data: LongStringActor(this.conn, dataURL),
++          size: size
++        };
++      }
++
++      fontsArray.push(fontFace);
++    }
++    fontsArray = fontsArray.sort(function(a, b) {
++      return a.srcIndex < b.srcIndex;
++    });
++
++    return fontsArray;
++  }, {
++    request: {
++      node: Arg(0, "domnode"),
++      includePreviews: Option(1, "boolean"),
++      previewText: Option(1, "string"),
++      previewFontSize: Option(1, "string")
++    },
++    response: {
++      fontFaces: RetVal("array:fontface")
++    }
++  }),
++
++  /**
+    * Get a list of selectors that match a given property for a node.
+    *
+    * @param NodeActor node
+    * @param string property
+    * @param object options
+    *   `filter`: A string filter that affects the "matched" handling.
+    *     'user': Include properties from user style sheets.
+    *     'ua': Include properties from user and user-agent sheets.
+@@ -1099,8 +1231,57 @@ var RuleModificationList = Class({
+   removeProperty: function(name) {
+     this.modifications.push({
+       type: "remove",
+       name: name
+     });
+   }
+ });
+ 
++/**
++ * Helper function for getting an image preview of the given font.
++ *
++ * @param font {string}
++ *        Name of font to preview
++ * @param doc {Document}
++ *        Document to use to render font
++ * @param options {object}
++ *        Object with options 'previewText' and 'previewFontSize'
++ *
++ * @return dataUrl
++ *         The data URI of the font preview image
++ */
++function getFontPreviewData(font, doc, options) {
++  options = options || {};
++  let previewText = options.previewText || FONT_PREVIEW_TEXT;
++  let previewFontSize = options.previewFontSize || FONT_PREVIEW_FONT_SIZE;
++  let fillStyle = options.fillStyle || FONT_PREVIEW_FILLSTYLE;
++  let fontStyle = options.fontStyle || "";
++
++  let canvas = doc.createElementNS(XHTML_NS, "canvas");
++  let ctx = canvas.getContext("2d");
++  let fontValue = fontStyle + " " + previewFontSize + "px " + font + ", serif";
++
++  // Get the correct preview text measurements and set the canvas dimensions
++  ctx.font = fontValue;
++  let textWidth = ctx.measureText(previewText).width;
++  let offset = 4; // offset to avoid cutting off text edge
++  canvas.width = textWidth * 2 + offset * 2;
++  canvas.height = previewFontSize * 3;
++
++  ctx.font = fontValue;
++  ctx.fillStyle = fillStyle;
++  ctx.mozImageSmoothingEnabled = true;
++
++  // Oversample the canvas for better text quality
++  ctx.textBaseline = "top";
++  ctx.scale(2, 2);
++  ctx.fillText(previewText, offset, Math.round(previewFontSize / 3));
++
++  let dataURL = canvas.toDataURL("image/png");
++
++  return {
++    dataURL: dataURL,
++    size: textWidth + offset * 2
++  };
++}
++
++exports.getFontPreviewData = getFontPreviewData;
