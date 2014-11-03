@@ -1,0 +1,1402 @@
+# HG changeset patch
+# Parent b642421cdb492579c706f87cdc585f28d2d05b08
+# User Heather Arthur <fayearthur@gmail.com>
+Bug 886041 - Make the font inspector remotable; r=bgrins
+
+diff --git a/browser/devtools/fontinspector/font-inspector.css b/browser/devtools/fontinspector/font-inspector.css
+--- a/browser/devtools/fontinspector/font-inspector.css
++++ b/browser/devtools/fontinspector/font-inspector.css
+@@ -10,8 +10,16 @@
+ #template {
+   display: none;
+ }
+ 
+ .font.is-remote .font-is-remote,
+ .font.is-local .font-is-local {
+   display: inline;
+ }
++
++.font-format::before {
++  content: "(";
++}
++
++.font-format::after {
++  content: ")";
++}
+diff --git a/browser/devtools/fontinspector/font-inspector.js b/browser/devtools/fontinspector/font-inspector.js
+--- a/browser/devtools/fontinspector/font-inspector.js
++++ b/browser/devtools/fontinspector/font-inspector.js
+@@ -4,19 +4,26 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const {classes: Cc, interfaces: Ci, utils: Cu} = Components;
+ const DOMUtils = Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils);
+ 
++Cu.import("resource://gre/modules/XPCOMUtils.jsm");
++XPCOMUtils.defineLazyModuleGetter(this, "Task",
++  "resource://gre/modules/Task.jsm");
++XPCOMUtils.defineLazyModuleGetter(this, "console",
++  "resource://gre/modules/devtools/Console.jsm");
++
+ function FontInspector(inspector, window)
+ {
+   this.inspector = inspector;
++  this.pageStyle = this.inspector.pageStyle;
+   this.chromeDoc = window.document;
+   this.init();
+ }
+ 
+ FontInspector.prototype = {
+   init: function FI_init() {
+     this.update = this.update.bind(this);
+     this.onNewNode = this.onNewNode.bind(this);
+@@ -46,17 +53,16 @@ FontInspector.prototype = {
+     this.showAllButton.removeEventListener("click", this.showAll);
+   },
+ 
+   /**
+    * Selection 'new-node' event handler.
+    */
+   onNewNode: function FI_onNewNode() {
+     if (this.isActive() &&
+-        this.inspector.selection.isLocal() &&
+         this.inspector.selection.isConnected() &&
+         this.inspector.selection.isElementNode()) {
+       this.undim();
+       this.update();
+     } else {
+       this.dim();
+     }
+   },
+@@ -71,130 +77,103 @@ FontInspector.prototype = {
+ 
+   /**
+    * Show the font list. A node is selected.
+    */
+   undim: function FI_undim() {
+     this.chromeDoc.body.classList.remove("dim");
+   },
+ 
+-  /**
+-   * Retrieve all the font related info we have for the selected
+-   * node and display them.
+-   */
+-  update: function FI_update() {
+-    if (!this.isActive() ||
++ /**
++  * Retrieve all the font info for the selected node and display it.
++  */
++  update: Task.async(function*() {
++    let node = this.inspector.selection.nodeFront;
++
++    if (!node ||
++        !this.isActive() ||
+         !this.inspector.selection.isConnected() ||
+         !this.inspector.selection.isElementNode() ||
+         this.chromeDoc.body.classList.contains("dim")) {
+       return;
+     }
+ 
+-    let node = this.inspector.selection.node;
+-    let contentDocument = node.ownerDocument;
++    this.chromeDoc.querySelector("#all-fonts").innerHTML = "";
+ 
+-    // We don't get fonts for a node, but for a range
+-    let rng = contentDocument.createRange();
+-    rng.selectNodeContents(node);
+-    let fonts = DOMUtils.getUsedFontFaces(rng);
+-    let fontsArray = [];
+-    for (let i = 0; i < fonts.length; i++) {
+-      fontsArray.push(fonts.item(i));
++    let fillStyle = (Services.prefs.getCharPref("devtools.theme") == "light") ?
++        "black" : "white";
++    let options = {
++      includePreviews: true,
++      previewFillStyle: fillStyle
+     }
+-    fontsArray = fontsArray.sort(function(a, b) {
+-      return a.srcIndex < b.srcIndex;
+-    });
++
++    let fonts = yield this.pageStyle.getUsedFontFaces(node, options)
++                      .then(null, console.error);
++    if (!fonts) {
++      return;
++    }
++
++    for (let font of fonts) {
++      font.previewUrl = yield font.preview.data.string();
++    }
++
++    // in case we've been destroyed in the meantime
++    if (!this.chromeDoc) {
++      return;
++    }
++
++    // clear again in case an update got in right before us
+     this.chromeDoc.querySelector("#all-fonts").innerHTML = "";
+-    for (let f of fontsArray) {
+-      this.render(f, contentDocument);
++
++    for (let font of fonts) {
++      this.render(font);
+     }
+-  },
++
++    this.inspector.emit("fontinspector-updated");
++  }),
+ 
+   /**
+    * Display the information of one font.
+    */
+-  render: function FI_render(font, document) {
++  render: function FI_render(font) {
+     let s = this.chromeDoc.querySelector("#template > section");
+     s = s.cloneNode(true);
+ 
+     s.querySelector(".font-name").textContent = font.name;
+     s.querySelector(".font-css-name").textContent = font.CSSFamilyName;
+-    s.querySelector(".font-format").textContent = font.format;
+ 
+-    if (font.srcIndex == -1) {
++    if (font.URI) {
++      s.classList.add("is-remote");
++    } else {
+       s.classList.add("is-local");
++    }
++
++    let formatElem = s.querySelector(".font-format");
++    if (font.format) {
++      formatElem.textContent = font.format;
+     } else {
+-      s.classList.add("is-remote");
++      formatElem.hidden = true;
+     }
+ 
+     s.querySelector(".font-url").value = font.URI;
+ 
+-    let iframe = s.querySelector(".font-preview");
+     if (font.rule) {
+       // This is the @font-face{…} code.
+-      let cssText = font.rule.style.parentRule.cssText;
++      let cssText = font.ruleText;
+ 
+       s.classList.add("has-code");
+       s.querySelector(".font-css-code").textContent = cssText;
+-
+-      // We guess the base URL of the stylesheet to make
+-      // sure the font will be accessible in the preview.
+-      // If the font-face is in an inline <style>, we get
+-      // the location of the page.
+-      let origin = font.rule.style.parentRule.parentStyleSheet.href;
+-      if (!origin) { // Inline stylesheet
+-        origin = document.location.href;
+-      }
+-      // We remove the last part of the URL to get a correct base.
+-      let base = origin.replace(/\/[^\/]*$/,"/")
+-
+-      // From all this information, we build a preview.
+-      this.buildPreview(iframe, font.CSSFamilyName, cssText, base);
+-    } else {
+-      this.buildPreview(iframe, font.CSSFamilyName, "", "");
+     }
++    let preview = s.querySelector(".font-preview");
++    preview.src = font.previewUrl;
+ 
+     this.chromeDoc.querySelector("#all-fonts").appendChild(s);
+   },
+ 
+   /**
+-   * Show a preview of the font in an iframe.
+-   */
+-  buildPreview: function FI_buildPreview(iframe, name, cssCode, base) {
+-    /* The HTML code of the preview is:
+-     *   <!DOCTYPE HTML>
+-     *   <head>
+-     *    <base href="{base}"></base>
+-     *   </head>
+-     *   <style>
+-     *   p {font-family: {name};}
+-     *   * {font-size: 40px;line-height:60px;padding:0 10px;margin:0};
+-     *   </style>
+-     *   <p contenteditable spellcheck='false'>Abc</p>
+-     */
+-    let extraCSS = "* {padding:0;margin:0}";
+-    extraCSS += ".theme-dark {color: white}";
+-    extraCSS += "p {font-size: 40px;line-height:60px;padding:0 10px;margin:0;}";
+-    cssCode += extraCSS;
+-    let src = "data:text/html;charset=utf-8,<!DOCTYPE HTML><head><base></base></head><style></style><p contenteditable spellcheck='false'>Abc</p>";
+-    iframe.addEventListener("load", function onload() {
+-      iframe.removeEventListener("load", onload, true);
+-      let doc = iframe.contentWindow.document;
+-      // We could have done that earlier, but we want to avoid any URL-encoding
+-      // nightmare.
+-      doc.querySelector("base").href = base;
+-      doc.querySelector("style").textContent = cssCode;
+-      doc.querySelector("p").style.fontFamily = name;
+-      // Forward theme
+-      doc.documentElement.className = document.documentElement.className;
+-    }, true);
+-    iframe.src = src;
+-  },
+-
+-  /**
+    * Select the <body> to show all the fonts included in the document.
+    */
+   showAll: function FI_showAll() {
+     if (!this.isActive() ||
+         !this.inspector.selection.isConnected() ||
+         !this.inspector.selection.isElementNode()) {
+       return;
+     }
+diff --git a/browser/devtools/fontinspector/font-inspector.xhtml b/browser/devtools/fontinspector/font-inspector.xhtml
+--- a/browser/devtools/fontinspector/font-inspector.xhtml
++++ b/browser/devtools/fontinspector/font-inspector.xhtml
+@@ -19,24 +19,24 @@
+   <body class="theme-sidebar devtools-monospace" role="application">
+     <script type="application/javascript;version=1.8" src="font-inspector.js"></script>
+     <div id="root">
+       <ul id="all-fonts"></ul>
+       <button id="showall">&showAllFonts;</button>
+     </div>
+     <div id="template">
+       <section class="font">
+-        <iframe sandbox="" class="font-preview"></iframe>
++        <img class="font-preview"></img>
+         <div class="font-info">
+           <h1 class="font-name"></h1>
+           <span class="font-is-local">&system;</span>
+           <span class="font-is-remote">&remote;</span>
+           <p class="font-format-url">
+             <input readonly="readonly" class="font-url"></input>
+-            (<span class="font-format"></span>)
++            <span class="font-format"></span>
+           </p>
+           <p class="font-css">&usedAs; "<span class="font-css-name"></span>"</p>
+           <pre class="font-css-code"></pre>
+         </div>
+       </section>
+     </div>
+   </body>
+ </html>
+diff --git a/browser/devtools/fontinspector/test/OstrichLicense.txt b/browser/devtools/fontinspector/test/OstrichLicense.txt
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/fontinspector/test/OstrichLicense.txt
+@@ -0,0 +1,41 @@
++This Font Software is licensed under the SIL Open Font License, Version 1.1.
++This license is copied below, and is also available with a FAQ at: http://scripts.sil.org/OFL
++
++-----------------------------------------------------------
++SIL OPEN FONT LICENSE Version 1.1 - 26 February 2007
++-----------------------------------------------------------
++
++PREAMBLE
++The goals of the Open Font License (OFL) are to stimulate worldwide development of collaborative font projects, to support the font creation efforts of academic and linguistic communities, and to provide a free and open framework in which fonts may be shared and improved in partnership with others.
++
++The OFL allows the licensed fonts to be used, studied, modified and redistributed freely as long as they are not sold by themselves. The fonts, including any derivative works, can be bundled, embedded, redistributed and/or sold with any software provided that any reserved names are not used by derivative works. The fonts and derivatives, however, cannot be released under any other type of license. The requirement for fonts to remain under this license does not apply to any document created using the fonts or their derivatives.
++
++DEFINITIONS
++"Font Software" refers to the set of files released by the Copyright Holder(s) under this license and clearly marked as such. This may include source files, build scripts and documentation.
++
++"Reserved Font Name" refers to any names specified as such after the copyright statement(s).
++
++"Original Version" refers to the collection of Font Software components as distributed by the Copyright Holder(s).
++
++"Modified Version" refers to any derivative made by adding to, deleting, or substituting -- in part or in whole -- any of the components of the Original Version, by changing formats or by porting the Font Software to a new environment.
++
++"Author" refers to any designer, engineer, programmer, technical writer or other person who contributed to the Font Software.
++
++PERMISSION & CONDITIONS
++Permission is hereby granted, free of charge, to any person obtaining a copy of the Font Software, to use, study, copy, merge, embed, modify, redistribute, and sell modified and unmodified copies of the Font Software, subject to the following conditions:
++
++1) Neither the Font Software nor any of its individual components, in Original or Modified Versions, may be sold by itself.
++
++2) Original or Modified Versions of the Font Software may be bundled, redistributed and/or sold with any software, provided that each copy contains the above copyright notice and this license. These can be included either as stand-alone text files, human-readable headers or in the appropriate machine-readable metadata fields within text or binary files as long as those fields can be easily viewed by the user.
++
++3) No Modified Version of the Font Software may use the Reserved Font Name(s) unless explicit written permission is granted by the corresponding Copyright Holder. This restriction only applies to the primary font name as presented to the users.
++
++4) The name(s) of the Copyright Holder(s) or the Author(s) of the Font Software shall not be used to promote, endorse or advertise any Modified Version, except to acknowledge the contribution(s) of the Copyright Holder(s) and the Author(s) or with their explicit written permission.
++
++5) The Font Software, modified or unmodified, in part or in whole, must be distributed entirely under this license, and must not be distributed under any other license. The requirement for fonts to remain under this license does not apply to any document created using the Font Software.
++
++TERMINATION
++This license becomes null and void if any of the above conditions are not met.
++
++DISCLAIMER
++THE FONT SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO ANY WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF COPYRIGHT, PATENT, TRADEMARK, OR OTHER RIGHT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, INCLUDING ANY GENERAL, SPECIAL, INDIRECT, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF THE USE OR INABILITY TO USE THE FONT SOFTWARE OR FROM OTHER DEALINGS IN THE FONT SOFTWARE.
+\ No newline at end of file
+diff --git a/browser/devtools/fontinspector/test/browser.ini b/browser/devtools/fontinspector/test/browser.ini
+--- a/browser/devtools/fontinspector/test/browser.ini
++++ b/browser/devtools/fontinspector/test/browser.ini
+@@ -1,10 +1,9 @@
+ [DEFAULT]
+-skip-if = e10s # Bug ?????? - devtools tests disabled with e10s
+ subsuite = devtools
+ support-files =
+-  browser_font.woff
+   browser_fontinspector.html
++  ostrich-black.woff
++  ostrich-regular.woff
++  head.js
+ 
+ [browser_fontinspector.js]
+-skip-if = e10s # Bug ?????? - devtools tests disabled with e10s
+-
+diff --git a/browser/devtools/fontinspector/test/browser_font.woff b/browser/devtools/fontinspector/test/browser_font.woff
+deleted file mode 100644
+Binary file browser/devtools/fontinspector/test/browser_font.woff has changed
+diff --git a/browser/devtools/fontinspector/test/browser_fontinspector.html b/browser/devtools/fontinspector/test/browser_fontinspector.html
+--- a/browser/devtools/fontinspector/test/browser_fontinspector.html
++++ b/browser/devtools/fontinspector/test/browser_fontinspector.html
+@@ -1,20 +1,31 @@
+ <!DOCTYPE html>
+ 
+ <style>
+   @font-face {
+     font-family: bar;
+-    src: url(bad/font/name.ttf), url(browser_font.woff) format("woff");
++    src: url(bad/font/name.ttf), url(ostrich-regular.woff) format("woff");
+   }
++  @font-face {
++    font-family: bar;
++    font-weight: 800;
++    src: url(ostrich-black.woff);
++  }
++
+   body{
+     font-family:Arial;
+   }
+   div {
+     font-family:Arial;
+     font-family:bar;
+   }
++  .bold-text {
++    font-family: bar;
++    font-weight: 800;
++  }
+ </style>
+ 
+ <body>
+   BODY
+   <div>DIV</div>
++  <div class="bold-text">BOLD DIV</div>
+ </body>
+diff --git a/browser/devtools/fontinspector/test/browser_fontinspector.js b/browser/devtools/fontinspector/test/browser_fontinspector.js
+--- a/browser/devtools/fontinspector/test/browser_fontinspector.js
++++ b/browser/devtools/fontinspector/test/browser_fontinspector.js
+@@ -1,130 +1,104 @@
+ /* Any copyright is dedicated to the Public Domain.
+    http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ let tempScope = {};
+ let {gDevTools} = Cu.import("resource:///modules/devtools/gDevTools.jsm", {});
+ let {devtools} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
+ let TargetFactory = devtools.TargetFactory;
+ 
+-let DOMUtils = Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils);
++let TEST_URI = "http://mochi.test:8888/browser/browser/devtools/fontinspector/test/browser_fontinspector.html";
+ 
+-function test() {
+-  waitForExplicitFinish();
++let view, viewDoc;
+ 
+-  let doc;
+-  let view;
+-  let viewDoc;
+-  let inspector;
++let test = asyncTest(function*() {
++  yield loadTab(TEST_URI);
++  let {toolbox, inspector} = yield openInspector();
+ 
+-  gDevTools.testing = true;
+-  SimpleTest.registerCleanupFunction(() => {
+-    gDevTools.testing = false;
+-  });
++  info("Selecting the test node");
++  yield selectNode("body", inspector);
+ 
+-  gBrowser.selectedTab = gBrowser.addTab();
+-  gBrowser.selectedBrowser.addEventListener("load", function onload() {
+-    gBrowser.selectedBrowser.removeEventListener("load", onload, true);
+-    doc = content.document;
+-    waitForFocus(setupTest, content);
+-  }, true);
++  let updated = inspector.once("fontinspector-updated");
++  inspector.sidebar.select("fontinspector");
++  yield updated;
+ 
+-  content.location = "http://mochi.test:8888/browser/browser/devtools/fontinspector/test/browser_fontinspector.html";
++  info("Font Inspector ready");
+ 
+-  function setupTest() {
+-    let rng = doc.createRange();
+-    rng.selectNode(doc.body);
+-    let fonts = DOMUtils.getUsedFontFaces(rng);
+-    if (fonts.length != 2) {
+-      // Fonts are not loaded yet.
+-      // Let try again in a couple of milliseconds (hacky, but
+-      // there's not better way to do it. See bug 835247).
+-      setTimeout(setupTest, 500);
+-    } else {
+-      let target = TargetFactory.forTab(gBrowser.selectedTab);
+-      gDevTools.showToolbox(target, "inspector").then(function(toolbox) {
+-        openFontInspector(toolbox.getCurrentPanel());
+-      });
+-    }
+-  }
++  view = inspector.sidebar.getWindowForTab("fontinspector");
++  viewDoc = view.document;
+ 
+-  function openFontInspector(aInspector) {
+-    info("Inspector open");
+-    inspector = aInspector;
++  ok(!!view.fontInspector, "Font inspector document is alive.");
+ 
+-    inspector.selection.setNode(doc.body);
+-    inspector.sidebar.select("fontinspector");
+-    inspector.sidebar.once("fontinspector-ready", testBodyFonts);
+-  }
++  yield testBodyFonts(inspector);
+ 
+-  function testBodyFonts() {
+-    info("Font Inspector ready");
++  yield testDivFonts(inspector);
+ 
+-    view = inspector.sidebar.getWindowForTab("fontinspector");
+-    viewDoc = view.document;
++  yield testShowAllFonts(inspector);
+ 
+-    ok(!!view.fontInspector, "Font inspector document is alive.");
++  view = viewDoc = null;
++});
+ 
+-    let s = viewDoc.querySelectorAll("#all-fonts > section");
+-    is(s.length, 2, "Found 2 fonts");
++function* testBodyFonts(inspector) {
++  let s = viewDoc.querySelectorAll("#all-fonts > section");
++  is(s.length, 3, "Found 3 fonts");
+ 
+-    is(s[0].querySelector(".font-name").textContent,
+-       "DeLarge Bold", "font 0: Right font name");
+-    ok(s[0].classList.contains("is-remote"),
+-       "font 0: is remote");
+-    is(s[0].querySelector(".font-url").value,
+-       "http://mochi.test:8888/browser/browser/devtools/fontinspector/test/browser_font.woff",
+-       "font 0: right url");
+-    is(s[0].querySelector(".font-format").textContent,
+-       "woff", "font 0: right font format");
+-    is(s[0].querySelector(".font-css-name").textContent,
+-       "bar", "font 0: right css name");
++  // test first web font
++  is(s[0].querySelector(".font-name").textContent,
++     "Ostrich Sans Medium", "font 0: Right font name");
++  ok(s[0].classList.contains("is-remote"),
++     "font 0: is remote");
++  is(s[0].querySelector(".font-url").value,
++     "http://mochi.test:8888/browser/browser/devtools/fontinspector/test/ostrich-regular.woff",
++     "font 0: right url");
++  is(s[0].querySelector(".font-format").textContent,
++     "woff", "font 0: right font format");
++  is(s[0].querySelector(".font-css-name").textContent,
++     "bar", "font 0: right css name");
+ 
+-    let font1Name = s[1].querySelector(".font-name").textContent;
+-    let font1CssName = s[1].querySelector(".font-css-name").textContent;
++  // test bold web font
++  is(s[1].querySelector(".font-name").textContent,
++     "Ostrich Sans Black", "font 1: Right font name");
++  ok(s[1].classList.contains("is-remote"),
++     "font 1: is remote");
++  is(s[1].querySelector(".font-url").value,
++     "http://mochi.test:8888/browser/browser/devtools/fontinspector/test/ostrich-black.woff",
++     "font 1: right url");
++  ok(s[1].querySelector(".font-format").hidden,
++     "font 1 format is hidden");
++  is(s[1].querySelector(".font-css-name").textContent,
++     "bar", "font 1: right css name");
+ 
+-    // On Linux test machines, the Arial font doesn't exist.
+-    // The fallback is "Liberation Sans"
++  // test system font
++  let font2Name = s[2].querySelector(".font-name").textContent;
++  let font2CssName = s[2].querySelector(".font-css-name").textContent;
+ 
+-    ok((font1Name == "Arial") || (font1Name == "Liberation Sans"),
+-       "font 1: Right font name");
+-    ok(s[1].classList.contains("is-local"), "font 1: is local");
+-    ok((font1CssName == "Arial") || (font1CssName == "Liberation Sans"),
+-       "Arial", "font 1: right css name");
++  // On Linux test machines, the Arial font doesn't exist.
++  // The fallback is "Liberation Sans"
++  ok((font2Name == "Arial") || (font2Name == "Liberation Sans"),
++     "font 1: Right font name");
++  ok(s[2].classList.contains("is-local"), "font 2: is local");
++  ok((font2CssName == "Arial") || (font2CssName == "Liberation Sans"),
++     "Arial", "font 2: right css name");
++}
+ 
+-    testDivFonts();
+-  }
++function* testDivFonts(inspector) {
++  let updated = inspector.once("fontinspector-updated");
++  yield selectNode("div", inspector);
++  yield updated;
+ 
+-  function testDivFonts() {
+-    inspector.selection.setNode(doc.querySelector("div"));
+-    inspector.once("inspector-updated", () => {
+-      let s = viewDoc.querySelectorAll("#all-fonts > section");
+-      is(s.length, 1, "Found 1 font on DIV");
+-      is(s[0].querySelector(".font-name").textContent, "DeLarge Bold",
+-        "The DIV font has the right name");
++  let sections1 = viewDoc.querySelectorAll("#all-fonts > section");
++  is(sections1.length, 1, "Found 1 font on DIV");
++  is(sections1[0].querySelector(".font-name").textContent, "Ostrich Sans Medium",
++    "The DIV font has the right name");
++}
+ 
+-      testShowAllFonts();
+-    });
+-  }
++function* testShowAllFonts(inspector) {
++  info("testing showing all fonts");
+ 
+-  function testShowAllFonts() {
+-    viewDoc.querySelector("#showall").click();
+-    inspector.once("inspector-updated", () => {
+-      is(inspector.selection.node, doc.body, "Show all fonts selected the body node");
+-      let s = viewDoc.querySelectorAll("#all-fonts > section");
+-      is(s.length, 2, "And font-inspector still shows 2 fonts for body");
++  let updated = inspector.once("fontinspector-updated");
++  viewDoc.querySelector("#showall").click();
++  yield updated;
+ 
+-      finishUp();
+-    });
+-  }
+-
+-  function finishUp() {
+-    executeSoon(function() {
+-      gDevTools.once("toolbox-destroyed", () => {
+-        doc = view = viewDoc = inspector = null;
+-        gBrowser.removeCurrentTab();
+-        finish();
+-      });
+-      inspector._toolbox.destroy();
+-    });
+-  }
++  is(inspector.selection.nodeFront.nodeName, "BODY", "Show all fonts selected the body node");
++  let sections = viewDoc.querySelectorAll("#all-fonts > section");
++  is(sections.length, 3, "And font-inspector still shows 3 fonts for body");
+ }
+diff --git a/browser/devtools/fontinspector/test/head.js b/browser/devtools/fontinspector/test/head.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/fontinspector/test/head.js
+@@ -0,0 +1,144 @@
++ /* vim: set ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++"use strict";
++
++const Cu = Components.utils;
++const Ci = Components.interfaces;
++const Cc = Components.classes;
++
++const { Promise: promise } = Cu.import("resource://gre/modules/Promise.jsm", {});
++
++let {devtools} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
++let TargetFactory = devtools.TargetFactory;
++
++// All test are asynchronous
++waitForExplicitFinish();
++
++gDevTools.testing = true;
++SimpleTest.registerCleanupFunction(() => {
++  gDevTools.testing = false;
++});
++
++registerCleanupFunction(function*() {
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++  yield gDevTools.closeToolbox(target);
++
++  while (gBrowser.tabs.length > 1) {
++    gBrowser.removeCurrentTab();
++  }
++});
++
++/**
++ * Define an async test based on a generator function
++ */
++function asyncTest(generator) {
++  return () => Task.spawn(generator).then(null, ok.bind(null, false)).then(finish);
++}
++
++/**
++ * Add a new test tab in the browser and load the given url.
++ * @param {String} url The url to be loaded in the new tab
++ * @return a promise that resolves to the tab object when the url is loaded
++ */
++function loadTab(url) {
++  let deferred = promise.defer();
++
++  let tab = gBrowser.selectedTab = gBrowser.addTab(url);
++  let browser = gBrowser.getBrowserForTab(tab);
++
++  browser.addEventListener("load", function onLoad() {
++    browser.removeEventListener("load", onLoad, true);
++    deferred.resolve({tab: tab, browser: browser});
++  }, true);
++
++  return deferred.promise;
++}
++
++/**
++ * Open the toolbox, with the inspector tool visible.
++ * @param {Function} cb Optional callback, if you don't want to use the returned
++ * promise
++ * @return a promise that resolves when the inspector is ready
++ */
++let openInspector = Task.async(function*(cb) {
++  info("Opening the inspector");
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++
++  let inspector, toolbox;
++
++  // Checking if the toolbox and the inspector are already loaded
++  // The inspector-updated event should only be waited for if the inspector
++  // isn't loaded yet
++  toolbox = gDevTools.getToolbox(target);
++  if (toolbox) {
++    inspector = toolbox.getPanel("inspector");
++    if (inspector) {
++      info("Toolbox and inspector already open");
++      if (cb) {
++        return cb(inspector, toolbox);
++      } else {
++        return {
++          toolbox: toolbox,
++          inspector: inspector
++        };
++      }
++    }
++  }
++
++  info("Opening the toolbox");
++  toolbox = yield gDevTools.showToolbox(target, "inspector");
++  yield waitForToolboxFrameFocus(toolbox);
++  inspector = toolbox.getPanel("inspector");
++
++  info("Waiting for the inspector to update");
++  yield inspector.once("inspector-updated");
++
++  if (cb) {
++    return cb(inspector, toolbox);
++  } else {
++    return {
++      toolbox: toolbox,
++      inspector: inspector
++    };
++  }
++});
++
++/**
++ * Select a node in the inspector given its selector.
++ */
++let selectNode = Task.async(function*(selector, inspector, reason="test") {
++  info("Selecting the node for '" + selector + "'");
++  let nodeFront = yield getNodeFront(selector, inspector);
++  let updated = inspector.once("inspector-updated");
++  inspector.selection.setNodeFront(nodeFront, reason);
++  yield updated;
++});
++
++/**
++ * Get the NodeFront for a given css selector, via the protocol
++ * @param {String|NodeFront} selector
++ * @param {InspectorPanel} inspector The instance of InspectorPanel currently
++ * loaded in the toolbox
++ * @return {Promise} Resolves to the NodeFront instance
++ */
++function getNodeFront(selector, {walker}) {
++  if (selector._form) {
++    return selector;
++  }
++  return walker.querySelector(walker.rootNode, selector);
++}
++
++/**
++ * Wait for the toolbox frame to receive focus after it loads
++ * @param {Toolbox} toolbox
++ * @return a promise that resolves when focus has been received
++ */
++function waitForToolboxFrameFocus(toolbox) {
++  info("Making sure that the toolbox's frame is focused");
++  let def = promise.defer();
++  let win = toolbox.frame.contentWindow;
++  waitForFocus(def.resolve, win);
++  return def.promise;
++}
+diff --git a/browser/devtools/fontinspector/test/ostrich-black.woff b/browser/devtools/fontinspector/test/ostrich-black.woff
+new file mode 100644
+index 0000000000000000000000000000000000000000..496c1d8837dbe5c790d956aee654bbbd18d34834
+GIT binary patch
+literal 5084
+zc$@*;6C><*Pew8T0RR9102AB*3;+NC05V7b027J;0RR9100000000000000000000
+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
+
+diff --git a/browser/devtools/fontinspector/test/ostrich-regular.woff b/browser/devtools/fontinspector/test/ostrich-regular.woff
+new file mode 100644
+index 0000000000000000000000000000000000000000..e23d4af391877f53b5f6f9ba04a77bb0e4809d04
+GIT binary patch
+literal 4956
+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
+aRk>8#vh%RmJm+AMg#hHe)XuT(?EnA<=voE<
+
+diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
+--- a/browser/devtools/inspector/inspector-panel.js
++++ b/browser/devtools/inspector/inspector-panel.js
+@@ -105,16 +105,20 @@ InspectorPanel.prototype = {
+   get hasUrlToImageDataResolver() {
+     return this._target.client.traits.urlToImageDataResolver;
+   },
+ 
+   get canGetUniqueSelector() {
+     return this._target.client.traits.getUniqueSelector;
+   },
+ 
++  get canGetUsedFontFaces() {
++    return this._target.client.traits.getUsedFontFaces;
++  },
++
+   _deferredOpen: function(defaultSelection) {
+     let deferred = promise.defer();
+ 
+     this.onNewRoot = this.onNewRoot.bind(this);
+     this.walker.on("new-root", this.onNewRoot);
+ 
+     this.nodemenu = this.panelDoc.getElementById("inspector-node-popup");
+     this.lastNodemenuItem = this.nodemenu.lastChild;
+@@ -314,17 +318,17 @@ InspectorPanel.prototype = {
+     this.sidebar.addTab("ruleview",
+                         "chrome://browser/content/devtools/cssruleview.xhtml",
+                         "ruleview" == defaultTab);
+ 
+     this.sidebar.addTab("computedview",
+                         "chrome://browser/content/devtools/computedview.xhtml",
+                         "computedview" == defaultTab);
+ 
+-    if (Services.prefs.getBoolPref("devtools.fontinspector.enabled") && !this.target.isRemote) {
++    if (Services.prefs.getBoolPref("devtools.fontinspector.enabled") && this.canGetUsedFontFaces) {
+       this.sidebar.addTab("fontinspector",
+                           "chrome://browser/content/devtools/fontinspector/font-inspector.xhtml",
+                           "fontinspector" == defaultTab);
+     }
+ 
+     this.sidebar.addTab("layoutview",
+                         "chrome://browser/content/devtools/layoutview/view.xhtml",
+                         "layoutview" == defaultTab);
+diff --git a/browser/themes/shared/devtools/font-inspector.css b/browser/themes/shared/devtools/font-inspector.css
+--- a/browser/themes/shared/devtools/font-inspector.css
++++ b/browser/themes/shared/devtools/font-inspector.css
+@@ -38,19 +38,18 @@ body {
+   border-bottom: 0;
+ }
+ 
+ .theme-light .font:nth-child(even) {
+   background: #F4F4F4;
+ }
+ 
+ .font-preview {
++  margin-left: -4px;
+   height: 60px;
+-  width: 100%;
+-  border: 0;
+   display: block;
+ }
+ 
+ .font-info {
+   display: block;
+ }
+ 
+ .font-name {
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -55,17 +55,17 @@ const Services = require("Services");
+ const protocol = require("devtools/server/protocol");
+ const {Arg, Option, method, RetVal, types} = protocol;
+ const {LongStringActor, ShortLongString} = require("devtools/server/actors/string");
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const object = require("sdk/util/object");
+ const events = require("sdk/event/core");
+ const {Unknown} = require("sdk/platform/xpcom");
+ const {Class} = require("sdk/core/heritage");
+-const {PageStyleActor} = require("devtools/server/actors/styles");
++const {PageStyleActor, getFontPreviewData} = require("devtools/server/actors/styles");
+ const {
+   HighlighterActor,
+   CustomHighlighterActor,
+   HIGHLIGHTER_CLASSES
+ } = require("devtools/server/actors/highlighter");
+ const {getLayoutChangesObserver, releaseLayoutChangesObserver} =
+   require("devtools/server/actors/layout");
+ 
+@@ -657,38 +657,24 @@ var NodeActor = exports.NodeActor = prot
+    * Given the font and fill style, get the image data of a canvas with the
+    * preview text and font.
+    * Returns an imageData object with the actual data being a LongStringActor
+    * and the width of the text as a string.
+    * The image data is transmitted as a base64 encoded png data-uri.
+    */
+   getFontFamilyDataURL: method(function(font, fillStyle="black") {
+     let doc = this.rawNode.ownerDocument;
+-    let canvas = doc.createElementNS(XHTML_NS, "canvas");
+-    let ctx = canvas.getContext("2d");
+-    let fontValue = FONT_FAMILY_PREVIEW_TEXT_SIZE + "px " + font + ", serif";
+-
+-    // Get the correct preview text measurements and set the canvas dimensions
+-    ctx.font = fontValue;
+-    let textWidth = ctx.measureText(FONT_FAMILY_PREVIEW_TEXT).width;
+-    canvas.width = textWidth * 2;
+-    canvas.height = FONT_FAMILY_PREVIEW_TEXT_SIZE * 3;
+-
+-    ctx.font = fontValue;
+-    ctx.fillStyle = fillStyle;
+-
+-    // Align the text to be vertically center in the tooltip and
+-    // oversample the canvas for better text quality
+-    ctx.textBaseline = "top";
+-    ctx.scale(2, 2);
+-    ctx.fillText(FONT_FAMILY_PREVIEW_TEXT, 0, Math.round(FONT_FAMILY_PREVIEW_TEXT_SIZE / 3));
+-
+-    let dataURL = canvas.toDataURL("image/png");
+-
+-    return { data: LongStringActor(this.conn, dataURL), size: textWidth };
++    let options = {
++      previewText: FONT_FAMILY_PREVIEW_TEXT,
++      previewFontSize: FONT_FAMILY_PREVIEW_TEXT_SIZE,
++      fillStyle: fillStyle
++    }
++    let { dataURL, size } = getFontPreviewData(font, doc, options);
++
++    return { data: LongStringActor(this.conn, dataURL), size: size };
+   }, {
+     request: {font: Arg(0, "string"), fillStyle: Arg(1, "nullable:string")},
+     response: RetVal("imageData")
+   })
+ });
+ 
+ /**
+  * Client side of the node actor.
+diff --git a/toolkit/devtools/server/actors/root.js b/toolkit/devtools/server/actors/root.js
+--- a/toolkit/devtools/server/actors/root.js
++++ b/toolkit/devtools/server/actors/root.js
+@@ -140,17 +140,20 @@ RootActor.prototype = {
+     bulk: true,
+     // Whether the style rule actor implements the modifySelector method
+     // that modifies the rule's selector
+     selectorEditable: true,
+     // Whether the page style actor implements the addNewRule method that
+     // adds new rules to the page
+     addNewRule: true,
+     // Whether the dom node actor implements the getUniqueSelector method
+-    getUniqueSelector: true
++    getUniqueSelector: true,
++    // Whether the page style actor implements the getUsedFontFaces method
++    // that returns the font faces used on a node
++    getUsedFontFaces: true
+   },
+ 
+   /**
+    * Return a 'hello' packet as specified by the Remote Debugging Protocol.
+    */
+   sayHello: function() {
+     return {
+       from: this.actorID,
+diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/actors/styles.js
+--- a/toolkit/devtools/server/actors/styles.js
++++ b/toolkit/devtools/server/actors/styles.js
+@@ -6,17 +6,19 @@
+ 
+ const {Cc, Ci, Cu} = require("chrome");
+ const Services = require("Services");
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const protocol = require("devtools/server/protocol");
+ const {Arg, Option, method, RetVal, types} = protocol;
+ const events = require("sdk/event/core");
+ const object = require("sdk/util/object");
+-const { Class } = require("sdk/core/heritage");
++const {Class} = require("sdk/core/heritage");
++const {LongStringActor} = require("devtools/server/actors/string");
++
+ 
+ // This will add the "stylesheet" actor type for protocol.js to recognize
+ require("devtools/server/actors/stylesheets");
+ 
+ loader.lazyGetter(this, "CssLogic", () => require("devtools/styleinspector/css-logic").CssLogic);
+ loader.lazyGetter(this, "DOMUtils", () => Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils));
+ 
+ // The PageStyle actor flattens the DOM CSS objects a little bit, merging
+@@ -29,16 +31,36 @@ const PSEUDO_ELEMENTS = [":first-line", 
+ exports.PSEUDO_ELEMENTS = PSEUDO_ELEMENTS;
+ 
+ // When gathering rules to read for pseudo elements, we will skip
+ // :before and :after, which are handled as a special case.
+ const PSEUDO_ELEMENTS_TO_READ = PSEUDO_ELEMENTS.filter(pseudo => {
+   return pseudo !== ":before" && pseudo !== ":after";
+ });
+ 
++const XHTML_NS = "http://www.w3.org/1999/xhtml";
++const FONT_PREVIEW_TEXT = "Abc";
++const FONT_PREVIEW_FONT_SIZE = 40;
++const FONT_PREVIEW_FILLSTYLE = "black";
++
++// fudgy list of common font weight names
++const FONT_WEIGHTS = {
++  "ultralight": 100,
++  "thin": 100,
++  "extralight": 200,
++  "light": 300,
++  "medium": 500,
++  "demibold": 600,
++  "semibold": 600,
++  "bold": 700,
++  "extrabold": 800,
++  "heavy": 800,
++  "black": 900
++}
++
+ // Predeclare the domnode actor type for use in requests.
+ types.addActorType("domnode");
+ 
+ // Predeclare the domstylerule actor type
+ types.addActorType("domstylerule");
+ 
+ /**
+  * DOM Nodes returned by the style actor will be owned by the DOM walker
+@@ -65,16 +87,33 @@ types.addDictType("matchedselector", {
+ });
+ 
+ types.addDictType("appliedStylesReturn", {
+   entries: "array:appliedstyle",
+   rules: "array:domstylerule",
+   sheets: "array:stylesheet"
+ });
+ 
++types.addDictType("fontpreview", {
++  data: "nullable:longstring",
++  size: "json"
++});
++
++types.addDictType("fontface", {
++  name: "string",
++  CSSFamilyName: "string",
++  rule: "nullable:domstylerule",
++  srcIndex: "number",
++  URI: "string",
++  format: "string",
++  preview: "nullable:fontpreview",
++  localName: "string",
++  metadata: "string"
++});
++
+ /**
+  * The PageStyle actor lets the client look at the styles on a page, as
+  * they are applied to a given node.
+  */
+ var PageStyleActor = protocol.ActorClass({
+   typeName: "pagestyle",
+ 
+   /**
+@@ -191,16 +230,136 @@ var PageStyleActor = protocol.ActorClass
+       filter: Option(1, "string"),
+     },
+     response: {
+       computed: RetVal("json")
+     }
+   }),
+ 
+   /**
++   * Get the font faces used in an element.
++   *
++   * @param NodeActor node
++   *    The node to get fonts from.
++   * @param object options
++   *   `includePreviews`: Whether to also return image previews of the fonts.
++   *   `previewText`: The text to display in the previews.
++   *   `previewFontSize`: The font size of the text in the previews.
++   *
++   * @returns object
++   *   object with 'fontFaces', a list of fonts that apply to this node.
++   */
++  getUsedFontFaces: method(function(node, options) {
++    let contentDocument = node.rawNode.ownerDocument;
++
++    // We don't get fonts for a node, but for a range
++    let rng = contentDocument.createRange();
++    rng.selectNodeContents(node.rawNode);
++    let fonts = DOMUtils.getUsedFontFaces(rng);
++    let fontsArray = [];
++
++    for (let i = 0; i < fonts.length; i++) {
++      let font = fonts.item(i);
++      let fontFace = {
++        name: font.name,
++        CSSFamilyName: font.CSSFamilyName,
++        srcIndex: font.srcIndex,
++        URI: font.URI,
++        format: font.format,
++        localName: font.localName,
++        metadata: font.metadata
++      }
++
++      // If this font comes from a @font-face rule
++      if (font.rule) {
++        fontFace.rule = StyleRuleActor(this, font.rule);
++        fontFace.ruleText = font.rule.cssText;
++      }
++
++      // Get the weight and style of this font for the preview and sort order
++      let weight = 400, style = "";
++      if (font.rule) {
++        weight = font.rule.style.getPropertyValue("font-weight") || 400;
++        if (weight == "bold") {
++          weight = 700;
++        }
++        else if (weight == "regular") {
++          weight = 400;
++        }
++        style = font.rule.style.getPropertyValue("font-style") || "";
++      }
++      else {
++        // System fonts have "bold", etc in the name
++        let name = font.name.toLowerCase();
++        for (let weightName in FONT_WEIGHTS) {
++          if (name.contains(" " + weightName)) {
++            weight = FONT_WEIGHTS[weightName];
++            break;
++          }
++        }
++        if (name.contains("italic")) {
++          style = "italic";
++        }
++        else if (name.contains("oblique")) {
++          style = "oblique";
++        }
++      }
++      fontFace.weight = weight;
++      fontFace.style = style;
++
++      if (options.includePreviews) {
++        let fontStyle = weight + " " + style;
++        let opts = {
++          previewText: options.previewText,
++          previewFontSize: options.previewFontSize,
++          fontStyle: fontStyle,
++          fillStyle: options.previewFillStyle
++        }
++        let { dataURL, size } = getFontPreviewData(font.CSSFamilyName,
++                                                   contentDocument, opts);
++        fontFace.preview = {
++          data: LongStringActor(this.conn, dataURL),
++          size: size
++        };
++      }
++      fontsArray.push(fontFace);
++    }
++
++    // @font-face fonts at the top, then alphabetically, then by weight
++    fontsArray.sort(function(a, b) {
++      return a.weight > b.weight ? 1 : -1;
++    });
++    fontsArray.sort(function(a, b) {
++      if (a.CSSFamilyName == b.CSSFamilyName) {
++        return 0;
++      }
++      return a.CSSFamilyName > b.CSSFamilyName ? 1 : -1;
++    });
++    fontsArray.sort(function(a, b) {
++      if ((a.rule && b.rule) || (!a.rule && !b.rule)) {
++        return 0;
++      }
++      return !a.rule && b.rule ? 1 : -1;
++    });
++
++    return fontsArray;
++  }, {
++    request: {
++      node: Arg(0, "domnode"),
++      includePreviews: Option(1, "boolean"),
++      previewText: Option(1, "string"),
++      previewFontSize: Option(1, "string"),
++      previewFillStyle: Option(1, "string")
++    },
++    response: {
++      fontFaces: RetVal("array:fontface")
++    }
++  }),
++
++  /**
+    * Get a list of selectors that match a given property for a node.
+    *
+    * @param NodeActor node
+    * @param string property
+    * @param object options
+    *   `filter`: A string filter that affects the "matched" handling.
+    *     'user': Include properties from user style sheets.
+    *     'ua': Include properties from user and user-agent sheets.
+@@ -1099,8 +1258,58 @@ var RuleModificationList = Class({
+   removeProperty: function(name) {
+     this.modifications.push({
+       type: "remove",
+       name: name
+     });
+   }
+ });
+ 
++/**
++ * Helper function for getting an image preview of the given font.
++ *
++ * @param font {string}
++ *        Name of font to preview
++ * @param doc {Document}
++ *        Document to use to render font
++ * @param options {object}
++ *        Object with options 'previewText' and 'previewFontSize'
++ *
++ * @return dataUrl
++ *         The data URI of the font preview image
++ */
++function getFontPreviewData(font, doc, options) {
++  options = options || {};
++  let previewText = options.previewText || FONT_PREVIEW_TEXT;
++  let previewFontSize = options.previewFontSize || FONT_PREVIEW_FONT_SIZE;
++  let fillStyle = options.fillStyle || FONT_PREVIEW_FILLSTYLE;
++  let fontStyle = options.fontStyle || "";
++
++  let canvas = doc.createElementNS(XHTML_NS, "canvas");
++  let ctx = canvas.getContext("2d");
++  let fontValue = fontStyle + " " + previewFontSize + "px " + font + ", serif";
++
++  // Get the correct preview text measurements and set the canvas dimensions
++  ctx.font = fontValue;
++  ctx.fillStyle = fillStyle;
++  let textWidth = ctx.measureText(previewText).width;
++  let offset = 4; // offset to avoid cutting off text edge of italics
++  canvas.width = textWidth * 2 + offset * 2;
++  canvas.height = previewFontSize * 3;
++
++  // we have to reset these after changing the canvas size
++  ctx.font = fontValue;
++  ctx.fillStyle = fillStyle;
++
++  // Oversample the canvas for better text quality
++  ctx.textBaseline = "top";
++  ctx.scale(2, 2);
++  ctx.fillText(previewText, offset, Math.round(previewFontSize / 3));
++
++  let dataURL = canvas.toDataURL("image/png");
++
++  return {
++    dataURL: dataURL,
++    size: textWidth + offset * 2
++  };
++}
++
++exports.getFontPreviewData = getFontPreviewData;
