@@ -1,0 +1,271 @@
+# HG changeset patch
+# User Gijs Kruitbosch <gijskruitbosch@gmail.com>
+# Date 1415296231 0
+#      Thu Nov 06 17:50:31 2014 +0000
+# Node ID 1314f6edef9c37dd46dfd5e0922a9d2b08a712e0
+# Parent  c5d2024fb400b29882140c4a423c4a642a64e5d5
+Bug 1094138 - turn off lwt where applicable when clicking devtools button, r?bgrins,jaws
+
+diff --git a/browser/base/content/browser-devedition.js b/browser/base/content/browser-devedition.js
+--- a/browser/base/content/browser-devedition.js
++++ b/browser/base/content/browser-devedition.js
+@@ -81,32 +81,36 @@ let DevEdition = {
+     this._toggleStyleSheet(deveditionThemeEnabled);
+   },
+ 
+   handleEvent: function(e) {
+     if (e.type === "load") {
+       this.styleSheet.removeEventListener("load", this);
+       gBrowser.tabContainer._positionPinnedTabs();
+       ToolbarIconColor.inferFromText();
++      debugger;
++      Services.obs.notifyObservers(window, "devedition-theme-state-changed", true);
+     }
+   },
+ 
+   _toggleStyleSheet: function(deveditionThemeEnabled) {
+     if (deveditionThemeEnabled && !this.styleSheet) {
+       let styleSheetAttr = `href="${this.styleSheetLocation}" type="text/css"`;
+       this.styleSheet = document.createProcessingInstruction(
+         'xml-stylesheet', styleSheetAttr);
+       this.styleSheet.addEventListener("load", this);
+       document.insertBefore(this.styleSheet, document.documentElement);
+     } else if (!deveditionThemeEnabled && this.styleSheet) {
+       this.styleSheet.removeEventListener("load", this);
+       this.styleSheet.remove();
+       this.styleSheet = null;
+       gBrowser.tabContainer._positionPinnedTabs();
+       ToolbarIconColor.inferFromText();
++      debugger;
++      Services.obs.notifyObservers(window, "devedition-theme-state-changed", false);
+     }
+   },
+ 
+   uninit: function () {
+     Services.prefs.removeObserver(this._lwThemePrefName, this);
+     Services.prefs.removeObserver(this._prefName, this);
+     Services.prefs.removeObserver(this._devtoolsThemePrefName, this);
+     Services.obs.removeObserver(this, "lightweight-theme-styling-update", false);
+diff --git a/browser/components/customizableui/CustomizeMode.jsm b/browser/components/customizableui/CustomizeMode.jsm
+--- a/browser/components/customizableui/CustomizeMode.jsm
++++ b/browser/components/customizableui/CustomizeMode.jsm
+@@ -14,16 +14,17 @@ const kPaletteId = "customization-palett
+ const kAboutURI = "about:customizing";
+ const kDragDataTypePrefix = "text/toolbarwrapper-id/";
+ const kPlaceholderClass = "panel-customization-placeholder";
+ const kSkipSourceNodePref = "browser.uiCustomization.skipSourceNodeCheck";
+ const kToolbarVisibilityBtn = "customization-toolbar-visibility-button";
+ const kDrawInTitlebarPref = "browser.tabs.drawInTitlebar";
+ const kDeveditionThemePref = "browser.devedition.theme.enabled";
+ const kDeveditionButtonPref = "browser.devedition.theme.showCustomizeButton";
++const kDeveditionChangedNotification = "devedition-theme-state-changed";
+ const kMaxTransitionDurationMs = 2000;
+ 
+ const kPanelItemContextMenu = "customizationPanelItemContextMenu";
+ const kPaletteItemContextMenu = "customizationPaletteItemContextMenu";
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource:///modules/CustomizableUI.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+@@ -59,27 +60,29 @@ function CustomizeMode(aWindow) {
+   // There are two palettes - there's the palette that can be overlayed with
+   // toolbar items in browser.xul. This is invisible, and never seen by the
+   // user. Then there's the visible palette, which gets populated and displayed
+   // to the user when in customizing mode.
+   this.visiblePalette = this.document.getElementById(kPaletteId);
+   this.paletteEmptyNotice = this.document.getElementById("customization-empty");
+   this.paletteSpacer = this.document.getElementById("customization-spacer");
+   this.tipPanel = this.document.getElementById("customization-tipPanel");
+-  let lwthemeButton = this.document.getElementById("customization-lwtheme-button");
+   if (Services.prefs.getCharPref("general.skins.selectedSkin") != "classic/1.0") {
++    let lwthemeButton = this.document.getElementById("customization-lwtheme-button");
++    let deveditionButton = this.document.getElementById("customization-devedition-theme-button");
+     lwthemeButton.setAttribute("hidden", "true");
++    deveditionButton.setAttribute("hidden", "true");
+   }
+ #ifdef CAN_DRAW_IN_TITLEBAR
+   this._updateTitlebarButton();
+   Services.prefs.addObserver(kDrawInTitlebarPref, this, false);
+ #endif
+   this._updateDevEditionThemeButton();
+   Services.prefs.addObserver(kDeveditionButtonPref, this, false);
+-  Services.prefs.addObserver(kDeveditionThemePref, this, false);
++  Services.obs.addObserver(this, kDeveditionChangedNotification, false);
+   this.window.addEventListener("unload", this);
+ };
+ 
+ CustomizeMode.prototype = {
+   _changed: false,
+   _transitioning: false,
+   window: null,
+   document: null,
+@@ -106,17 +109,17 @@ CustomizeMode.prototype = {
+     return this.window.CustomizationHandler;
+   },
+ 
+   uninit: function() {
+ #ifdef CAN_DRAW_IN_TITLEBAR
+     Services.prefs.removeObserver(kDrawInTitlebarPref, this);
+ #endif
+     Services.prefs.removeObserver(kDeveditionButtonPref, this);
+-    Services.prefs.removeObserver(kDeveditionThemePref, this);
++    Services.obs.removeObserver(this, kDeveditionChangedNotification);
+   },
+ 
+   toggle: function() {
+     if (this._handler.isEnteringCustomizeMode || this._handler.isExitingCustomizeMode) {
+       this._wantToBeInCustomizeMode = !this._wantToBeInCustomizeMode;
+       return;
+     }
+     if (this._customizing) {
+@@ -465,16 +468,17 @@ CustomizeMode.prototype = {
+         mainView.setAttribute("context", this._mainViewContext);
+       }
+ 
+       let customizableToolbars = document.querySelectorAll("toolbar[customizable=true]:not([autohide=true])");
+       for (let toolbar of customizableToolbars)
+         toolbar.removeAttribute("customizing");
+ 
+       this.window.PanelUI.endBatchUpdate();
++      delete this._lastLightWeightTheme;
+       this._changed = false;
+       this._transitioning = false;
+       this._handler.isExitingCustomizeMode = false;
+       CustomizableUI.dispatchToolboxEvent("aftercustomization", {}, window);
+       CustomizableUI.notifyEndCustomizing(window);
+ 
+       if (this._wantToBeInCustomizeMode) {
+         this.enter();
+@@ -1464,28 +1468,34 @@ CustomizeMode.prototype = {
+   observe: function(aSubject, aTopic, aData) {
+     switch (aTopic) {
+       case "nsPref:changed":
+         this._updateResetButton();
+         this._updateUndoResetButton();
+ #ifdef CAN_DRAW_IN_TITLEBAR
+         this._updateTitlebarButton();
+ #endif
+-        this._updateDevEditionThemeButton();
+         break;
+       case "lightweight-theme-window-updated":
+         if (aSubject == this.window) {
+           aData = JSON.parse(aData);
+           if (!aData) {
+             this.removeLWTStyling();
+           } else {
+             this.updateLWTStyling(aData);
+           }
+         }
+         break;
++      case kDeveditionChangedNotification:
++        if (aSubject == this.window) {
++          this._updateDevEditionThemeButton();
++          this._updateResetButton();
++          this._updateUndoResetButton();
++        }
++        break;
+     }
+   },
+ 
+ #ifdef CAN_DRAW_IN_TITLEBAR
+   _updateTitlebarButton: function() {
+     let drawInTitlebar = true;
+     try {
+       drawInTitlebar = Services.prefs.getBoolPref(kDrawInTitlebarPref);
+@@ -1503,34 +1513,49 @@ CustomizeMode.prototype = {
+     // Drawing in the titlebar means not showing the titlebar, hence the negation:
+     Services.prefs.setBoolPref(kDrawInTitlebarPref, !aShouldShowTitlebar);
+   },
+ #endif
+ 
+   _updateDevEditionThemeButton: function() {
+     let button = this.document.getElementById("customization-devedition-theme-button");
+ 
+-    let themeEnabled = Services.prefs.getBoolPref(kDeveditionThemePref);
++    let themeEnabled = !!this.window.DevEdition.styleSheet;
+     if (themeEnabled) {
+       button.setAttribute("checked", "true");
+     } else {
+       button.removeAttribute("checked");
+     }
+ 
+     let buttonVisible = Services.prefs.getBoolPref(kDeveditionButtonPref);
+     if (buttonVisible) {
+       button.removeAttribute("hidden");
+     } else {
+       button.setAttribute("hidden", "true");
+     }
+   },
+   toggleDevEditionTheme: function() {
++    const DEFAULT_THEME_ID = "{972ce4c6-7e08-4474-a285-3208198ce6fd}";
+     let button = this.document.getElementById("customization-devedition-theme-button");
+-    let preferenceValue = button.hasAttribute("checked");
+-    Services.prefs.setBoolPref(kDeveditionThemePref, preferenceValue);
++    let shouldEnable = button.hasAttribute("checked");
++
++    Services.prefs.setBoolPref(kDeveditionThemePref, shouldEnable);
++    if (LightweightThemeManager.currentTheme && shouldEnable) {
++      this._lastLightWeightTheme = LightweightThemeManager.currentTheme;
++      AddonManager.getAddonByID(DEFAULT_THEME_ID, function(aDefaultTheme) {
++        // Theoretically, this could race if people are /very/ quick in switching
++        // something else here, so doublecheck:
++        if (button.hasAttribute("checked")) {
++          aDefaultTheme.userDisabled = false;
++        }
++      });
++    } else if (!LightweightThemeManager.currentTheme && !shouldEnable &&
++               this._lastLightWeightTheme) {
++      LightweightThemeManager.currentTheme = this._lastLightWeightTheme;
++    }
+   },
+ 
+   _onDragStart: function(aEvent) {
+     __dumpDragData(aEvent);
+     let item = aEvent.target;
+     while (item && item.localName != "toolbarpaletteitem") {
+       if (item.localName == "toolbar") {
+         return;
+diff --git a/browser/components/customizableui/test/browser_970511_undo_restore_default.js b/browser/components/customizableui/test/browser_970511_undo_restore_default.js
+--- a/browser/components/customizableui/test/browser_970511_undo_restore_default.js
++++ b/browser/components/customizableui/test/browser_970511_undo_restore_default.js
+@@ -109,16 +109,21 @@ add_task(function() {
+   let restoreDefaultsButton = document.getElementById("customization-reset-button");
+   let deveditionThemeButton = document.getElementById("customization-devedition-theme-button");
+   let undoResetButton = document.getElementById("customization-undo-reset-button");
+   ok(CustomizableUI.inDefaultState, "Should be in default state at start of test");
+   ok(restoreDefaultsButton.disabled, "Restore defaults button should be disabled when in default state");
+   is(deveditionThemeButton.hasAttribute("checked"), defaultValue, "Devedition theme button should reflect pref value");
+   is(undoResetButton.hidden, true, "Undo reset button should be hidden at start of test");
+   Services.prefs.setBoolPref(prefName, !defaultValue);
++
++  //XXXgijs this line should be removed once bug 1094509 lands
++  Services.prefs.setCharPref("devtools.theme", "dark");
++
++  yield waitForCondition(() => !restoreDefaultsButton.disabled);
+   ok(!restoreDefaultsButton.disabled, "Restore defaults button should be enabled when pref changed");
+   is(deveditionThemeButton.hasAttribute("checked"), !defaultValue, "Devedition theme button should reflect changed pref value");
+   ok(!CustomizableUI.inDefaultState, "With devedition theme flipped, no longer default");
+   is(undoResetButton.hidden, true, "Undo reset button should be hidden after pref change");
+ 
+   yield gCustomizeMode.reset();
+   ok(restoreDefaultsButton.disabled, "Restore defaults button should be disabled after reset");
+   is(deveditionThemeButton.hasAttribute("checked"), defaultValue, "devedition theme button should reflect default value after reset");
+@@ -129,16 +134,18 @@ add_task(function() {
+ 
+   yield gCustomizeMode.undoReset();
+   ok(!restoreDefaultsButton.disabled, "Restore defaults button should be enabled after undo-reset");
+   is(deveditionThemeButton.hasAttribute("checked"), !defaultValue, "devedition theme button should reflect undo-reset value");
+   ok(!CustomizableUI.inDefaultState, "No longer in default state after undo");
+   is(Services.prefs.getBoolPref(prefName), !defaultValue, "Undo-reset goes back to previous pref value");
+   is(undoResetButton.hidden, true, "Undo reset button should be hidden after undo-reset clicked");
+ 
++  //XXXgijs this line should be removed once bug 1094509 lands
++  Services.prefs.clearUserPref("devtools.theme");
+   Services.prefs.clearUserPref(prefName);
+   ok(CustomizableUI.inDefaultState, "In default state after pref cleared");
+   is(undoResetButton.hidden, true, "Undo reset button should be hidden at end of test");
+ });
+ 
+ add_task(function asyncCleanup() {
+   yield gCustomizeMode.reset();
+   yield endCustomizing();
