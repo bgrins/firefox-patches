@@ -1,0 +1,217 @@
+# HG changeset patch
+# Parent 103ffeaa554dc878f489a18d2ba8223b6a192b63
+# User Tomasz Kołodziejski <tkolodziejski@gmail.com>
+
+Bug 1094622 - Deleting node in inspector now selects previous sibling and not parent. r=bgrins
+
+---
+ browser/devtools/markupview/markup-view.js         | 15 +++++----
+ .../test/browser_markupview_tag_edit_04.js         | 38 +++++++++++++++-------
+ browser/devtools/markupview/test/head.js           |  2 +-
+ toolkit/devtools/server/actors/inspector.js        | 14 +++++++-
+ 4 files changed, 48 insertions(+), 21 deletions(-)
+
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -516,26 +516,27 @@ MarkupView.prototype = {
+       return;
+     }
+ 
+     let container = this.getContainer(aNode);
+ 
+     // Retain the node so we can undo this...
+     this.walker.retainNode(aNode).then(() => {
+       let parent = aNode.parentNode();
+-      let sibling = null;
++      let nextSibling = null;
+       this.undo.do(() => {
+-        if (container.selected) {
+-          this.navigate(this.getContainer(parent));
+-        }
+-        this.walker.removeNode(aNode).then(nextSibling => {
+-          sibling = nextSibling;
++        this.walker.removeNode(aNode).then(siblings => {
++          let focusNode = siblings.previousSibling || parent;
++          nextSibling = siblings.nextSibling;
++          if (container.selected) {
++            this.navigate(this.getContainer(focusNode));
++          }
+         });
+       }, () => {
+-        this.walker.insertBefore(aNode, parent, sibling);
++        this.walker.insertBefore(aNode, parent, nextSibling);
+       });
+     }).then(null, console.error);
+   },
+ 
+   /**
+    * If an editable item is focused, select its container.
+    */
+   _onFocus: function(aEvent) {
+diff --git a/browser/devtools/markupview/test/browser_markupview_tag_edit_04.js b/browser/devtools/markupview/test/browser_markupview_tag_edit_04.js
+--- a/browser/devtools/markupview/test/browser_markupview_tag_edit_04.js
++++ b/browser/devtools/markupview/test/browser_markupview_tag_edit_04.js
+@@ -1,30 +1,44 @@
+ /* vim: set ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+-// Tests that a node can be deleted from the markup-view with the delete key
++// Tests that a node can be deleted from the markup-view with the delete key.
++// Also checks that after deletion the correct element is highlighted.
++// The next sibling is preferred, but the parent is a fallback.
+ 
+-const TEST_URL = "data:text/html,<div id='delete-me'></div>";
++const TEST_URL = "data:text/html,<div id='parent'><div id='first'></div><div id='second'></div><div id='third'></div></div>";
++
++function* checkDeleteAndSelection(inspector, nodeSelector, focusedNodeSelector) {
++  yield selectNode(nodeSelector, inspector);
++  yield clickContainer(nodeSelector, inspector);
++
++  info("Deleting the element \"" + nodeSelector + "\" with the keyboard");
++  let mutated = inspector.once("markupmutation");
++  EventUtils.sendKey("delete", inspector.panelWin);
++
++  yield Promise.all([mutated, inspector.once("inspector-updated")]);
++
++  let nodeFront = yield getNodeFront(focusedNodeSelector, inspector);
++  is(inspector.selection.nodeFront, nodeFront,
++    focusedNodeSelector + " should be selected after " + nodeSelector + " node gets deleted.");
++
++  info("Checking that it's gone, baby gone!");
++  ok(!content.document.querySelector(nodeSelector), "The test node does not exist");
++
++  yield undoChange(inspector);
++  ok(content.document.querySelector(nodeSelector), "The test node is back!");
++}
+ 
+ let test = asyncTest(function*() {
+-  let {toolbox, inspector} = yield addTab(TEST_URL).then(openInspector);
++  let {inspector} = yield addTab(TEST_URL).then(openInspector);
+ 
+   info("Selecting the test node by clicking on it to make sure it receives focus");
+-  let node = content.document.querySelector("#delete-me");
+-  yield clickContainer("#delete-me", inspector);
+ 
+-  info("Deleting the element with the keyboard");
+-  let mutated = inspector.once("markupmutation");
+-  EventUtils.sendKey("delete", inspector.panelWin);
+-  yield mutated;
+-
+-  info("Checking that it's gone, baby gone!");
+-  ok(!content.document.querySelector("#delete-me"), "The test node does not exist");
+-
+-  yield undoChange(inspector);
+-  ok(content.document.querySelector("#delete-me"), "The test node is back!");
++  yield checkDeleteAndSelection(inspector, "#first", "#parent");
++  yield checkDeleteAndSelection(inspector, "#second", "#first");
++  yield checkDeleteAndSelection(inspector, "#third", "#second");
+ 
+   yield inspector.once("inspector-updated");
+ });
+diff --git a/browser/devtools/markupview/test/head.js b/browser/devtools/markupview/test/head.js
+--- a/browser/devtools/markupview/test/head.js
++++ b/browser/devtools/markupview/test/head.js
+@@ -247,17 +247,17 @@ function waitForChildrenUpdated({markup}
+  * @return {Promise} Resolves when the node has been selected.
+  */
+ let clickContainer = Task.async(function*(selector, inspector) {
+   info("Clicking on the markup-container for node " + selector);
+ 
+   let nodeFront = yield getNodeFront(selector, inspector);
+   let container = getContainerForNodeFront(nodeFront, inspector);
+ 
+-  let updated = inspector.once("inspector-updated");
++  let updated = container.selected ? promise.resolve() : inspector.once("inspector-updated");
+   EventUtils.synthesizeMouseAtCenter(container.tagLine, {type: "mousedown"},
+     inspector.markup.doc.defaultView);
+   EventUtils.synthesizeMouseAtCenter(container.tagLine, {type: "mouseup"},
+     inspector.markup.doc.defaultView);
+   return updated;
+ });
+ 
+ /**
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -51,16 +51,17 @@
+  */
+ 
+ const {Cc, Ci, Cu, Cr} = require("chrome");
+ const Services = require("Services");
+ const protocol = require("devtools/server/protocol");
+ const {Arg, Option, method, RetVal, types} = protocol;
+ const {LongStringActor, ShortLongString} = require("devtools/server/actors/string");
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
++const {Task} = Cu.import("resource://gre/modules/Task.jsm", {});
+ const object = require("sdk/util/object");
+ const events = require("sdk/event/core");
+ const {Unknown} = require("sdk/platform/xpcom");
+ const {Class} = require("sdk/core/heritage");
+ const {PageStyleActor} = require("devtools/server/actors/styles");
+ const {
+   HighlighterActor,
+   CustomHighlighterActor,
+@@ -2871,17 +2872,28 @@ var WalkerFront = exports.WalkerFront = 
+     }
+ 
+     if (top !== this.rootNode) {
+       // Imported an already-orphaned node.
+       this._orphaned.add(top);
+       walkerActor._orphaned.add(this.conn._transport._serverConnection.getActor(top.actorID));
+     }
+     return returnNode;
+-  }
++  },
++
++  removeNode: protocol.custom(Task.async(function* (node) {
++    let previousSibling = yield this.previousSibling(node);
++    let nextSibling = yield this._removeNode(node);
++    return {
++      previousSibling: previousSibling,
++      nextSibling: nextSibling,
++    };
++  }), {
++    impl: "_removeNode"
++  }),
+ });
+ 
+ /**
+  * Convenience API for building a list of attribute modifications
+  * for the `modifyAttributes` request.
+  */
+ var AttributeModificationList = Class({
+   initialize: function(node) {
+diff --git a/toolkit/devtools/server/tests/mochitest/test_inspector-remove.html b/toolkit/devtools/server/tests/mochitest/test_inspector-remove.html
+--- a/toolkit/devtools/server/tests/mochitest/test_inspector-remove.html
++++ b/toolkit/devtools/server/tests/mochitest/test_inspector-remove.html
+@@ -57,23 +57,23 @@ addTest(function testRemoveSubtree() {
+     longlist = listFront;
+     longlistID = longlist.actorID;
+   }).then(() => {
+     return gWalker.children(longlist);
+   }).then((items)=> {
+     originalOwnershipSize = assertOwnership();
+     ok(originalOwnershipSize > 26, "Should have at least 26 items in our ownership tree");
+     return gWalker.removeNode(longlist);
+-  }).then(nextSiblingFront => {
+-    is(nextSiblingFront.rawNode(), nextSibling, "Should have returned the next sibling.");
++  }).then(siblingFronts => {
++    is(siblingFronts.nextSibling.rawNode(), nextSibling, "Should have returned the next sibling.");
+     return waitForMutation(gWalker, isChildList);
+   }).then(() => {
+     // Our ownership size should now be 26 fewer (we forgot about #longlist + 26 children, but learned about #longlist's next sibling)
+     let newOwnershipSize = assertOwnership();
+-    is(newOwnershipSize, originalOwnershipSize - 26, "Ownership tree should have dropped by 27 nodes");
++    is(newOwnershipSize, originalOwnershipSize - 25, "Ownership tree should have dropped by 27 nodes");
+     // Now verify that some nodes have gone away
+     return checkMissing(gClient, longlistID);
+   }).then(runNextTest));
+ });
+ 
+ addTest(function cleanup() {
+   delete gWalker;
+   delete gClient;
