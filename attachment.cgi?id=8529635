@@ -1,0 +1,505 @@
+diff --git a/browser/devtools/styleeditor/StyleEditorUI.jsm b/browser/devtools/styleeditor/StyleEditorUI.jsm
+--- a/browser/devtools/styleeditor/StyleEditorUI.jsm
++++ b/browser/devtools/styleeditor/StyleEditorUI.jsm
+@@ -74,16 +74,18 @@ function StyleEditorUI(debuggee, target,
+   this._onMediaPrefChanged = this._onMediaPrefChanged.bind(this);
+   this._updateMediaList = this._updateMediaList.bind(this);
+   this._clear = this._clear.bind(this);
+   this._onError = this._onError.bind(this);
+ 
+   this._prefObserver = new PrefObserver("devtools.styleeditor.");
+   this._prefObserver.on(PREF_ORIG_SOURCES, this._onNewDocument);
+   this._prefObserver.on(PREF_MEDIA_SIDEBAR, this._onMediaPrefChanged);
++
++  this._resetPromise = Promise.resolve();
+ }
+ 
+ StyleEditorUI.prototype = {
+   /**
+    * Get whether any of the editors have unsaved changes.
+    *
+    * @return boolean
+    */
+@@ -130,20 +132,25 @@ StyleEditorUI.prototype = {
+           // The selectorHighlighter can't always be instantiated, for example
+           // it doesn't work with XUL windows (until bug 1094959 gets fixed).
+           console.warn("The selectorHighlighter couldn't be instantiated, " +
+             "elements matching hovered selectors will not be highlighted");
+         }
+       }
+     }.bind(this)).then(() => {
+       this.createUI();
+-      this._debuggee.getStyleSheets().then((styleSheets) => {
+-        this._resetStyleSheetList(styleSheets); 
++
++      // Make sure to return a promise here so the tests do not continue until
++      // initialization is fully completed. This is necessary because otherwise
++      // the tests might shut down before initialization is complete, causing
++      // unresolved promise rejections in the code below.
++      return this._debuggee.getStyleSheets().then((styleSheets) => {
+         this._target.on("will-navigate", this._clear);
+         this._target.on("navigate", this._onNewDocument);
++        return this._resetStyleSheetList(styleSheets); 
+       });
+     });
+   },
+ 
+   /**
+    * Build the initial UI and wire buttons with event handlers.
+    */
+   createUI: function() {
+@@ -212,25 +219,41 @@ StyleEditorUI.prototype = {
+ 
+   /**
+    * Add editors for all the given stylesheets to the UI.
+    *
+    * @param  {array} styleSheets
+    *         Array of StyleSheetFront
+    */
+   _resetStyleSheetList: function(styleSheets) {
+-    this._clear();
++    // See initialize for an explanation of why we need to return a promise
++    // here. Because _resetStyleSheetList is an async operation, it is possible
++    // for _resetStyleSheetList to be called again before the previous call has
++    // completed (see bug 870339). To ensure the correct behavior, we should not
++    // process calls to _resetStyleSheetList until all previous calls have
++    // completed.
++    return this._resetPromise = this._resetPromise.then(() => {
++      this._clear();
+ 
+-    for (let sheet of styleSheets) {
+-      this._addStyleSheet(sheet);
+-    }
++      // We cannot use Promise.all here because the tests assume that
++      // stylesheets are added in the same order as they appear in the page.
++      // Instead, we add each stylesheet after the previous stylesheets has been
++      // added.
++      let promise = Promise.resolve();
++      for (let s of styleSheets) {
++        let sheet = s;
++        promise = promise.then(() => this._addStyleSheet(sheet));
++      }
+ 
+-    this._root.classList.remove("loading");
++      this._root.classList.remove("loading");
+ 
+-    this.emit("stylesheets-reset");
++      return promise.then(() => {
++        this.emit("stylesheets-reset");
++      });
++    });
+   },
+ 
+   /**
+    * Remove all editors and add loading indicator.
+    */
+   _clear: function() {
+     // remember selected sheet and line number for next load
+     if (this.selectedEditor && this.selectedEditor.sourceEditor) {
+@@ -263,33 +286,33 @@ StyleEditorUI.prototype = {
+   /**
+    * Add an editor for this stylesheet. Add editors for its original sources
+    * instead (e.g. Sass sources), if applicable.
+    *
+    * @param  {StyleSheetFront} styleSheet
+    *         Style sheet to add to style editor
+    */
+   _addStyleSheet: function(styleSheet) {
+-    let editor = this._addStyleSheetEditor(styleSheet);
++    return this._addStyleSheetEditor(styleSheet).then((editor) => {
++      if (!Services.prefs.getBoolPref(PREF_ORIG_SOURCES)) {
++        return;
++      }
+ 
+-    if (!Services.prefs.getBoolPref(PREF_ORIG_SOURCES)) {
+-      return;
+-    }
++      return styleSheet.getOriginalSources().then((sources) => {
++        if (sources && sources.length) {
++          this._removeStyleSheetEditor(editor);
++          sources.forEach((source) => {
++            // set so the first sheet will be selected, even if it's a source
++            source.styleSheetIndex = styleSheet.styleSheetIndex;
++            source.relatedStyleSheet = styleSheet;
+ 
+-    styleSheet.getOriginalSources().then((sources) => {
+-      if (sources && sources.length) {
+-        this._removeStyleSheetEditor(editor);
+-        sources.forEach((source) => {
+-          // set so the first sheet will be selected, even if it's a source
+-          source.styleSheetIndex = styleSheet.styleSheetIndex;
+-          source.relatedStyleSheet = styleSheet;
+-
+-          this._addStyleSheetEditor(source);
+-        });
+-      }
++            return this._addStyleSheetEditor(source);
++          });
++        }
++      });
+     });
+   },
+ 
+   /**
+    * Add a new editor to the UI for a source.
+    *
+    * @param {StyleSheet}  styleSheet
+    *        Object representing stylesheet
+@@ -310,20 +333,22 @@ StyleEditorUI.prototype = {
+                                       this._walker, this._highlighter);
+ 
+     editor.on("property-change", this._summaryChange.bind(this, editor));
+     editor.on("media-rules-changed", this._updateMediaList.bind(this, editor));
+     editor.on("linked-css-file", this._summaryChange.bind(this, editor));
+     editor.on("linked-css-file-error", this._summaryChange.bind(this, editor));
+     editor.on("error", this._onError);
+ 
+-    this.editors.push(editor);
+-
+-    editor.fetchSource(this._sourceLoaded.bind(this, editor));
+-    return editor;
++    return new Promise((resolve) => {
++      editor.fetchSource(() => {
++        this._sourceLoaded(editor);
++        resolve(editor);
++      });
++    });
+   },
+ 
+   /**
+    * Import a style sheet from file and asynchronously create a
+    * new stylesheet on the debuggee for it.
+    *
+    * @param {mixed} file
+    *        Optional nsIFile or filename string.
+@@ -502,16 +527,24 @@ StyleEditorUI.prototype = {
+           }
+         });
+ 
+         // autofocus if it's a new user-created stylesheet
+         if (editor.isNew) {
+           this._selectEditor(editor);
+         }
+ 
++        // We have to add the editor to the list of editors here rather than in
++        // _addStyleSheetEditor, otherwise we can end up iterating over editors
++        // that have not yet fully loaded if we don't wait for initialization to
++        // be fully completed.
++        this.editors.push(editor);
++
++        // N.B. _isEditorToSelect assumes that the editor has already been
++        // added to the list of editors above.
+         if (this._isEditorToSelect(editor)) {
+           this.switchToSelectedSheet();
+         }
+ 
+         // If this is the first stylesheet and there is no pending request to
+         // select a particular style sheet, select this sheet.
+         if (!this.selectedEditor && !this._styleSheetBoundToSelect
+             && editor.styleSheet.styleSheetIndex == 0) {
+@@ -531,23 +564,23 @@ StyleEditorUI.prototype = {
+             yield editor.load(inputElement);
+           }
+ 
+           editor.onShow();
+ 
+           this.emit("editor-selected", editor);
+ 
+           // Is there any CSS coverage markup to include?
+-          csscoverage.getUsage(this._target).then(usage => {
++          yield csscoverage.getUsage(this._target).then(usage => {
+             if (usage == null) {
+               return;
+             }
+ 
+             let href = csscoverage.sheetToUrl(editor.styleSheet);
+-            usage.createEditorReport(href).then(data => {
++            return usage.createEditorReport(href).then(data => {
+               editor.removeAllUnusedRegions();
+ 
+               if (data.reports.length > 0) {
+                 // Only apply if this file isn't compressed. We detect a
+                 // compressed file if there are more rules than lines.
+                 let text = editor.sourceEditor.getText();
+                 let lineCount = text.split("\n").length;
+                 let ruleCount = editor.styleSheet.ruleCount;
+diff --git a/browser/devtools/styleeditor/test/browser_styleeditor_import.js b/browser/devtools/styleeditor/test/browser_styleeditor_import.js
+--- a/browser/devtools/styleeditor/test/browser_styleeditor_import.js
++++ b/browser/devtools/styleeditor/test/browser_styleeditor_import.js
+@@ -47,24 +47,26 @@ function testImport()
+       EventUtils.synthesizeMouseAtCenter(importButton, {}, gPanelWindow);
+     }, gPanelWindow);
+   });
+ }
+ 
+ let gAddedCount = 0;
+ function testEditorAdded(aEditor)
+ {
+-  if (++gAddedCount == 2) {
++  ++gAddedCount;
++
++  if (gAddedCount == 2) {
+     // test import after the 2 initial stylesheets have been loaded
+     gUI.editors[0].getSourceEditor().then(function() {
+       testImport();
+     });
+   }
+ 
+-  if (!aEditor.savedFile) {
++  if (gAddedCount < 3) {
+     return;
+   }
+ 
+   is(aEditor.savedFile.leafName, FILENAME,
+      "imported stylesheet will be saved directly into the same file");
+   is(aEditor.friendlyName, FILENAME,
+      "imported stylesheet has the same name as the filename");
+ 
+diff --git a/browser/devtools/styleeditor/test/browser_styleeditor_init.js b/browser/devtools/styleeditor/test/browser_styleeditor_init.js
+--- a/browser/devtools/styleeditor/test/browser_styleeditor_init.js
++++ b/browser/devtools/styleeditor/test/browser_styleeditor_init.js
+@@ -22,17 +22,17 @@ function test()
+   content.location = TESTCASE_URI;
+ }
+ 
+ let gEditorAddedCount = 0;
+ function testEditorAdded(aEditor)
+ {
+   if (aEditor.styleSheet.styleSheetIndex == 0) {
+     gEditorAddedCount++;
+-    gUI.editors[0].getSourceEditor().then(testFirstStyleSheetEditor);
++    return gUI.editors[0].getSourceEditor().then(testFirstStyleSheetEditor);
+   }
+   if (aEditor.styleSheet.styleSheetIndex == 1) {
+     gEditorAddedCount++;
+     testSecondStyleSheetEditor(aEditor);
+   }
+ 
+   if (gEditorAddedCount == 2) {
+     gUI = null;
+diff --git a/browser/devtools/styleeditor/test/browser_styleeditor_media_sidebar_sourcemaps.js b/browser/devtools/styleeditor/test/browser_styleeditor_media_sidebar_sourcemaps.js
+--- a/browser/devtools/styleeditor/test/browser_styleeditor_media_sidebar_sourcemaps.js
++++ b/browser/devtools/styleeditor/test/browser_styleeditor_media_sidebar_sourcemaps.js
+@@ -10,17 +10,17 @@ const LABELS = ["screen and (max-width: 
+                 "screen and (min-width: 1200px)"];
+ const LINE_NOS = [5, 8];
+ 
+ waitForExplicitFinish();
+ 
+ let test = asyncTest(function*() {
+   Services.prefs.setBoolPref(MAP_PREF, true);
+ 
+-  let {UI} = yield addTabAndOpenStyleEditors(2, null, TESTCASE_URI);
++  let {UI} = yield addTabAndOpenStyleEditors(1, null, TESTCASE_URI);
+ 
+   yield listenForMediaChange(UI);
+ 
+   is(UI.editors.length, 1, "correct number of editors");
+ 
+   // Test editor with @media rules
+   let mediaEditor = UI.editors[0];
+   yield openEditor(mediaEditor);
+diff --git a/browser/devtools/styleeditor/test/browser_styleeditor_private_perwindowpb.js b/browser/devtools/styleeditor/test/browser_styleeditor_private_perwindowpb.js
+--- a/browser/devtools/styleeditor/test/browser_styleeditor_private_perwindowpb.js
++++ b/browser/devtools/styleeditor/test/browser_styleeditor_private_perwindowpb.js
+@@ -22,25 +22,25 @@ function test() {
+       win.gBrowser.selectedBrowser.removeEventListener("load", onLoad, true);
+ 
+       info("Clearing the browser cache");
+       cache.clear();
+ 
+       info("Opening the style editor in the private window");
+       openStyleEditorInWindow(win, function(panel) {
+         gUI = panel.UI;
+-        gUI.on("editor-added", onEditorAdded);
++        onEditorAdded(gUI.editors[0]);
+       });
+     }, true);
+ 
+     info("Loading the test URL in the new private window");
+     win.content.location = testURI;
+   }
+ 
+-  function onEditorAdded(aEvent, aEditor) {
++  function onEditorAdded(aEditor) {
+     info("The style editor is ready")
+     aEditor.getSourceEditor().then(checkCache);
+   }
+ 
+   function checkCache() {
+     checkDiskCacheFor(TEST_HOST, function() {
+       gUI.off("editor-added", onEditorAdded);
+       win.close();
+diff --git a/browser/devtools/styleeditor/test/browser_styleeditor_sourcemap_watching.js b/browser/devtools/styleeditor/test/browser_styleeditor_sourcemap_watching.js
+--- a/browser/devtools/styleeditor/test/browser_styleeditor_sourcemap_watching.js
++++ b/browser/devtools/styleeditor/test/browser_styleeditor_sourcemap_watching.js
+@@ -67,17 +67,17 @@ function test()
+ 
+     info("wrote to CSS file");
+   })
+ }
+ 
+ function openEditor(testcaseURI) {
+   let deferred = promise.defer();
+ 
+-  addTabAndOpenStyleEditors(3, panel => {
++  addTabAndOpenStyleEditors(2, panel => {
+     let UI = panel.UI;
+ 
+     // wait for 5 editors - 1 for first style sheet, 2 for the
+     // generated style sheets, and 2 for original source after it
+     // loads and replaces the generated style sheets.
+     let editor = UI.editors[1];
+     if (getStylesheetNameFor(editor) != TESTCASE_SCSS_NAME) {
+       editor = UI.editors[2];
+diff --git a/browser/devtools/styleeditor/test/browser_styleeditor_sourcemaps.js b/browser/devtools/styleeditor/test/browser_styleeditor_sourcemaps.js
+--- a/browser/devtools/styleeditor/test/browser_styleeditor_sourcemaps.js
++++ b/browser/devtools/styleeditor/test/browser_styleeditor_sourcemaps.js
+@@ -64,17 +64,21 @@ const contents = {
+ }
+ 
+ const cssNames = ["sourcemaps.css", "contained.css", "test-stylus.css"];
+ const origNames = ["sourcemaps.scss", "contained.scss", "test-stylus.styl"];
+ 
+ waitForExplicitFinish();
+ 
+ let test = asyncTest(function*() {
+-  let {UI} = yield addTabAndOpenStyleEditors(7, null, TESTCASE_URI);
++  // Now that we are waiting for the source editor to be fully initialized, the
++  // editors for the generated css files will aready have been replaced by the
++  // editors for the original css files by the time initialization is complete,
++  // so we will only iterate over the latter.
++  let {UI} = yield addTabAndOpenStyleEditors(4, null, TESTCASE_URI);
+ 
+   is(UI.editors.length, 4,
+     "correct number of editors with source maps enabled");
+ 
+   // Test first plain css editor
+   testFirstEditor(UI.editors[0]);
+ 
+   // Test Scss editors
+@@ -88,16 +92,27 @@ let test = asyncTest(function*() {
+   is(UI.editors.length, 4, "correct number of editors after pref toggled");
+ 
+   // Test CSS editors
+   yield testEditor(UI.editors[1], cssNames);
+   yield testEditor(UI.editors[2], cssNames);
+   yield testEditor(UI.editors[3], cssNames);
+ 
+   Services.prefs.clearUserPref(PREF);
++
++  // Clearing the user pref triggers another reset, so we have to wait for that
++  // to complete before shutting down.
++  let count = 0;
++  yield new Promise((resolve) => {
++    UI.on("editor-added", (event, editor) => {
++      if (++count == 4) {
++        resolve();
++      }
++    })
++  });
+ });
+ 
+ function testFirstEditor(editor) {
+   let name = getStylesheetNameFor(editor);
+   is(name, "simple.css", "First style sheet display name is correct");
+ }
+ 
+ function testEditor(editor, possibleNames) {
+@@ -115,24 +130,25 @@ function testEditor(editor, possibleName
+ 
+ /* Helpers */
+ 
+ function togglePref(UI) {
+   let deferred = promise.defer();
+   let count = 0;
+ 
+   UI.on("editor-added", (event, editor) => {
+-    if (++count == 3) {
++    if (++count == 4) {
+       deferred.resolve();
+     }
+   })
+   let editorsPromise = deferred.promise;
+ 
+   let selectedPromise = UI.once("editor-selected");
+ 
++  dump(">>>>>>>>>> TURNING OFF PREF <<<<<<<<<<\n");
+   Services.prefs.setBoolPref(PREF, false);
+ 
+   return promise.all([editorsPromise, selectedPromise]);
+ }
+ 
+ function openEditor(editor) {
+   getLinkFor(editor).click();
+ 
+diff --git a/browser/devtools/styleeditor/test/head.js b/browser/devtools/styleeditor/test/head.js
+--- a/browser/devtools/styleeditor/test/head.js
++++ b/browser/devtools/styleeditor/test/head.js
+@@ -104,18 +104,22 @@ function addTabAndOpenStyleEditors(count
+ function addTabAndCheckOnStyleEditorAdded(callbackOnce, callbackOnAdded) {
+   gBrowser.selectedTab = gBrowser.addTab();
+   gBrowser.selectedBrowser.addEventListener("load", function onLoad() {
+     gBrowser.selectedBrowser.removeEventListener("load", onLoad, true);
+     openStyleEditorInWindow(window, function (panel) {
+       // Execute the individual callback with the panel argument.
+       callbackOnce(panel);
+       // Report editors that already opened while loading.
+-      for (let editor of panel.UI.editors) {
+-        callbackOnAdded(editor);
++      let promise = Promise.resolve();
++      for (let e of panel.UI.editors) {
++        let editor = e;
++        promise = promise.then(() => {
++          callbackOnAdded(editor);
++        });
+       }
+       // Report new editors added afterwards.
+       panel.UI.on("editor-added", (event, editor) => callbackOnAdded(editor));
+     });
+   }, true);
+ }
+ 
+ function openStyleEditorInWindow(win, callback) {
+diff --git a/toolkit/modules/Promise-backend.js b/toolkit/modules/Promise-backend.js
+--- a/toolkit/modules/Promise-backend.js
++++ b/toolkit/modules/Promise-backend.js
+@@ -338,16 +338,18 @@ this.Promise = function Promise(aExecuto
+      * a rejection callback, this contains an array
+      * - {string} id An id for use with |PendingErrors|;
+      * - {FinalizationWitness} witness A witness broadcasting |id| on
+      *   notification "promise-finalization-witness".
+      */
+     witness: undefined
+   }});
+ 
++  this.stack = Error().stack;
++
+   Object.seal(this);
+ 
+   let resolve = PromiseWalker.completePromise
+                              .bind(PromiseWalker, this, STATUS_RESOLVED);
+   let reject = PromiseWalker.completePromise
+                             .bind(PromiseWalker, this, STATUS_REJECTED);
+ 
+   try {
+@@ -670,16 +672,19 @@ this.PromiseWalker = {
+     // Change the promise status and schedule our handlers for processing.
+     aPromise[N_INTERNALS].status = aStatus;
+     aPromise[N_INTERNALS].value = aValue;
+     if (aPromise[N_INTERNALS].handlers.length > 0) {
+       this.schedulePromise(aPromise);
+     } else if (aStatus == STATUS_REJECTED) {
+       // This is a rejection and the promise is the last in the chain.
+       // For the time being we therefore have an uncaught error.
++      dump(">>>>>>>>>> PENDING ERROR FOR PROMISE <<<<<<<<<<\n");
++      dump(aPromise.stack + "\n");
++
+       let id = PendingErrors.register(aValue);
+       let witness =
+           FinalizationWitnessService.make("promise-finalization-witness", id);
+       aPromise[N_INTERNALS].witness = [id, witness];
+     }
+   },
+ 
+   /**
