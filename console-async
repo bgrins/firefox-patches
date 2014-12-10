@@ -1,0 +1,223 @@
+# HG changeset patch
+# Parent 01cc420d461b1909a32c7d6d5ee6e588eb2b350b
+# User Brian Grinstead <bgrinstead@mozilla.com>
+Bug 1088861 - Console doesn't respond when debugger is paused at breakpoint that was hit by executing a command in the console;r=past
+
+
+diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webconsole/webconsole.js
+--- a/browser/devtools/webconsole/webconsole.js
++++ b/browser/devtools/webconsole/webconsole.js
+@@ -3227,16 +3227,17 @@ JSTerm.prototype = {
+    *        The message received from the server.
+    */
+   _executeResultCallback:
+   function JST__executeResultCallback(aAfterMessage, aCallback, aResponse)
+   {
+     if (!this.hud) {
+       return;
+     }
++
+     if (aResponse.error) {
+       Cu.reportError("Evaluation error " + aResponse.error + ": " +
+                      aResponse.message);
+       return;
+     }
+     let errorMessage = aResponse.exceptionMessage;
+     let result = aResponse.result;
+     let helperResult = aResponse.helperResult;
+@@ -3400,17 +3401,17 @@ JSTerm.prototype = {
+     }
+ 
+     let evalOptions = {
+       bindObjectActor: aOptions.bindObjectActor,
+       frameActor: frameActor,
+       selectedNodeActor: aOptions.selectedNodeActor,
+     };
+ 
+-    this.webConsoleClient.evaluateJS(aString, onResult, evalOptions);
++    this.webConsoleClient.evaluateJSAsync(aString, onResult, evalOptions);
+     return deferred.promise;
+   },
+ 
+   /**
+    * Retrieve the FrameActor ID given a frame depth.
+    *
+    * @param number aFrame
+    *        Frame depth.
+diff --git a/toolkit/devtools/server/actors/webconsole.js b/toolkit/devtools/server/actors/webconsole.js
+--- a/toolkit/devtools/server/actors/webconsole.js
++++ b/toolkit/devtools/server/actors/webconsole.js
+@@ -5,16 +5,17 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const { Cc, Ci, Cu } = require("chrome");
+ const { DebuggerServer, ActorPool } = require("devtools/server/main");
+ const { EnvironmentActor, LongStringActor, ObjectActor, ThreadActor } = require("devtools/server/actors/script");
+ const { update } = require("devtools/toolkit/DevToolsUtils");
++const {setTimeout, clearTimeout} = require('sdk/timers');
+ 
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "Services",
+                                   "resource://gre/modules/Services.jsm");
+ XPCOMUtils.defineLazyGetter(this, "NetworkMonitor", () => {
+   return require("devtools/toolkit/webconsole/network-monitor")
+          .NetworkMonitor;
+@@ -41,16 +42,28 @@ for (let name of ["WebConsoleUtils", "Co
+       }
+       return require("devtools/toolkit/webconsole/utils")[prop];
+     }.bind(null, name),
+     configurable: true,
+     enumerable: true
+   });
+ }
+ 
++var guid = (function() {
++  function s4() {
++    return Math.floor((1 + Math.random()) * 0x10000)
++               .toString(16)
++               .substring(1);
++  }
++  return function() {
++    return s4() + s4() + '-' + s4() + '-' + s4() + '-' +
++           s4() + '-' + s4() + s4() + s4();
++  };
++})();
++
+ /**
+  * The WebConsoleActor implements capabilities needed for the Web Console
+  * feature.
+  *
+  * @constructor
+  * @param object aConnection
+  *        The connection to the client, DebuggerServerConnection.
+  * @param object [aParentActor]
+@@ -723,16 +736,36 @@ WebConsoleActor.prototype =
+     messages.sort(function(a, b) { return a.timeStamp - b.timeStamp; });
+ 
+     return {
+       from: this.actorID,
+       messages: messages,
+     };
+   },
+ 
++  onEvaluateJSAsync: function WCA_onEvaluateJSAsync(aRequest)
++  {
++
++    let foo = guid();
++    console.log("Requesting evaluation!!", aRequest, foo);
++
++    this.conn.send({
++      from: this.actorID,
++      uuid: foo
++    });
++
++    let response = this.onEvaluateJS(aRequest);
++    response.type = "evaluationResult";
++    response.uuid = foo;
++    console.log("RESPONSE", response);
++    this.conn.send(response);
++
++    // return response;
++  },
++
+   /**
+    * Handler for the "evaluateJS" request. This method evaluates the given
+    * JavaScript string and sends back the result.
+    *
+    * @param object aRequest
+    *        The JSON request object received from the Web Console client.
+    * @return object
+    *         The evaluation response packet.
+@@ -1466,16 +1499,17 @@ WebConsoleActor.prototype =
+ };
+ 
+ WebConsoleActor.prototype.requestTypes =
+ {
+   startListeners: WebConsoleActor.prototype.onStartListeners,
+   stopListeners: WebConsoleActor.prototype.onStopListeners,
+   getCachedMessages: WebConsoleActor.prototype.onGetCachedMessages,
+   evaluateJS: WebConsoleActor.prototype.onEvaluateJS,
++  evaluateJSAsync: WebConsoleActor.prototype.onEvaluateJSAsync,
+   autocomplete: WebConsoleActor.prototype.onAutocomplete,
+   clearMessagesCache: WebConsoleActor.prototype.onClearMessagesCache,
+   getPreferences: WebConsoleActor.prototype.onGetPreferences,
+   setPreferences: WebConsoleActor.prototype.onSetPreferences,
+   sendHTTPRequest: WebConsoleActor.prototype.onSendHTTPRequest
+ };
+ 
+ exports.WebConsoleActor = WebConsoleActor;
+diff --git a/toolkit/devtools/webconsole/client.js b/toolkit/devtools/webconsole/client.js
+--- a/toolkit/devtools/webconsole/client.js
++++ b/toolkit/devtools/webconsole/client.js
+@@ -22,17 +22,23 @@ loader.lazyImporter(this, "LongStringCli
+  */
+ function WebConsoleClient(aDebuggerClient, aResponse)
+ {
+   this._actor = aResponse.from;
+   this._client = aDebuggerClient;
+   this._longStrings = {};
+   this.traits = aResponse.traits || {};
+   this.events = [];
++
++  this.pendingEvaluationResults = new Map();
++  this.onEvaluationResult = this.onEvaluationResult.bind(this);
++
++  this._client.addListener("evaluationResult", this.onEvaluationResult);
+ }
++
+ exports.WebConsoleClient = WebConsoleClient;
+ 
+ WebConsoleClient.prototype = {
+   _longStrings: null,
+   traits: null,
+ 
+   get actor() { return this._actor; },
+ 
+@@ -120,16 +126,44 @@ WebConsoleClient.prototype = {
+       frameActor: aOptions.frameActor,
+       url: aOptions.url,
+       selectedNodeActor: aOptions.selectedNodeActor,
+     };
+     this._client.request(packet, aOnResponse);
+   },
+ 
+   /**
++   * Handler for the web console client's unsolicited evaluationResult notification.
++   */
++  onEvaluationResult: function(aNotification, aPacket) {
++    console.log(aNotification, aPacket);
++    let onResponse = this.pendingEvaluationResults.get(aPacket.uuid);
++    if (onResponse) {
++      onResponse(aPacket);
++    }
++  },
++
++  evaluateJSAsync: function WCC_evaluateJS(aString, aOnResponse, aOptions = {})
++  {
++    let packet = {
++      to: this._actor,
++      type: "evaluateJSAsync",
++      text: aString,
++      bindObjectActor: aOptions.bindObjectActor,
++      frameActor: aOptions.frameActor,
++      url: aOptions.url,
++      selectedNodeActor: aOptions.selectedNodeActor,
++    };
++    this._client.request(packet, response => {
++      console.log("EVALUATE JS DONE!!", arguments, aOnResponse);
++      this.pendingEvaluationResults.set(response.uuid, aOnResponse);
++    });
++  },
++
++  /**
+    * Autocomplete a JavaScript expression.
+    *
+    * @param string aString
+    *        The code you want to autocomplete.
+    * @param number aCursor
+    *        Cursor location inside the string. Index starts from 0.
+    * @param function aOnResponse
+    *        The function invoked when the response is received.
