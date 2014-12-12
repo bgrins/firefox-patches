@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent dd59cf445ac265ee2d03d25f7db2cb67f2f8bf5e
+# Parent 0d35326dfbae2d2dc62ebcd99d8696d8fedb9bbf
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 1088861 - Add evaluateJSAsync method on the web console actor;r=past
 
@@ -47,43 +47,33 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
     *
     * @param number aFrame
     *        Frame depth.
+diff --git a/toolkit/devtools/client/dbg-client.jsm b/toolkit/devtools/client/dbg-client.jsm
+--- a/toolkit/devtools/client/dbg-client.jsm
++++ b/toolkit/devtools/client/dbg-client.jsm
+@@ -229,17 +229,18 @@ const UnsolicitedNotifications = {
+   "frameUpdate": "frameUpdate",
+   "pageError": "pageError",
+   "documentLoad": "documentLoad",
+   "enteredFrame": "enteredFrame",
+   "exitedFrame": "exitedFrame",
+   "appOpen": "appOpen",
+   "appClose": "appClose",
+   "appInstall": "appInstall",
+-  "appUninstall": "appUninstall"
++  "appUninstall": "appUninstall",
++  "evaluationResult": "evaluationResult",
+ };
+ 
+ /**
+  * Set of pause types that are sent by the server and not as an immediate
+  * response to a client request.
+  */
+ const UnsolicitedPauses = {
+   "resumeLimit": "resumeLimit",
 diff --git a/toolkit/devtools/server/actors/webconsole.js b/toolkit/devtools/server/actors/webconsole.js
 --- a/toolkit/devtools/server/actors/webconsole.js
 +++ b/toolkit/devtools/server/actors/webconsole.js
-@@ -42,16 +42,32 @@ for (let name of ["WebConsoleUtils", "Co
-       return require("devtools/toolkit/webconsole/utils")[prop];
-     }.bind(null, name),
-     configurable: true,
-     enumerable: true
-   });
- }
- 
- /**
-+ * A function to get an auto incrementing numeric ID.
-+ * This is used for packet IDs, so if it happens to reach MAX_VALUE it
-+ * will just wrap back to 0, assuming that the earlier packets will
-+ * have been processed at this point.
-+ */
-+let getIncrementedID = (function() {
-+  let i = 0;
-+  return function() {
-+    if (i === Number.MAX_VALUE) {
-+      i = 0;
-+    }
-+    return i++;
-+  };
-+})();
-+
-+/**
-  * The WebConsoleActor implements capabilities needed for the Web Console
-  * feature.
-  *
-  * @constructor
-  * @param object aConnection
-  *        The connection to the client, DebuggerServerConnection.
-  * @param object [aParentActor]
-  *        Optional, the parent actor.
-@@ -724,16 +740,51 @@ WebConsoleActor.prototype =
+@@ -724,16 +724,50 @@ WebConsoleActor.prototype =
  
      return {
        from: this.actorID,
@@ -108,22 +98,21 @@ diff --git a/toolkit/devtools/server/actors/webconsole.js b/toolkit/devtools/ser
 +    // We want to be able to run console commands without waiting
 +    // for the first to return (see Bug 1088861).
 +
-+    // First, send a response packet with the id only
-+    let id = getIncrementedID();
++    // First, send a response packet with the id only.
++    let resultID = Date.now();
 +    this.conn.send({
 +      from: this.actorID,
-+      id: id
++      resultID: resultID
 +    });
 +
 +    // Then, execute the script that may pause.
 +    let response = this.onEvaluateJS(aRequest);
 +    response.type = "evaluationResult";
-+    delete response.input;
-+    response.id = id;
++    response.resultID = resultID;
 +
 +    // Finally, send an unsolicited evaluationResult packet with
 +    // the normal return value
-+    this.conn.send(response);
++    this.conn.sendActorEvent(this.actorID, "evaluationResult", response);
 +  },
 +
 +  /**
@@ -135,7 +124,7 @@ diff --git a/toolkit/devtools/server/actors/webconsole.js b/toolkit/devtools/ser
     * @return object
     *         The evaluation response packet.
     */
-@@ -1466,16 +1517,17 @@ WebConsoleActor.prototype =
+@@ -1466,16 +1500,17 @@ WebConsoleActor.prototype =
  };
  
  WebConsoleActor.prototype.requestTypes =
@@ -192,7 +181,7 @@ diff --git a/toolkit/devtools/webconsole/client.js b/toolkit/devtools/webconsole
 +   * Evaluate a JavaScript expression asynchronously.
 +   * See evaluateJS for parameter and response information.
 +   */
-+  evaluateJSAsync: function WCC_evaluateJS(aString, aOnResponse, aOptions = {})
++  evaluateJSAsync: function(aString, aOnResponse, aOptions = {})
 +  {
 +    let packet = {
 +      to: this._actor,
@@ -205,7 +194,7 @@ diff --git a/toolkit/devtools/webconsole/client.js b/toolkit/devtools/webconsole
 +    };
 +
 +    this._client.request(packet, response => {
-+      this.pendingEvaluationResults.set(response.id, aOnResponse);
++      this.pendingEvaluationResults.set(response.resultID, aOnResponse);
 +    });
 +  },
 +
@@ -216,10 +205,10 @@ diff --git a/toolkit/devtools/webconsole/client.js b/toolkit/devtools/webconsole
 +    // Find the associated callback based on this ID, and fire it.
 +    // In a sync evaluation, this would have already been called in
 +    // direct response to the client.request function.
-+    let onResponse = this.pendingEvaluationResults.get(aPacket.id);
++    let onResponse = this.pendingEvaluationResults.get(aPacket.resultID);
 +    if (onResponse) {
 +      onResponse(aPacket);
-+      this.pendingEvaluationResults.delete(aPacket.id);
++      this.pendingEvaluationResults.delete(aPacket.resultID);
 +    }
 +  },
 +
@@ -232,7 +221,7 @@ diff --git a/toolkit/devtools/webconsole/client.js b/toolkit/devtools/webconsole
     *        Cursor location inside the string. Index starts from 0.
     * @param function aOnResponse
     *        The function invoked when the response is received.
-@@ -395,13 +436,19 @@ WebConsoleClient.prototype = {
+@@ -395,13 +436,16 @@ WebConsoleClient.prototype = {
     * Close the WebConsoleClient. This stops all the listeners on the server and
     * detaches from the console actor.
     *
@@ -241,9 +230,6 @@ diff --git a/toolkit/devtools/webconsole/client.js b/toolkit/devtools/webconsole
     */
    detach: function WCC_detach(aOnResponse)
    {
-+    // XXX - Two questions:
-+    // 1) Is there a reason this doesn't use DebuggerClient.requester?
-+    // 2) Should this call this._client.unregisterClient(this)?
 +    this._client.removeListener("evaluationResult", this.onEvaluationResult);
      this.stopListeners(null, aOnResponse);
      this._longStrings = null;
