@@ -1,0 +1,688 @@
+# HG changeset patch
+# User Alexandre Poirot <poirot.alex@gmail.com>
+
+Bug 1059308 - Make frame selection button to work in browser toolbox. r=?
+
+diff --git a/browser/devtools/framework/toolbox-process-window.js b/browser/devtools/framework/toolbox-process-window.js
+index 499c2dc..577dd60 100644
+--- a/browser/devtools/framework/toolbox-process-window.js
++++ b/browser/devtools/framework/toolbox-process-window.js
+@@ -33,47 +33,56 @@ let connect = Task.async(function*() {
+   });
+   gClient = new DebuggerClient(transport);
+   gClient.connect(() => {
+     let addonID = getParameterByName("addonID");
+ 
+     if (addonID) {
+       gClient.listAddons(({addons}) => {
+         let addonActor = addons.filter(addon => addon.id === addonID).pop();
+-        openToolbox(addonActor);
++        openToolbox(addonActor, true);
+       });
+     } else {
+-      gClient.listTabs(openToolbox);
++      let packet = {
++        to: "root",
++        type: "chromeActor"
++      };
++      gClient.request(packet, aResponse => {
++        // Set chrome:false in order to attach to the target
++        // (i.e. send an `attach` request to the chrome actor)
++        openToolbox(aResponse.chromeActor, false);
++      });
+     }
+   });
+ });
+ 
+ // Certain options should be toggled since we can assume chrome debugging here
+ function setPrefDefaults() {
+   Services.prefs.setBoolPref("devtools.inspector.showUserAgentStyles", true);
+   Services.prefs.setBoolPref("devtools.profiler.ui.show-platform-data", true);
+   Services.prefs.setBoolPref("browser.devedition.theme.showCustomizeButton", false);
++  Services.prefs.setBoolPref("browser.dom.window.dump.enabled", true);
+ }
+ 
+ window.addEventListener("load", function() {
+   let cmdClose = document.getElementById("toolbox-cmd-close");
+   cmdClose.addEventListener("command", onCloseCommand);
+   setPrefDefaults();
+   connect().catch(Cu.reportError);
+ });
+ 
+ function onCloseCommand(event) {
+   window.close();
+ }
+ 
+-function openToolbox(form) {
++function openToolbox(form, chrome) {
+   let options = {
+     form: form,
+     client: gClient,
+-    chrome: true
++    chrome: chrome
+   };
+   devtools.TargetFactory.forRemoteTab(options).then(target => {
+     let frame = document.getElementById("toolbox-iframe");
+     let selectedTool = "jsdebugger";
+ 
+     try {
+       // Remember the last panel that was used inside of this profile.
+       selectedTool = Services.prefs.getCharPref("devtools.toolbox.selectedTool");
+diff --git a/browser/devtools/webconsole/hudservice.js b/browser/devtools/webconsole/hudservice.js
+index 61ebbaf..cd685e9 100644
+--- a/browser/devtools/webconsole/hudservice.js
++++ b/browser/devtools/webconsole/hudservice.js
+@@ -184,41 +184,38 @@ HUD_SERVICE.prototype =
+       let deferred = promise.defer();
+ 
+       if (!DebuggerServer.initialized) {
+         DebuggerServer.init();
+         DebuggerServer.addBrowserActors();
+       }
+ 
+       let client = new DebuggerClient(DebuggerServer.connectPipe());
+-      client.connect(() =>
+-        client.listTabs((aResponse) => {
+-          // Add Global Process debugging...
+-          let globals = Cu.cloneInto(aResponse, {});
+-          delete globals.tabs;
+-          delete globals.selected;
+-          // ...only if there are appropriate actors (a 'from' property will
+-          // always be there).
+-          if (Object.keys(globals).length > 1) {
+-            deferred.resolve({ form: globals, client: client, chrome: true });
+-          } else {
+-            deferred.reject("Global console not found!");
+-          }
+-        }));
++      client.connect(() => {
++        let packet = {
++          to: "root",
++          type: "chromeActor"
++        };
++        client.request(packet, aResponse => {
++          // Set chrome:false in order to attach to the target
++          // (i.e. send an `attach` request to the chrome actor)
++          deferred.resolve({ form: aResponse.chromeActor, client: client, chrome: false });
++        });
++      });
+ 
+       return deferred.promise;
+     }
+ 
+     let target;
+     function getTarget(aConnection)
+     {
+       let options = {
+         form: aConnection.form,
+         client: aConnection.client,
+-        chrome: true,
++        chrome: aConnection.chrome,
+       };
+ 
+       return devtools.TargetFactory.forRemoteTab(options);
+     }
+ 
+     function openWindow(aTarget)
+     {
+       target = aTarget;
+diff --git a/toolkit/devtools/server/actors/chrome.js b/toolkit/devtools/server/actors/chrome.js
+new file mode 100644
+index 0000000..aa0c486
+--- /dev/null
++++ b/toolkit/devtools/server/actors/chrome.js
+@@ -0,0 +1,133 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++const { Ci } = require("chrome");
++const Services = require("Services");
++const { DebuggerServer } = require("../main");
++const { TabActor } = require("./webbrowser");
++const makeDebugger = require("./utils/make-debugger");
++
++/**
++ * Creates a tab actor for handling requests to all the chrome content
++ * in the parent process. Most of the implementation comes from TabActor.
++ *
++ * @param aConnection DebuggerServerConnection
++ *        The connection to the client.
++ */
++function ChromeActor(aConnection)
++{
++  TabActor.call(this, aConnection);
++
++  // Defines the default docshell selected for the tab actor
++  let window = Services.wm.getMostRecentWindow(DebuggerServer.chromeWindowType);
++  Object.defineProperty(this, "docShell", {
++    configurable: true,
++    value: window.QueryInterface(Ci.nsIInterfaceRequestor)
++                 .getInterface(Ci.nsIDocShell)
++  });
++
++  Services.ww.registerNotification(this);
++
++  // This creates a Debugger instance for chrome debugging all globals.
++  this.makeDebugger = makeDebugger.bind(null, {
++    findDebuggees: dbg => dbg.findAllGlobals(),
++    shouldAddNewGlobalAsDebuggee: () => true
++  });
++}
++exports.ChromeActor = ChromeActor;
++
++ChromeActor.prototype = Object.create(TabActor.prototype);
++
++ChromeActor.prototype.constructor = ChromeActor;
++
++ChromeActor.prototype.isRootActor = true;
++
++/**
++ * Getter for the list of all docshell in this tabActor
++ * @return {Array}
++ */
++Object.defineProperty(ChromeActor.prototype, "docShells", {
++  get : function () {
++    // Iterate over all top-level windows and all their docshells.
++    let docShells = [];
++    let e = Services.ww.getWindowEnumerator();
++    while(e.hasMoreElements()) {
++      let window = e.getNext();
++      let docShell = window.QueryInterface(Ci.nsIInterfaceRequestor)
++                           .getInterface(Ci.nsIWebNavigation)
++                           .QueryInterface(Ci.nsIDocShell);
++      let docShellsEnum = docShell.getDocShellEnumerator(
++        Ci.nsIDocShellTreeItem.typeAll,
++        Ci.nsIDocShell.ENUMERATE_FORWARDS
++      );
++
++      while (docShellsEnum.hasMoreElements()) {
++        let docShell = docShellsEnum.getNext();
++        docShell.QueryInterface(Ci.nsIInterfaceRequestor)
++                .getInterface(Ci.nsIWebProgress);
++        docShells.push(docShell);
++      }
++    }
++
++    return docShells;
++  }
++});
++
++ChromeActor.prototype.observe = function(aSubject, aTopic, aData) {
++  TabActor.prototype.observe.call(this, aSubject, aTopic, aData);
++  if (!this.attached) {
++    return;
++  }
++  if (aTopic == "domwindowopened") {
++    let docShell = aSubject.QueryInterface(Ci.nsIInterfaceRequestor)
++                           .getInterface(Ci.nsIWebNavigation)
++                           .QueryInterface(Ci.nsIDocShell);
++    this._progressListener.watch(docShell);
++    this._notifyDocShellsUpdate([docShell]);
++  } else if (aTopic == "domwindowclosed") {
++    let docShell = aSubject.QueryInterface(Ci.nsIInterfaceRequestor)
++                           .getInterface(Ci.nsIWebNavigation)
++                           .QueryInterface(Ci.nsIDocShell);
++    this._notifyDocShellDestroy(docShell);
++  }
++}
++
++ChromeActor.prototype._detach = function() {
++  TabActor.prototype._detach.call(this);
++  Services.ww.unregisterNotification(this);
++};
++
++/* ThreadActor hooks. */
++
++/**
++ * Prepare to enter a nested event loop by disabling debuggee events.
++ */
++ChromeActor.prototype.preNest = function() {
++  // Disable events in all open windows.
++  let e = Services.wm.getEnumerator(null);
++  while (e.hasMoreElements()) {
++    let win = e.getNext();
++    let windowUtils = win.QueryInterface(Ci.nsIInterfaceRequestor)
++                         .getInterface(Ci.nsIDOMWindowUtils);
++    windowUtils.suppressEventHandling(true);
++    windowUtils.suspendTimeouts();
++  }
++}
++
++/**
++ * Prepare to exit a nested event loop by enabling debuggee events.
++ */
++ChromeActor.prototype.postNest = function(aNestData) {
++  // Enable events in all open windows.
++  let e = Services.wm.getEnumerator(null);
++  while (e.hasMoreElements()) {
++    let win = e.getNext();
++    let windowUtils = win.QueryInterface(Ci.nsIInterfaceRequestor)
++                         .getInterface(Ci.nsIDOMWindowUtils);
++    windowUtils.resumeTimeouts();
++    windowUtils.suppressEventHandling(false);
++  }
++}
+diff --git a/toolkit/devtools/server/actors/root.js b/toolkit/devtools/server/actors/root.js
+index 0f6ecce..d3e5328 100644
+--- a/toolkit/devtools/server/actors/root.js
++++ b/toolkit/devtools/server/actors/root.js
+@@ -5,19 +5,16 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const { Cc, Ci, Cu } = require("chrome");
+ const Services = require("Services");
+ const { ActorPool, appendExtraActors, createExtraActors } = require("devtools/server/actors/common");
+ const { DebuggerServer } = require("devtools/server/main");
+-const makeDebugger = require("./utils/make-debugger");
+-
+-loader.lazyRequireGetter(this, "StyleSheetActor", "devtools/server/actors/stylesheets", true);
+ 
+ loader.lazyGetter(this, "ppmm", () => {
+   return Cc["@mozilla.org/parentprocessmessagemanager;1"].getService(Ci.nsIMessageBroadcaster);
+ });
+ 
+ /* Root actor for the remote debugging protocol. */
+ 
+ /**
+@@ -94,24 +91,20 @@ loader.lazyGetter(this, "ppmm", () => {
+  */
+ function RootActor(aConnection, aParameters) {
+   this.conn = aConnection;
+   this._parameters = aParameters;
+   this._onTabListChanged = this.onTabListChanged.bind(this);
+   this._onAddonListChanged = this.onAddonListChanged.bind(this);
+   this._extraActors = {};
+ 
+-  // Map of DOM stylesheets to StyleSheetActors
+-  this._styleSheetActors = new Map();
++  this._globalActorPool = new ActorPool(this.conn);
++  this.conn.addActorPool(this._globalActorPool);
+ 
+-  // This creates a Debugger instance for chrome debugging all globals.
+-  this.makeDebugger = makeDebugger.bind(null, {
+-    findDebuggees: dbg => dbg.findAllGlobals(),
+-    shouldAddNewGlobalAsDebuggee: () => true
+-  });
++  this._chromeActor = null;
+ }
+ 
+ RootActor.prototype = {
+   constructor: RootActor,
+   applicationType: "browser",
+ 
+   traits: {
+     sources: true,
+@@ -172,92 +165,30 @@ RootActor.prototype = {
+       applicationType: this.applicationType,
+       /* This is not in the spec, but it's used by tests. */
+       testConnectionPrefix: this.conn.prefix,
+       traits: this.traits
+     };
+   },
+ 
+   /**
+-   * This is true for the root actor only, used by some child actors
+-   */
+-  get isRootActor() true,
+-
+-  /**
+-   * The (chrome) window, for use by child actors
+-   */
+-  get window() isWorker ? null : Services.wm.getMostRecentWindow(DebuggerServer.chromeWindowType),
+-
+-  /**
+-   * The list of all windows
+-   */
+-  get windows() {
+-    return this.docShells.map(docShell => {
+-      return docShell.QueryInterface(Ci.nsIInterfaceRequestor)
+-                     .getInterface(Ci.nsIDOMWindow);
+-    });
+-  },
+-
+-  /**
+-   * URL of the chrome window.
+-   */
+-  get url() { return this.window ? this.window.document.location.href : null; },
+-
+-  /**
+-   * The top level window's docshell
+-   */
+-  get docShell() {
+-    return this.window
+-      .QueryInterface(Ci.nsIInterfaceRequestor)
+-      .getInterface(Ci.nsIDocShell);
+-  },
+-
+-  /**
+-   * The list of all docshells
+-   */
+-  get docShells() {
+-    let docShellsEnum = this.docShell.getDocShellEnumerator(
+-      Ci.nsIDocShellTreeItem.typeAll,
+-      Ci.nsIDocShell.ENUMERATE_FORWARDS
+-    );
+-
+-    let docShells = [];
+-    while (docShellsEnum.hasMoreElements()) {
+-      docShells.push(docShellsEnum.getNext());
+-    }
+-
+-    return docShells;
+-  },
+-
+-  /**
+-   * Getter for the best nsIWebProgress for to watching this window.
+-   */
+-  get webProgress() {
+-    return this.docShell
+-      .QueryInterface(Ci.nsIInterfaceRequestor)
+-      .getInterface(Ci.nsIWebProgress);
+-  },
+-
+-  /**
+    * Disconnects the actor from the browser window.
+    */
+   disconnect: function() {
+     /* Tell the live lists we aren't watching any more. */
+     if (this._parameters.tabList) {
+       this._parameters.tabList.onListChanged = null;
+     }
+     if (this._parameters.addonList) {
+       this._parameters.addonList.onListChanged = null;
+     }
+     if (typeof this._parameters.onShutdown === 'function') {
+       this._parameters.onShutdown();
+     }
+     this._extraActors = null;
+-    this._styleSheetActors.clear();
+-    this._styleSheetActors = null;
+   },
+ 
+   /* The 'listTabs' request and the 'tabListChanged' notification. */
+ 
+   /**
+    * Handles the listTabs request. The actors will survive until at least
+    * the next listTabs request.
+    */
+@@ -401,70 +332,16 @@ RootActor.prototype = {
+   onProtocolDescription: function () {
+     return require("devtools/server/protocol").dumpProtocolSpec();
+   },
+ 
+   /* Support for DebuggerServer.addGlobalActor. */
+   _createExtraActors: createExtraActors,
+   _appendExtraActors: appendExtraActors,
+ 
+-  /* ThreadActor hooks. */
+-
+-  /**
+-   * Prepare to enter a nested event loop by disabling debuggee events.
+-   */
+-  preNest: function() {
+-    // Disable events in all open windows.
+-    let e = Services.wm.getEnumerator(null);
+-    while (e.hasMoreElements()) {
+-      let win = e.getNext();
+-      let windowUtils = win.QueryInterface(Ci.nsIInterfaceRequestor)
+-                           .getInterface(Ci.nsIDOMWindowUtils);
+-      windowUtils.suppressEventHandling(true);
+-      windowUtils.suspendTimeouts();
+-    }
+-  },
+-
+-  /**
+-   * Prepare to exit a nested event loop by enabling debuggee events.
+-   */
+-  postNest: function(aNestData) {
+-    // Enable events in all open windows.
+-    let e = Services.wm.getEnumerator(null);
+-    while (e.hasMoreElements()) {
+-      let win = e.getNext();
+-      let windowUtils = win.QueryInterface(Ci.nsIInterfaceRequestor)
+-                           .getInterface(Ci.nsIDOMWindowUtils);
+-      windowUtils.resumeTimeouts();
+-      windowUtils.suppressEventHandling(false);
+-    }
+-  },
+-
+-  /**
+-   * Create or return the StyleSheetActor for a style sheet. This method
+-   * is here because the Style Editor and Inspector share style sheet actors.
+-   *
+-   * @param DOMStyleSheet styleSheet
+-   *        The style sheet to create an actor for.
+-   * @return StyleSheetActor actor
+-   *         The actor for this style sheet.
+-   *
+-   */
+-  createStyleSheetActor: function(styleSheet) {
+-    if (this._styleSheetActors.has(styleSheet)) {
+-      return this._styleSheetActors.get(styleSheet);
+-    }
+-    let actor = new StyleSheetActor(styleSheet, this);
+-    this._styleSheetActors.set(styleSheet, actor);
+-
+-    this._globalActorPool.addActor(actor);
+-
+-    return actor;
+-  },
+-
+   /**
+    * Remove the extra actor (added by DebuggerServer.addGlobalActor or
+    * DebuggerServer.addTabActor) name |aName|.
+    */
+   removeActorByName: function(aName) {
+     if (aName in this._extraActors) {
+       const actor = this._extraActors[aName];
+       if (this._globalActorPool.has(actor)) {
+@@ -474,20 +351,35 @@ RootActor.prototype = {
+         // Iterate over TabActor instances to also remove tab actors
+         // created during listTabs for each document.
+         this._tabActorPool.forEach(tab => {
+           tab.removeActorByName(aName);
+         });
+       }
+       delete this._extraActors[aName];
+     }
+-   }
++   },
++
++  onChromeActor: function () {
++    // XXX: check for certified pref
++
++    if (!this._chromeActor) {
++      // Create a ChromeActor for the current top level xul window
++      let { ChromeActor } = require("devtools/server/actors/chrome");
++      this._chromeActor = new ChromeActor(this.conn);
++      this._globalActorPool.addActor(this._chromeActor);
++    }
++    return {
++      chromeActor: this._chromeActor.form()
++    };
++  }
+ };
+ 
+ RootActor.prototype.requestTypes = {
++  "chromeActor": RootActor.prototype.onChromeActor,
+   "listTabs": RootActor.prototype.onListTabs,
+   "listAddons": RootActor.prototype.onListAddons,
+   "listProcesses": RootActor.prototype.onListProcesses,
+   "attachProcess": RootActor.prototype.onAttachProcess,
+   "echo": RootActor.prototype.onEcho,
+   "protocolDescription": RootActor.prototype.onProtocolDescription
+ };
+ 
+diff --git a/toolkit/devtools/server/actors/webbrowser.js b/toolkit/devtools/server/actors/webbrowser.js
+index bdcf988d..f5f9a34 100644
+--- a/toolkit/devtools/server/actors/webbrowser.js
++++ b/toolkit/devtools/server/actors/webbrowser.js
+@@ -31,16 +31,28 @@ loader.lazyRequireGetter(this, "events", "sdk/event/core");
+ loader.lazyRequireGetter(this, "StyleSheetActor", "devtools/server/actors/stylesheets", true);
+ 
+ function getWindowID(window) {
+   return window.QueryInterface(Ci.nsIInterfaceRequestor)
+                .getInterface(Ci.nsIDOMWindowUtils)
+                .currentInnerWindowID;
+ }
+ 
++function getDocShellChromeEventHandler(docShell) {
++  let handler = docShell.chromeEventHandler;
++  if (!handler) {
++    try {
++      // toplevel xul window's docshell don't have chromeEventHandler attribute
++      handler = docShell.QueryInterface(Ci.nsIInterfaceRequestor)
++                        .getInterface(Ci.nsIDOMWindow);
++    } catch(e) {}
++  }
++  return handler;
++}
++
+ /**
+  * Browser-specific actors.
+  */
+ 
+ function getInnerId(window) {
+   return window.QueryInterface(Ci.nsIInterfaceRequestor).
+                 getInterface(Ci.nsIDOMWindowUtils).currentInnerWindowID;
+ };
+@@ -601,20 +613,17 @@ TabActor.prototype = {
+ 
+   // A constant prefix that will be used to form the actor ID by the server.
+   actorPrefix: "tab",
+ 
+   /**
+    * An object on which listen for DOMWindowCreated and pageshow events.
+    */
+   get chromeEventHandler() {
+-    // TODO: bug 992778, fix docShell.chromeEventHandler in child processes
+-    return this.docShell.chromeEventHandler ||
+-           this.docShell.QueryInterface(Ci.nsIInterfaceRequestor)
+-                        .getInterface(Ci.nsIContentFrameMessageManager);
++    return getDocShellChromeEventHandler(docShell);
+   },
+ 
+   /**
+    * Getter for the nsIMessageManager associated to the tab.
+    */
+   get messageManager() {
+     return this.docShell
+       .QueryInterface(Ci.nsIInterfaceRequestor)
+@@ -956,17 +965,19 @@ TabActor.prototype = {
+     // xul:iframe, xul:browser or html:iframe.
+     return !docShell.chromeEventHandler ||
+            !(docShell.chromeEventHandler instanceof Ci.nsIDOMElement);
+   },
+ 
+   // Convert docShell list to windows objects list being sent to the client
+   _docShellsToWindows: function (docshells) {
+     return docshells.map(docShell => {
+-      let window = docShell.DOMWindow;
++      let webProgress = docShell.QueryInterface(Ci.nsIInterfaceRequestor)
++                                .getInterface(Ci.nsIWebProgress);
++      let window = webProgress.DOMWindow;
+       let id = window.QueryInterface(Ci.nsIInterfaceRequestor)
+                      .getInterface(Ci.nsIDOMWindowUtils)
+                      .outerWindowID;
+       let parentID = undefined;
+       // Ignore the parent of the original document on non-e10s firefox,
+       // as we get the xul window as parent and don't care about it.
+       if (window.parent && window != this._originalWindow) {
+         parentID = window.parent
+@@ -1998,21 +2009,17 @@ DebuggerProgressListener.prototype = {
+ 
+   watch: function(docShell) {
+     let webProgress = docShell.QueryInterface(Ci.nsIInterfaceRequestor)
+                               .getInterface(Ci.nsIWebProgress);
+     webProgress.addProgressListener(this, Ci.nsIWebProgress.NOTIFY_STATUS |
+                                           Ci.nsIWebProgress.NOTIFY_STATE_WINDOW |
+                                           Ci.nsIWebProgress.NOTIFY_STATE_DOCUMENT);
+ 
+-    // TODO: fix docShell.chromeEventHandler in child processes!
+-    let handler = docShell.chromeEventHandler ||
+-                  docShell.QueryInterface(Ci.nsIInterfaceRequestor)
+-                    .getInterface(Ci.nsIContentFrameMessageManager);
+-
++    let handler = getDocShellChromeEventHandler(docShell);
+     handler.addEventListener("DOMWindowCreated", this._onWindowCreated, true);
+     handler.addEventListener("pageshow", this._onWindowCreated, true);
+     handler.addEventListener("pagehide", this._onWindowHidden, true);
+ 
+     // Dispatch the _windowReady event on the tabActor for pre-existing windows
+     for (let win of this._getWindowsInDocShell(docShell)) {
+       this._tabActor._windowReady(win);
+       this._knownWindowIDs.set(getWindowID(win), win);
+@@ -2022,21 +2029,17 @@ DebuggerProgressListener.prototype = {
+   unwatch: function(docShell) {
+     let webProgress = docShell.QueryInterface(Ci.nsIInterfaceRequestor)
+                               .getInterface(Ci.nsIWebProgress);
+     // During process shutdown, the docshell may already be cleaned up and throw
+     try {
+       webProgress.removeProgressListener(this);
+     } catch(e) {}
+ 
+-    // TODO: fix docShell.chromeEventHandler in child processes!
+-    let handler = docShell.chromeEventHandler ||
+-                  docShell.QueryInterface(Ci.nsIInterfaceRequestor)
+-                    .getInterface(Ci.nsIContentFrameMessageManager);
+-
++    let handler = getDocShellChromeEventHandler(docShell);
+     handler.removeEventListener("DOMWindowCreated", this._onWindowCreated, true);
+     handler.removeEventListener("pageshow", this._onWindowCreated, true);
+     handler.removeEventListener("pagehide", this._onWindowHidden, true);
+ 
+     for (let win of this._getWindowsInDocShell(docShell)) {
+       this._knownWindowIDs.delete(getWindowID(win));
+     }
+   },
+diff --git a/toolkit/devtools/server/actors/webconsole.js b/toolkit/devtools/server/actors/webconsole.js
+index b52f6ac..a1f5bc5 100644
+--- a/toolkit/devtools/server/actors/webconsole.js
++++ b/toolkit/devtools/server/actors/webconsole.js
+@@ -1490,16 +1490,19 @@ WebConsoleActor.prototype =
+ 
+     // Unregister existing listener on the previous document
+     // (pass a copy of the array as it will shift from it)
+     this.onStopListeners({listeners: listeners.slice()});
+ 
+     // This method is called after this.window is changed,
+     // so we register new listener on this new window
+     this.onStartListeners({listeners: listeners});
++
++    // Also reset the cached top level chrome window being targetted
++    this._lastChromeWindow  = null;
+   },
+ };
+ 
+ WebConsoleActor.prototype.requestTypes =
+ {
+   startListeners: WebConsoleActor.prototype.onStartListeners,
+   stopListeners: WebConsoleActor.prototype.onStopListeners,
+   getCachedMessages: WebConsoleActor.prototype.onGetCachedMessages,
+diff --git a/toolkit/devtools/server/moz.build b/toolkit/devtools/server/moz.build
+index 492cc61..c9b31f1 100644
+--- a/toolkit/devtools/server/moz.build
++++ b/toolkit/devtools/server/moz.build
+@@ -34,16 +34,17 @@ EXTRA_JS_MODULES.devtools.server += [
+ 
+ EXTRA_JS_MODULES.devtools.server.actors += [
+     'actors/actor-registry.js',
+     'actors/animation.js',
+     'actors/call-watcher.js',
+     'actors/canvas.js',
+     'actors/child-process.js',
+     'actors/childtab.js',
++    'actors/chrome.js',
+     'actors/common.js',
+     'actors/csscoverage.js',
+     'actors/device.js',
+     'actors/eventlooplag.js',
+     'actors/framerate.js',
+     'actors/gcli.js',
+     'actors/highlighter.js',
+     'actors/inspector.js',
