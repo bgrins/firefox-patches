@@ -1,0 +1,396 @@
+# HG changeset patch
+# Parent 95536a1053927bb7ae09c6f10d6695af5b51d59c
+# User Brian Grinstead <bgrinstead@mozilla.com>
+Bug 1119276 - Show all native anon content in browser toolbox;r=pbrosset
+
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -1136,16 +1136,19 @@ var WalkerActor = protocol.ActorClass({
+   /**
+    * Create the WalkerActor
+    * @param DebuggerServerConnection conn
+    *    The server connection.
+    */
+   initialize: function(conn, tabActor, options) {
+     protocol.Actor.prototype.initialize.call(this, conn);
+     this.tabActor = tabActor;
++    // Allow native anon content (like <video> controls) in Browser Toolbox
++    this.skipNativeAnonymousContent = !tabActor.isRootActor;
++    this.nodeFilter = this.nodeFilter.bind(this);
+     this.rootWin = tabActor.window;
+     this.rootDoc = this.rootWin.document;
+     this._refMap = new Map();
+     this._pendingMutations = [];
+     this._activePseudoClassLocks = new Set();
+ 
+     this.layoutHelpers = new LayoutHelpers(this.rootWin);
+ 
+@@ -1182,16 +1185,46 @@ var WalkerActor = protocol.ActorClass({
+       root: this.rootNode.form()
+     }
+   },
+ 
+   toString: function() {
+     return "[WalkerActor " + this.actorID + "]";
+   },
+ 
++  getDocumentWalker: function(node, whatToShow) {
++    return new DocumentWalker(node, this.rootWin, this.nodeFilter, whatToShow);
++  },
++
++  nodeFilter: function(aNode) {
++    // Ignore empty whitespace text nodes.
++    if (aNode.nodeType == Ci.nsIDOMNode.TEXT_NODE &&
++        !/[^\s]/.exec(aNode.nodeValue)) {
++      return Ci.nsIDOMNodeFilter.FILTER_SKIP;
++    }
++
++    // Ignore all native anonymous content (like internals for form
++    // controls).  Except for:
++    //   1) Anonymous content in a XUL document. This is needed for all
++    //      elements within the Browser Toolbox to properly show up.
++    //   2) ::before/::after - we do want this to show in the walker so
++    //      they can be inspected.
++    if (this.skipNativeAnonymousContent &&
++        LayoutHelpers.isNativeAnonymous(aNode) &&
++        !isXULElement(aNode.parentNode) &&
++        (
++          aNode.nodeName !== "_moz_generated_content_before" &&
++          aNode.nodeName !== "_moz_generated_content_after")
++        ) {
++      return Ci.nsIDOMNodeFilter.FILTER_SKIP;
++    }
++
++    return Ci.nsIDOMNodeFilter.FILTER_ACCEPT;
++  },
++
+   destroy: function() {
+     this._destroyed = true;
+ 
+     this.clearPseudoClassLocks();
+     this._activePseudoClassLocks = null;
+ 
+     this._hoveredNode = null;
+     this.rootDoc = null;
+@@ -1371,17 +1404,17 @@ var WalkerActor = protocol.ActorClass({
+    * @param NodeActor node
+    *    The node whose parents are requested.
+    * @param object options
+    *    Named options, including:
+    *    `sameDocument`: If true, parents will be restricted to the same
+    *      document as the node.
+    */
+   parents: method(function(node, options={}) {
+-    let walker = DocumentWalker(node.rawNode, this.rootWin);
++    let walker = this.getDocumentWalker(node.rawNode);
+     let parents = [];
+     let cur;
+     while((cur = walker.parentNode())) {
+       if (options.sameDocument && cur.ownerDocument != node.rawNode.ownerDocument) {
+         break;
+       }
+       parents.push(this._ref(cur));
+     }
+@@ -1392,17 +1425,17 @@ var WalkerActor = protocol.ActorClass({
+       sameDocument: Option(1)
+     },
+     response: {
+       nodes: RetVal("array:domnode")
+     },
+   }),
+ 
+   parentNode: function(node) {
+-    let walker = DocumentWalker(node.rawNode, this.rootWin);
++    let walker = this.getDocumentWalker(node.rawNode);
+     let parent = walker.parentNode();
+     if (parent) {
+       return this._ref(parent);
+     }
+     return null;
+   },
+ 
+   /**
+@@ -1453,17 +1486,17 @@ var WalkerActor = protocol.ActorClass({
+       return;
+     }
+ 
+     if (node.retained) {
+       // Forcing a retained node to go away.
+       this._retainedOrphans.delete(node);
+     }
+ 
+-    let walker = DocumentWalker(node.rawNode, this.rootWin);
++    let walker = this.getDocumentWalker(node.rawNode);
+ 
+     let child = walker.firstChild();
+     while (child) {
+       let childActor = this._refMap.get(child);
+       if (childActor) {
+         this.releaseNode(childActor, options);
+       }
+       child = walker.nextSibling();
+@@ -1480,17 +1513,17 @@ var WalkerActor = protocol.ActorClass({
+   /**
+    * Add any nodes between `node` and the walker's root node that have not
+    * yet been seen by the client.
+    */
+   ensurePathToRoot: function(node, newParents=new Set()) {
+     if (!node) {
+       return newParents;
+     }
+-    let walker = DocumentWalker(node.rawNode, this.rootWin);
++    let walker = this.getDocumentWalker(node.rawNode);
+     let cur;
+     while ((cur = walker.parentNode())) {
+       let parent = this._refMap.get(cur);
+       if (!parent) {
+         // This parent didn't exist, so hasn't been seen by the client yet.
+         newParents.add(this._ref(cur));
+       } else {
+         // This parent did exist, so the client knows about it.
+@@ -1531,17 +1564,17 @@ var WalkerActor = protocol.ActorClass({
+     let maxNodes = options.maxNodes || -1;
+     if (maxNodes == -1) {
+       maxNodes = Number.MAX_VALUE;
+     }
+ 
+     // We're going to create a few document walkers with the same filter,
+     // make it easier.
+     let getFilteredWalker = (node) => {
+-      return new DocumentWalker(node, this.rootWin, options.whatToShow);
++      return this.getDocumentWalker(node, options.whatToShow);
+     }
+ 
+     // Need to know the first and last child.
+     let rawNode = node.rawNode;
+     let firstChild = getFilteredWalker(rawNode).firstChild();
+     let lastChild = getFilteredWalker(rawNode).lastChild();
+ 
+     if (!firstChild) {
+@@ -1614,17 +1647,17 @@ var WalkerActor = protocol.ActorClass({
+    *       https://developer.mozilla.org/en-US/docs/Web/API/NodeFilter.
+    *
+    * @returns an object with three items:
+    *    hasFirst: true if the first child of the node is included in the list.
+    *    hasLast: true if the last child of the node is included in the list.
+    *    nodes: Child nodes returned by the request.
+    */
+   siblings: method(function(node, options={}) {
+-    let parentNode = DocumentWalker(node.rawNode, this.rootWin).parentNode();
++    let parentNode = this.getDocumentWalker(node.rawNode, options.whatToShow).parentNode();
+     if (!parentNode) {
+       return {
+         hasFirst: true,
+         hasLast: true,
+         nodes: [node]
+       };
+     }
+ 
+@@ -1640,32 +1673,32 @@ var WalkerActor = protocol.ActorClass({
+    * might be inefficient, be careful.
+    *
+    * @param object options
+    *    Named options:
+    *    `whatToShow`: A bitmask of node types that should be included.  See
+    *       https://developer.mozilla.org/en-US/docs/Web/API/NodeFilter.
+    */
+   nextSibling: method(function(node, options={}) {
+-    let walker = DocumentWalker(node.rawNode, this.rootWin, options.whatToShow || Ci.nsIDOMNodeFilter.SHOW_ALL);
++    let walker = this.getDocumentWalker(node.rawNode, options.whatToShow);
+     let sibling = walker.nextSibling();
+     return sibling ? this._ref(sibling) : null;
+   }, traversalMethod),
+ 
+   /**
+    * Get the previous sibling of a given node.  Getting nodes one at a time
+    * might be inefficient, be careful.
+    *
+    * @param object options
+    *    Named options:
+    *    `whatToShow`: A bitmask of node types that should be included.  See
+    *       https://developer.mozilla.org/en-US/docs/Web/API/NodeFilter.
+    */
+   previousSibling: method(function(node, options={}) {
+-    let walker = DocumentWalker(node.rawNode, this.rootWin, options.whatToShow || Ci.nsIDOMNodeFilter.SHOW_ALL);
++    let walker = this.getDocumentWalker(node.rawNode, options.whatToShow);
+     let sibling = walker.previousSibling();
+     return sibling ? this._ref(sibling) : null;
+   }, traversalMethod),
+ 
+   /**
+    * Helper function for the `children` method: Read forward in the sibling
+    * list into an array with `count` items, including the current node.
+    */
+@@ -1912,17 +1945,17 @@ var WalkerActor = protocol.ActorClass({
+    */
+   addPseudoClassLock: method(function(node, pseudo, options={}) {
+     this._addPseudoClassLock(node, pseudo);
+ 
+     if (!options.parents) {
+       return;
+     }
+ 
+-    let walker = DocumentWalker(node.rawNode, this.rootWin);
++    let walker = this.getDocumentWalker(node.rawNode);
+     let cur;
+     while ((cur = walker.parentNode())) {
+       let curNode = this._ref(cur);
+       this._addPseudoClassLock(curNode, pseudo);
+     }
+   }, {
+     request: {
+       node: Arg(0, "domnode"),
+@@ -1993,17 +2026,17 @@ var WalkerActor = protocol.ActorClass({
+    */
+   removePseudoClassLock: method(function(node, pseudo, options={}) {
+     this._removePseudoClassLock(node, pseudo);
+ 
+     if (!options.parents) {
+       return;
+     }
+ 
+-    let walker = DocumentWalker(node.rawNode, this.rootWin);
++    let walker = this.getDocumentWalker(node.rawNode);
+     let cur;
+     while ((cur = walker.parentNode())) {
+       let curNode = this._ref(cur);
+       this._removePseudoClassLock(curNode, pseudo);
+     }
+   }, {
+     request: {
+       node: Arg(0, "domnode"),
+@@ -2562,17 +2595,17 @@ var WalkerActor = protocol.ActorClass({
+       this.rootNode = null;
+     }
+ 
+     this.queueMutation({
+       type: "documentUnload",
+       target: documentActor.actorID
+     });
+ 
+-    let walker = DocumentWalker(doc, this.rootWin);
++    let walker = this.getDocumentWalker(doc);
+     let parentNode = walker.parentNode();
+     if (parentNode) {
+       // Send a childList mutation on the frame so that clients know
+       // they should reread the children list.
+       this.queueMutation({
+         type: "childList",
+         target: this._refMap.get(parentNode).actorID,
+         added: [],
+@@ -2587,17 +2620,17 @@ var WalkerActor = protocol.ActorClass({
+ 
+   /**
+    * Check if a node is attached to the DOM tree of the current page.
+    * @param {nsIDomNode} rawNode
+    * @return {Boolean} false if the node is removed from the tree or within a
+    * document fragment
+    */
+   _isInDOMTree: function(rawNode) {
+-    let walker = DocumentWalker(rawNode, this.rootWin);
++    let walker = this.getDocumentWalker(rawNode);
+     let current = walker.currentNode;
+ 
+     // Reaching the top of tree
+     while (walker.parentNode()) {
+       current = walker.currentNode;
+     }
+ 
+     // The top of the tree is a fragment or is not rootDoc, hence rawNode isn't
+@@ -3287,39 +3320,35 @@ exports._documentWalker = DocumentWalker
+ function nodeDocument(node) {
+   return node.ownerDocument || (node.nodeType == Ci.nsIDOMNode.DOCUMENT_NODE ? node : null);
+ }
+ 
+ /**
+  * Wrapper for inDeepTreeWalker.  Adds filtering to the traversal methods.
+  * See inDeepTreeWalker for more information about the methods.
+  *
+- * @param {DOMNode} aNode
+- * @param {Window} aRootWin
+- * @param {Int} aShow See Ci.nsIDOMNodeFilter / inIDeepTreeWalker for options.
+- * @param {Function} aFilter A custom filter function Taking in a DOMNode
+- *        and returning an Int. See nodeFilter for an example.
++ * @param {DOMNode} node
++ * @param {Window} rootWin
++ * @param {Function} nodeFilter A custom filter function Taking in a DOMNode
++ *        and returning an Int. See WalkerActor.nodeFilter for an example.
++ * @param {Int} whatToShow See Ci.nsIDOMNodeFilter / inIDeepTreeWalker for options.
+  */
+-function DocumentWalker(aNode, aRootWin, aShow=Ci.nsIDOMNodeFilter.SHOW_ALL,
+-                        aFilter=nodeFilter) {
+-  if (!(this instanceof DocumentWalker)) {
+-    return new DocumentWalker(aNode, aRootWin, aShow, aFilter);
+-  }
+-
+-  if (!aRootWin.location) {
++function DocumentWalker(node, rootWin, nodeFilter, whatToShow) {
++  if (!rootWin.location) {
+     throw new Error("Got an invalid root window in DocumentWalker");
+   }
+ 
++  whatToShow = whatToShow || Ci.nsIDOMNodeFilter.SHOW_ALL;
+   this.walker = Cc["@mozilla.org/inspector/deep-tree-walker;1"].createInstance(Ci.inIDeepTreeWalker);
+   this.walker.showAnonymousContent = true;
+   this.walker.showSubDocuments = true;
+   this.walker.showDocumentsAsNodes = true;
+-  this.walker.init(aRootWin.document, aShow);
+-  this.walker.currentNode = aNode;
+-  this.filter = aFilter;
++  this.walker.init(rootWin.document, whatToShow || Ci.nsIDOMNodeFilter.SHOW_ALL);
++  this.walker.currentNode = node;
++  this.filter = nodeFilter;
+ }
+ 
+ DocumentWalker.prototype = {
+   get node() this.walker.node,
+   get whatToShow() this.walker.whatToShow,
+   get currentNode() this.walker.currentNode,
+   set currentNode(aVal) this.walker.currentNode = aVal,
+ 
+@@ -3371,44 +3400,16 @@ DocumentWalker.prototype = {
+ };
+ 
+ function isXULElement(el) {
+   return el &&
+          el.namespaceURI === XUL_NS;
+ }
+ 
+ /**
+- * A tree walker filter for avoiding empty whitespace text nodes.
+- */
+-function nodeFilter(aNode) {
+-  // Ignore empty whitespace text nodes.
+-  if (aNode.nodeType == Ci.nsIDOMNode.TEXT_NODE &&
+-      !/[^\s]/.exec(aNode.nodeValue)) {
+-    return Ci.nsIDOMNodeFilter.FILTER_SKIP;
+-  }
+-
+-  // Ignore all native anonymous content (like internals for form
+-  // controls).  Except for:
+-  //   1) Anonymous content in a XUL document. This is needed for all
+-  //      elements within the Browser Toolbox to properly show up.
+-  //   2) ::before/::after - we do want this to show in the walker so
+-  //      they can be inspected.
+-  if (LayoutHelpers.isNativeAnonymous(aNode) &&
+-      !isXULElement(aNode.parentNode) &&
+-      (
+-        aNode.nodeName !== "_moz_generated_content_before" &&
+-        aNode.nodeName !== "_moz_generated_content_after")
+-      ) {
+-    return Ci.nsIDOMNodeFilter.FILTER_SKIP;
+-  }
+-
+-  return Ci.nsIDOMNodeFilter.FILTER_ACCEPT;
+-}
+-
+-/**
+  * Given an image DOMNode, return the image data-uri.
+  * @param {DOMNode} node The image node
+  * @param {Number} maxDim Optionally pass a maximum size you want the longest
+  * side of the image to be resized to before getting the image data.
+  * @return {Object} An object containing the data-uri and size-related information
+  * {data: "...", size: {naturalWidth: 400, naturalHeight: 300, resized: true}}
+  * @throws an error if the node isn't an image or if the image is missing
+  */
