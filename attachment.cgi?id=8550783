@@ -1,0 +1,180 @@
+# HG changeset patch
+# User Ehsan Akhgari <ehsan@mozilla.com>
+
+Bug 1119503 - Part 3: Insert a line break between preformatted block boundaries when creating raw output; r=bzbarsky
+
+diff --git a/dom/base/nsPlainTextSerializer.cpp b/dom/base/nsPlainTextSerializer.cpp
+index 0aa8892..e4de480 100644
+--- a/dom/base/nsPlainTextSerializer.cpp
++++ b/dom/base/nsPlainTextSerializer.cpp
+@@ -86,16 +86,18 @@ nsPlainTextSerializer::nsPlainTextSerializer()
+   mCurrentLineWidth = 0;
+ 
+   // Flow
+   mEmptyLines = 1; // The start of the document is an "empty line" in itself,
+   mInWhitespace = false;
+   mPreFormatted = false;
+   mStartedOutput = false;
+ 
++  mPreformattedBlockBoundary = false;
++
+   // initialize the tag stack to zero:
+   // The stack only ever contains pointers to static atoms, so they don't
+   // need refcounting.
+   mTagStack = new nsIAtom*[TagStackSize];
+   mTagStackIndex = 0;
+   mIgnoreAboveIndex = (uint32_t)kNotFound;
+ 
+   // initialize the OL stack, where numbers for ordered lists are kept
+@@ -162,16 +164,18 @@ nsPlainTextSerializer::Init(uint32_t aFlags, uint32_t aWrapColumn,
+   else {
+     // Platform/default
+     mLineBreak.AssignLiteral(NS_LINEBREAK);
+   }
+ 
+   mLineBreakDue = false;
+   mFloatingLines = -1;
+ 
++  mPreformattedBlockBoundary = false;
++
+   if (mFlags & nsIDocumentEncoder::OutputFormatted) {
+     // Get some prefs that controls how we do formatted output
+     mStructs = Preferences::GetBool(PREF_STRUCTS, mStructs);
+ 
+     mHeaderStrategy =
+       Preferences::GetInt(PREF_HEADER_STRATEGY, mHeaderStrategy);
+ 
+     // DontWrapAnyQuotes is set according to whether plaintext mail
+@@ -433,24 +437,29 @@ nsPlainTextSerializer::DoOpenContainer(nsIAtom* aTag)
+       Write(NS_LITERAL_STRING("\xFFFC"));
+     }
+     // Ignore child nodes.
+     mIgnoredChildNodeLevel++;
+     return NS_OK;
+   }
+ 
+   if (mFlags & nsIDocumentEncoder::OutputRaw) {
+-    // Raw means raw.  Don't even think about doing anything fancy
+-    // here like indenting, adding line breaks or any other
+-    // characters such as list item bullets, quote characters
+-    // around <q>, etc.  I mean it!  Don't make me smack you!
++    if (mPreformattedBlockBoundary && DoOutput()) {
++      // Should always end a line, but get no more whitespace
++      if (mFloatingLines < 0)
++        mFloatingLines = 0;
++      mLineBreakDue = true;
++    }
++    mPreformattedBlockBoundary = false;
+ 
+     return NS_OK;
+   }
+ 
++  mPreformattedBlockBoundary = false;
++
+   if (mTagStackIndex < TagStackSize) {
+     mTagStack[mTagStackIndex++] = aTag;
+   }
+ 
+   if (mIgnoreAboveIndex != (uint32_t)kNotFound) {
+     return NS_OK;
+   }
+ 
+@@ -763,20 +772,21 @@ nsresult
+ nsPlainTextSerializer::DoCloseContainer(nsIAtom* aTag)
+ {
+   if (ShouldReplaceContainerWithPlaceholder(mElement->Tag())) {
+     mIgnoredChildNodeLevel--;
+     return NS_OK;
+   }
+ 
+   if (mFlags & nsIDocumentEncoder::OutputRaw) {
+-    // Raw means raw.  Don't even think about doing anything fancy
+-    // here like indenting, adding line breaks or any other
+-    // characters such as list item bullets, quote characters
+-    // around <q>, etc.  I mean it!  Don't make me smack you!
++    if (DoOutput() && IsInPre() && IsElementBlock(mElement)) {
++      // If we're closing a preformatted block element, output a line break
++      // when we find a new container.
++      mPreformattedBlockBoundary = true;
++    }
+ 
+     return NS_OK;
+   }
+ 
+   if (mTagStackIndex > 0) {
+     --mTagStackIndex;
+   }
+ 
+@@ -1031,16 +1041,18 @@ nsPlainTextSerializer::DoAddText(bool aIsLineBreak, const nsAString& aText)
+     mURL.Truncate();
+   }
+   Write(aText);
+ }
+ 
+ nsresult
+ nsPlainTextSerializer::DoAddLeaf(nsIAtom* aTag)
+ {
++  mPreformattedBlockBoundary = false;
++
+   // If we don't want any output, just return
+   if (!DoOutput()) {
+     return NS_OK;
+   }
+ 
+   if (mLineBreakDue)
+     EnsureVerticalSpace(mFloatingLines);
+ 
+diff --git a/dom/base/nsPlainTextSerializer.h b/dom/base/nsPlainTextSerializer.h
+index ea2d049..9535a59 100644
+--- a/dom/base/nsPlainTextSerializer.h
++++ b/dom/base/nsPlainTextSerializer.h
+@@ -165,17 +165,19 @@ private:
+ 
+   bool             mInWhitespace;
+   bool             mPreFormatted;
+   bool             mStartedOutput; // we've produced at least a character
+ 
+   // While handling a new tag, this variable should remind if any line break
+   // is due because of a closing tag. Setting it to "TRUE" while closing the tags.
+   // Hence opening tags are guaranteed to start with appropriate line breaks.
+-  bool             mLineBreakDue; 
++  bool             mLineBreakDue;
++
++  bool             mPreformattedBlockBoundary;
+ 
+   nsString         mURL;
+   int32_t          mHeaderStrategy;    /* Header strategy (pref)
+                                           0 = no indention
+                                           1 = indention, increased with
+                                               header level (default)
+                                           2 = numbering and slight indention */
+   int32_t          mHeaderCounter[7];  /* For header-numbering:
+diff --git a/dom/base/test/test_bug116083.html b/dom/base/test/test_bug116083.html
+index 4244a13..5ac1181 100644
+--- a/dom/base/test/test_bug116083.html
++++ b/dom/base/test/test_bug116083.html
+@@ -15,16 +15,24 @@ https://bugzilla.mozilla.org/show_bug.cgi?id=116083
+ <div style="white-space: pre">foo  bar</div>
+ <div style="white-space: pre-wrap">foo  bar</div>
+ <div style="white-space: pre-line">foo  bar</div>
+ <div style="white-space: -moz-pre-space">foo  bar</div>
+ <div data-result="bar  baz"><span style="white-space: pre">bar  </span>baz</div>
+ <div data-result="bar  baz"><span style="white-space: pre-wrap">bar  </span>baz</div>
+ <div data-result="bar  baz"><span style="white-space: pre-line">bar  </span>baz</div>
+ <div data-result="bar  baz"><span style="white-space: -moz-pre-space">bar  </span>baz</div>
++<div data-result="foo  &#10;  bar&#10;&#10;!&#10;&#10;&#10;baz" style="white-space: pre"><div>foo  </div><div>  bar</div><div><br></div><div>!</div><div><br><br></div><div>baz</div></div>
++<div data-result="foo &#10; bar&#10;&#10;!&#10;&#10;&#10;baz" style="white-space: pre" contenteditable><div>foo </div><div> bar</div><div><br></div><div>!</div><div><br><br></div><div>baz</div></div>
++<div data-result="foo  &#10;  bar&#10;&#10;!&#10;&#10;&#10;baz" style="white-space: pre-wrap"><div>foo  </div><div>  bar</div><div><br></div><div>!</div><div><br><br></div><div>baz</div></div>
++<div data-result="foo &#10; bar&#10;&#10;!&#10;&#10;&#10;baz" style="white-space: pre-wrap" contenteditable><div>foo </div><div> bar</div><div><br></div><div>!</div><div><br><br></div><div>baz</div></div>
++<div data-result="foo  &#10;  bar&#10;&#10;!&#10;&#10;&#10;baz" style="white-space: pre-line"><div>foo  </div><div>  bar</div><div><br></div><div>!</div><div><br><br></div><div>baz</div></div>
++<div data-result="foo &#10; bar&#10;&#10;!&#10;&#10;&#10;baz" style="white-space: pre-line" contenteditable><div>foo </div><div> bar</div><div><br></div><div>!</div><div><br><br></div><div>baz</div></div>
++<div data-result="foo  &#10;  bar&#10;&#10;!&#10;&#10;&#10;baz" style="white-space: -moz-pre-space"><div>foo  </div><div>  bar</div><div><br></div><div>!</div><div><br><br></div><div>baz</div></div>
++<div data-result="foo &#10; bar&#10;&#10;!&#10;&#10;&#10;baz" style="white-space: -moz-pre-space" contenteditable><div>foo </div><div> bar</div><div><br></div><div>!</div><div><br><br></div><div>baz</div></div>
+ <div data-result="&#10;foo bar&#10;">foo  bar</div>
+ </div>
+ <script type="application/javascript">
+ 
+ SimpleTest.waitForExplicitFinish();
+ SimpleTest.waitForFocus(function nextTest() {
+   var div = document.querySelector("#content>div");
+   if (!div) {
