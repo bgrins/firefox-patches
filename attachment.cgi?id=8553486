@@ -1,10 +1,62 @@
 # HG changeset patch
 # User Ehsan Akhgari <ehsan@mozilla.com>
 
-Bug 1119503 - Part 3: Insert a line break between preformatted block boundaries when creating raw output; r=bzbarsky
+Bug 1119503 - Part 2: Insert a line break between preformatted block boundaries when creating raw output; r=bzbarsky
 
+diff --git a/dom/base/nsCopySupport.cpp b/dom/base/nsCopySupport.cpp
+index 56ac20e..3f6db39 100644
+--- a/dom/base/nsCopySupport.cpp
++++ b/dom/base/nsCopySupport.cpp
+@@ -92,17 +92,18 @@ SelectionCopyHelper(nsISelection *aSel, nsIDocument *aDoc,
+   // is. if it is a selection into input/textarea element or in a html content
+   // with pre-wrap style : text/plain. Otherwise text/html.
+   // see nsHTMLCopyEncoder::SetSelection
+   nsAutoString mimeType;
+   mimeType.AssignLiteral(kUnicodeMime);
+ 
+   // Do the first and potentially trial encoding as preformatted and raw.
+   uint32_t flags = aFlags | nsIDocumentEncoder::OutputPreformatted
+-                          | nsIDocumentEncoder::OutputRaw;
++                          | nsIDocumentEncoder::OutputRaw
++                          | nsIDocumentEncoder::OutputForPlainTextClipboardCopy;
+ 
+   nsCOMPtr<nsIDOMDocument> domDoc = do_QueryInterface(aDoc);
+   NS_ASSERTION(domDoc, "Need a document");
+ 
+   rv = docEncoder->Init(domDoc, mimeType, flags);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   rv = docEncoder->SetSelection(aSel);
+diff --git a/dom/base/nsIDocumentEncoder.idl b/dom/base/nsIDocumentEncoder.idl
+index b5963bb..155e5c3 100644
+--- a/dom/base/nsIDocumentEncoder.idl
++++ b/dom/base/nsIDocumentEncoder.idl
+@@ -223,16 +223,23 @@ interface nsIDocumentEncoder : nsISupports
+   const unsigned long OutputNonTextContentAsPlaceholder = (1 << 23);
+ 
+   /**
+    * Don't Strip ending spaces from a line (only for serializing to plaintext).
+    */
+   const unsigned long OutputDontRemoveLineEndingSpaces = (1 << 24);
+ 
+   /**
++   * Serialize in a way that is suitable for copying a plaintext version of the
++   * document to the clipboard.  This can for example cause line endings to be
++   * injected at preformatted block element boundaries.
++   */
++  const unsigned long OutputForPlainTextClipboardCopy = (1 << 25);
++
++  /**
+    * Initialize with a pointer to the document and the mime type.
+    * @param aDocument Document to encode.
+    * @param aMimeType MimeType to use. May also be set by SetMimeType.
+    * @param aFlags Flags to use while encoding. May also be set by SetFlags.
+    */
+   void init(in nsIDOMDocument aDocument,
+             in AString aMimeType,
+             in unsigned long aFlags);
 diff --git a/dom/base/nsPlainTextSerializer.cpp b/dom/base/nsPlainTextSerializer.cpp
-index 0aa8892..e4de480 100644
+index 30c0da5..4d1d417 100644
 --- a/dom/base/nsPlainTextSerializer.cpp
 +++ b/dom/base/nsPlainTextSerializer.cpp
 @@ -86,16 +86,18 @@ nsPlainTextSerializer::nsPlainTextSerializer()
@@ -45,7 +97,8 @@ index 0aa8892..e4de480 100644
        Preferences::GetInt(PREF_HEADER_STRATEGY, mHeaderStrategy);
  
      // DontWrapAnyQuotes is set according to whether plaintext mail
-@@ -433,24 +437,29 @@ nsPlainTextSerializer::DoOpenContainer(nsIAtom* aTag)
+@@ -432,16 +436,26 @@ nsPlainTextSerializer::DoOpenContainer(nsIAtom* aTag)
+       // Serialize current node as placeholder character
        Write(NS_LITERAL_STRING("\xFFFC"));
      }
      // Ignore child nodes.
@@ -53,11 +106,7 @@ index 0aa8892..e4de480 100644
      return NS_OK;
    }
  
-   if (mFlags & nsIDocumentEncoder::OutputRaw) {
--    // Raw means raw.  Don't even think about doing anything fancy
--    // here like indenting, adding line breaks or any other
--    // characters such as list item bullets, quote characters
--    // around <q>, etc.  I mean it!  Don't make me smack you!
++  if (mFlags & nsIDocumentEncoder::OutputForPlainTextClipboardCopy) {
 +    if (mPreformattedBlockBoundary && DoOutput()) {
 +      // Should always end a line, but get no more whitespace
 +      if (mFloatingLines < 0)
@@ -65,21 +114,18 @@ index 0aa8892..e4de480 100644
 +      mLineBreakDue = true;
 +    }
 +    mPreformattedBlockBoundary = false;
- 
-     return NS_OK;
-   }
- 
-+  mPreformattedBlockBoundary = false;
++  }
 +
-   if (mTagStackIndex < TagStackSize) {
-     mTagStack[mTagStackIndex++] = aTag;
-   }
+   if (mFlags & nsIDocumentEncoder::OutputRaw) {
+     // Raw means raw.  Don't even think about doing anything fancy
+     // here like indenting, adding line breaks or any other
+     // characters such as list item bullets, quote characters
+     // around <q>, etc.  I mean it!  Don't make me smack you!
  
-   if (mIgnoreAboveIndex != (uint32_t)kNotFound) {
      return NS_OK;
    }
- 
-@@ -763,20 +772,21 @@ nsresult
+@@ -762,16 +776,24 @@ nsPlainTextSerializer::DoOpenContainer(nsIAtom* aTag)
+ nsresult
  nsPlainTextSerializer::DoCloseContainer(nsIAtom* aTag)
  {
    if (ShouldReplaceContainerWithPlaceholder(mElement->Tag())) {
@@ -87,25 +133,23 @@ index 0aa8892..e4de480 100644
      return NS_OK;
    }
  
-   if (mFlags & nsIDocumentEncoder::OutputRaw) {
--    // Raw means raw.  Don't even think about doing anything fancy
--    // here like indenting, adding line breaks or any other
--    // characters such as list item bullets, quote characters
--    // around <q>, etc.  I mean it!  Don't make me smack you!
++  if (mFlags & nsIDocumentEncoder::OutputForPlainTextClipboardCopy) {
 +    if (DoOutput() && IsInPre() && IsElementBlock(mElement)) {
 +      // If we're closing a preformatted block element, output a line break
 +      // when we find a new container.
 +      mPreformattedBlockBoundary = true;
 +    }
++  }
++
+   if (mFlags & nsIDocumentEncoder::OutputRaw) {
+     // Raw means raw.  Don't even think about doing anything fancy
+     // here like indenting, adding line breaks or any other
+     // characters such as list item bullets, quote characters
+     // around <q>, etc.  I mean it!  Don't make me smack you!
  
      return NS_OK;
    }
- 
-   if (mTagStackIndex > 0) {
-     --mTagStackIndex;
-   }
- 
-@@ -1031,16 +1041,18 @@ nsPlainTextSerializer::DoAddText(bool aIsLineBreak, const nsAString& aText)
+@@ -1031,16 +1053,18 @@ nsPlainTextSerializer::DoAddText(bool aIsLineBreak, const nsAString& aText)
      mURL.Truncate();
    }
    Write(aText);
