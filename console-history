@@ -1,8 +1,97 @@
 # HG changeset patch
-# Parent aa29e86d1f0e4071f607bd157fb67951da7b6256
+# Parent 584d995002a6c922f6896adf70414baa7069a047
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 943306 - Allow persisting (browser) console input history between sessions - WIP
 
+diff --git a/browser/devtools/webconsole/test/browser.ini b/browser/devtools/webconsole/test/browser.ini
+--- a/browser/devtools/webconsole/test/browser.ini
++++ b/browser/devtools/webconsole/test/browser.ini
+@@ -343,16 +343,17 @@ skip-if = e10s # Bug 1042253 - webconsol
+ [browser_webconsole_log_file_filter.js]
+ [browser_webconsole_expandable_timestamps.js]
+ [browser_webconsole_autocomplete_in_debugger_stackframe.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_webconsole_autocomplete_popup_close_on_tab_switch.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_webconsole_autocomplete-properties-with-non-alphanumeric-names.js]
+ [browser_console_hide_jsterm_when_devtools_chrome_enabled_false.js]
++[browser_console_history_persist.js]
+ [browser_webconsole_output_01.js]
+ skip-if = e10s # Bug 1042253 - webconsole e10s tests
+ [browser_webconsole_output_02.js]
+ [browser_webconsole_output_03.js]
+ [browser_webconsole_output_04.js]
+ [browser_webconsole_output_05.js]
+ [browser_webconsole_output_06.js]
+ [browser_webconsole_output_dom_elements_01.js]
+diff --git a/browser/devtools/webconsole/test/browser_console_history_persist.js b/browser/devtools/webconsole/test/browser_console_history_persist.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/webconsole/test/browser_console_history_persist.js
+@@ -0,0 +1,63 @@
++/* -*- js-indent-level: 2; indent-tabs-mode: nil -*- */
++/* vim:set ts=2 sw=2 sts=2 et: */
++/* ***** BEGIN LICENSE BLOCK *****
++ * Any copyright is dedicated to the Public Domain.
++ * http://creativecommons.org/publicdomain/zero/1.0/
++ *
++ * Contributor(s):
++ *  zmgmoz <zmgmoz@gmail.com>
++ *
++ * ***** END LICENSE BLOCK ***** */
++
++// Test that user input that is not submitted in the command line input is not
++// lost after navigating in history.
++// See https://bugzilla.mozilla.org/show_bug.cgi?id=817834
++
++"use strict";
++
++const TEST_URI = "data:text/html;charset=utf-8,Web Console test for bug 817834";
++
++let test = asyncTest(function* () {
++  yield loadTab(TEST_URI);
++
++  let hud = yield openConsole();
++
++  testEditedInputHistory(hud);
++});
++
++function testEditedInputHistory(HUD) {
++  let jsterm = HUD.jsterm;
++  let inputNode = jsterm.inputNode;
++  ok(!inputNode.value, "inputNode.value is empty");
++  is(inputNode.selectionStart, 0);
++  is(inputNode.selectionEnd, 0);
++
++  jsterm.setInputValue('"first item"');
++  EventUtils.synthesizeKey("VK_UP", {});
++  is(inputNode.value, '"first item"', "null test history up");
++  EventUtils.synthesizeKey("VK_DOWN", {});
++  is(inputNode.value, '"first item"', "null test history down");
++
++  jsterm.execute();
++  is(inputNode.value, "", "cleared input line after submit");
++
++  jsterm.setInputValue('"editing input 1"');
++  EventUtils.synthesizeKey("VK_UP", {});
++  is(inputNode.value, '"first item"', "test history up");
++  EventUtils.synthesizeKey("VK_DOWN", {});
++  is(inputNode.value, '"editing input 1"',
++    "test history down restores in-progress input");
++
++  jsterm.setInputValue('"second item"');
++  jsterm.execute();
++  jsterm.setInputValue('"editing input 2"');
++  EventUtils.synthesizeKey("VK_UP", {});
++  is(inputNode.value, '"second item"', "test history up");
++  EventUtils.synthesizeKey("VK_UP", {});
++  is(inputNode.value, '"first item"', "test history up");
++  EventUtils.synthesizeKey("VK_DOWN", {});
++  is(inputNode.value, '"second item"', "test history down");
++  EventUtils.synthesizeKey("VK_DOWN", {});
++  is(inputNode.value, '"editing input 2"',
++     "test history down restores new in-progress input again");
++}
 diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webconsole/webconsole.js
 --- a/browser/devtools/webconsole/webconsole.js
 +++ b/browser/devtools/webconsole/webconsole.js
@@ -45,7 +134,7 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  // each category. The user can change this number by adjusting the hidden
  // "devtools.hud.loglimit.{network,cssparser,exception,console}" preferences.
  const DEFAULT_LOG_LIMIT = 200;
-@@ -3032,39 +3037,53 @@ function getterOrSetterEvalMacro(aItem, 
+@@ -3041,39 +3046,54 @@ function getterOrSetterEvalMacro(aItem, 
   *        The WebConsoleFrame object that owns this JSTerm instance.
   */
  function JSTerm(aWebConsoleFrame)
@@ -80,12 +169,13 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
    SELECTED_FRAME: -1,
  
 +  loadHistory: function() {
-+    this.history = SimpleStorage.webConsoleHistory.slice();
-+    console.log("Loaded history", this.history, Array.isArray(this.history));
-+    if (!Array.isArray(this.history)) {
-+      this.history = [];
-+    }
++    // The object returned from SimpleStorage will be undefined if it's never
++    // been set.  If this is the case, just use an empty array.
++    let historyFromStorage = SimpleStorage.webConsoleHistory;
++    this.history =
++      Array.isArray(historyFromStorage) ? historyFromStorage.slice() : [];
 +
++console.log(historyFromStorage, this.history)
 +    // Holds the number of entries in history. This value is incremented in
 +    // this.execute().
 +    this.historyIndex = this.history.length; // incremented on this.execute()
@@ -108,7 +198,7 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  
    /**
     * Array that caches the user input suggestions received from the server.
-@@ -3361,16 +3380,22 @@ JSTerm.prototype = {
+@@ -3370,16 +3390,22 @@ JSTerm.prototype = {
  
      this.requestEvaluation(aExecuteString, options).then(onResult, onResult);
  
