@@ -1,0 +1,600 @@
+From 414e83e184a67a820ff6ae5d5c327764fb6a146d Mon Sep 17 00:00:00 2001
+From: Will Bamberg <wbamberg@mozilla.com>
+Date: Fri, 13 Feb 2015 15:27:07 -0800
+Subject: Add MDN tooltips for CSS properties
+
+---
+ browser/devtools/jar.mn                            |   2 +
+ browser/devtools/shared/mdn-docs.js                | 135 +++++++++++++++++++++
+ browser/devtools/shared/moz.build                  |   2 +
+ browser/devtools/shared/widgets/CssDocsWidget.js   |  31 +++++
+ browser/devtools/shared/widgets/Tooltip.js         | 102 +++++++++++++++-
+ .../devtools/shared/widgets/css-docs-frame.xhtml   |  30 +++++
+ browser/devtools/shared/widgets/css-docs.css       |  42 +++++++
+ browser/devtools/styleinspector/rule-view.js       |  29 +++++
+ .../styleinspector/style-inspector-overlays.js     |   9 +-
+ .../chrome/browser/devtools/inspector.properties   |   4 +
+ .../global/devtools/styleinspector.properties      |   8 ++
+ 11 files changed, 392 insertions(+), 2 deletions(-)
+ create mode 100644 browser/devtools/shared/mdn-docs.js
+ create mode 100644 browser/devtools/shared/widgets/CssDocsWidget.js
+ create mode 100644 browser/devtools/shared/widgets/css-docs-frame.xhtml
+ create mode 100644 browser/devtools/shared/widgets/css-docs.css
+
+diff --git a/browser/devtools/jar.mn b/browser/devtools/jar.mn
+index afa1729..803cf5d 100644
+--- a/browser/devtools/jar.mn
++++ b/browser/devtools/jar.mn
+@@ -143,6 +143,8 @@ browser.jar:
+     content/browser/devtools/spectrum.css                              (shared/widgets/spectrum.css)
+     content/browser/devtools/cubic-bezier-frame.xhtml                  (shared/widgets/cubic-bezier-frame.xhtml)
+     content/browser/devtools/cubic-bezier.css                          (shared/widgets/cubic-bezier.css)
++    content/browser/devtools/css-docs-frame.xhtml                      (shared/widgets/css-docs-frame.xhtml)
++    content/browser/devtools/css-docs.css                              (shared/widgets/css-docs.css)
+     content/browser/devtools/eyedropper.xul                            (eyedropper/eyedropper.xul)
+     content/browser/devtools/eyedropper/crosshairs.css                 (eyedropper/crosshairs.css)
+     content/browser/devtools/eyedropper/nocursor.css                   (eyedropper/nocursor.css)
+diff --git a/browser/devtools/shared/mdn-docs.js b/browser/devtools/shared/mdn-docs.js
+new file mode 100644
+index 0000000..fe4b7a8
+--- /dev/null
++++ b/browser/devtools/shared/mdn-docs.js
+@@ -0,0 +1,135 @@
++/* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
++/* vim: set ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++const {Cc, Ci, Cu} = require("chrome");
++Cu.import("resource://gre/modules/Promise.jsm");
++
++const URL_POSTFIX = "?raw&macros";
++const BASE_MDN_PAGE = "https://developer.mozilla.org/docs/Web/CSS/";
++
++/**
++ * The following 3 functions are taken from MDN, and enable us to get
++ * the next sibling that is not a comment or whitespace.
++ */
++function is_all_ws( node ) {
++  // Use ECMA-262 Edition 3 String and RegExp features
++  return !(/[^\t\n\r ]/.test(node.textContent));
++}
++
++function is_ignorable( node ) {
++  return ( node.nodeType == 8) || // A comment node
++         ( (node.nodeType == 3) && is_all_ws(node) ); // a text node, all ws
++}
++
++function node_after( sib ) {
++  while ((sib = sib.nextSibling)) {
++    if (!is_ignorable(sib)) return sib;
++  }
++  return null;
++}
++
++/**
++ * Throw if the node is undefined or not what we expect.
++ */
++function check(node, tagName) {
++  if (!node || node.tagName != tagName) {
++    throw new Error("Couldn't find docs node in document");
++  }
++}
++
++/**
++ * Return the textContent of the first non-whitespace
++ * element in the #Summary section of the document.
++ *
++ * It's expected to be a <P> element.
++ */
++function getSummary(responseDocument) {
++  let summary = responseDocument.getElementById("Summary");
++  check(summary, "H2");
++
++  let firstParagraph = node_after(summary);
++  check(firstParagraph, "P");
++
++  return firstParagraph.textContent;
++}
++
++/**
++ * Return the textContent of the second non-whitespace
++ * node in the #Syntax section of the document.
++ *
++ * Both the first and second nodes are expected to be <PRE> nodes.
++ */
++function getSyntax(responseDocument) {
++  let syntax = responseDocument.getElementById("Syntax");
++  check(syntax, "H2");
++
++  let firstParagraph = node_after(syntax);
++  check(firstParagraph, "PRE");
++
++  let secondParagraph = node_after(firstParagraph);
++  check(secondParagraph, "PRE");
++
++  return secondParagraph.textContent;
++}
++
++/**
++ * Gets some docs for the given CSS property.
++ * Loads an MDN page for the property and gets some
++ * information about the property.
++ *
++ * Returns a promise.
++ *
++ * The promise is resolved with an object containing:
++ * - propertyName: the CSS property we were asked about
++ * - summary: a short summary of the property
++ * - syntax: some example syntax
++ * - url: MDN page containing full docs
++ *
++ * The promise is rejected with an error message if:
++ * - we could not load the page
++ * - the page did not contain the expected elements
++ *
++ */
++function getCssDocs(cssProperty) {
++
++  function _getCssDocs(resolve, reject) {
++    let xhr = Cc["@mozilla.org/xmlextras/xmlhttprequest;1"].createInstance(Ci.nsIXMLHttpRequest);
++    let pageUrl = BASE_MDN_PAGE + cssProperty + URL_POSTFIX;
++
++    xhr.addEventListener("load", onLoaded, false);
++    xhr.addEventListener("error", onError, false);
++
++    xhr.open("GET", pageUrl);
++    xhr.responseType = "document";
++    xhr.send();
++
++    function parseDocsFromResponse(responseDocument, resolve, reject) {
++      try {
++        let theDocs = {};
++        theDocs.summary = getSummary(responseDocument);
++        theDocs.syntax = getSyntax(responseDocument);
++        theDocs.propertyName = cssProperty;
++        theDocs.url = BASE_MDN_PAGE + cssProperty;
++        resolve(theDocs);
++      }
++      catch(error) {
++        reject(error);
++      }
++    }
++
++    function onLoaded(e) {
++      parseDocsFromResponse(xhr.responseXML, resolve, reject);
++    }
++
++    function onError(e) {
++      reject("Error loading remote docs page at " + pageUrl + " : " + xhr.status);
++    }
++  }
++
++  return new Promise(_getCssDocs);
++}
++
++exports.getCssDocs = getCssDocs;
+diff --git a/browser/devtools/shared/moz.build b/browser/devtools/shared/moz.build
+index 2ff1dc0..e6f59c6 100644
+--- a/browser/devtools/shared/moz.build
++++ b/browser/devtools/shared/moz.build
+@@ -51,6 +51,7 @@ EXTRA_JS_MODULES.devtools.shared += [
+     'doorhanger.js',
+     'frame-script-utils.js',
+     'inplace-editor.js',
++    'mdn-docs.js',
+     'observable-object.js',
+     'options-view.js',
+     'telemetry.js',
+@@ -60,6 +61,7 @@ EXTRA_JS_MODULES.devtools.shared += [
+ ]
+ 
+ EXTRA_JS_MODULES.devtools.shared.widgets += [
++    'widgets/CssDocsWidget.js',
+     'widgets/CubicBezierWidget.js',
+     'widgets/FastListWidget.js',
+     'widgets/Spectrum.js',
+diff --git a/browser/devtools/shared/widgets/CssDocsWidget.js b/browser/devtools/shared/widgets/CssDocsWidget.js
+new file mode 100644
+index 0000000..bf768cd7
+--- /dev/null
++++ b/browser/devtools/shared/widgets/CssDocsWidget.js
+@@ -0,0 +1,31 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++function CssDocsWidget(tooltipDocument) {
++  this.tooltipDocument = tooltipDocument;
++}
++
++module.exports.CssDocsWidget = CssDocsWidget;
++
++/**
++ * This is called just before the tooltip is displayed.
++ * It updates the tooltip's content from the cssDocs object.
++*/
++CssDocsWidget.prototype = {
++  updateUI: function(cssDocs) {
++    let propertyNameHeading = this.tooltipDocument.getElementById("property-name");
++    propertyNameHeading.textContent = cssDocs.propertyName;
++
++    let propertySummary = this.tooltipDocument.getElementById("summary");
++    propertySummary.textContent = cssDocs.summary;
++
++    let propertySyntax = this.tooltipDocument.getElementById("syntax");
++    propertySyntax.textContent = cssDocs.syntax;
++
++    let mdnLink = this.tooltipDocument.getElementById("visit-mdn-page");
++    mdnLink.setAttribute("href", cssDocs.url);
++  }
++};
+diff --git a/browser/devtools/shared/widgets/Tooltip.js b/browser/devtools/shared/widgets/Tooltip.js
+index 3b802d5..472c119 100644
+--- a/browser/devtools/shared/widgets/Tooltip.js
++++ b/browser/devtools/shared/widgets/Tooltip.js
+@@ -10,6 +10,7 @@ const IOService = Cc["@mozilla.org/network/io-service;1"]
+   .getService(Ci.nsIIOService);
+ const {Spectrum} = require("devtools/shared/widgets/Spectrum");
+ const {CubicBezierWidget} = require("devtools/shared/widgets/CubicBezierWidget");
++const {CssDocsWidget} = require("devtools/shared/widgets/CssDocsWidget");
+ const EventEmitter = require("devtools/toolkit/event-emitter");
+ const {colorUtils} = require("devtools/css-color");
+ const Heritage = require("sdk/core/heritage");
+@@ -39,9 +40,11 @@ const BORDER_RE = /^border(-(top|bottom|left|right))?$/ig;
+ const XHTML_NS = "http://www.w3.org/1999/xhtml";
+ const SPECTRUM_FRAME = "chrome://browser/content/devtools/spectrum-frame.xhtml";
+ const CUBIC_BEZIER_FRAME = "chrome://browser/content/devtools/cubic-bezier-frame.xhtml";
++const CSS_DOCS_FRAME = "chrome://browser/content/devtools/css-docs-frame.xhtml";
+ const ESCAPE_KEYCODE = Ci.nsIDOMKeyEvent.DOM_VK_ESCAPE;
+ const RETURN_KEYCODE = Ci.nsIDOMKeyEvent.DOM_VK_RETURN;
+ const POPUP_EVENTS = ["shown", "hidden", "showing", "hiding"];
++const BROWSER_WINDOW = 'navigator:browser';
+ 
+ /**
+  * Tooltip widget.
+@@ -854,7 +857,65 @@ Tooltip.prototype = {
+       let str = yield data.string();
+       this.setImageContent(str, { hideDimensionLabel: true, maxDim: size });
+     }
+-  })
++  }),
++
++  /**
++   * Set up a CSS docs tooltip.
++   *
++   * This is called when the tooltip is first constructed.
++   *
++   * @return {promise} A promise which is resolved with a CssDocsWidget.
++   *
++   * It loads the tooltip's structure from a separate XHTML file
++   * into an iframe. When the iframe is loaded it does some final
++   * setup, then constructs a CssDocsWidget and passes that into
++   * resolve.
++   *
++   * The caller can use the CssDocsWidget to update the tooltip's
++   * UI with new content each time the tooltip is shown.
++   */
++  setCssDocsContent: function() {
++
++    let def = promise.defer();
++
++    // Create an iframe to host the css docs widget
++    let iframe = this.doc.createElementNS(XHTML_NS, "iframe");
++    iframe.setAttribute("transparent", true);
++    iframe.setAttribute("width", "400");
++    iframe.setAttribute("height", "300");
++    iframe.setAttribute("flex", "1");
++    iframe.setAttribute("class", "devtools-tooltip-iframe");
++
++    // Wait for the load to initialize the widget
++    function onLoad() {
++      iframe.removeEventListener("load", onLoad, true);
++      let win = iframe.contentWindow.wrappedJSObject;
++
++      // get the localized string for the link text
++      let linkToMdn = win.document.getElementById("visit-mdn-page");
++      linkToMdn.textContent = l10n.strings.GetStringFromName("docsTooltip.visitMDN");
++
++      // listen for clicks and open in the browser window instead
++      let browserWindow = Services.wm.getMostRecentWindow(BROWSER_WINDOW);
++      linkToMdn.addEventListener("click", function(e) {
++        e.stopPropagation();
++        e.preventDefault();
++        let link = e.target.href;
++        browserWindow.gBrowser.addTab(link);
++      });
++
++      // create a CssDocsWidget, initializing it with the content document
++      let widget = new CssDocsWidget(win.document);
++      def.resolve(widget);
++    }
++    iframe.addEventListener("load", onLoad, true);
++    iframe.setAttribute("src", CSS_DOCS_FRAME);
++
++    // Put the iframe in the tooltip
++    this.content = iframe;
++
++    return def.promise;
++  }
+ };
+ 
+ /**
+@@ -1476,6 +1537,45 @@ SwatchCubicBezierTooltip.prototype = Heritage.extend(SwatchBasedEditorTooltip.pr
+ });
+ 
+ /**
++ * Tooltip for displaying docs for CSS properties from MDN.
++ *
++ * @param {XULDocument} doc
++ */
++function CssDocsTooltip(doc) {
++  this.tooltip = new Tooltip(doc, {
++    consumeOutsideClick: true,
++    closeOnKeys: [ESCAPE_KEYCODE, RETURN_KEYCODE],
++    noAutoFocus: false
++  });
++  this.widget = this.tooltip.setCssDocsContent();
++}
++
++module.exports.CssDocsTooltip = CssDocsTooltip;
++
++CssDocsTooltip.prototype = {
++/**
++ * Update the UI with the cssDocs object,
++ * then show the tooltip.
++ */
++  show: function(anchor, cssDocs) {
++    let tooltip = this.tooltip;
++    this.widget.then(function(widget) {
++      widget.updateUI(cssDocs);
++      tooltip.show(anchor, "topcenter bottomleft");
++    });
++  },
++
++  hide: function() {
++    this.tooltip.hide();
++  },
++
++  destroy: function() {
++    this.tooltip.destroy();
++  }
++};
++
++
++/**
+  * L10N utility class
+  */
+ function L10N() {}
+diff --git a/browser/devtools/shared/widgets/css-docs-frame.xhtml b/browser/devtools/shared/widgets/css-docs-frame.xhtml
+new file mode 100644
+index 0000000..563b101
+--- /dev/null
++++ b/browser/devtools/shared/widgets/css-docs-frame.xhtml
+@@ -0,0 +1,30 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<!DOCTYPE html>
++
++<html xmlns="http://www.w3.org/1999/xhtml">
++<head>
++  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
++  <link rel="stylesheet" href="chrome://browser/skin/devtools/common.css" type="text/css"/>
++  <link rel="stylesheet" href="chrome://browser/content/devtools/css-docs.css" type="text/css"/>
++  <script type="application/javascript;version=1.8" src="theme-switching.js"/>
++</head>
++<body class="theme-body">
++
++  <header>
++    <h1 id="property-name" class="theme-fg-color5"></h1>
++  </header>
++
++  <div id="content">
++    <div id="summary"></div>
++    <pre id="syntax"></pre>
++  </div>
++
++  <footer>
++    <a id="visit-mdn-page" class="theme-link" href="#">Visit MDN (placeholder)</a>
++  </footer>
++
++</body>
++</html>
+\ No newline at end of file
+diff --git a/browser/devtools/shared/widgets/css-docs.css b/browser/devtools/shared/widgets/css-docs.css
+new file mode 100644
+index 0000000..849022c
+--- /dev/null
++++ b/browser/devtools/shared/widgets/css-docs.css
+@@ -0,0 +1,42 @@
++
++#visit-mdn-page {
++  display: inline-block;
++  padding: 1em 0;
++}
++
++html, body {
++  height: 100%;
++  width: 100%;
++  margin: 0;
++  padding: 0;
++}
++
++header {
++  position: absolute;
++  top: 0;
++  left: 0;
++  height: 5em;
++  right: 0;
++  overflow: hidden;
++  padding: 0 1em;
++}
++
++#content {
++  position: absolute;
++  top: 5em;
++  bottom: 3em;
++  left: 0;
++  right: 0;
++  overflow: auto;
++  padding: 0 1em;
++}
++
++footer {
++  position: absolute;
++  bottom: 0;
++  height: 3em;
++  left: 0;
++  right: 0;
++  overflow: hidden;
++  padding: 0 1em;
++}
+\ No newline at end of file
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+index 87e7475..69cdf1f 100644
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -16,6 +16,7 @@ const {OutputParser} = require("devtools/output-parser");
+ const {PrefObserver, PREF_ORIG_SOURCES} = require("devtools/styleeditor/utils");
+ const {parseSingleValue, parseDeclarations} = require("devtools/styleinspector/css-parsing-utils");
+ const overlays = require("devtools/styleinspector/style-inspector-overlays");
++const mdnDocs = require("devtools/shared/mdn-docs");
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+@@ -25,6 +26,8 @@ const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+ const PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
+ const PREF_DEFAULT_COLOR_UNIT = "devtools.defaultColorUnit";
+ 
++const PROPERTY_NAME_CLASS = "ruleview-propertyname";
++
+ /**
+  * These regular expressions are adapted from firebug's css.js, and are
+  * used to parse CSSStyleDeclaration's cssText attribute.
+@@ -1126,6 +1129,7 @@ function CssRuleView(aInspector, aDoc, aStore, aPageStyle) {
+   this._onCopy = this._onCopy.bind(this);
+   this._onCopyColor = this._onCopyColor.bind(this);
+   this._onToggleOrigSources = this._onToggleOrigSources.bind(this);
++  this._onShowMdnDocs = this._onShowMdnDocs.bind(this);
+ 
+   this.element.addEventListener("copy", this._onCopy);
+ 
+@@ -1198,6 +1202,12 @@ CssRuleView.prototype = {
+       type: "checkbox"
+     });
+ 
++    this.menuitemShowMdnDocs = createMenuItem(this._contextmenu, {
++      label: "ruleView.contextmenu.showMdnDocs",
++      accesskey: "ruleView.contextmenu.showMdnDocs.accessKey",
++      command: this._onShowMdnDocs
++    });
++
+     let popupset = doc.documentElement.querySelector("popupset");
+     if (!popupset) {
+       popupset = doc.createElementNS(XUL_NS, "popupset");
+@@ -1240,6 +1250,8 @@ CssRuleView.prototype = {
+     var showOrig = Services.prefs.getBoolPref(PREF_ORIG_SOURCES);
+     this.menuitemSources.setAttribute("checked", showOrig);
+ 
++    this.menuitemShowMdnDocs.hidden = !this.doc.popupNode.parentNode.classList.contains(PROPERTY_NAME_CLASS);
++
+     this.menuitemAddRule.disabled = this.inspector.selection.isAnonymousNode();
+   },
+ 
+@@ -1402,6 +1414,23 @@ CssRuleView.prototype = {
+   },
+ 
+   /**
++   *  Show docs from MDN for a CSS property.
++   */
++  _onShowMdnDocs: function() {
++    let cssPropertyName = this.doc.popupNode.textContent;
++    let anchor = this.doc.popupNode.parentNode;
++    let cssDocsTooltip = this.tooltips.cssDocs;
++    mdnDocs.getCssDocs(cssPropertyName).then(
++      docs => {
++        cssDocsTooltip.show(anchor, docs);
++      },
++      errorMessage => {
++        console.warn("MDN docs tooltip: " + errorMessage);
++      }
++    );
++  },
++
++  /**
+    * Add a new rule to the current element.
+    */
+   _onAddRule: function() {
+diff --git a/browser/devtools/styleinspector/style-inspector-overlays.js b/browser/devtools/styleinspector/style-inspector-overlays.js
+index 6b38ae8..f607bff 100644
+--- a/browser/devtools/styleinspector/style-inspector-overlays.js
++++ b/browser/devtools/styleinspector/style-inspector-overlays.js
+@@ -16,7 +16,8 @@ const {Cc, Ci, Cu} = require("chrome");
+ const {
+   Tooltip,
+   SwatchColorPickerTooltip,
+-  SwatchCubicBezierTooltip
++  SwatchCubicBezierTooltip,
++  CssDocsTooltip
+ } = require("devtools/shared/widgets/Tooltip");
+ const {CssLogic} = require("devtools/styleinspector/css-logic");
+ const {Promise:promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+@@ -277,6 +278,8 @@ TooltipsOverlay.prototype = {
+       this.colorPicker = new SwatchColorPickerTooltip(this.view.inspector.panelDoc);
+       // Cubic bezier tooltip
+       this.cubicBezier = new SwatchCubicBezierTooltip(this.view.inspector.panelDoc);
++      // MDN CSS help tooltip
++      this.cssDocs = new CssDocsTooltip(this.view.inspector.panelDoc);
+     }
+ 
+     this._isStarted = true;
+@@ -302,6 +305,10 @@ TooltipsOverlay.prototype = {
+       this.cubicBezier.destroy();
+     }
+ 
++    if (this.cssDocs) {
++      this.cssDocs.destroy();
++    }
++
+     this._isStarted = false;
+   },
+ 
+diff --git a/browser/locales/en-US/chrome/browser/devtools/inspector.properties b/browser/locales/en-US/chrome/browser/devtools/inspector.properties
+index d6ab766..e91cac9 100644
+--- a/browser/locales/en-US/chrome/browser/devtools/inspector.properties
++++ b/browser/locales/en-US/chrome/browser/devtools/inspector.properties
+@@ -54,3 +54,7 @@ previewTooltip.image.brokenImage=Could not load the image
+ 
+ #LOCALIZATION NOTE: Used in the image preview tooltip when the image could not be loaded
+ eventsTooltip.openInDebugger=Open in Debugger
++
++# LOCALIZATION NOTE (docsTooltip.visitMDN): Link to visit the MDN documentation
++# page for a particular CSS property.
++docsTooltip.visitMDN=Visit MDN page
+diff --git a/toolkit/locales/en-US/chrome/global/devtools/styleinspector.properties b/toolkit/locales/en-US/chrome/global/devtools/styleinspector.properties
+index 4b9a49e..90fef1b 100644
+--- a/toolkit/locales/en-US/chrome/global/devtools/styleinspector.properties
++++ b/toolkit/locales/en-US/chrome/global/devtools/styleinspector.properties
+@@ -100,6 +100,14 @@ ruleView.contextmenu.showOrigSources=Show original sources
+ # the rule view context menu "Show original sources" entry.
+ ruleView.contextmenu.showOrigSources.accessKey=O
+ 
++# LOCALIZATION NOTE (ruleView.contextmenu.showMdnDocs): Text displayed in the rule view
++# context menu.
++ruleView.contextmenu.showMdnDocs=Show MDN docs
++
++# LOCALIZATION NOTE (ruleView.contextmenu.showMdnDocs.accessKey): Access key for
++# the rule view context menu "Show MDN docs" entry.
++ruleView.contextmenu.showMdnDocs.accessKey=D
++
+ # LOCALIZATION NOTE (ruleView.contextmenu.addRule): Text displayed in the
+ # rule view context menu for adding a new rule to the element.
+ ruleView.contextmenu.addRule=Add rule
+-- 
+1.8.5.2 (Apple Git-48)
+
