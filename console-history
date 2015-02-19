@@ -1,8 +1,31 @@
 # HG changeset patch
-# Parent 357259a21ce258863e5cc3aad128d8ef3e5f2750
+# Parent 917ccaef1006595a8e40e2dbe55533bbe15f749b
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 943306 - Allow persisting console input history between sessions;r=past
 
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -1549,16 +1549,19 @@ pref("devtools.browserconsole.filter.war
+ pref("devtools.browserconsole.filter.info", true);
+ pref("devtools.browserconsole.filter.log", true);
+ pref("devtools.browserconsole.filter.secerror", true);
+ pref("devtools.browserconsole.filter.secwarn", true);
+ 
+ // Text size in the Web Console. Use 0 for the system default size.
+ pref("devtools.webconsole.fontSize", 0);
+ 
++// Max number of inputs to store in web console history.
++pref("devtools.webconsole.inputHistoryCount", 50);
++
+ // Persistent logging: |true| if you want the Web Console to keep all of the
+ // logged messages after reloading the page, |false| if you want the output to
+ // be cleared each time page navigation happens.
+ pref("devtools.webconsole.persistlog", false);
+ 
+ // Web Console timestamp: |true| if you want the logs and instructions
+ // in the Web Console to display a timestamp, or |false| to not display
+ // any timestamps.
 diff --git a/browser/devtools/webconsole/test/browser.ini b/browser/devtools/webconsole/test/browser.ini
 --- a/browser/devtools/webconsole/test/browser.ini
 +++ b/browser/devtools/webconsole/test/browser.ini
@@ -28,7 +51,7 @@ diff --git a/browser/devtools/webconsole/test/browser_console_history_persist.js
 new file mode 100644
 --- /dev/null
 +++ b/browser/devtools/webconsole/test/browser_console_history_persist.js
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,91 @@
 +/* vim:set ts=2 sw=2 sts=2 et: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -88,8 +111,10 @@ new file mode 100644
 +    "Fourth tab has most recent history");
 +});
 +
-+// Populate the history by running the following commands
-+//   [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
++/**
++ * Populate the history by running the following commands:
++ *  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
++ */
 +function* populateInputHistory(hud) {
 +  let jsterm = hud.jsterm;
 +  let {inputNode} = jsterm;
@@ -101,8 +126,10 @@ new file mode 100644
 +  }
 +}
 +
-+// Check pressing up results in history traversal like:
-+//   [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
++/**
++ * Check pressing up results in history traversal like:
++ *  [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
++ */
 +function* testNaviatingHistoryInUI(hud) {
 +  let jsterm = hud.jsterm;
 +  let {inputNode} = jsterm;
@@ -169,8 +196,8 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
                    () => require("devtools/webconsole/console-output").ConsoleOutput);
  loader.lazyGetter(this, "Messages",
                    () => require("devtools/webconsole/console-output").Messages);
-+loader.lazyGetter(this, "asyncStorage",
-+                  () => require("devtools/toolkit/shared/async-storage"));
++loader.lazyGetter(this, "SimpleStorage",
++                  () => require("sdk/simple-storage").storage);
  loader.lazyImporter(this, "EnvironmentClient", "resource://gre/modules/devtools/dbg-client.jsm");
  loader.lazyImporter(this, "ObjectClient", "resource://gre/modules/devtools/dbg-client.jsm");
  loader.lazyImporter(this, "VariablesView", "resource:///modules/devtools/VariablesView.jsm");
@@ -179,27 +206,25 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  loader.lazyImporter(this, "gDevTools", "resource:///modules/devtools/gDevTools.jsm");
  
  const STRINGS_URI = "chrome://browser/locale/devtools/webconsole.properties";
-@@ -49,16 +51,19 @@ const WEAK_SIGNATURE_ALGORITHM_LEARN_MOR
- const HELP_URL = "https://developer.mozilla.org/docs/Tools/Web_Console/Helpers";
+@@ -171,16 +173,17 @@ const THROTTLE_UPDATES = 1000; // millis
+ const FILTER_PREFS_PREFIX = "devtools.webconsole.filter.";
  
- const VARIABLES_VIEW_URL = "chrome://browser/content/devtools/widgets/VariablesView.xul";
+ // The minimum font size.
+ const MIN_FONT_SIZE = 10;
  
- const CONSOLE_DIR_VIEW_HEIGHT = 0.6;
+ const PREF_CONNECTION_TIMEOUT = "devtools.debugger.remote-timeout";
+ const PREF_PERSISTLOG = "devtools.webconsole.persistlog";
+ const PREF_MESSAGE_TIMESTAMP = "devtools.webconsole.timestampMessages";
++const PREF_INPUT_HISTORY_COUNT = "devtools.webconsole.inputHistoryCount";
  
- const IGNORED_SOURCE_URLS = ["debugger eval code"];
- 
-+// The number of entries to store in input history
-+const INPUT_HISTORY_COUNT = 50;
-+
- // The amount of time in milliseconds that we wait before performing a live
- // search.
- const SEARCH_DELAY = 200;
- 
- // The number of lines that are displayed in the console output by default, for
- // each category. The user can change this number by adjusting the hidden
- // "devtools.hud.loglimit.{network,cssparser,exception,console}" preferences.
- const DEFAULT_LOG_LIMIT = 200;
-@@ -3051,39 +3056,66 @@ function getterOrSetterEvalMacro(aItem, 
+ /**
+  * A WebConsoleFrame instance is an interactive console initialized *per target*
+  * that displays console log data as well as provides an interactive terminal to
+  * manipulate the target's document content.
+  *
+  * The WebConsoleFrame is responsible for the actual Web Console UI
+  * implementation.
+@@ -3051,40 +3054,62 @@ function getterOrSetterEvalMacro(aItem, 
   *        The WebConsoleFrame object that owns this JSTerm instance.
   */
  function JSTerm(aWebConsoleFrame)
@@ -219,6 +244,8 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
 -  this.historyPlaceHolder = 0;
 +  this.loadHistory();
 +
++  this.INPUT_HISTORY_COUNT = Services.prefs.getIntPref(PREF_INPUT_HISTORY_COUNT);
++
    this._objectActorsInVariablesViews = new Map();
  
    this._keyPress = this._keyPress.bind(this);
@@ -233,41 +260,34 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  JSTerm.prototype = {
    SELECTED_FRAME: -1,
  
-+  // Expose this so tests can work with it
-+  INPUT_HISTORY_COUNT: INPUT_HISTORY_COUNT,
-+
-+  /**
+   /**
 +   * Load the console history from previous sessions.
 +   */
 +  loadHistory: function() {
 +    this.history = [];
 +    this.historyIndex = this.historyPlaceHolder = 0;
 +
-+    asyncStorage.getItem("webConsoleHistory").then(value => {
-+      if (Array.isArray(value)) {
-+        // Since it was gotten asynchronously, there could be items already in
-+        // the history.  It's not likely but stick them onto the end anyway.
-+        this.history = value.concat(this.history);
++    let historyFromStorage = SimpleStorage.webConsoleHistory;
++    this.history =
++      Array.isArray(historyFromStorage) ? historyFromStorage.slice() : [];
 +
-+        // Holds the number of entries in history. This value is incremented in
-+        // this.execute().
-+        this.historyIndex = this.history.length;
++    // Holds the number of entries in history. This value is incremented in
++    // this.execute().
++    this.historyIndex = this.history.length;
 +
-+        // Holds the index of the history entry that the user is currently viewing.
-+        // This is reset to this.history.length when this.execute() is invoked.
-+        this.historyPlaceHolder = this.history.length;
-+      }
-+    }, console.error);
++    // Holds the index of the history entry that the user is currently viewing.
++    // This is reset to this.history.length when this.execute() is invoked.
++    this.historyPlaceHolder = this.history.length;
 +  },
 +
 +  /**
 +   * Stores the console history for future sessions.
 +   */
 +  storeHistory: function() {
-+    asyncStorage.setItem("webConsoleHistory", this.history);
++    SimpleStorage.webConsoleHistory = this.history.slice();
 +  },
 +
-   /**
++  /**
     * Stores the data for the last completion.
     * @type object
     */
@@ -275,7 +295,8 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  
    /**
     * Array that caches the user input suggestions received from the server.
-@@ -3383,16 +3415,22 @@ JSTerm.prototype = {
+    * @private
+@@ -3383,16 +3408,22 @@ JSTerm.prototype = {
  
      this.requestEvaluation(aExecuteString, options).then(onResult, onResult);
  
@@ -286,7 +307,7 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
      this.historyPlaceHolder = this.history.length;
 +
 +    if (this.history.length > this.INPUT_HISTORY_COUNT) {
-+      this.history.shift();
++      this.history.splice(0, this.history.length - this.INPUT_HISTORY_COUNT);
 +      this.historyIndex = this.historyPlaceHolder = this.history.length;
 +    }
 +    this.storeHistory();
@@ -298,6 +319,48 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  
    /**
     * Request a JavaScript string evaluation from the server.
+diff --git a/toolkit/devtools/Loader.jsm b/toolkit/devtools/Loader.jsm
+--- a/toolkit/devtools/Loader.jsm
++++ b/toolkit/devtools/Loader.jsm
+@@ -7,16 +7,17 @@
+ /**
+  * Manages the addon-sdk loader instance used to load the developer tools.
+  */
+ 
+ let { Constructor: CC, classes: Cc, interfaces: Ci, utils: Cu } = Components;
+ 
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ Cu.import("resource://gre/modules/Services.jsm");
++Cu.import("resource://gre/modules/AsyncShutdown.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "NetUtil", "resource://gre/modules/NetUtil.jsm");
+ XPCOMUtils.defineLazyModuleGetter(this, "FileUtils", "resource://gre/modules/FileUtils.jsm");
+ XPCOMUtils.defineLazyModuleGetter(this, "OS", "resource://gre/modules/osfile.jsm");
+ 
+ let loader = Cu.import("resource://gre/modules/commonjs/toolkit/loader.js", {}).Loader;
+ let promise = Cu.import("resource://gre/modules/Promise.jsm", {}).Promise;
+ 
+@@ -429,8 +430,20 @@ DevToolsLoader.prototype = {
+    * loader instance.
+    * @see browser/devtools/framework/ToolboxProcess.jsm
+    */
+   invisibleToDebugger: Services.appinfo.name !== "Firefox"
+ };
+ 
+ // Export the standard instance of DevToolsLoader used by the tools.
+ this.devtools = new DevToolsLoader();
++
++// Notify the provider when a shutdown happens, so that the loader can be
++// unloaded.  This is important so addon sdk objects (like simple-storage)
++// will clean up after themselves.
++function unloadLoader() {
++  if (this.devtools._provider) {
++    this.devtools._provider.unload("shutdown");
++  }
++}
++
++AsyncShutdown.profileBeforeChange.addBlocker("Sending unload event from devtools loader.",
++                                             unloadLoader.bind(this));
 diff --git a/toolkit/devtools/webconsole/client.js b/toolkit/devtools/webconsole/client.js
 --- a/toolkit/devtools/webconsole/client.js
 +++ b/toolkit/devtools/webconsole/client.js
