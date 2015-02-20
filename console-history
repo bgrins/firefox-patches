@@ -1,5 +1,5 @@
 # HG changeset patch
-# Parent 917ccaef1006595a8e40e2dbe55533bbe15f749b
+# Parent 44e760cc3ec0b953a73f57a348584cbc85479aec
 # User Brian Grinstead <bgrinstead@mozilla.com>
 Bug 943306 - Allow persisting console input history between sessions;r=past
 
@@ -196,8 +196,8 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
                    () => require("devtools/webconsole/console-output").ConsoleOutput);
  loader.lazyGetter(this, "Messages",
                    () => require("devtools/webconsole/console-output").Messages);
-+loader.lazyGetter(this, "SimpleStorage",
-+                  () => require("sdk/simple-storage").storage);
++loader.lazyGetter(this, "asyncStorage",
++                  () => require("devtools/toolkit/shared/async-storage"));
  loader.lazyImporter(this, "EnvironmentClient", "resource://gre/modules/devtools/dbg-client.jsm");
  loader.lazyImporter(this, "ObjectClient", "resource://gre/modules/devtools/dbg-client.jsm");
  loader.lazyImporter(this, "VariablesView", "resource:///modules/devtools/VariablesView.jsm");
@@ -224,7 +224,7 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
   *
   * The WebConsoleFrame is responsible for the actual Web Console UI
   * implementation.
-@@ -3051,40 +3054,62 @@ function getterOrSetterEvalMacro(aItem, 
+@@ -3051,40 +3054,67 @@ function getterOrSetterEvalMacro(aItem, 
   *        The WebConsoleFrame object that owns this JSTerm instance.
   */
  function JSTerm(aWebConsoleFrame)
@@ -267,24 +267,29 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
 +    this.history = [];
 +    this.historyIndex = this.historyPlaceHolder = 0;
 +
-+    let historyFromStorage = SimpleStorage.webConsoleHistory;
-+    this.history =
-+      Array.isArray(historyFromStorage) ? historyFromStorage.slice() : [];
++    asyncStorage.getItem("webConsoleHistory").then(value => {
++      console.log("GOTTEN", value);
++      if (Array.isArray(value)) {
++        // Since it was gotten asynchronously, there could be items already in
++        // the history.  It's not likely but stick them onto the end anyway.
++        this.history = value.concat(this.history);
 +
-+    // Holds the number of entries in history. This value is incremented in
-+    // this.execute().
-+    this.historyIndex = this.history.length;
++        // Holds the number of entries in history. This value is incremented in
++        // this.execute().
++        this.historyIndex = this.history.length;
 +
-+    // Holds the index of the history entry that the user is currently viewing.
-+    // This is reset to this.history.length when this.execute() is invoked.
-+    this.historyPlaceHolder = this.history.length;
++        // Holds the index of the history entry that the user is currently viewing.
++        // This is reset to this.history.length when this.execute() is invoked.
++        this.historyPlaceHolder = this.history.length;
++      }
++    }, console.error);
 +  },
 +
 +  /**
 +   * Stores the console history for future sessions.
 +   */
 +  storeHistory: function() {
-+    SimpleStorage.webConsoleHistory = this.history.slice();
++    asyncStorage.setItem("webConsoleHistory", this.history);
 +  },
 +
 +  /**
@@ -296,7 +301,7 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
    /**
     * Array that caches the user input suggestions received from the server.
     * @private
-@@ -3383,16 +3408,22 @@ JSTerm.prototype = {
+@@ -3383,16 +3413,22 @@ JSTerm.prototype = {
  
      this.requestEvaluation(aExecuteString, options).then(onResult, onResult);
  
@@ -319,6 +324,129 @@ diff --git a/browser/devtools/webconsole/webconsole.js b/browser/devtools/webcon
  
    /**
     * Request a JavaScript string evaluation from the server.
+diff --git a/toolkit/devtools/shared/async-storage.js b/toolkit/devtools/shared/async-storage.js
+--- a/toolkit/devtools/shared/async-storage.js
++++ b/toolkit/devtools/shared/async-storage.js
+@@ -66,43 +66,41 @@ module.exports = (function() {
+       };
+       openreq.onsuccess = function withStoreOnSuccess() {
+         db = openreq.result;
+         f();
+       };
+     }
+   }
+ 
+-  function withStore(type, callback, oncomplete) {
++  function withStore(type, callback) {
+     withDatabase(function() {
+       if (!db) {
+ 
+       }
+       var transaction = db.transaction(STORENAME, type);
+-      if (oncomplete) {
+-        transaction.oncomplete = oncomplete;
+-      }
+-      callback(transaction.objectStore(STORENAME));
++      callback(transaction.objectStore(STORENAME), transaction);
+     });
+   }
+ 
+   function getItem(key) {
+     return new Promise((resolve, reject) => {
+       var req;
+-      withStore("readonly", function getItemBody(store) {
++      withStore("readonly", function getItemBody(store, transaction) {
++        transaction.oncomplete = function onComplete() {
++          var value = req.result;
++          if (value === undefined) {
++            value = null;
++          }
++          resolve(value);
++        };
+         req = store.get(key);
+         req.onerror = function getItemOnError() {
+           reject("Error in asyncStorage.getItem(): ", req.error.name);
+         };
+-      }, function onComplete() {
+-        var value = req.result;
+-        if (value === undefined) {
+-          value = null;
+-        }
+-        resolve(value);
+       });
+     });
+   }
+ 
+   function setItem(key, value) {
+     return new Promise((resolve, reject) => {
+       withStore("readwrite", function setItemBody(store) {
+         var req = store.put(value, key);
+@@ -133,36 +131,41 @@ module.exports = (function() {
+         };
+       }, resolve);
+     });
+   }
+ 
+   function length() {
+     return new Promise((resolve, reject) => {
+       var req;
+-      withStore("readonly", function lengthBody(store) {
++      withStore("readonly", function lengthBody(store, transaction) {
++        transaction.oncomplete = function onComplete() {
++          resolve(req.result);
++        }
+         req = store.count();
+         req.onerror = function lengthOnError() {
+           reject("Error in asyncStorage.length(): ", req.error.name);
+         };
+-      }, function onComplete() {
+-        resolve(req.result);
+       });
+     });
+   }
+ 
+   function key(n) {
+     return new Promise((resolve, reject) => {
+       if (n < 0) {
+         resolve(null);
+         return;
+       }
+ 
+       var req;
+-      withStore("readonly", function keyBody(store) {
++      withStore("readonly", function keyBody(store, transaction) {
++        transaction.oncomplete = function onComplete() {
++          var cursor = req.result;
++          resolve(cursor ? cursor.key : null);
++        };
+         var advanced = false;
+         req = store.openCursor();
+         req.onsuccess = function keyOnSuccess() {
+           var cursor = req.result;
+           if (!cursor) {
+             // this means there weren"t enough keys
+             return;
+           }
+@@ -174,19 +177,16 @@ module.exports = (function() {
+ 
+           // Otherwise, ask the cursor to skip ahead n records
+           advanced = true;
+           cursor.advance(n);
+         };
+         req.onerror = function keyOnError() {
+           reject("Error in asyncStorage.key(): ", req.error.name);
+         };
+-      }, function onComplete() {
+-        var cursor = req.result;
+-        resolve(cursor ? cursor.key : null);
+       });
+     });
+   }
+ 
+   return {
+     getItem: getItem,
+     setItem: setItem,
+     removeItem: removeItem,
 diff --git a/toolkit/devtools/webconsole/client.js b/toolkit/devtools/webconsole/client.js
 --- a/toolkit/devtools/webconsole/client.js
 +++ b/toolkit/devtools/webconsole/client.js
