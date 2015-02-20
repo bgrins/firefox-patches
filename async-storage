@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  cee52e6c3662bbdb135c2f7e56f9b3dbd8ff12d2
+# Parent  2e20e21d578505d78c192e5c190bc17876d1e516
 Bug 1134265 - Add async-storage for a simple key value store in devtools;r=jryans
 
 diff --git a/toolkit/devtools/moz.build b/toolkit/devtools/moz.build
@@ -28,10 +28,10 @@ diff --git a/toolkit/devtools/shared/async-storage.js b/toolkit/devtools/shared/
 new file mode 100644
 --- /dev/null
 +++ b/toolkit/devtools/shared/async-storage.js
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,193 @@
 +/**
 + *
-+ * Adapted from https://github.com/mozilla-b2g/gaia/blob/master/shared/js/async_storage.js
++ * Adapted from https://github.com/mozilla-b2g/gaia/blob/f09993563fb5fec4393eb71816ce76cb00463190/shared/js/async_storage.js
 + * (converted to use Promises instead of callbacks).
 + *
 + * This file defines an asynchronous version of the localStorage API, backed by
@@ -70,9 +70,8 @@ new file mode 100644
 + * DOM elements, but they may include things like Blobs and typed arrays.
 + *
 + */
-+
 +const {Cc, Ci, Cu, Cr} = require("chrome");
-+Cu.importGlobalProperties(["indexedDB"]);
++const { indexedDB } = require("sdk/indexed-db");
 +const {Promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
 +
 +module.exports = (function() {
@@ -83,13 +82,15 @@ new file mode 100644
 +  var STORENAME = "keyvaluepairs";
 +  var db = null;
 +
-+  function withDatabase(f) {
++  function withStore(type, onsuccess, onerror) {
 +    if (db) {
-+      f();
++      var transaction = db.transaction(STORENAME, type);
++      var store = transaction.objectStore(STORENAME);
++      onsuccess(store);
 +    } else {
 +      var openreq = indexedDB.open(DBNAME, DBVERSION);
 +      openreq.onerror = function withStoreOnError() {
-+        f();
++        onerror();
 +      };
 +      openreq.onupgradeneeded = function withStoreOnUpgradeNeeded() {
 +        // First time setup: create an empty object store
@@ -97,86 +98,80 @@ new file mode 100644
 +      };
 +      openreq.onsuccess = function withStoreOnSuccess() {
 +        db = openreq.result;
-+        f();
++        var transaction = db.transaction(STORENAME, type);
++        var store = transaction.objectStore(STORENAME);
++        onsuccess(store);
 +      };
 +    }
-+  }
-+
-+  function withStore(type, callback, oncomplete) {
-+    withDatabase(function() {
-+      if (!db) {
-+
-+      }
-+      var transaction = db.transaction(STORENAME, type);
-+      if (oncomplete) {
-+        transaction.oncomplete = oncomplete;
-+      }
-+      callback(transaction.objectStore(STORENAME));
-+    });
 +  }
 +
 +  function getItem(key) {
 +    return new Promise((resolve, reject) => {
 +      var req;
-+      withStore("readonly", function getItemBody(store) {
++      withStore("readonly", (store) => {
++        store.transaction.oncomplete = function onComplete() {
++          var value = req.result;
++          if (value === undefined) {
++            value = null;
++          }
++          resolve(value);
++        };
 +        req = store.get(key);
 +        req.onerror = function getItemOnError() {
 +          reject("Error in asyncStorage.getItem(): ", req.error.name);
 +        };
-+      }, function onComplete() {
-+        var value = req.result;
-+        if (value === undefined) {
-+          value = null;
-+        }
-+        resolve(value);
-+      });
++      }, reject);
 +    });
 +  }
 +
 +  function setItem(key, value) {
 +    return new Promise((resolve, reject) => {
-+      withStore("readwrite", function setItemBody(store) {
++      withStore("readwrite", (store) => {
++        store.transaction.oncomplete = resolve;
 +        var req = store.put(value, key);
 +        req.onerror = function setItemOnError() {
 +          reject("Error in asyncStorage.setItem(): ", req.error.name);
 +        };
-+      }, resolve);
++      }, reject);
 +    });
 +  }
 +
 +  function removeItem(key) {
 +    return new Promise((resolve, reject) => {
-+      withStore("readwrite", function removeItemBody(store) {
++      withStore("readwrite", (store) => {
++        store.transaction.oncomplete = resolve;
 +        var req = store.delete(key);
 +        req.onerror = function removeItemOnError() {
 +          reject("Error in asyncStorage.removeItem(): ", req.error.name);
 +        };
-+      }, resolve);
++      }, reject);
 +    });
 +  }
 +
 +  function clear() {
 +    return new Promise((resolve, reject) => {
-+      withStore("readwrite", function clearBody(store) {
++      withStore("readwrite", (store) => {
++        store.transaction.oncomplete = resolve;
 +        var req = store.clear();
 +        req.onerror = function clearOnError() {
 +          reject("Error in asyncStorage.clear(): ", req.error.name);
 +        };
-+      }, resolve);
++      }, reject);
 +    });
 +  }
 +
 +  function length() {
 +    return new Promise((resolve, reject) => {
 +      var req;
-+      withStore("readonly", function lengthBody(store) {
++      withStore("readonly", (store) => {
++        store.transaction.oncomplete = function onComplete() {
++          resolve(req.result);
++        }
 +        req = store.count();
 +        req.onerror = function lengthOnError() {
 +          reject("Error in asyncStorage.length(): ", req.error.name);
 +        };
-+      }, function onComplete() {
-+        resolve(req.result);
-+      });
++      }, reject);
 +    });
 +  }
 +
@@ -188,7 +183,11 @@ new file mode 100644
 +      }
 +
 +      var req;
-+      withStore("readonly", function keyBody(store) {
++      withStore("readonly", (store) => {
++        store.transaction.oncomplete = function onComplete() {
++          var cursor = req.result;
++          resolve(cursor ? cursor.key : null);
++        };
 +        var advanced = false;
 +        req = store.openCursor();
 +        req.onsuccess = function keyOnSuccess() {
@@ -210,10 +209,7 @@ new file mode 100644
 +        req.onerror = function keyOnError() {
 +          reject("Error in asyncStorage.key(): ", req.error.name);
 +        };
-+      }, function onComplete() {
-+        var cursor = req.result;
-+        resolve(cursor ? cursor.key : null);
-+      });
++      }, reject);
 +    });
 +  }
 +
@@ -226,7 +222,6 @@ new file mode 100644
 +    key: key
 +  };
 +}());
-+
 diff --git a/toolkit/devtools/shared/moz.build b/toolkit/devtools/shared/moz.build
 new file mode 100644
 --- /dev/null
@@ -263,7 +258,7 @@ new file mode 100644
 +"use strict";
 +
 +// Test the basic functionality of async-storage.
-+// Adapted from https://github.com/mozilla-b2g/gaia/blob/master/apps/sharedtest/test/unit/async_storage_test.js.
++// Adapted from https://github.com/mozilla-b2g/gaia/blob/f09993563fb5fec4393eb71816ce76cb00463190/apps/sharedtest/test/unit/async_storage_test.js.
 +
 +const asyncStorage = require("devtools/toolkit/shared/async-storage");
 +add_task(function*() {
