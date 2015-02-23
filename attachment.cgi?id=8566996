@@ -1,0 +1,180 @@
+# HG changeset patch
+# User Patrick Brosset <pbrosset@mozilla.com>
+# Parent  01cb54e0e93d7104386754ebdc9b00bd0f6dc08b
+Bug 1123851 - 2 - GCLI command to highlight element's geometry; r=jwalker
+
+diff --git a/browser/locales/en-US/chrome/browser/devtools/gclicommands.properties b/browser/locales/en-US/chrome/browser/devtools/gclicommands.properties
+--- a/browser/locales/en-US/chrome/browser/devtools/gclicommands.properties
++++ b/browser/locales/en-US/chrome/browser/devtools/gclicommands.properties
+@@ -211,16 +211,26 @@ highlightFillManual=Override the default
+ # dialog when the user is using this command.
+ highlightKeepDesc=Keep existing highlighters
+ 
+ # LOCALIZATION NOTE (highlightKeepManual) A fuller description of the 'keep'
+ # option parameter to the 'highlight' command, displayed when the user asks for
+ # help on what it does.
+ highlightKeepManual=By default, existing highlighters are hidden when running the command, unless this option is set
+ 
++# LOCALIZATION NOTE (highlightGeometryDesc) A very short string to describe the
++# 'geometry' option parameter to the 'highlight' command, which is displayed in a
++# dialog when the user is using this command.
++highlightGeometryDesc=Show node's geometry
++
++# LOCALIZATION NOTE (highlightGeometryManual) A fuller description of the
++# 'geometry' option parameter to the 'highlight' command, displayed when the
++# user asks for help on what it does.
++highlightGeometryManual=Set this option to display the node's top, right, bottom, left, width and height CSS properties, if they are set
++
+ # LOCALIZATION NOTE (highlightOutputConfirm) A confirmation message for the
+ # 'highlight' command, displayed to the user once the command has been entered,
+ # informing the user how many nodes have been highlighted successfully and how
+ # to turn highlighting off
+ highlightOutputConfirm2=%1$S node highlighted;%1$S nodes highlighted
+ 
+ # LOCALIZATION NOTE (highlightOutputMaxReached) A confirmation message for the
+ # 'highlight' command, displayed to the user once the command has been entered,
+diff --git a/toolkit/devtools/gcli/commands/highlight.js b/toolkit/devtools/gcli/commands/highlight.js
+--- a/toolkit/devtools/gcli/commands/highlight.js
++++ b/toolkit/devtools/gcli/commands/highlight.js
+@@ -2,17 +2,18 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const {Cc, Ci, Cu} = require("chrome");
+ const gcli = require("gcli/index");
+ require("devtools/server/actors/inspector");
+-const {BoxModelHighlighter} = require("devtools/server/actors/highlighter");
++const {BoxModelHighlighter,
++       GeometryEditorHighlighter} = require("devtools/server/actors/highlighter");
+ 
+ XPCOMUtils.defineLazyGetter(this, "nodesSelected", function() {
+   return Services.strings.createBundle("chrome://browser/locale/devtools/gclicommands.properties");
+ });
+ XPCOMUtils.defineLazyModuleGetter(this, "PluralForm","resource://gre/modules/PluralForm.jsm");
+ 
+ // How many maximum nodes can be highlighted in parallel
+ const MAX_HIGHLIGHTED_ELEMENTS = 100;
+@@ -20,23 +21,33 @@ const MAX_HIGHLIGHTED_ELEMENTS = 100;
+ // Stores the highlighters instances so they can be destroyed later.
+ // also export them so tests can access those and assert they got created
+ // correctly.
+ exports.highlighters = [];
+ 
+ /**
+  * Destroy all existing highlighters
+  */
+-function unhighlightAll() {
++function destroyHighlighters() {
+   for (let highlighter of exports.highlighters) {
+     highlighter.destroy();
+   }
+   exports.highlighters.length = 0;
+ }
+ 
++/**
++ * Get an object that looks like a TabActor for instantiating highlighters
++ */
++function getTabActorContext(env) {
++  return {
++    browser: env.chromeWindow.gBrowser.getBrowserForDocument(env.document),
++    window: env.window
++  };
++}
++
+ exports.items = [
+   {
+     name: "highlight",
+     description: gcli.lookup("highlightDesc"),
+     manual: gcli.lookup("highlightManual"),
+     params: [
+       {
+         name: "selector",
+@@ -82,53 +93,59 @@ exports.items = [
+             manual: gcli.lookup("highlightFillManual"),
+             defaultValue: null
+           },
+           {
+             name: "keep",
+             type: "boolean",
+             description: gcli.lookup("highlightKeepDesc"),
+             manual: gcli.lookup("highlightKeepManual"),
++          },
++          {
++            name: "geometry",
++            type: "boolean",
++            description: gcli.lookup("highlightGeometryDesc"),
++            manual: gcli.lookup("highlightGeometryManual"),
+           }
+         ]
+       }
+     ],
+     exec: function(args, context) {
+       // Remove all existing highlighters unless told otherwise
+       if (!args.keep) {
+-        unhighlightAll();
++        destroyHighlighters();
+       }
+ 
+       let env = context.environment;
+ 
+       // Unhighlight on navigate
+-      env.target.once("navigate", unhighlightAll);
+-
+-      // Build a tab context for the highlighter (which normally takes a
+-      // TabActor as parameter to its constructor)
+-      let tabContext = {
+-        browser: env.chromeWindow.gBrowser.getBrowserForDocument(env.document),
+-        window: env.window
+-      };
++      env.target.once("navigate", destroyHighlighters);
+ 
+       let i = 0;
+       for (let node of args.selector) {
+         if (!args.showall && i >= MAX_HIGHLIGHTED_ELEMENTS) {
+           break;
+         }
+ 
+-        let highlighter = new BoxModelHighlighter(tabContext);
+-        if (args.fill) {
++        let highlighter;
++        if (args.geometry) {
++          highlighter = new GeometryEditorHighlighter(getTabActorContext(env));
++        } else {
++          highlighter = new BoxModelHighlighter(getTabActorContext(env));
++        }
++
++        if (args.fill && highlighter.regionFill) {
+           highlighter.regionFill[args.region] = args.fill;
+         }
+         highlighter.show(node, {
+           region: args.region,
+           hideInfoBar: !args.showinfobar,
+           hideGuides: args.hideguides,
+-          showOnly: args.region
++          showOnly: args.region,
++          hideOffsetParent: true
+         });
+         exports.highlighters.push(highlighter);
+         i ++;
+       }
+ 
+       let highlightText = nodesSelected.GetStringFromName("highlightOutputConfirm2");
+       let output = PluralForm.get(args.selector.length, highlightText)
+                              .replace("%1$S", args.selector.length);
+@@ -139,11 +156,13 @@ exports.items = [
+ 
+       return output;
+     }
+   },
+   {
+     name: "unhighlight",
+     description: gcli.lookup("unhighlightDesc"),
+     manual: gcli.lookup("unhighlightManual"),
+-    exec: unhighlightAll
++    exec: () => {
++      destroyHighlighters();
++    }
+   }
+ ];
