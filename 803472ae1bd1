@@ -1,0 +1,156 @@
+
+# HG changeset patch
+# User J. Ryan Stinnett <jryans@gmail.com>
+# Date 1424720639 21600
+# Node ID 803472ae1bd11e7dd49d639ae818f3dfe2900d7d
+# Parent  c1d72213f4b2fb09f63eb829a43549d96fe29d18
+Bug 1128027 - Clean up protocol.js pools after connection close. r=bgrins
+
+diff --git a/toolkit/devtools/client/dbg-client.jsm b/toolkit/devtools/client/dbg-client.jsm
+--- a/toolkit/devtools/client/dbg-client.jsm
++++ b/toolkit/devtools/client/dbg-client.jsm
+@@ -1065,16 +1065,23 @@ DebuggerClient.prototype = {
+    * Called by DebuggerTransport when the underlying stream is closed.
+    *
+    * @param aStatus nsresult
+    *        The status code that corresponds to the reason for closing
+    *        the stream.
+    */
+   onClosed: function (aStatus) {
+     this.emit("closed");
++    // In case destruction does not happen in the usual way (because the
++    // connection aborts unexpectedly, for example), call |cleanup| on each pool
++    // once connection has closed.  Pools are meant to remove themselves from
++    // the pool set as part of the |cleanup| call.
++    for (let pool of this._pools) {
++      pool.cleanup();
++    }
+   },
+ 
+   registerClient: function (client) {
+     let actorID = client.actor;
+     if (!actorID) {
+       throw new Error("DebuggerServer.registerClient expects " +
+                       "a client instance with an `actor` attribute.");
+     }
+diff --git a/toolkit/devtools/server/protocol.js b/toolkit/devtools/server/protocol.js
+--- a/toolkit/devtools/server/protocol.js
++++ b/toolkit/devtools/server/protocol.js
+@@ -1107,17 +1107,17 @@ let Front = Class({
+     }
+   },
+ 
+   destroy: function() {
+     // Reject all outstanding requests, they won't make sense after
+     // the front is destroyed.
+     while (this._requests && this._requests.length > 0) {
+       let deferred = this._requests.shift();
+-      deferred.reject(new Error("Connection closed"));
++      deferred.reject(new Error("Connection closed, pending request not sent"));
+     }
+     Pool.prototype.destroy.call(this);
+     this.actorID = null;
+   },
+ 
+   manage: function(front) {
+     if (!front.actorID) {
+       throw new Error("Can't manage front without an actor ID.\n" +
+diff --git a/toolkit/devtools/server/tests/unit/test_protocol_abort.js b/toolkit/devtools/server/tests/unit/test_protocol_abort.js
+new file mode 100644
+--- /dev/null
++++ b/toolkit/devtools/server/tests/unit/test_protocol_abort.js
+@@ -0,0 +1,72 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++/**
++ * Outstanding requests should be rejected when the connection aborts
++ * unexpectedly.
++ */
++
++let protocol = devtools.require("devtools/server/protocol");
++let {method, Arg, Option, RetVal} = protocol;
++let events = devtools.require("sdk/event/core");
++
++function simpleHello() {
++  return {
++    from: "root",
++    applicationType: "xpcshell-tests",
++    traits: [],
++  }
++}
++
++let RootActor = protocol.ActorClass({
++  typeName: "root",
++  initialize: function(conn) {
++    protocol.Actor.prototype.initialize.call(this, conn);
++    // Root actor owns itself.
++    this.manage(this);
++    this.actorID = "root";
++    this.sequence = 0;
++  },
++
++  sayHello: simpleHello,
++
++  simpleReturn: method(function() {
++    return this.sequence++;
++  }, {
++    response: { value: RetVal() },
++  })
++});
++
++let RootFront = protocol.FrontClass(RootActor, {
++  initialize: function(client) {
++    this.actorID = "root";
++    protocol.Front.prototype.initialize.call(this, client);
++    // Root owns itself.
++    this.manage(this);
++  }
++});
++
++function run_test() {
++  DebuggerServer.createRootActor = RootActor;
++  DebuggerServer.init();
++
++  let trace = connectPipeTracing();
++  let client = new DebuggerClient(trace);
++  let rootClient;
++
++  client.connect((applicationType, traits) => {
++    rootClient = RootFront(client);
++
++    rootClient.simpleReturn().then(() => {
++      ok(false, "Connection was aborted, request shouldn't resolve");
++      do_test_finished();
++    }, () => {
++      ok(true, "Connection was aborted, request rejected correctly");
++      do_test_finished();
++    });
++
++    trace.close();
++  });
++
++  do_test_pending();
++}
+diff --git a/toolkit/devtools/server/tests/unit/xpcshell.ini b/toolkit/devtools/server/tests/unit/xpcshell.ini
+--- a/toolkit/devtools/server/tests/unit/xpcshell.ini
++++ b/toolkit/devtools/server/tests/unit/xpcshell.ini
+@@ -59,16 +59,17 @@ support-files =
+ [test_frameclient-02.js]
+ [test_nativewrappers.js]
+ [test_nodelistactor.js]
+ [test_eval-01.js]
+ [test_eval-02.js]
+ [test_eval-03.js]
+ [test_eval-04.js]
+ [test_eval-05.js]
++[test_protocol_abort.js]
+ [test_protocol_async.js]
+ [test_protocol_children.js]
+ [test_protocol_formtype.js]
+ [test_protocol_longstring.js]
+ [test_protocol_simple.js]
+ [test_protocol_unregister.js]
+ [test_breakpoint-01.js]
+ [test_register_actor.js]
+
