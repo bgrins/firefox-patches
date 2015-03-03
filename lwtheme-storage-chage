@@ -1,0 +1,152 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  bc64e42506859066cd411c64f0156e33f1fbd16c
+Bug 1094821 - Change storage for LightweightThemeManager;r=Unfocused
+
+diff --git a/toolkit/mozapps/extensions/LightweightThemeManager.jsm b/toolkit/mozapps/extensions/LightweightThemeManager.jsm
+--- a/toolkit/mozapps/extensions/LightweightThemeManager.jsm
++++ b/toolkit/mozapps/extensions/LightweightThemeManager.jsm
+@@ -7,16 +7,17 @@
+ this.EXPORTED_SYMBOLS = ["LightweightThemeManager"];
+ 
+ const Cc = Components.classes;
+ const Ci = Components.interfaces;
+ 
+ Components.utils.import("resource://gre/modules/XPCOMUtils.jsm");
+ Components.utils.import("resource://gre/modules/AddonManager.jsm");
+ Components.utils.import("resource://gre/modules/Services.jsm");
++let {console} = Components.utils.import("resource://gre/modules/devtools/Console.jsm", {});
+ 
+ const ID_SUFFIX              = "@personas.mozilla.org";
+ const PREF_LWTHEME_TO_SELECT = "extensions.lwThemeToSelect";
+ const PREF_GENERAL_SKINS_SELECTEDSKIN = "general.skins.selectedSkin";
+ const PREF_EM_DSS_ENABLED    = "extensions.dss.enabled";
+ const ADDON_TYPE             = "theme";
+ 
+ const URI_EXTENSION_STRINGS  = "chrome://mozapps/locale/extensions/extensions.properties";
+@@ -64,34 +65,70 @@ this.__defineSetter__("_maxUsedThemes", 
+ });
+ 
+ // Holds the ID of the theme being enabled or disabled while sending out the
+ // events so cached AddonWrapper instances can return correct values for
+ // permissions and pendingOperations
+ var _themeIDBeingEnabled = null;
+ var _themeIDBeingDisabled = null;
+ 
++// Convert from the old storage format (in which the order of usedThemes
++// was combined with isThemeSelected to determine which theme was selected)
++// to the new one (where a selectedThemeID determines which theme is selected).
++function migrateToNewStorageFormat() {
++  let wasThemeSelected = false;
++  try {
++    wasThemeSelected = _prefs.getBoolPref("isThemeSelected");
++  } catch(e) { }
++
++  if (wasThemeSelected) {
++    Services.prefs.clearUserPref("lightweightThemes.isThemeSelected");
++    let themes = [];
++    try {
++      themes = JSON.parse(_prefs.getComplexValue("usedThemes",
++                                                 Ci.nsISupportsString).data);
++    } catch (e) { }
++
++    if (themes[0]) {
++      _prefs.setCharPref("selectedThemeID", themes[0].id);
++    }
++  }
++};
++
++migrateToNewStorageFormat();
++
+ this.LightweightThemeManager = {
+   get name() "LightweightThemeManager",
+ 
++  // Themes that can be added for an application.  They can't be removed, and
++  // will always show up at the top of the list.
++  appSpecificThemes: [],
++
+   get usedThemes () {
++    let themes = [];
+     try {
+-      return JSON.parse(_prefs.getComplexValue("usedThemes",
+-                                               Ci.nsISupportsString).data);
+-    } catch (e) {
+-      return [];
+-    }
++      themes = JSON.parse(_prefs.getComplexValue("usedThemes",
++                                                 Ci.nsISupportsString).data);
++    } catch (e) { }
++
++
++    themes = this.appSpecificThemes.concat(themes);
++    return themes;
+   },
+ 
+   get currentTheme () {
++    let selectedThemeID = null;
+     try {
+-      if (_prefs.getBoolPref("isThemeSelected"))
+-        var data = this.usedThemes[0];
++      selectedThemeID = _prefs.getCharPref("selectedThemeID");
+     } catch (e) {}
+ 
++    let data = null;
++    if (selectedThemeID) {
++      data = this.getUsedTheme(selectedThemeID);
++    }
+     return data || null;
+   },
+ 
+   get currentThemeForDisplay () {
+     var data = this.currentTheme;
+ 
+     if (data && PERSIST_ENABLED) {
+       for (let key in PERSIST_FILES) {
+@@ -237,17 +274,22 @@ this.LightweightThemeManager = {
+       if (PERSIST_ENABLED) {
+         LightweightThemeImageOptimizer.purge();
+         _persistImages(aData, function themeChanged_persistImages() {
+           _notifyWindows(this.currentThemeForDisplay);
+         }.bind(this));
+       }
+     }
+ 
+-    _prefs.setBoolPref("isThemeSelected", aData != null);
++    if (aData) {
++      _prefs.setCharPref("selectedThemeID", aData.id);
++    } else {
++      _prefs.clearUserPref("selectedThemeID");
++    }
++
+     _notifyWindows(aData);
+     Services.obs.notifyObservers(null, "lightweight-theme-changed", null);
+   },
+ 
+   /**
+    * Starts the Addons provider and enables the new lightweight theme if
+    * necessary.
+    */
+@@ -674,16 +716,23 @@ function _usedThemesExceptId(aId)
+ 
+ function _version(aThemeData)
+   aThemeData.version || "";
+ 
+ function _makeURI(aURL, aBaseURI)
+   Services.io.newURI(aURL, null, aBaseURI);
+ 
+ function _updateUsedThemes(aList) {
++  // Remove app specific themes before loading themes from list.
++  LightweightThemeManager.appSpecificThemes.forEach(appSpecificTheme=> {
++    aList = aList.filter(theme=> {
++      return theme.id != appSpecificTheme.id;
++    })
++  });
++
+   // Send uninstall events for all themes that need to be removed.
+   while (aList.length > _maxUsedThemes) {
+     let wrapper = new AddonWrapper(aList[aList.length - 1]);
+     AddonManagerPrivate.callAddonListeners("onUninstalling", wrapper, false);
+     aList.pop();
+     AddonManagerPrivate.callAddonListeners("onUninstalled", wrapper);
+   }
+ 
