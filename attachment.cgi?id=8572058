@@ -1,0 +1,619 @@
+# HG changeset patch
+# User Michael Ratcliffe <mratcliffe@mozilla.com>
+# Date 1425403903 0
+# Parent  407249540dc9358ab401e6ca7ab3fe45c500298a
+Bug 1136257 - Shift-click to switch between color unit format in place r=bgrins
+
+diff --git a/browser/devtools/shared/widgets/Tooltip.js b/browser/devtools/shared/widgets/Tooltip.js
+--- a/browser/devtools/shared/widgets/Tooltip.js
++++ b/browser/devtools/shared/widgets/Tooltip.js
+@@ -938,16 +938,17 @@ SwatchBasedEditorTooltip.prototype = {
+    *        - onRevert: will be called when the user ESCapes out of the tooltip
+    *        - onCommit: will be called when the user presses ENTER or clicks
+    *        outside the tooltip.
+    */
+   addSwatch: function(swatchEl, callbacks={}) {
+     if (!callbacks.onPreview) callbacks.onPreview = function() {};
+     if (!callbacks.onRevert) callbacks.onRevert = function() {};
+     if (!callbacks.onCommit) callbacks.onCommit = function() {};
++    if (!callbacks.onNext) callbacks.onNext = function() {};
+ 
+     this.swatches.set(swatchEl, {
+       callbacks: callbacks
+     });
+     swatchEl.addEventListener("click", this._onSwatchClick, false);
+   },
+ 
+   removeSwatch: function(swatchEl) {
+@@ -959,18 +960,22 @@ SwatchBasedEditorTooltip.prototype = {
+       swatchEl.removeEventListener("click", this._onSwatchClick, false);
+       this.swatches.delete(swatchEl);
+     }
+   },
+ 
+   _onSwatchClick: function(event) {
+     let swatch = this.swatches.get(event.target);
+     if (swatch) {
+-      this.activeSwatch = event.target;
+-      this.show();
++      if (event.shiftKey) {
++        this.next(event, swatch);
++      } else {
++        this.activeSwatch = event.target;
++        this.show();
++      }
+       event.stopPropagation();
+     }
+   },
+ 
+   /**
+    * Not called by this parent class, needs to be taken care of by sub-classes
+    */
+   preview: function(value) {
+@@ -996,16 +1001,20 @@ SwatchBasedEditorTooltip.prototype = {
+    */
+   commit: function() {
+     if (this.activeSwatch) {
+       let swatch = this.swatches.get(this.activeSwatch);
+       swatch.callbacks.onCommit();
+     }
+   },
+ 
++  next: function(event, swatch) {
++    swatch.callbacks.onNext(event);
++  },
++
+   destroy: function() {
+     this.swatches.clear();
+     this.activeSwatch = null;
+     this.tooltip.off("keypress", this._onTooltipKeypress);
+     this.tooltip.destroy();
+   }
+ };
+ 
+diff --git a/browser/devtools/styleinspector/computed-view.js b/browser/devtools/styleinspector/computed-view.js
+--- a/browser/devtools/styleinspector/computed-view.js
++++ b/browser/devtools/styleinspector/computed-view.js
+@@ -10,16 +10,17 @@ const ToolDefinitions = require("main").
+ const {CssLogic} = require("devtools/styleinspector/css-logic");
+ const {ELEMENT_STYLE} = require("devtools/server/actors/styles");
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const {EventEmitter} = require("devtools/toolkit/event-emitter");
+ const {OutputParser} = require("devtools/output-parser");
+ const {PrefObserver, PREF_ORIG_SOURCES} = require("devtools/styleeditor/utils");
+ const {gDevTools} = Cu.import("resource:///modules/devtools/gDevTools.jsm", {});
+ const overlays = require("devtools/styleinspector/style-inspector-overlays");
++const {colorUtils} = require("devtools/css-color");
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ Cu.import("resource://gre/modules/devtools/Templater.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "PluralForm",
+                                   "resource://gre/modules/PluralForm.jsm");
+ 
+@@ -926,16 +927,18 @@ function createMenuItem(aMenu, aAttribut
+ function PropertyView(aTree, aName)
+ {
+   this.tree = aTree;
+   this.name = aName;
+   this.getRTLAttr = aTree.getRTLAttr;
+ 
+   this.link = "https://developer.mozilla.org/CSS/" + aName;
+ 
++  this._swatchClicked = this._swatchClicked.bind(this);
++
+   this.templateMatchedSelectors = aTree.styleDocument.getElementById("templateMatchedSelectors");
+   this._propertyInfo = new PropertyInfo(aTree, aName);
+ }
+ 
+ PropertyView.prototype = {
+   // The parent element which contains the open attribute
+   element: null,
+ 
+@@ -943,16 +946,18 @@ PropertyView.prototype = {
+   propertyHeader: null,
+ 
+   // Destination for property names
+   nameNode: null,
+ 
+   // Destination for property values
+   valueNode: null,
+ 
++  colors: new WeakMap(),
++
+   // Are matched rules expanded?
+   matchedExpanded: false,
+ 
+   // Matched selector container
+   matchedSelectorsContainer: null,
+ 
+   // Matched selector expando
+   matchedExpander: null,
+@@ -1136,25 +1141,57 @@ PropertyView.prototype = {
+ 
+     this.tree.numVisibleProperties++;
+ 
+     let outputParser = this.tree._outputParser;
+     let frag = outputParser.parseCssProperty(this.propertyInfo.name,
+       this.propertyInfo.value,
+       {
+         colorSwatchClass: "computedview-colorswatch",
++        colorClass: "computedview-color",
+         urlClass: "theme-link"
+         // No need to use baseURI here as computed URIs are never relative.
+       });
+     this.valueNode.innerHTML = "";
+     this.valueNode.appendChild(frag);
+ 
++    let swatch = this.valueNode.querySelector(".computedview-colorswatch");
++    if (swatch) {
++      swatch.addEventListener("click", this._swatchClicked, false);
++    }
++
+     this.refreshMatchedSelectors();
+   },
+ 
++  _swatchClicked: function(event) {
++    if (!event.shiftKey) {
++      return;
++    }
++
++    // Shift-click causes text selection and we need that for copy paste so all
++    // we can do here is quickly clear it.
++    this.tree.styleDocument.getSelection().removeAllRanges();
++
++    let parent = event.target.parentNode;
++    let colorNode = parent.querySelector(".computedview-color");
++
++    let originalValue = colorNode.textContent;
++
++    let color;
++    if (this.colors.has(colorNode)) {
++      color = this.colors.get(colorNode);
++    } else {
++      color = new colorUtils.CssColor(originalValue);
++      this.colors.set(colorNode, color);
++    }
++
++    let val = color.nextColorUnit();
++    colorNode.textContent = val;
++  },
++
+   /**
+    * Refresh the panel matched rules.
+    */
+   refreshMatchedSelectors: function PropertyView_refreshMatchedSelectors()
+   {
+     let hasMatchedSelectors = this.hasMatchedSelectors;
+     this.matchedSelectorsContainer.parentNode.hidden = !hasMatchedSelectors;
+ 
+@@ -1169,16 +1206,23 @@ PropertyView.prototype = {
+         if (!this.matchedExpanded) {
+           return;
+         }
+ 
+         this._matchedSelectorResponse = matched;
+         CssHtmlTree.processTemplate(this.templateMatchedSelectors,
+           this.matchedSelectorsContainer, this);
+         this.matchedExpander.setAttribute("open", "");
++
++        let swatches = this.matchedSelectorsContainer
++                           .querySelectorAll(".computedview-colorswatch");
++        for (let swatch of swatches) {
++          swatch.addEventListener("click", this._swatchClicked, false);
++        }
++
+         this.tree.inspector.emit("computed-view-property-expanded");
+       }).then(null, console.error);
+     } else {
+       this.matchedSelectorsContainer.innerHTML = "";
+       this.matchedExpander.removeAttribute("open");
+       this.tree.inspector.emit("computed-view-property-collapsed");
+       return promise.resolve(undefined);
+     }
+@@ -1223,16 +1267,20 @@ PropertyView.prototype = {
+   /**
+    * The action when a user expands matched selectors.
+    *
+    * @param {Event} aEvent Used to determine the class name of the targets click
+    * event.
+    */
+   onMatchedToggle: function PropertyView_onMatchedToggle(aEvent)
+   {
++    if (aEvent.shiftKey) {
++      return;
++    }
++
+     this.matchedExpanded = !this.matchedExpanded;
+     this.refreshMatchedSelectors();
+     aEvent.preventDefault();
+   },
+ 
+   /**
+    * The action when a user clicks on the MDN help link for a property.
+    */
+@@ -1246,16 +1294,18 @@ PropertyView.prototype = {
+     }
+     aEvent.preventDefault();
+   },
+ 
+   /**
+    * Destroy this property view, removing event listeners
+    */
+   destroy: function PropertyView_destroy() {
++    this.colors = null;
++
+     this.element.removeEventListener("dblclick", this.onMatchedToggle, false);
+     this.element.removeEventListener("keydown", this.onKeyDown, false);
+     this.element = null;
+ 
+     this.matchedExpander.removeEventListener("click", this.onMatchedToggle, false);
+     this.matchedExpander = null;
+ 
+     this.nameNode.removeEventListener("click", this.onFocus, false);
+@@ -1362,16 +1412,17 @@ SelectorView.prototype = {
+     // we lose any events that are attached. This means that URLs will open in a
+     // new window. At some point we should fix this by stopping using the
+     // templater.
+     let outputParser = this.tree._outputParser;
+     let frag = outputParser.parseCssProperty(
+       this.selectorInfo.name,
+       this.selectorInfo.value, {
+       colorSwatchClass: "computedview-colorswatch",
++      colorClass: "computedview-color",
+       urlClass: "theme-link",
+       baseURI: this.selectorInfo.rule.href
+     });
+     return frag;
+   },
+ 
+   /**
+    * Update the text of the source link to reflect whether we're showing
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -11,16 +11,17 @@ const {Promise: promise} = Cu.import("re
+ const {CssLogic} = require("devtools/styleinspector/css-logic");
+ const {InplaceEditor, editableField, editableItem} = require("devtools/shared/inplace-editor");
+ const {ELEMENT_STYLE, PSEUDO_ELEMENTS} = require("devtools/server/actors/styles");
+ const {gDevTools} = Cu.import("resource:///modules/devtools/gDevTools.jsm", {});
+ const {OutputParser} = require("devtools/output-parser");
+ const {PrefObserver, PREF_ORIG_SOURCES} = require("devtools/styleeditor/utils");
+ const {parseSingleValue, parseDeclarations} = require("devtools/styleinspector/css-parsing-utils");
+ const overlays = require("devtools/styleinspector/style-inspector-overlays");
++const {colorUtils} = require("devtools/css-color");
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ 
+ const HTML_NS = "http://www.w3.org/1999/xhtml";
+ const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+ const PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
+ const PREF_DEFAULT_COLOR_UNIT = "devtools.defaultColorUnit";
+@@ -2538,40 +2539,57 @@ TextPropertyEditor.prototype = {
+     if (this.ruleEditor.isEditable) {
+       for (let span of this._colorSwatchSpans) {
+         // Capture the original declaration value to be able to revert later
+         let originalValue = this.valueSpan.textContent;
+         // Adding this swatch to the list of swatches our colorpicker knows about
+         this.ruleEditor.ruleView.tooltips.colorPicker.addSwatch(span, {
+           onPreview: () => this._previewValue(this.valueSpan.textContent),
+           onCommit: () => this._applyNewValue(this.valueSpan.textContent),
+-          onRevert: () => this._applyNewValue(originalValue, false)
++          onRevert: () => this._applyNewValue(originalValue, false),
++          onNext: event => this._nextColorType(event)
+         });
+       }
+     }
+ 
+     // Attach the cubic-bezier tooltip to the bezier swatches
+     this._bezierSwatchSpans = this.valueSpan.querySelectorAll("." + bezierSwatchClass);
+     if (this.ruleEditor.isEditable) {
+       for (let span of this._bezierSwatchSpans) {
+         // Capture the original declaration value to be able to revert later
+         let originalValue = this.valueSpan.textContent;
+         // Adding this swatch to the list of swatches our colorpicker knows about
+         this.ruleEditor.ruleView.tooltips.cubicBezier.addSwatch(span, {
+           onPreview: () => this._previewValue(this.valueSpan.textContent),
+           onCommit: () => this._applyNewValue(this.valueSpan.textContent),
+-          onRevert: () => this._applyNewValue(originalValue, false)
++          onRevert: () => this._applyNewValue(originalValue, true)
+         });
+       }
+     }
+ 
+     // Populate the computed styles.
+     this._updateComputed();
+   },
+ 
++  _nextColorType: function(event) {
++    // Shift-click causes text selection and we need that for copy paste so all
++    // we can do here is quickly clear it.
++    this.doc.getSelection().removeAllRanges();
++
++    let parent = event.target.parentNode;
++    let originalValue = parent.querySelector(".ruleview-color").textContent;
++
++    if (!this.color) {
++      this.color = new colorUtils.CssColor(originalValue);
++    }
++
++    let val = this.color.nextColorUnit();
++    parent.querySelector(".ruleview-color").textContent = val;
++  },
++
+   _onStartEditing: function() {
+     this.element.classList.remove("ruleview-overridden");
+     this._previewValue(this.prop.value);
+   },
+ 
+   /**
+    * Populate the list of computed styles.
+    */
+diff --git a/browser/devtools/styleinspector/test/browser.ini b/browser/devtools/styleinspector/test/browser.ini
+--- a/browser/devtools/styleinspector/test/browser.ini
++++ b/browser/devtools/styleinspector/test/browser.ini
+@@ -20,16 +20,17 @@ support-files =
+   doc_sourcemaps.scss
+   doc_style_editor_link.css
+   doc_test_image.png
+   doc_urls_clickable.css
+   doc_urls_clickable.html
+   head.js
+ 
+ [browser_computedview_browser-styles.js]
++[browser_computedview_color_swatch_cycle_color.js]
+ [browser_computedview_getNodeInfo.js]
+ [browser_computedview_keybindings_01.js]
+ [browser_computedview_keybindings_02.js]
+ [browser_computedview_matched-selectors-toggle.js]
+ [browser_computedview_matched-selectors_01.js]
+ [browser_computedview_matched-selectors_02.js]
+ [browser_computedview_media-queries.js]
+ [browser_computedview_no-results-placeholder.js]
+@@ -48,16 +49,17 @@ support-files =
+ [browser_ruleview_add-property-svg.js]
+ [browser_ruleview_add-rule_01.js]
+ [browser_ruleview_add-rule_02.js]
+ [browser_ruleview_add-rule_03.js]
+ [browser_ruleview_colorpicker-and-image-tooltip_01.js]
+ [browser_ruleview_colorpicker-and-image-tooltip_02.js]
+ [browser_ruleview_colorpicker-appears-on-swatch-click.js]
+ [browser_ruleview_colorpicker-commit-on-ENTER.js]
++[browser_ruleview_colorpicker-cycle-color.js]
+ [browser_ruleview_colorpicker-edit-gradient.js]
+ [browser_ruleview_colorpicker-hides-on-tooltip.js]
+ [browser_ruleview_colorpicker-multiple-changes.js]
+ [browser_ruleview_colorpicker-revert-on-ESC.js]
+ [browser_ruleview_colorpicker-swatch-displayed.js]
+ [browser_ruleview_completion-existing-property_01.js]
+ [browser_ruleview_completion-existing-property_02.js]
+ [browser_ruleview_completion-new-property_01.js]
+diff --git a/browser/devtools/styleinspector/test/browser_computedview_color_swatch_cycle_color.js b/browser/devtools/styleinspector/test/browser_computedview_color_swatch_cycle_color.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_computedview_color_swatch_cycle_color.js
+@@ -0,0 +1,53 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Computed view color swatch color cycling test.
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," +
++               "Computed view color swatch color cycling test.");
++
++  info("Creating the test document");
++  content.document.body.innerHTML = '<style type="text/css"> ' +
++    '.matches {color: #F00;}</style>' +
++    '<span id="matches" class="matches">Some styled text</span>' +
++    '</div>';
++  content.document.title = "Computed view color swatch color cycling test";
++
++  info("Opening the computed view");
++  let {toolbox, inspector, view} = yield openComputedView();
++
++  info("Selecting the test node");
++  yield selectNode("#matches", inspector);
++
++  info("Checking the property itself");
++  let container = getComputedViewPropertyView(view, "color").valueNode;
++  checkColorCycling(container, inspector);
++
++  info("Checking matched selectors");
++  container = yield getComputedViewMatchedRules(view, "color");
++  checkColorCycling(container, inspector);
++});
++
++function checkColorCycling(container, inspector) {
++  let swatch = container.querySelector(".computedview-colorswatch");
++  let valueNode = container.querySelector(".computedview-color");
++  let win = inspector.sidebar.getWindowForTab("computedview");
++
++  is(valueNode.textContent, "#F00", "Color displayed as a hex value.");
++
++  EventUtils.synthesizeMouseAtCenter(swatch, {shiftKey: true}, win);
++  is(valueNode.textContent, "hsl(0, 100%, 50%)",
++                            "Color displayed as an HSL value.");
++
++  EventUtils.synthesizeMouseAtCenter(swatch, {shiftKey: true}, win);
++  is(valueNode.textContent, "red",
++                            "Color displayed as a color name.");
++
++  EventUtils.synthesizeMouseAtCenter(swatch, {shiftKey: true}, win);
++  is(valueNode.textContent, "rgb(255, 0, 0)",
++                            "Color displayed as an RGB value.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_colorpicker-cycle-color.js b/browser/devtools/styleinspector/test/browser_ruleview_colorpicker-cycle-color.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_colorpicker-cycle-color.js
+@@ -0,0 +1,46 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Test cycling color types in the rule view color picker tooltip
++
++const PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  body {',
++  '    color: red;',
++  '  }',
++  '</style>',
++  'Test cycling color types in the rule view color picker tooltip!'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8,Test cycling color types in the " +
++               "rule view color picker tooltip.");
++  content.document.body.innerHTML = PAGE_CONTENT;
++  let {toolbox, inspector, view} = yield openRuleView();
++
++  let container = getRuleViewProperty(view, "body", "color").valueSpan;
++  checkColorCycling(container, inspector);
++});
++
++function checkColorCycling(container, inspector) {
++  let swatch = container.querySelector(".ruleview-colorswatch");
++  let valueNode = container.querySelector(".ruleview-color");
++  let win = inspector.sidebar.getWindowForTab("ruleview");
++
++  is(valueNode.textContent, "#F00", "Color displayed as a hex value.");
++
++  EventUtils.synthesizeMouseAtCenter(swatch, {shiftKey: true}, win);
++  is(valueNode.textContent, "hsl(0, 100%, 50%)",
++                            "Color displayed as an HSL value.");
++
++  EventUtils.synthesizeMouseAtCenter(swatch, {shiftKey: true}, win);
++  is(valueNode.textContent, "red",
++                            "Color displayed as a color name.");
++
++  EventUtils.synthesizeMouseAtCenter(swatch, {shiftKey: true}, win);
++  is(valueNode.textContent, "rgb(255, 0, 0)",
++                            "Color displayed as an RGB value.");
++}
+diff --git a/toolkit/devtools/css-color.js b/toolkit/devtools/css-color.js
+--- a/toolkit/devtools/css-color.js
++++ b/toolkit/devtools/css-color.js
+@@ -90,18 +90,28 @@ CssColor.COLORUNIT = {
+   "authored": "authored",
+   "hex": "hex",
+   "name": "name",
+   "rgb": "rgb",
+   "hsl": "hsl"
+ };
+ 
+ CssColor.prototype = {
++  _colorUnit: null,
++
+   authored: null,
+ 
++  get colorUnit() {
++    if (this._colorUnit === null) {
++      let defaultUnit = Services.prefs.getCharPref(COLOR_UNIT_PREF);
++      this._colorUnit = CssColor.COLORUNIT[defaultUnit];
++    }
++    return this._colorUnit;
++  },
++
+   get hasAlpha() {
+     if (!this.valid) {
+       return false;
+     }
+     return this._getRGBATuple().a !== 1;
+   },
+ 
+   get valid() {
+@@ -264,25 +274,82 @@ CssColor.prototype = {
+    * @param  {String} color
+    *         Any valid color string
+    */
+   newColor: function(color) {
+     this.authored = color.toLowerCase();
+     return this;
+   },
+ 
++  nextColorUnit: function() {
++
++    // // Reorder the formats array to have the current format at the
++    // // front so we can cycle through.
++    // let formats = ["authored", "hex", "hsl", "rgb", "name"];
++    // let putOnEnd = formats.splice(0, formats.indexOf(this.colorUnit));
++    // formats = formats.concat(putOnEnd);
++
++    // let currentDisplayedColor = this[formats[0]];
++    // console.log("Going to look in this order: ", formats, currentDisplayedColor);
++
++    // for (let format of formats) {
++    //   console.log(format, this[format]);
++    //   if (this[format] !== currentDisplayedColor) {
++    //     this._colorUnit = CssColor.COLORUNIT[format];
++    //     break;
++    //   }
++    // }
++
++    // return this.toString();
++    
++
++    let current = {
++      authored: this.authored,
++      hex: this.hex,
++      hsl: this.hsl,
++      name: this.name,
++      rgb: this.rgb
++    };
++
++    // Remove duplicates, we don't care about them.
++    for (let name in current) {
++      let value = current[name];
++      for (let innerName in current) {
++        let innerValue = current[innerName];
++        if (innerValue === value && innerName !== name) {
++          delete current[innerName];
++        }
++      }
++    }
++
++    let grab = false;
++    let grabbed = "";
++    for (let name in current) {
++      if (grab) {
++        grabbed = name;
++        break;
++      }
++      if (this.colorUnit === CssColor.COLORUNIT[name]) {
++        grab = true;
++      }
++    }
++
++    this._colorUnit = grabbed ? CssColor.COLORUNIT[grabbed] :
++                                CssColor.COLORUNIT.authored;
++
++    return this.toString();
++  },
++
+   /**
+    * Return a string representing a color of type defined in COLOR_UNIT_PREF.
+    */
+   toString: function() {
+     let color;
+-    let defaultUnit = Services.prefs.getCharPref(COLOR_UNIT_PREF);
+-    let unit = CssColor.COLORUNIT[defaultUnit];
+ 
+-    switch(unit) {
++    switch(this.colorUnit) {
+       case CssColor.COLORUNIT.authored:
+         color = this.authored;
+         break;
+       case CssColor.COLORUNIT.hex:
+         color = this.hex;
+         break;
+       case CssColor.COLORUNIT.hsl:
+         color = this.hsl;
