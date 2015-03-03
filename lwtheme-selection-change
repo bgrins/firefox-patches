@@ -1,0 +1,567 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  bc64e42506859066cd411c64f0156e33f1fbd16c
+Bug 1094821 - Install a devedition lightweight theme on startup, then wait for it to be applied before applying devedition styles
+
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -1289,17 +1289,17 @@ pref("services.sync.prefs.sync.dom.disab
+ pref("services.sync.prefs.sync.dom.disable_window_flip", true);
+ pref("services.sync.prefs.sync.dom.disable_window_move_resize", true);
+ pref("services.sync.prefs.sync.dom.event.contextmenu.enabled", true);
+ pref("services.sync.prefs.sync.extensions.personas.current", true);
+ pref("services.sync.prefs.sync.extensions.update.enabled", true);
+ pref("services.sync.prefs.sync.intl.accept_languages", true);
+ pref("services.sync.prefs.sync.javascript.enabled", true);
+ pref("services.sync.prefs.sync.layout.spellcheckDefault", true);
+-pref("services.sync.prefs.sync.lightweightThemes.isThemeSelected", true);
++pref("services.sync.prefs.sync.lightweightThemes.selectedThemeID", "");
+ pref("services.sync.prefs.sync.lightweightThemes.usedThemes", true);
+ pref("services.sync.prefs.sync.network.cookie.cookieBehavior", true);
+ pref("services.sync.prefs.sync.network.cookie.lifetimePolicy", true);
+ pref("services.sync.prefs.sync.permissions.default.image", true);
+ pref("services.sync.prefs.sync.pref.advanced.images.disable_button.view_image", true);
+ pref("services.sync.prefs.sync.pref.advanced.javascript.disable_button.advanced", true);
+ pref("services.sync.prefs.sync.pref.downloads.disable_button.edit_actions", true);
+ pref("services.sync.prefs.sync.pref.privacy.disable_button.cookie_exceptions", true);
+@@ -1322,19 +1322,24 @@ pref("services.sync.prefs.sync.security.
+ pref("services.sync.prefs.sync.security.tls.version.max", true);
+ pref("services.sync.prefs.sync.signon.rememberSignons", true);
+ pref("services.sync.prefs.sync.spellchecker.dictionary", true);
+ pref("services.sync.prefs.sync.xpinstall.whitelist.required", true);
+ #endif
+ 
+ // Developer edition preferences
+ #ifdef MOZ_DEV_EDITION
++pref("browser.devedition.theme.install", true);
++pref("browser.devedition.theme.firstRun", true);
+ pref("browser.devedition.theme.enabled", true);
+ pref("browser.devedition.theme.showCustomizeButton", true);
+ #else
++// XXX: Make these false, but leaving as true for testing.
++pref("browser.devedition.theme.install", true);
++pref("browser.devedition.theme.firstRun", true);
+ pref("browser.devedition.theme.enabled", false);
+ pref("browser.devedition.theme.showCustomizeButton", false);
+ #endif
+ 
+ // Developer edition promo preferences
+ pref("devtools.devedition.promo.shown", false);
+ pref("devtools.devedition.promo.url", "https://www.mozilla.org/firefox/developer/?utm_source=firefox-dev-tools&utm_medium=firefox-browser&utm_content=betadoorhanger");
+ 
+diff --git a/browser/base/content/browser-devedition.js b/browser/base/content/browser-devedition.js
+--- a/browser/base/content/browser-devedition.js
++++ b/browser/base/content/browser-devedition.js
+@@ -1,57 +1,72 @@
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
++// XXX TODO:
++// * Audit lw theme styles to make sure new -moz-lw-theme rules don't apply and interfere with the theme
++//   (or old ones that were important are no longer applying).
++// * Is there some way to limit FOUC?
++//   Like moving this code to somewhere that runs before browser.js, maybe nsBrowserGlue?
++// * Make the resources a separate patch that can be uplifted to prevent visual when running
++//   this in an old build that doesn't have these listeners.
++// * Have a one-time migration for users that currently have the theme applied with
++//   browser.devedition.theme.enabled (and no other themes applied),
++//   so that the new lw theme is selected by default.
++
+ /**
+  * Listeners for the DevEdition theme.  This adds an extra stylesheet
+  * to browser.xul if a pref is set and no other themes are applied.
+  */
+ let DevEdition = {
+-  _prefName: "browser.devedition.theme.enabled",
+-  _themePrefName: "general.skins.selectedSkin",
+-  _lwThemePrefName: "lightweightThemes.isThemeSelected",
+   _devtoolsThemePrefName: "devtools.theme",
+-
++  _installThemePrefName: "browser.devedition.theme.install",
++  _firstRunPrefName: "browser.devedition.theme.firstRun",
+   styleSheetLocation: "chrome://browser/skin/devedition.css",
+   styleSheet: null,
+ 
++  get deveditionTheme() {
++    return {
++        "id": "devedition",
++        "name": "Developer Edition",
++        "headerURL": "resource:///chrome/browser/content/browser/defaultthemes/devedition.header.png",
++        "iconURL": "resource:///chrome/browser/content/browser/defaultthemes/devedition.icon.png",
++        "author": "Firefox DevTools",
++        "version":"0",
++    };
++  },
++
++  get isThemeCurrentlyApplied() {
++    let theme = LightweightThemeManager.currentTheme;
++    return theme && theme.id == "devedition";
++  },
++
+   init: function () {
+-    this._updateDevtoolsThemeAttribute();
+-    this._updateStyleSheetFromPrefs();
+-
+-    // Listen for changes to all prefs except for complete themes.
+-    // No need for this since changing a complete theme requires a
+-    // restart.
+-    Services.prefs.addObserver(this._lwThemePrefName, this, false);
+-    Services.prefs.addObserver(this._prefName, this, false);
+     Services.prefs.addObserver(this._devtoolsThemePrefName, this, false);
+     Services.obs.addObserver(this, "lightweight-theme-styling-update", false);
++    this._updateDevtoolsThemeAttribute();
++
++    if (this.isThemeCurrentlyApplied) {
++      this._toggleStyleSheet(true);
++    }
+   },
+ 
+   observe: function (subject, topic, data) {
+     if (topic == "lightweight-theme-styling-update") {
+       let newTheme = JSON.parse(data);
+-      if (!newTheme) {
+-        // A lightweight theme has been unapplied, so just re-read prefs.
+-        this._updateStyleSheetFromPrefs();
++      if (newTheme && newTheme.id == "devedition") {
++        this._toggleStyleSheet(true);
+       } else {
+-        // A lightweight theme has been applied, but the pref may not be
+-        // set yet if this happened from customize menu or addons page.
+         this._toggleStyleSheet(false);
+       }
+     }
+ 
+-    if (topic == "nsPref:changed") {
+-      if (data == this._devtoolsThemePrefName) {
+-        this._updateDevtoolsThemeAttribute();
+-      } else {
+-        this._updateStyleSheetFromPrefs();
+-      }
++    if (topic == "nsPref:changed" && data == this._devtoolsThemePrefName) {
++      this._updateDevtoolsThemeAttribute();
+     }
+   },
+ 
+   _inferBrightness: function() {
+     ToolbarIconColor.inferFromText();
+     // Get an inverted full screen button if the dark theme is applied.
+     if (this.styleSheet &&
+         document.documentElement.getAttribute("devtoolstheme") == "dark") {
+@@ -65,34 +80,16 @@ let DevEdition = {
+     // Set an attribute on root element to make it possible
+     // to change colors based on the selected devtools theme.
+     let devtoolsTheme = Services.prefs.getCharPref(this._devtoolsThemePrefName);
+     if (devtoolsTheme != "dark") {
+       devtoolsTheme = "light";
+     }
+     document.documentElement.setAttribute("devtoolstheme", devtoolsTheme);
+     this._inferBrightness();
+-    this._updateStyleSheetFromPrefs();
+-  },
+-
+-  _updateStyleSheetFromPrefs: function() {
+-    let lightweightThemeSelected = false;
+-    try {
+-      lightweightThemeSelected = Services.prefs.getBoolPref(this._lwThemePrefName);
+-    } catch(e) {}
+-
+-    let defaultThemeSelected = false;
+-    try {
+-       defaultThemeSelected = Services.prefs.getCharPref(this._themePrefName) == "classic/1.0";
+-    } catch(e) {}
+-
+-    let deveditionThemeEnabled = Services.prefs.getBoolPref(this._prefName) &&
+-      !lightweightThemeSelected && defaultThemeSelected;
+-
+-    this._toggleStyleSheet(deveditionThemeEnabled);
+   },
+ 
+   handleEvent: function(e) {
+     if (e.type === "load") {
+       this.styleSheet.removeEventListener("load", this);
+       gBrowser.tabContainer._positionPinnedTabs();
+       this._inferBrightness();
+       Services.obs.notifyObservers(window, "devedition-theme-state-changed", true);
+@@ -114,18 +111,16 @@ let DevEdition = {
+       this.styleSheet = null;
+       gBrowser.tabContainer._positionPinnedTabs();
+       this._inferBrightness();
+       Services.obs.notifyObservers(window, "devedition-theme-state-changed", false);
+     }
+   },
+ 
+   uninit: function () {
+-    Services.prefs.removeObserver(this._lwThemePrefName, this);
+-    Services.prefs.removeObserver(this._prefName, this);
+     Services.prefs.removeObserver(this._devtoolsThemePrefName, this);
+     Services.obs.removeObserver(this, "lightweight-theme-styling-update", false);
+     if (this.styleSheet) {
+       this.styleSheet.removeEventListener("load", this);
+     }
+     this.styleSheet = null;
+   }
+ };
+diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+--- a/browser/base/content/browser.js
++++ b/browser/base/content/browser.js
+@@ -40,16 +40,18 @@ XPCOMUtils.defineLazyModuleGetter(this, 
+ XPCOMUtils.defineLazyModuleGetter(this, "Log",
+                                   "resource://gre/modules/Log.jsm");
+ XPCOMUtils.defineLazyServiceGetter(this, "Favicons",
+                                    "@mozilla.org/browser/favicon-service;1",
+                                    "mozIAsyncFavicons");
+ XPCOMUtils.defineLazyServiceGetter(this, "gDNSService",
+                                    "@mozilla.org/network/dns-service;1",
+                                    "nsIDNSService");
++XPCOMUtils.defineLazyModuleGetter(this, "LightweightThemeManager",
++                                  "resource://gre/modules/LightweightThemeManager.jsm");
+ 
+ const nsIWebNavigation = Ci.nsIWebNavigation;
+ 
+ var gLastBrowserCharset = null;
+ var gProxyFavIcon = null;
+ var gLastValidURLStr = "";
+ var gInPrintPreviewMode = false;
+ var gContextMenu = null; // nsContextMenu instance
+@@ -915,25 +917,28 @@ var gBrowserInit = {
+ 
+   onLoad: function() {
+     gBrowser.addEventListener("DOMUpdatePageReport", gPopupBlockerObserver, false);
+ 
+     Services.obs.addObserver(gPluginHandler.pluginCrashed, "plugin-crashed", false);
+ 
+     window.addEventListener("AppCommand", HandleAppCommandEvent, true);
+ 
++    // This loads a stylesheet if the devedition lw theme is applied,
++    // so run it early to limit a flash of unstyled content.
++    DevEdition.init();
++
+     // These routines add message listeners. They must run before
+     // loading the frame script to ensure that we don't miss any
+     // message sent between when the frame script is loaded and when
+     // the listener is registered.
+     DOMLinkHandler.init();
+     gPageStyleMenu.init();
+     LanguageDetectionListener.init();
+     BrowserOnClick.init();
+-    DevEdition.init();
+ 
+     let mm = window.getGroupMessageManager("browsers");
+     mm.loadFrameScript("chrome://browser/content/content.js", true);
+     mm.loadFrameScript("chrome://browser/content/content-UITour.js", true);
+ 
+     window.messageManager.addMessageListener("Browser:LoadURI", RedirectLoad);
+ 
+     // initialize observers and listeners
+diff --git a/browser/base/content/defaultthemes/devedition.header.png b/browser/base/content/defaultthemes/devedition.header.png
+new file mode 100644
+index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..e4e8dcaa3b3cd01a1287359902561166d7f942ee
+GIT binary patch
+literal 95
+zc%17D@N?(olHy`uVBq!ia0vp^j3CU&3?x-=hn)ga%mF?juK#@*VoWXSL2@NQe!&b5
+m&u*jvIb5DDjv*Cul9PaJHU?%h^O_Yv7K5j&pUXO@geCw~dlW4I
+
+diff --git a/browser/base/content/defaultthemes/devedition.icon.png b/browser/base/content/defaultthemes/devedition.icon.png
+new file mode 100644
+index e69de29bb2d1d6434b8b29ae775ad8c2e48c5391..04cfba796dc6aa0bac6b3b368e929009bf01af52
+GIT binary patch
+literal 2402
+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
+UJkx%vwEzGB07*qoM6N<$f}8H2SpWb4
+
+diff --git a/browser/base/jar.mn b/browser/base/jar.mn
+--- a/browser/base/jar.mn
++++ b/browser/base/jar.mn
+@@ -93,16 +93,18 @@ browser.jar:
+         content/browser/defaultthemes/4.footer.png    (content/defaultthemes/4.footer.png)
+         content/browser/defaultthemes/4.header.png    (content/defaultthemes/4.header.png)
+         content/browser/defaultthemes/4.icon.png      (content/defaultthemes/4.icon.png)
+         content/browser/defaultthemes/4.preview.png   (content/defaultthemes/4.preview.png)
+         content/browser/defaultthemes/5.footer.png    (content/defaultthemes/5.footer.png)
+         content/browser/defaultthemes/5.header.png    (content/defaultthemes/5.header.png)
+         content/browser/defaultthemes/5.icon.jpg      (content/defaultthemes/5.icon.jpg)
+         content/browser/defaultthemes/5.preview.jpg   (content/defaultthemes/5.preview.jpg)
++        content/browser/defaultthemes/devedition.header.png   (content/defaultthemes/devedition.header.png)
++        content/browser/defaultthemes/devedition.icon.png     (content/defaultthemes/devedition.icon.png)
+         content/browser/newtab/newTab.xul             (content/newtab/newTab.xul)
+ *       content/browser/newtab/newTab.js              (content/newtab/newTab.js)
+         content/browser/newtab/newTab.css             (content/newtab/newTab.css)
+ *       content/browser/pageinfo/pageInfo.xul         (content/pageinfo/pageInfo.xul)
+         content/browser/pageinfo/pageInfo.js          (content/pageinfo/pageInfo.js)
+         content/browser/pageinfo/pageInfo.css         (content/pageinfo/pageInfo.css)
+         content/browser/pageinfo/pageInfo.xml         (content/pageinfo/pageInfo.xml)
+         content/browser/pageinfo/feeds.js             (content/pageinfo/feeds.js)
+diff --git a/browser/components/nsBrowserGlue.js b/browser/components/nsBrowserGlue.js
+--- a/browser/components/nsBrowserGlue.js
++++ b/browser/components/nsBrowserGlue.js
+@@ -146,16 +146,19 @@ XPCOMUtils.defineLazyModuleGetter(this, 
+                                   "resource://gre/modules/WebChannel.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "ReaderParent",
+                                   "resource:///modules/ReaderParent.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "AddonWatcher",
+                                   "resource://gre/modules/AddonWatcher.jsm");
+ 
++XPCOMUtils.defineLazyModuleGetter(this, "LightweightThemeManager",
++                                  "resource://gre/modules/LightweightThemeManager.jsm");
++
+ const PREF_PLUGINS_NOTIFYUSER = "plugins.update.notifyUser";
+ const PREF_PLUGINS_UPDATEURL  = "plugins.update.url";
+ 
+ // Seconds of idle before trying to create a bookmarks backup.
+ const BOOKMARKS_BACKUP_IDLE_TIME_SEC = 8 * 60;
+ // Minimum interval between backups.  We try to not create more than one backup
+ // per interval.
+ const BOOKMARKS_BACKUP_MIN_INTERVAL_DAYS = 1;
+@@ -710,16 +713,28 @@ BrowserGlue.prototype = {
+     Services.prefs.addObserver(POLARIS_ENABLED, this, false);
+ #endif
+ 
+ #ifdef MOZ_DEBUG_UA
+     UserAgentOverrides.init();
+     DebugUserAgent.init();
+ #endif
+ 
++    LightweightThemeManager.appSpecificThemes = [
++      {
++          "id": "devedition",
++          "name": "Developer Edition",
++          "headerURL": "resource:///chrome/browser/content/browser/defaultthemes/devedition.header.png",
++          "iconURL": "resource:///chrome/browser/content/browser/defaultthemes/devedition.icon.png",
++          "author": "Firefox DevTools",
++          "version":"0",
++      }
++    ];
++
++
+     Services.obs.notifyObservers(null, "browser-ui-startup-complete", "");
+ 
+     AddonWatcher.init(this._notifySlowAddon);
+   },
+ 
+   _checkForOldBuildUpdates: function () {
+     // check for update if our build is old
+     if (Services.prefs.getBoolPref("app.update.enabled") &&
+diff --git a/browser/metro/profile/metro.js b/browser/metro/profile/metro.js
+--- a/browser/metro/profile/metro.js
++++ b/browser/metro/profile/metro.js
+@@ -539,17 +539,17 @@ pref("editor.singleLine.pasteNewlines", 
+ 
+ #ifdef MOZ_SERVICES_SYNC
+ // sync service
+ pref("services.sync.registerEngines", "Tab,Bookmarks,Form,History,Password,Prefs");
+ 
+ // prefs to sync by default
+ pref("services.sync.prefs.sync.browser.tabs.warnOnClose", true);
+ pref("services.sync.prefs.sync.devtools.errorconsole.enabled", true);
+-pref("services.sync.prefs.sync.lightweightThemes.isThemeSelected", true);
++pref("services.sync.prefs.sync.lightweightThemes.selectedThemeID", "");
+ pref("services.sync.prefs.sync.lightweightThemes.usedThemes", true);
+ pref("services.sync.prefs.sync.privacy.donottrackheader.enabled", true);
+ pref("services.sync.prefs.sync.privacy.donottrackheader.value", true);
+ pref("services.sync.prefs.sync.signon.rememberSignons", true);
+ #endif
+ 
+ // threshold where a tap becomes a drag, in 1/240" reference pixels
+ // The names of the preferences are to be in sync with EventStateManager.cpp
+diff --git a/toolkit/mozapps/extensions/LightweightThemeManager.jsm b/toolkit/mozapps/extensions/LightweightThemeManager.jsm
+--- a/toolkit/mozapps/extensions/LightweightThemeManager.jsm
++++ b/toolkit/mozapps/extensions/LightweightThemeManager.jsm
+@@ -7,16 +7,17 @@
+ this.EXPORTED_SYMBOLS = ["LightweightThemeManager"];
+ 
+ const Cc = Components.classes;
+ const Ci = Components.interfaces;
+ 
+ Components.utils.import("resource://gre/modules/XPCOMUtils.jsm");
+ Components.utils.import("resource://gre/modules/AddonManager.jsm");
+ Components.utils.import("resource://gre/modules/Services.jsm");
++let {console} = Components.utils.import("resource://gre/modules/devtools/Console.jsm", {});
+ 
+ const ID_SUFFIX              = "@personas.mozilla.org";
+ const PREF_LWTHEME_TO_SELECT = "extensions.lwThemeToSelect";
+ const PREF_GENERAL_SKINS_SELECTEDSKIN = "general.skins.selectedSkin";
+ const PREF_EM_DSS_ENABLED    = "extensions.dss.enabled";
+ const ADDON_TYPE             = "theme";
+ 
+ const URI_EXTENSION_STRINGS  = "chrome://mozapps/locale/extensions/extensions.properties";
+@@ -64,34 +65,72 @@ this.__defineSetter__("_maxUsedThemes", 
+ });
+ 
+ // Holds the ID of the theme being enabled or disabled while sending out the
+ // events so cached AddonWrapper instances can return correct values for
+ // permissions and pendingOperations
+ var _themeIDBeingEnabled = null;
+ var _themeIDBeingDisabled = null;
+ 
++// Convert from the old storage format (in which the order of usedThemes
++// was combined with isThemeSelected to determine which theme was selected)
++// to the new one (where a selectedThemeID determines which theme is selected).
++this.migrateToNewStorage = function() {
++  let wasThemeSelected = false;
++  try {
++    wasThemeSelected = _prefs.getBoolPref("isThemeSelected");
++  } catch(e) { }
++
++  if (wasThemeSelected) {
++    Services.prefs.clearUserPref("lightweightThemes.isThemeSelected");
++    let themes = [];
++    try {
++      themes = JSON.parse(_prefs.getComplexValue("usedThemes",
++                                                 Ci.nsISupportsString).data);
++    } catch (e) { }
++
++    if (themes[0]) {
++      _prefs.setCharPref("selectedThemeID", themes[0].id);
++    }
++  }
++};
++
++this.migrateToNewStorage();
++
+ this.LightweightThemeManager = {
+   get name() "LightweightThemeManager",
+ 
++  // Themes that can be added for an application.  They can't be removed, and
++  // will always show up at the top of the list.
++  appSpecificThemes: [],
++
+   get usedThemes () {
++    let themes = [];
+     try {
+-      return JSON.parse(_prefs.getComplexValue("usedThemes",
+-                                               Ci.nsISupportsString).data);
+-    } catch (e) {
+-      return [];
+-    }
++      themes = JSON.parse(_prefs.getComplexValue("usedThemes",
++                                                 Ci.nsISupportsString).data);
++    } catch (e) { }
++
++
++    themes = this.appSpecificThemes.concat(themes);
++    return themes;
+   },
+ 
+   get currentTheme () {
++    console.log("Getting current themem now");
++    let selectedThemeID = null;
+     try {
+-      if (_prefs.getBoolPref("isThemeSelected"))
+-        var data = this.usedThemes[0];
++      selectedThemeID = _prefs.getCharPref("selectedThemeID");
+     } catch (e) {}
+ 
++    let data = null;
++    if (selectedThemeID) {
++      data = this.getUsedTheme(selectedThemeID);
++    }
++    console.log("Selected theme ID?", selectedThemeID, " Data", data);
+     return data || null;
+   },
+ 
+   get currentThemeForDisplay () {
+     var data = this.currentTheme;
+ 
+     if (data && PERSIST_ENABLED) {
+       for (let key in PERSIST_FILES) {
+@@ -237,17 +276,23 @@ this.LightweightThemeManager = {
+       if (PERSIST_ENABLED) {
+         LightweightThemeImageOptimizer.purge();
+         _persistImages(aData, function themeChanged_persistImages() {
+           _notifyWindows(this.currentThemeForDisplay);
+         }.bind(this));
+       }
+     }
+ 
+-    _prefs.setBoolPref("isThemeSelected", aData != null);
++console.log("Setting pref", aData && aData.id);
++    if (aData) {
++      _prefs.setCharPref("selectedThemeID", aData.id);
++    } else {
++      _prefs.clearUserPref("selectedThemeID");
++    }
++
+     _notifyWindows(aData);
+     Services.obs.notifyObservers(null, "lightweight-theme-changed", null);
+   },
+ 
+   /**
+    * Starts the Addons provider and enables the new lightweight theme if
+    * necessary.
+    */
+@@ -674,16 +719,26 @@ function _usedThemesExceptId(aId)
+ 
+ function _version(aThemeData)
+   aThemeData.version || "";
+ 
+ function _makeURI(aURL, aBaseURI)
+   Services.io.newURI(aURL, null, aBaseURI);
+ 
+ function _updateUsedThemes(aList) {
++
++  // Remove app specific themes before  loaded themes from list first
++  LightweightThemeManager.appSpecificThemes.forEach(appSpecificTheme=> {
++    console.log("Side loaded theme", appSpecificTheme);
++    aList = aList.filter(theme=> {
++    console.log("Removing?", theme.id != appSpecificTheme.id, theme.id, appSpecificTheme.id);
++      return theme.id != appSpecificTheme.id;
++    })
++  });
++
+   // Send uninstall events for all themes that need to be removed.
+   while (aList.length > _maxUsedThemes) {
+     let wrapper = new AddonWrapper(aList[aList.length - 1]);
+     AddonManagerPrivate.callAddonListeners("onUninstalling", wrapper, false);
+     aList.pop();
+     AddonManagerPrivate.callAddonListeners("onUninstalled", wrapper);
+   }
+ 
