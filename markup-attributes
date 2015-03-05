@@ -1,139 +1,22 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
 # Parent  f078882f6e3a5d28e003aded2f589ddcf35b95a2
-Bug 1139569 - Animation slowed down when element is expanded in markup view
+Bug 1139569 - Optimize update function for element editors in markup view;r=mratcliffe
+
+Previously, any call to update() would destroy and recreate all attribute
+editors.  This got really slow and caused a lot of unnecessary work, since
+this ran any time any attribute changed.  Also, old attributes wouldn't
+end up getting removed but would simply be hidden.  With this patch, we
+update each attribute if it's changed, and any unused attributes are removed.
 
 diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
 --- a/browser/devtools/markupview/markup-view.js
 +++ b/browser/devtools/markupview/markup-view.js
-@@ -773,25 +773,30 @@ MarkupView.prototype = {
-   },
- 
-   /**
-    * Given a list of mutations returned by the mutation observer, flash the
-    * corresponding containers to attract attention.
-    */
-   _flashMutatedNodes: function(aMutations) {
-     let addedOrEditedContainers = new Set();
-+    let addedOrEditedAttributes = new Map();
-     let removedContainers = new Set();
- 
--    for (let {type, target, added, removed} of aMutations) {
-+    for (let {type, target, added, removed, attributeName}  of aMutations) {
-       let container = this.getContainer(target);
- 
-       if (container) {
--        if (type === "attributes" || type === "characterData") {
-+        if (type === "attributes") {
-+          let arr = addedOrEditedAttributes.get(container) || new Set();
-+          arr.add(attributeName);
-+          addedOrEditedAttributes.set(container, arr);
-+        }  else if (type === "characterData") {
-           addedOrEditedContainers.add(container);
--        } else if (type === "childList") {
-+        }else if (type === "childList") {
-           // If there has been removals, flash the parent
-           if (removed.length) {
-             removedContainers.add(container);
-           }
- 
-           // If there has been additions, flash the nodes if their associated
-           // container exist (so if their parent is expanded in the inspector).
-           added.forEach(added => {
-@@ -811,16 +816,19 @@ MarkupView.prototype = {
-     }
- 
-     for (let container of removedContainers) {
-       container.flashMutation();
-     }
-     for (let container of addedOrEditedContainers) {
-       container.flashMutation();
-     }
-+    for (let [container, attributes] of addedOrEditedAttributes) {
-+      container.flashMutation(attributes);
-+    }
-   },
- 
-   /**
-    * Make sure the given node's parents are expanded and the
-    * node is scrolled on to screen.
-    */
-   showNode: function(aNode, centered) {
-     let parent = aNode;
-@@ -1875,17 +1883,22 @@ MarkupContainer.prototype = {
- 
-     this.markup.indicateDropTarget(el);
-   },
- 
-   /**
-    * Temporarily flash the container to attract attention.
-    * Used for markup mutations.
-    */
--  flashMutation: function() {
-+  flashMutation: function(attributes) {
-+    if (attributes) {
-+      // console.log(this.editor, this.editor.attrList);
-+      return;
-+    }
-+
-     if (!this.selected) {
-       let contentWin = this.win;
-       this.flashed = true;
-       if (this._flashMutationTimer) {
-         contentWin.clearTimeout(this._flashMutationTimer);
-         this._flashMutationTimer = null;
-       }
-       this._flashMutationTimer = contentWin.setTimeout(() => {
-@@ -2357,16 +2370,18 @@ function ElementEditor(aContainer, aNode
-   this.closeTag = null;
-   this.attrList = null;
-   this.newAttr = null;
-   this.closeElt = null;
- 
-   // Create the main editor
-   this.template("element", this);
- 
-+  this.animationTimers = new WeakMap();
-+
-   // Make the tag name editable (unless this is a remote node or
-   // a document element)
-   if (!aNode.isDocumentElement) {
-     this.tag.setAttribute("tabindex", "0");
-     editableField({
-       element: this.tag,
-       trigger: "dblclick",
-       stopOnReturn: true,
-@@ -2405,43 +2420,72 @@ function ElementEditor(aContainer, aNode
-   this.tag.textContent = tagName;
-   this.closeTag.textContent = tagName;
-   this.eventNode.style.display = this.node.hasEventListeners ? "inline-block" : "none";
- 
+@@ -2409,38 +2409,43 @@ function ElementEditor(aContainer, aNode
    this.update();
  }
  
  ElementEditor.prototype = {
-+
-+  flashElement: function(el) {
-+    // Make sure the animation class is not here
-+    el.classList.remove("flash-out");
-+    
-+    // Change the background
-+    el.classList.add("theme-bg-contrast");
-+
-+    let timer = this.animationTimers.get(el);
-+    if (timer) {
-+      this.markup.win.clearTimeout(timer);
-+    }
-+
-+    this.animationTimers.set(el, this.markup.win.setTimeout(() => {
-+      // Add the animation class to smoothly remove the background
-+      el.classList.add("flash-out");
-+      
-+      // Remove the background
-+      el.classList.remove("theme-bg-contrast");
-+    }, this.markup.CONTAINER_FLASHING_DURATION));
-+  },
-+
    /**
     * Update the state of the editor from the node.
     */
@@ -153,26 +36,25 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
 +    let attrs = this.node.attributes || [];
 +    let attrsToRemove = new Set(this.attrList.querySelectorAll(".attreditor"));
 +
-+    // Don't do work for attributes that haven't changed
++    // Only loop through the current attributes on the node, anything that's
++    // been removed will be removed from this DOM because it will be part of
++    // the attrsToRemove set.
 +    for (let attr of attrs) {
-+      let {name, value} = attr;
-+      let el = this.attrs[name];
-+      let valueChanged = el && el.querySelector(".attr-value").innerHTML !== value;
++      let el = this.attrs[attr.name];
++      let valueChanged = el && el.querySelector(".attr-value").innerHTML !== attr.value;
 +      let isEditing = el && el.querySelector(".editable").inplaceEditor;
++      let needToCreateAttributeEditor = el && (!valueChanged || isEditing);
 +
-+      if (el && (!valueChanged || isEditing)) {
-+        // Element already exists and doesn't need any more work, except
-+        // to make it visible.
-+        el.style.removeProperty("display");
++      if (needToCreateAttributeEditor) {
++        // Element already exists and doesn't need to be recreated.
++        // Just show it (it's hidden by default due to the template).
 +        attrsToRemove.delete(el);
++        el.style.removeProperty("display");
 +      } else {
-+        // Create a new editor if we aren't currently editing the attribute.
++        // Create a new editor, because the value of an existing attribute
++        // has changed.
 +        let attribute = this._createAttribute(attr);
 +        attribute.style.removeProperty("display");
-+        if (valueChanged) {
-+          let val = attribute.querySelector(".attr-value");
-+          this.flashElement(val);
-+        }
        }
      }
  
@@ -186,7 +68,6 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
 +    for (let el of attrsToRemove) {
 +      el.remove();
      }
-+
    },
  
    _startModifyingAttributes: function() {
@@ -194,4 +75,31 @@ diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/marku
    },
  
    /**
-    * Get the element used for one of the attributes of this element
+diff --git a/browser/devtools/markupview/test/browser_markupview_mutation_01.js b/browser/devtools/markupview/test/browser_markupview_mutation_01.js
+--- a/browser/devtools/markupview/test/browser_markupview_mutation_01.js
++++ b/browser/devtools/markupview/test/browser_markupview_mutation_01.js
+@@ -28,22 +28,19 @@ const TEST_DATA = [
+   },
+   {
+     desc: "Removing an attribute",
+     test: () => {
+       let node1 = getNode("#node1");
+       node1.removeAttribute("newattr");
+     },
+     check: function*(inspector) {
+-      // The markup-view is a little weird in that it doesn't remove the
+-      // attribute but only hides it with display:none
+       let {editor} = yield getContainerForSelector("#node1", inspector);
+-      ok([...editor.attrList.querySelectorAll(".attreditor")].some(attr => {
+-        return attr.textContent.trim() === "newattr=\"newattrval\"" &&
+-               attr.style.display === "none";
++      ok(![...editor.attrList.querySelectorAll(".attreditor")].some(attr => {
++        return attr.textContent.trim() === "newattr=\"newattrval\"";
+       }), "newattr attribute removed");
+     }
+   },
+   {
+     desc: "Updating the text-content",
+     test: () => {
+       let node1 = getNode("#node1");
+       node1.textContent = "newtext";
