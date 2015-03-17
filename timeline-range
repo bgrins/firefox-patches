@@ -1,36 +1,77 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
 # Parent  b8b1d58af8c670684b18660ad5f6d6af50031047
-Bug 1066504 - Allow timeline range selection after mouseout
+Bug 1066504 - Allow timeline range selection to continue even after mouseout of the graph window;r=vporof
 
-diff --git a/browser/devtools/shared/widgets/FlameGraph.jsm b/browser/devtools/shared/widgets/FlameGraph.jsm
---- a/browser/devtools/shared/widgets/FlameGraph.jsm
-+++ b/browser/devtools/shared/widgets/FlameGraph.jsm
-@@ -145,20 +145,20 @@ function FlameGraph(parent, sharpness) {
-     this._onAnimationFrame = this._onAnimationFrame.bind(this);
-     this._onMouseMove = this._onMouseMove.bind(this);
-     this._onMouseDown = this._onMouseDown.bind(this);
-     this._onMouseUp = this._onMouseUp.bind(this);
-     this._onMouseWheel = this._onMouseWheel.bind(this);
-     this._onResize = this._onResize.bind(this);
-     this.refresh = this.refresh.bind(this);
+diff --git a/browser/devtools/shared/test/browser_graphs-07a.js b/browser/devtools/shared/test/browser_graphs-07a.js
+--- a/browser/devtools/shared/test/browser_graphs-07a.js
++++ b/browser/devtools/shared/test/browser_graphs-07a.js
+@@ -12,24 +12,28 @@ add_task(function*() {
+   yield performTest();
+   gBrowser.removeCurrentTab();
+ });
  
--    this._window.addEventListener("mousemove", this._onMouseMove);
--    this._window.addEventListener("mousedown", this._onMouseDown);
--    this._window.addEventListener("mouseup", this._onMouseUp);
--    this._window.addEventListener("MozMousePixelScroll", this._onMouseWheel);
-+    // this._window.addEventListener("mousemove", this._onMouseMove);
-+    // this._window.addEventListener("mousedown", this._onMouseDown);
-+    // this._window.addEventListener("mouseup", this._onMouseUp);
-+    // this._window.addEventListener("MozMousePixelScroll", this._onMouseWheel);
+ function* performTest() {
+   let [host, win, doc] = yield createHost();
+   let graph = new LineGraphWidget(doc.body, "fps");
+   yield graph.once("ready");
++  testGraph(graph, normalDragStop);
++  yield graph.destroy();
  
-     let ownerWindow = this._parent.ownerDocument.defaultView;
-     ownerWindow.addEventListener("resize", this._onResize);
+-  testGraph(graph);
++  let graph2 = new LineGraphWidget(doc.body, "fps");
++  yield graph2.once("ready");
++  testGraph(graph2, buggyDragStop);
++  yield graph2.destroy();
  
-     this._animationId = this._window.requestAnimationFrame(this._onAnimationFrame);
+-  yield graph.destroy();
+   host.destroy();
+ }
  
-     this._ready.resolve(this);
-     this.emit("ready", this);
+-function testGraph(graph) {
++function testGraph(graph, dragStop) {
+   graph.setData(TEST_DATA);
+ 
+   info("Making a selection.");
+ 
+   dragStart(graph, 300);
+   ok(graph.hasSelectionInProgress(),
+     "The selection should start (1).");
+   is(graph.getSelection().start, 300,
+@@ -181,21 +185,32 @@ function click(graph, x, y = 1) {
+ 
+ function dragStart(graph, x, y = 1) {
+   x /= window.devicePixelRatio;
+   y /= window.devicePixelRatio;
+   graph._onMouseMove({ clientX: x, clientY: y });
+   graph._onMouseDown({ clientX: x, clientY: y });
+ }
+ 
+-function dragStop(graph, x, y = 1) {
++function normalDragStop(graph, x, y = 1) {
+   x /= window.devicePixelRatio;
+   y /= window.devicePixelRatio;
+   graph._onMouseMove({ clientX: x, clientY: y });
+   graph._onMouseUp({ clientX: x, clientY: y });
+ }
+ 
++function buggyDragStop(graph, x, y = 1) {
++  x /= window.devicePixelRatio;
++  y /= window.devicePixelRatio;
++
++  // Only fire a mousemove instead of a mouseup.
++  // This happens when the mouseup happens outside of the toolbox,
++  // see Bug 1066504.
++  graph._onMouseMove({ clientX: x, clientY: y });
++  graph._onMouseMove({ clientX: x, clientY: y, buttons: 0 });
++}
++
+ function scroll(graph, wheel, x, y = 1) {
+   x /= window.devicePixelRatio;
+   y /= window.devicePixelRatio;
+   graph._onMouseMove({ clientX: x, clientY: y });
+   graph._onMouseWheel({ clientX: x, clientY: y, detail: wheel });
+ }
 diff --git a/browser/devtools/shared/widgets/Graphs.jsm b/browser/devtools/shared/widgets/Graphs.jsm
 --- a/browser/devtools/shared/widgets/Graphs.jsm
 +++ b/browser/devtools/shared/widgets/Graphs.jsm
@@ -78,32 +119,7 @@ diff --git a/browser/devtools/shared/widgets/Graphs.jsm b/browser/devtools/share
  
      this._window.cancelAnimationFrame(this._animationId);
      this._iframe.remove();
-@@ -540,16 +537,24 @@ AbstractCanvasGraph.prototype = {
-    * @return boolean
-    */
-   hasSelectionInProgress: function() {
-     return this._selection &&
-       this._selection.start != null && this._selection.end == null;
-   },
- 
-   /**
-+   * Gets whether or not a selection is currently being dragged.
-+   * @return boolean
-+   */
-+  hasSelectionDragInProgress: function() {
-+    return this._selectionDragger && this._selectionDragger.origin != null;
-+  },
-+
-+  /**
-    * Specifies whether or not mouse selection is allowed.
-    * @type boolean
-    */
-   selectionEnabled: true,
- 
-   /**
-    * Sets the selection bounds.
-    * Use `dropCursor` to hide the cursor.
-@@ -947,16 +952,23 @@ AbstractCanvasGraph.prototype = {
+@@ -947,31 +944,40 @@ AbstractCanvasGraph.prototype = {
  
      return { left: x, top: y };
    },
@@ -112,10 +128,14 @@ diff --git a/browser/devtools/shared/widgets/Graphs.jsm b/browser/devtools/share
     * Listener for the "mousemove" event on the graph's container.
     */
    _onMouseMove: function(e) {
++    let resizer = this._selectionResizer;
++    let dragger = this._selectionDragger;
++
 +    // If a mouseup happened outside the toolbox and the current operation
-+    // is causing the selection to be resized or dragged, then end it.
++    // is causing the selection changed, then end it.
 +    if (e.buttons == 0 && (this.hasSelectionInProgress() ||
-+                           this.hasSelectionDragInProgress())) {
++                           resizer.margin != null ||
++                           dragger.origin != null)) {
 +      return this._onMouseUp(e);
 +    }
 +
@@ -125,9 +145,24 @@ diff --git a/browser/devtools/shared/widgets/Graphs.jsm b/browser/devtools/share
      this._cursor.x = mouseX;
      this._cursor.y = mouseY;
  
-     let resizer = this._selectionResizer;
+-    let resizer = this._selectionResizer;
      if (resizer.margin != null) {
-@@ -1157,33 +1169,16 @@ AbstractCanvasGraph.prototype = {
+       this._selection[resizer.margin] = mouseX;
+       this._shouldRedraw = true;
+       this.emit("selecting");
+       return;
+     }
+ 
+-    let dragger = this._selectionDragger;
+     if (dragger.origin != null) {
+       this._selection.start = dragger.anchor.start - dragger.origin + mouseX;
+       this._selection.end = dragger.anchor.end - dragger.origin + mouseX;
+       this._shouldRedraw = true;
+       this.emit("selecting");
+       return;
+     }
+ 
+@@ -1157,33 +1163,16 @@ AbstractCanvasGraph.prototype = {
      }
  
      this._shouldRedraw = true;
