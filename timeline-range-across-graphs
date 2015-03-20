@@ -1,0 +1,161 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  95f16308b4abd7a10ff2d355eb4e025ff4dc9ce5
+Bug 1145784 - Trying out some different things with graph movement
+
+diff --git a/browser/devtools/shared/widgets/Graphs.jsm b/browser/devtools/shared/widgets/Graphs.jsm
+--- a/browser/devtools/shared/widgets/Graphs.jsm
++++ b/browser/devtools/shared/widgets/Graphs.jsm
+@@ -4,16 +4,17 @@
+ "use strict";
+ 
+ const Cu = Components.utils;
+ 
+ Cu.import("resource:///modules/devtools/ViewHelpers.jsm");
+ const promise = Cu.import("resource://gre/modules/Promise.jsm", {}).Promise;
+ const {Task} = Cu.import("resource://gre/modules/Task.jsm", {});
+ const {EventEmitter} = Cu.import("resource://gre/modules/devtools/event-emitter.js", {});
++let {console} = Cu.import("resource://gre/modules/devtools/Console.jsm", {});
+ 
+ this.EXPORTED_SYMBOLS = [
+   "GraphCursor",
+   "GraphArea",
+   "GraphAreaDragger",
+   "GraphAreaResizer",
+   "AbstractCanvasGraph",
+   "LineGraphWidget",
+@@ -152,16 +153,17 @@ this.AbstractCanvasGraph = function(pare
+   this._ready = promise.defer();
+ 
+   this._uid = "canvas-graph-" + Date.now();
+   this._renderTargets = new Map();
+ 
+   AbstractCanvasGraph.createIframe(GRAPH_SRC, parent, iframe => {
+     this._iframe = iframe;
+     this._window = iframe.contentWindow;
++    this._topWindow = this._window.top;
+     this._document = iframe.contentDocument;
+     this._pixelRatio = sharpness || this._window.devicePixelRatio;
+ 
+     let container = this._container = this._document.getElementById("graph-container");
+     container.className = name + "-widget-container graph-widget-container";
+ 
+     let canvas = this._canvas = this._document.getElementById("graph-canvas");
+     canvas.className = name + "-widget-canvas graph-widget-canvas";
+@@ -187,19 +189,17 @@ this.AbstractCanvasGraph = function(pare
+     this._onMouseMove = this._onMouseMove.bind(this);
+     this._onMouseDown = this._onMouseDown.bind(this);
+     this._onMouseUp = this._onMouseUp.bind(this);
+     this._onMouseWheel = this._onMouseWheel.bind(this);
+     this._onMouseOut = this._onMouseOut.bind(this);
+     this._onResize = this._onResize.bind(this);
+     this.refresh = this.refresh.bind(this);
+ 
+-    this._window.addEventListener("mousemove", this._onMouseMove);
+     this._window.addEventListener("mousedown", this._onMouseDown);
+-    this._window.addEventListener("mouseup", this._onMouseUp);
+     this._window.addEventListener("MozMousePixelScroll", this._onMouseWheel);
+     this._window.addEventListener("mouseout", this._onMouseOut);
+ 
+     let ownerWindow = this._parent.ownerDocument.defaultView;
+     ownerWindow.addEventListener("resize", this._onResize);
+ 
+     this._animationId = this._window.requestAnimationFrame(this._onAnimationFrame);
+ 
+@@ -228,19 +228,19 @@ AbstractCanvasGraph.prototype = {
+   },
+ 
+   /**
+    * Destroys this graph.
+    */
+   destroy: Task.async(function *() {
+     yield this.ready();
+ 
+-    this._window.removeEventListener("mousemove", this._onMouseMove);
++    this._topWindow.removeEventListener("mousemove", this._onMouseMove);
++    this._topWindow.removeEventListener("mouseup", this._onMouseUp);
+     this._window.removeEventListener("mousedown", this._onMouseDown);
+-    this._window.removeEventListener("mouseup", this._onMouseUp);
+     this._window.removeEventListener("MozMousePixelScroll", this._onMouseWheel);
+     this._window.removeEventListener("mouseout", this._onMouseOut);
+ 
+     let ownerWindow = this._parent.ownerDocument.defaultView;
+     if (ownerWindow) {
+       ownerWindow.removeEventListener("resize", this._onResize);
+     }
+ 
+@@ -950,17 +950,17 @@ AbstractCanvasGraph.prototype = {
+   },
+ 
+   /**
+    * Listener for the "mousemove" event on the graph's container.
+    */
+   _onMouseMove: function(e) {
+     let resizer = this._selectionResizer;
+     let dragger = this._selectionDragger;
+-
++    console.log("_onMouseMove", e, this._iframe, this._iframe.getBoundingClientRect(), this._iframe.getBoxQuads());
+     // If a mouseup happened outside the toolbox and the current operation
+     // is causing the selection changed, then end it.
+     if (e.buttons == 0 && (this.hasSelectionInProgress() ||
+                            resizer.margin != null ||
+                            dragger.origin != null)) {
+       return this._onMouseUp(e);
+     }
+ 
+@@ -1051,23 +1051,28 @@ AbstractCanvasGraph.prototype = {
+         this._selectionDragger.anchor.start = this._selection.start;
+         this._selectionDragger.anchor.end = this._selection.end;
+         this._canvas.setAttribute("input", "dragging-selection-contents");
+         break;
+     }
+ 
+     this._shouldRedraw = true;
+     this.emit("mousedown");
++
++    this._topWindow.addEventListener("mousemove", this._onMouseMove, true);
++    this._topWindow.addEventListener("mouseup", this._onMouseUp, true);
+   },
+ 
+   /**
+    * Listener for the "mouseup" event on the graph's container.
+    */
+   _onMouseUp: function(e) {
+     this._isMouseActive = false;
++    this._topWindow.removeEventListener("mousemove", this._onMouseMove, true);
++    this._topWindow.removeEventListener("mouseup", this._onMouseUp, true);
+     let offset = this._getContainerOffset();
+     let mouseX = (e.clientX - offset.left) * this._pixelRatio;
+ 
+     switch (this._canvas.getAttribute("input")) {
+       case "hovering-background":
+       case "hovering-region":
+         if (!this.selectionEnabled) {
+           break;
+@@ -2084,23 +2089,26 @@ this.CanvasGraphUtils = {
+   /**
+    * Makes sure selections in one graph are reflected in another.
+    */
+   linkSelection: function(graph1, graph2) {
+     if (!graph1 || !graph2) {
+       return;
+     }
+ 
++    return;
++
+     if (graph1.hasSelection()) {
+       graph2.setSelection(graph1.getSelection());
+     } else {
+       graph2.dropSelection();
+     }
+ 
+     graph1.on("selecting", () => {
++      console.log("Sycing selection", graph1.getSelection(), graph2.getSelection())
+       graph2.setSelection(graph1.getSelection());
+     });
+     graph2.on("selecting", () => {
+       graph1.setSelection(graph2.getSelection());
+     });
+     graph1.on("deselecting", () => {
+       graph2.dropSelection();
+     });
