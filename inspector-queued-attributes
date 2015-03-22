@@ -1,0 +1,146 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  c0262092fed258760ba2c55975c0cac6020fa408
+Bug 1145914 - Multiple attribute changes are queued up on server and sent over with the same values
+
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -2401,17 +2401,36 @@ var WalkerActor = protocol.ActorClass({
+       for (let node of this._orphaned) {
+         // Release the orphaned node.  Nodes or children that have been
+         // retained will be moved to this._retainedOrphans.
+         this.releaseNode(node);
+       }
+       this._orphaned = new Set();
+     }
+ 
+-    return pending;
++
++    // Clear out any duplicate attribute mutations before sending them over
++    // the wire.
++    let targetMap = {};
++    let filtered = pending.reverse().filter(mutation=> {
++      if (mutation.type === "attributes") {
++        targetMap[mutation.target] = targetMap[mutation.target] || {};
++        let attributesForTarget = targetMap[mutation.target];
++
++        if (attributesForTarget[mutation.attributeName]) {
++          // Skip any previous attributes if we've already seen them.
++          return false;
++        }
++
++        attributesForTarget[mutation.attributeName] = true;
++      }
++      return true;
++    }).reverse();
++
++    return filtered;
+   }, {
+     request: {
+       cleanup: Option(0)
+     },
+     response: {
+       mutations: RetVal("array:dommutation")
+     }
+   }),
+diff --git a/toolkit/devtools/server/tests/mochitest/test_inspector-mutations-attr.html b/toolkit/devtools/server/tests/mochitest/test_inspector-mutations-attr.html
+--- a/toolkit/devtools/server/tests/mochitest/test_inspector-mutations-attr.html
++++ b/toolkit/devtools/server/tests/mochitest/test_inspector-mutations-attr.html
+@@ -40,20 +40,24 @@ addTest(function setup() {
+     }).then(runNextTest));
+   });
+ });
+ 
+ addTest(setupAttrTest);
+ addTest(testAddAttribute);
+ addTest(testChangeAttribute);
+ addTest(testRemoveAttribute);
++addTest(testAddAndRemoveAttribute);
++addTest(testRemoveAndAddAttribute);
+ addTest(setupFrameAttrTest);
+ addTest(testAddAttribute);
+ addTest(testChangeAttribute);
+ addTest(testRemoveAttribute);
++addTest(testAddAndRemoveAttribute);
++addTest(testRemoveAndAddAttribute);
+ 
+ function setupAttrTest() {
+   attrNode = gInspectee.querySelector("#a")
+   promiseDone(gWalker.querySelector(gWalker.rootNode, "#a").then(node => {
+     attrFront = node;
+   }).then(runNextTest));
+ }
+ 
+@@ -80,35 +84,67 @@ function testAddAttribute() {
+     is(attrFront.attributes.length, 3, "Should have id and two new attributes.");
+     is(attrFront.getAttribute("data-newattr"), "newvalue", "Node front should have the first new attribute");
+     is(attrFront.getAttribute("data-newattr2"), "newvalue", "Node front should have the second new attribute.");
+     runNextTest();
+   });
+ }
+ 
+ function testChangeAttribute() {
+-  attrNode.setAttribute("data-newattr", "changedvalue");
+-  gWalker.once("mutations", () => {
++  attrNode.setAttribute("data-newattr", "changedvalue1");
++  attrNode.setAttribute("data-newattr", "changedvalue2");
++  attrNode.setAttribute("data-newattr", "changedvalue3");
++  gWalker.once("mutations", mutations => {
++    is(mutations.length, 1, "Only one mutation is sent for multiple queued attribute changes");
+     is(attrFront.attributes.length, 3, "Should have id and two new attributes.");
+-    is(attrFront.getAttribute("data-newattr"), "changedvalue", "Node front should have the changed first value");
++    is(attrFront.getAttribute("data-newattr"), "changedvalue3", "Node front should have the changed first value");
+     is(attrFront.getAttribute("data-newattr2"), "newvalue", "Second value should remain unchanged.");
+     runNextTest();
+   });
+ }
+ 
+ function testRemoveAttribute() {
+   attrNode.removeAttribute("data-newattr2");
+   gWalker.once("mutations", () => {
+     is(attrFront.attributes.length, 2, "Should have id and one remaining attribute.");
+-    is(attrFront.getAttribute("data-newattr"), "changedvalue", "Node front should still have the first value");
++    is(attrFront.getAttribute("data-newattr"), "changedvalue3", "Node front should still have the first value");
+     ok(!attrFront.hasAttribute("data-newattr2"), "Second value should be removed.");
+     runNextTest();
+   })
+ }
+ 
++function testAddAndRemoveAttribute() {
++  attrNode.removeAttribute("data-newattr");
++  attrNode.setAttribute("data-newattr", "1");
++  attrNode.removeAttribute("data-newattr");
++  attrNode.setAttribute("data-newattr", "2");
++  attrNode.removeAttribute("data-newattr");
++  gWalker.once("mutations", mutations => {
++    is(mutations.length, 1, "Only one mutation is sent for multiple queued attribute changes");
++    is(attrFront.attributes.length, 1, "Should have only id.");
++    ok(!attrFront.hasAttribute("data-newattr"), "Attribute value should be removed.");
++    runNextTest();
++  })
++}
++
++function testRemoveAndAddAttribute() {
++  attrNode.removeAttribute("data-newattr");
++  attrNode.setAttribute("data-newattr", "1");
++  attrNode.removeAttribute("data-newattr");
++  attrNode.setAttribute("data-newattr", "2");
++  attrNode.removeAttribute("data-newattr");
++  attrNode.setAttribute("data-newattr", "3");
++  gWalker.once("mutations", mutations => {
++    is(mutations.length, 1, "Only one mutation is sent for multiple queued attribute changes");
++    is(attrFront.attributes.length, 2, "Should have id and one remaining attribute.");
++    is(attrFront.getAttribute("data-newattr"), "3", "Node front should still have the value value");
++    runNextTest();
++  })
++}
++
+ addTest(function cleanup() {
+   delete gInspectee;
+   delete gWalker;
+   delete gClient;
+   runNextTest();
+ });
+ 
+ 
