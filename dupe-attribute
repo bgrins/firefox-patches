@@ -1,0 +1,190 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  6dd5b23f5558daf996798b2a3983a7fd9d4359b6
+Bug 1147128 - Make sure attribute shows up in markup view after removing and setting to the previous value;r=mratcliffe
+
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -2344,17 +2344,17 @@ TextEditor.prototype = {
+  */
+ function ElementEditor(aContainer, aNode) {
+   this.container = aContainer;
+   this.node = aNode;
+   this.markup = this.container.markup;
+   this.template = this.markup.template.bind(this.markup);
+   this.doc = this.markup.doc;
+ 
+-  this.attrs = {};
++  this.attrs = new Map();
+ 
+   // The templates will fill the following properties
+   this.elt = null;
+   this.tag = null;
+   this.closeTag = null;
+   this.attrList = null;
+   this.newAttr = null;
+   this.closeElt = null;
+@@ -2410,59 +2410,72 @@ function ElementEditor(aContainer, aNode
+ }
+ 
+ ElementEditor.prototype = {
+   /**
+    * Update the state of the editor from the node.
+    */
+   update: function() {
+     let attrs = this.node.attributes || [];
+-    let attrsToRemove = new Set(this.attrList.querySelectorAll(".attreditor"));
+-
+-    // Only loop through the current attributes on the node, anything that's
+-    // been removed will be removed from this DOM because it will be part of
+-    // the attrsToRemove set.
++
++    // Keep the data model in sync with attributes on the node.
++    let currentAttributes = new Set(attrs.map(a=>a.name));
++    for (let name of this.attrs.keys()) {
++      if (!currentAttributes.has(name)) {
++        this.removeAttribute(name);
++      }
++    }
++
++    // Only loop through the current attributes on the node.  Missing
++    // attributes have already been removed at this point.
+     for (let attr of attrs) {
+-      let el = this.attrs[attr.name];
++      let el = this.attrs.get(attr.name);
+       let valueChanged = el && el.querySelector(".attr-value").innerHTML !== attr.value;
+       let isEditing = el && el.querySelector(".editable").inplaceEditor;
+       let needToCreateAttributeEditor = el && (!valueChanged || isEditing);
+ 
+       if (needToCreateAttributeEditor) {
+         // Element already exists and doesn't need to be recreated.
+         // Just show it (it's hidden by default due to the template).
+-        attrsToRemove.delete(el);
+         el.style.removeProperty("display");
+       } else {
+         // Create a new editor, because the value of an existing attribute
+         // has changed.
+         let attribute = this._createAttribute(attr);
+         attribute.style.removeProperty("display");
+       }
+     }
+-
+-    for (let el of attrsToRemove) {
+-      el.remove();
+-    }
+   },
+ 
+   _startModifyingAttributes: function() {
+     return this.node.startModifyingAttributes();
+   },
+ 
+   /**
+    * Get the element used for one of the attributes of this element
+    * @param string attrName The name of the attribute to get the element for
+    * @return DOMElement
+    */
+   getAttributeElement: function(attrName) {
+     return this.attrList.querySelector(
+       ".attreditor[data-attr=" + attrName + "] .attr-value");
+   },
+ 
++  /**
++   * Remove an attribute from the attrs object and the DOM
++   * @param string attrName The name of the attribute to remove
++   */
++  removeAttribute: function(attrName) {
++    let attr = this.attrs.get(attrName);
++    if (attr) {
++      this.attrs.delete(attrName);
++      attr.remove();
++    }
++  },
++
+   _createAttribute: function(aAttr, aBefore = null) {
+     // Create the template editor, which will save some variables here.
+     let data = {
+       attrName: aAttr.name,
+     };
+     this.template("attribute", data);
+     var {attr, inner, name, val} = data;
+ 
+@@ -2535,28 +2548,24 @@ ElementEditor.prototype = {
+       }
+     });
+ 
+     // Figure out where we should place the attribute.
+     let before = aBefore;
+     if (aAttr.name == "id") {
+       before = this.attrList.firstChild;
+     } else if (aAttr.name == "class") {
+-      let idNode = this.attrs["id"];
++      let idNode = this.attrs.get("id");
+       before = idNode ? idNode.nextSibling : this.attrList.firstChild;
+     }
+     this.attrList.insertBefore(attr, before);
+ 
+-    // Remove the old version of this attribute from the DOM.
+-    let oldAttr = this.attrs[aAttr.name];
+-    if (oldAttr && oldAttr.parentNode) {
+-      oldAttr.parentNode.removeChild(oldAttr);
+-    }
+-
+-    this.attrs[aAttr.name] = attr;
++    this.removeAttribute(aAttr.name);
++
++    this.attrs.set(aAttr.name, attr);
+ 
+     let collapsedValue;
+     if (aAttr.value.match(COLLAPSE_DATA_URL_REGEX)) {
+       collapsedValue = truncateString(aAttr.value, COLLAPSE_DATA_URL_LENGTH);
+     } else {
+       collapsedValue = truncateString(aAttr.value, COLLAPSE_ATTRIBUTE_LENGTH);
+     }
+ 
+diff --git a/browser/devtools/markupview/test/browser_markupview_mutation_01.js b/browser/devtools/markupview/test/browser_markupview_mutation_01.js
+--- a/browser/devtools/markupview/test/browser_markupview_mutation_01.js
++++ b/browser/devtools/markupview/test/browser_markupview_mutation_01.js
+@@ -35,16 +35,42 @@ const TEST_DATA = [
+     check: function*(inspector) {
+       let {editor} = yield getContainerForSelector("#node1", inspector);
+       ok(![...editor.attrList.querySelectorAll(".attreditor")].some(attr => {
+         return attr.textContent.trim() === "newattr=\"newattrval\"";
+       }), "newattr attribute removed");
+     }
+   },
+   {
++    desc: "Re-adding an attribute",
++    test: () => {
++      let node1 = getNode("#node1");
++      node1.setAttribute("newattr", "newattrval");
++    },
++    check: function*(inspector) {
++      let {editor} = yield getContainerForSelector("#node1", inspector);
++      ok([...editor.attrList.querySelectorAll(".attreditor")].some(attr => {
++        return attr.textContent.trim() === "newattr=\"newattrval\"";
++      }), "newattr attribute found");
++    }
++  },
++  {
++    desc: "Changing an attribute",
++    test: () => {
++      let node1 = getNode("#node1");
++      node1.setAttribute("newattr", "newattrchanged");
++    },
++    check: function*(inspector) {
++      let {editor} = yield getContainerForSelector("#node1", inspector);
++      ok([...editor.attrList.querySelectorAll(".attreditor")].some(attr => {
++        return attr.textContent.trim() === "newattr=\"newattrchanged\"";
++      }), "newattr attribute found");
++    }
++  },
++  {
+     desc: "Updating the text-content",
+     test: () => {
+       let node1 = getNode("#node1");
+       node1.textContent = "newtext";
+     },
+     check: function*(inspector) {
+       let {children} = yield getContainerForSelector("#node1", inspector);
+       is(children.querySelector(".text").textContent.trim(), "newtext",
