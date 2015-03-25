@@ -1,0 +1,1556 @@
+# HG changeset patch
+# User Gabriel Luong <gabriel.luong@gmail.com>
+# Parent  06f1b43f5a7b8f5cba9bb4ae18cdc488946154ff
+Bug 1120616 - Part 1: Implement filter styles in rule view r=bgrins
+
+diff --git a/browser/devtools/styleinspector/computed-view.js b/browser/devtools/styleinspector/computed-view.js
+--- a/browser/devtools/styleinspector/computed-view.js
++++ b/browser/devtools/styleinspector/computed-view.js
+@@ -18,17 +18,17 @@
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ Cu.import("resource://gre/modules/devtools/Templater.jsm");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "PluralForm",
+                                   "resource://gre/modules/PluralForm.jsm");
+ 
+-const FILTER_CHANGED_TIMEOUT = 300;
++const FILTER_CHANGED_TIMEOUT = 150;
+ const HTML_NS = "http://www.w3.org/1999/xhtml";
+ const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+ 
+ /**
+  * Helper for long-running processes that should yield occasionally to
+  * the mainloop.
+  *
+  * @param {Window} aWin
+diff --git a/browser/devtools/styleinspector/cssruleview.xhtml b/browser/devtools/styleinspector/cssruleview.xhtml
+--- a/browser/devtools/styleinspector/cssruleview.xhtml
++++ b/browser/devtools/styleinspector/cssruleview.xhtml
+@@ -30,9 +30,24 @@
+       }
+       window.onunload = function() {
+         if (this.ruleview) {
+           this.ruleview.destroy();
+         }
+       }
+     </script>
+   </head>
++  <body>
++
++    <div id="root" class="devtools-monospace">
++      <div class="devtools-toolbar">
++        <input id="ruleview-searchbox"
++               class="devtools-searchinput devtools-rule-searchbox"
++               type="search" placeholder="&userStylesSearch;"/>
++        <button id="ruleview-searchinput-clear" class="devtools-searchinput-clear"></button>
++      </div>
++    </div>
++
++    <div id="ruleview-container" class="ruleview devtools-monospace">
++    </div>
++
++  </body>
+ </html>
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -19,16 +19,17 @@
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ 
+ const HTML_NS = "http://www.w3.org/1999/xhtml";
+ const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+ const PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
+ const PREF_DEFAULT_COLOR_UNIT = "devtools.defaultColorUnit";
++const FILTER_CHANGED_TIMEOUT = 150;
+ 
+ /**
+  * These regular expressions are adapted from firebug's css.js, and are
+  * used to parse CSSStyleDeclaration's cssText attribute.
+  */
+ 
+ // Used to split on css line separators
+ const CSS_LINE_RE = /(?:[^;\(]*(?:\([^\)]*?\))?[^;\(]*)*;?/g;
+@@ -1108,31 +1109,40 @@
+  *        The PageStyleFront for communicating with the remote server.
+  * @constructor
+  */
+ function CssRuleView(aInspector, aDoc, aStore, aPageStyle) {
+   this.inspector = aInspector;
+   this.doc = aDoc;
+   this.store = aStore || {};
+   this.pageStyle = aPageStyle;
+-  this.element = this.doc.createElementNS(HTML_NS, "div");
+-  this.element.className = "ruleview devtools-monospace";
+-  this.element.flex = 1;
+-
++
++  this._highlightedElements = [];
+   this._outputParser = new OutputParser();
+ 
+   this._buildContextMenu = this._buildContextMenu.bind(this);
++  this._onContextMenu = this._onContextMenu.bind(this);
+   this._contextMenuUpdate = this._contextMenuUpdate.bind(this);
+   this._onAddRule = this._onAddRule.bind(this);
+   this._onSelectAll = this._onSelectAll.bind(this);
+   this._onCopy = this._onCopy.bind(this);
+   this._onCopyColor = this._onCopyColor.bind(this);
+   this._onToggleOrigSources = this._onToggleOrigSources.bind(this);
+-
+-  this.element.addEventListener("copy", this._onCopy);
++  this._onFilterStyles = this._onFilterStyles.bind(this);
++  this._onClearSearch = this._onClearSearch.bind(this);
++
++  this.element = this.doc.getElementById("ruleview-container");
++  this.searchField = this.doc.getElementById("ruleview-searchbox");
++  this.searchClearButton = this.doc.getElementById("ruleview-searchinput-clear");
++
++  this.doc.addEventListener("copy", this._onCopy);
++  this.element.addEventListener("contextmenu", this._onContextMenu);
++  this.searchField.addEventListener("input", this._onFilterStyles);
++  this.searchClearButton.addEventListener("click", this._onClearSearch);
++
+ 
+   this._handlePrefChange = this._handlePrefChange.bind(this);
+   this._onSourcePrefChanged = this._onSourcePrefChanged.bind(this);
+ 
+   this._prefObserver = new PrefObserver("devtools.");
+   this._prefObserver.on(PREF_ORIG_SOURCES, this._onSourcePrefChanged);
+   this._prefObserver.on(PREF_UA_STYLES, this._handlePrefChange);
+   this._prefObserver.on(PREF_DEFAULT_COLOR_UNIT, this._handlePrefChange);
+@@ -1156,16 +1166,19 @@
+ }
+ 
+ exports.CssRuleView = CssRuleView;
+ 
+ CssRuleView.prototype = {
+   // The element that we're inspecting.
+   _viewedElement: null,
+ 
++  // Used for cancelling timeouts in the style filter.
++  _filterChangedTimeout: null,
++
+   /**
+    * Build the context menu.
+    */
+   _buildContextMenu: function() {
+     let doc = this.doc.defaultView.parent.document;
+ 
+     this._contextmenu = doc.createElementNS(XUL_NS, "menupopup");
+     this._contextmenu.addEventListener("popupshowing", this._contextMenuUpdate);
+@@ -1330,16 +1343,31 @@
+       }
+     }
+ 
+     this._colorToCopy = container.dataset["color"];
+     return true;
+   },
+ 
+   /**
++   * Context menu handler.
++   */
++  _onContextMenu: function(event) {
++    try {
++      // In the sidebar we do not have this.doc.popupNode so we need to save
++      // the node ourselves.
++      this.doc.popupNode = event.explicitOriginalTarget;
++      this.doc.defaultView.focus();
++      this._contextmenu.openPopupAtScreen(event.screenX, event.screenY, true);
++    } catch(e) {
++      console.error(e);
++    }
++  },
++
++  /**
+    * Select all text.
+    */
+   _onSelectAll: function() {
+     let win = this.doc.defaultView;
+     let selection = win.getSelection();
+ 
+     selection.selectAllChildren(this.doc.documentElement);
+   },
+@@ -1476,31 +1504,63 @@
+         if (rule.editor) {
+           rule.editor.updateSourceLink();
+         }
+       }
+       this.inspector.emit("rule-view-sourcelinks-updated");
+     }
+   },
+ 
++  /**
++   * Called when the user enters a search term in the filter style search box.
++   */
++  _onFilterStyles: function() {
++    if (this._filterChangedTimeout) {
++      clearTimeout(this._filterChangedTimeout);
++    }
++
++    let filterTimeout = (this.searchField.value.length > 0)
++      ? FILTER_CHANGED_TIMEOUT : 0;
++    this.searchClearButton.style.display = (this.searchField.value.length > 0)
++      ? "block" : "none";
++
++    this._filterChangedTimeout = setTimeout(() => {
++      if (this.searchField.value.length > 0) {
++        this.searchField.setAttribute("filled", true);
++      } else {
++        this.searchField.removeAttribute("filled");
++      }
++
++      this._clearRules();
++      this._createEditors();
++
++      this.inspector.emit("rule-view-filtered");
++
++      this._filterChangeTimeout = null;
++    }, filterTimeout);
++  },
++
++  _onClearSearch: function() {
++    this.searchField.value = "";
++    this.searchField.focus();
++    this._onFilterStyles();
++  },
++
+   destroy: function() {
+     this.isDestroyed = true;
+     this.clear();
+ 
+     gDummyPromise = null;
+ 
+     this._prefObserver.off(PREF_ORIG_SOURCES, this._onSourcePrefChanged);
+     this._prefObserver.off(PREF_UA_STYLES, this._handlePrefChange);
+     this._prefObserver.off(PREF_DEFAULT_COLOR_UNIT, this._handlePrefChange);
+     this._prefObserver.destroy();
+ 
+-    this.element.removeEventListener("copy", this._onCopy);
+-    this._onCopy = null;
+-
+-    this._outputParser = null;
++    this._outputParser = this._highlightedElements = null;
+ 
+     // Remove context menu
+     if (this._contextmenu) {
+       // Destroy the Add Rule menuitem.
+       this.menuitemAddRule.removeEventListener("command", this._onAddRule);
+       this.menuitemAddRule = null;
+ 
+       // Destroy the Select All menuitem.
+@@ -1525,16 +1585,24 @@
+     }
+ 
+     // We manage the popupNode ourselves so we also need to destroy it.
+     this.doc.popupNode = null;
+ 
+     this.tooltips.destroy();
+     this.highlighters.destroy();
+ 
++    // Remove bound listeners
++    this.doc.removeEventListener("contextmenu", this._onContextMenu);
++    this.doc.removeEventListener("copy", this._onCopy);
++    this.searchField.removeEventListener("input", this._onFilterStyles);
++    this.searchClearButton.removeEventListener("click", this._onClearSearch);
++    this.searchField = null;
++    this.searchClearButton = null;
++
+     if (this.element.parentNode) {
+       this.element.parentNode.removeChild(this.element);
+     }
+ 
+     if (this._elementStyle) {
+       this._elementStyle.destroy();
+     }
+ 
+@@ -1766,27 +1834,47 @@
+    */
+   _createEditors: function() {
+     // Run through the current list of rules, attaching
+     // their editors in order.  Create editors if needed.
+     let lastInheritedSource = "";
+     let lastKeyframes = null;
+     let seenPseudoElement = false;
+     let seenNormalElement = false;
++    let seenSearchTerm = false;
+     let container = null;
++    let searchTerm = this.searchField.value.toLowerCase();
+ 
+     if (!this._elementStyle.rules) {
+       return;
+     }
+ 
++    if (this._highlightedElements.length > 0) {
++      this.clearHighlight();
++    }
++
+     for (let rule of this._elementStyle.rules) {
+       if (rule.domRule.system) {
+         continue;
+       }
+ 
++      // Initialize rule editor
++      if (!rule.editor) {
++        rule.editor = new RuleEditor(this, rule);
++      }
++
++      // Filter the rules and highlight any matches if there is a search input
++      if (searchTerm) {
++        if (this.highlightRules(rule, searchTerm)) {
++          seenSearchTerm = true;
++        } else if (rule.domRule.type !== ELEMENT_STYLE) {
++          continue;
++        }
++      }
++
+       // Only print header for this element if there are pseudo elements
+       if (seenPseudoElement && !seenNormalElement && !rule.pseudoElement) {
+         seenNormalElement = true;
+         let div = this.doc.createElementNS(HTML_NS, "div");
+         div.className = this._getRuleViewHeaderClassName();
+         div.textContent = this.selectedElementLabel;
+         this.element.appendChild(div);
+       }
+@@ -1806,26 +1894,103 @@
+       }
+ 
+       let keyframes = rule.keyframes;
+       if (keyframes && keyframes != lastKeyframes) {
+         lastKeyframes = keyframes;
+         container = this.createExpandableContainer(rule.keyframesName);
+       }
+ 
+-      if (!rule.editor) {
+-        rule.editor = new RuleEditor(this, rule);
+-      }
+-
+       if (container && (rule.pseudoElement || keyframes)) {
+         container.appendChild(rule.editor.element);
+       } else {
+         this.element.appendChild(rule.editor.element);
+       }
+     }
++
++    if (searchTerm && !seenSearchTerm) {
++      this.searchField.classList.add("devtools-style-searchbox-no-match");
++    } else {
++      this.searchField.classList.remove("devtools-style-searchbox-no-match");
++    }
++  },
++
++  /**
++   * Highlight rules that matches the given search value and returns a boolean
++   * indicating whether or not rules were highlighted.
++   *
++   * @param {Rule} aRule
++   *        The rule object we're highlighting if its rule selectors or property
++   *        values match the search value.
++   * @param {String} aValue
++   *        The search value.
++   */
++  highlightRules: function(aRule, aValue) {
++    let isHighlighted = false;
++
++    let selectorNodes = [...aRule.editor.selectorText.childNodes];
++    if (aRule.domRule.type === Ci.nsIDOMCSSRule.KEYFRAME_RULE ||
++        aRule.domRule.type === ELEMENT_STYLE) {
++      selectorNodes = [aRule.editor.selectorText];
++    }
++
++    aValue = aValue.trim();
++
++    // Highlight search matches in the rule selectors
++    for (let selectorNode of selectorNodes) {
++      if (selectorNode.textContent.toLowerCase().contains(aValue)) {
++        selectorNode.setAttribute("selected", true);
++        this._highlightedElements.push(selectorNode);
++        isHighlighted = true;
++      }
++    }
++
++    // Parse search value as a single property line and extract the property
++    // name and value. Otherwise, use the search value as both the name and
++    // value.
++    let propertyMatch = CSS_PROP_RE.exec(aValue);
++    let name = propertyMatch ? propertyMatch[1] : aValue;
++    let value = propertyMatch ? propertyMatch[2] : aValue;
++
++    // Highlight search matches in the rule properties
++    for (let textProp of aRule.textProps) {
++      // Get the actual property value displayed in the rule view
++      let propertyValue = textProp.editor.valueSpan.textContent;
++
++      // If the search value matches a property line, check if there is a exact
++      // match for the property name and value in the rule property.
++      let matchTextProperty = propertyMatch && name && value &&
++           textProp.name.toLowerCase().contains(name) &&
++           propertyValue.toLowerCase().contains(value);
++
++      // Check if there is a match for the parsed search value which only
++      // contains a property name or value
++      let matchNameOrValue = (!propertyMatch || !name || !value) &&
++        ((name && textProp.name.toLowerCase().contains(name)) ||
++         (value && propertyValue.toLowerCase().contains(value)));
++
++      if (matchTextProperty || matchNameOrValue) {
++        textProp.editor.element.setAttribute("selected", true);
++        this._highlightedElements.push(textProp.editor.element);
++        isHighlighted = true;
++      }
++    }
++
++    return isHighlighted;
++  },
++
++  /**
++   * Clear all search filter highlights in the panel.
++   */
++  clearHighlight: function() {
++    for (let element of this._highlightedElements) {
++      element.removeAttribute("selected");
++    }
++
++    this._highlightedElements = [];
+   }
+ };
+ 
+ /**
+  * Create a RuleEditor.
+  *
+  * @param {CssRuleView} aRuleView
+  *        The CssRuleView containg the document holding this rule editor.
+@@ -1935,32 +2100,16 @@
+     this.populate();
+ 
+     this.closeBrace = createChild(code, "div", {
+       class: "ruleview-ruleclose",
+       tabindex: this.isEditable ? "0" : "-1",
+       textContent: "}"
+     });
+ 
+-    this.element.addEventListener("contextmenu", event => {
+-      try {
+-        // In the sidebar we do not have this.doc.popupNode so we need to save
+-        // the node ourselves.
+-        this.doc.popupNode = event.explicitOriginalTarget;
+-        let win = this.doc.defaultView;
+-        win.focus();
+-
+-        this.ruleView._contextmenu.openPopupAtScreen(
+-          event.screenX, event.screenY, true);
+-
+-      } catch(e) {
+-        console.error(e);
+-      }
+-    }, false);
+-
+     if (this.isEditable) {
+       code.addEventListener("click", () => {
+         let selection = this.doc.defaultView.getSelection();
+         if (selection.isCollapsed) {
+           this.newProperty();
+         }
+       }, false);
+ 
+diff --git a/browser/devtools/styleinspector/ruleview.css b/browser/devtools/styleinspector/ruleview.css
+--- a/browser/devtools/styleinspector/ruleview.css
++++ b/browser/devtools/styleinspector/ruleview.css
+@@ -1,13 +1,36 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-#root {
++* {
++  box-sizing: border-box;
++}
++
++:root {
++  height: 100%;
++}
++
++body {
++  margin: 0;
++  display : flex;
++  flex-direction: column;
++  height: 100%;
++}
++
++#ruleview-container {
++  -moz-user-select: text;
++  overflow: auto;
++  min-height: 0;
++  flex: 1;
++}
++
++#root .devtools-toolbar {
++  width: 100%;
+   display: -moz-box;
+ }
+ 
+ .ruleview {
+   overflow: auto;
+   -moz-user-select: text;
+ }
+ 
+diff --git a/browser/devtools/styleinspector/style-inspector.js b/browser/devtools/styleinspector/style-inspector.js
+--- a/browser/devtools/styleinspector/style-inspector.js
++++ b/browser/devtools/styleinspector/style-inspector.js
+@@ -19,17 +19,16 @@
+ // This module doesn't currently export any symbols directly, it only
+ // registers inspector tools.
+ 
+ function RuleViewTool(inspector, window, iframe) {
+   this.inspector = inspector;
+   this.doc = window.document;
+ 
+   this.view = new RuleView.CssRuleView(inspector, this.doc);
+-  this.doc.documentElement.appendChild(this.view.element);
+ 
+   this.onLinkClicked = this.onLinkClicked.bind(this);
+   this.onSelected = this.onSelected.bind(this);
+   this.refresh = this.refresh.bind(this);
+   this.clearUserProperties = this.clearUserProperties.bind(this);
+   this.onPropertyChanged = this.onPropertyChanged.bind(this);
+   this.onViewRefreshed = this.onViewRefreshed.bind(this);
+   this.onPanelSelected = this.onPanelSelected.bind(this);
+@@ -148,18 +147,16 @@
+     this.inspector.selection.off("new-node-front", this.onSelected);
+     this.inspector.target.off("navigate", this.clearUserProperties);
+     this.inspector.sidebar.off("ruleview-selected", this.onPanelSelected);
+ 
+     this.view.element.removeEventListener("CssRuleViewCSSLinkClicked", this.onLinkClicked);
+     this.view.element.removeEventListener("CssRuleViewChanged", this.onPropertyChanged);
+     this.view.element.removeEventListener("CssRuleViewRefreshed", this.onViewRefreshed);
+ 
+-    this.doc.documentElement.removeChild(this.view.element);
+-
+     this.view.destroy();
+ 
+     this.view = this.doc = this.inspector = null;
+   }
+ };
+ 
+ function ComputedViewTool(inspector, window, iframe) {
+   this.inspector = inspector;
+diff --git a/browser/devtools/styleinspector/test/browser.ini b/browser/devtools/styleinspector/test/browser.ini
+--- a/browser/devtools/styleinspector/test/browser.ini
++++ b/browser/devtools/styleinspector/test/browser.ini
+@@ -94,16 +94,25 @@
+ [browser_ruleview_original-source-link.js]
+ [browser_ruleview_override.js]
+ [browser_ruleview_pseudo-element_01.js]
+ [browser_ruleview_pseudo-element_02.js]
+ skip-if = e10s # Bug 1090340
+ [browser_ruleview_refresh-on-attribute-change_01.js]
+ [browser_ruleview_refresh-on-attribute-change_02.js]
+ [browser_ruleview_refresh-on-style-change.js]
++[browser_ruleview_search-filter_01.js]
++[browser_ruleview_search-filter_02.js]
++[browser_ruleview_search-filter_03.js]
++[browser_ruleview_search-filter_04.js]
++[browser_ruleview_search-filter_05.js]
++[browser_ruleview_search-filter_06.js]
++[browser_ruleview_search-filter_07.js]
++[browser_ruleview_search-filter_08.js]
++[browser_ruleview_search-filter_09.js]
+ [browser_ruleview_select-and-copy-styles.js]
+ [browser_ruleview_selector-highlighter_01.js]
+ [browser_ruleview_selector-highlighter_02.js]
+ [browser_ruleview_style-editor-link.js]
+ skip-if = e10s # bug 1040670 Cannot open inline styles in viewSourceUtils
+ [browser_ruleview_urls-clickable.js]
+ [browser_ruleview_user-agent-styles.js]
+ [browser_ruleview_user-agent-styles-uneditable.js]
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_01.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_01.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_01.js
+@@ -0,0 +1,56 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly for property values.
++
++let PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    background-color: #00F;',
++  '  }',
++  '  .testclass {',
++  '    width: 100%;',
++  '  }',
++  '</style>',
++  '<div id="testid" class="testclass">Styled Node</div>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8,test rule view search filter");
++
++  info("Creating the test document");
++  content.document.body.innerHTML = PAGE_CONTENT;
++
++  info("Opening the rule-view");
++  let {toolbox, inspector, view} = yield openRuleView();
++
++  info("Selecting the test node");
++  yield selectNode("#testid", inspector);
++
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("setting filter text to \"00F\"");
++
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("rule-view-filtered");;
++  searchField.focus();
++
++  let win = ruleView.doc.defaultView;
++  EventUtils.synthesizeKey("0", {}, win);
++  EventUtils.synthesizeKey("0", {}, win);
++  EventUtils.synthesizeKey("F", {}, win);
++
++  yield onRuleViewFiltered;
++
++  info("check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(ruleView.element.children[0]._ruleEditor.rule.selectorText, "element", "First rule is inline element.");
++  is(ruleView.element.children[1]._ruleEditor.rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(ruleView.element.children[1]._ruleEditor.rule.textProps[0].editor.element.getAttribute("selected"),
++    "background-color text property is correctly highlighted.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_02.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_02.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_02.js
+@@ -0,0 +1,59 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly for property names.
++
++let PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    font-family: arial;',
++  '    background-color: #00F;',
++  '  }',
++  '  .testclass {',
++  '    width: 100%;',
++  '  }',
++  '</style>',
++  '<div id="testid" class="testclass">Styled Node</div>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8,test rule view search filter");
++
++  info("Creating the test document");
++  content.document.body.innerHTML = PAGE_CONTENT;
++
++  info("Opening the rule-view");
++  let {toolbox, inspector, view} = yield openRuleView();
++
++  info("Selecting the test node");
++  yield selectNode("#testid", inspector);
++
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("setting filter text to \"color\"");
++
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("rule-view-filtered");;
++  searchField.focus();
++
++  let win = ruleView.doc.defaultView;
++  EventUtils.synthesizeKey("c", {}, win);
++  EventUtils.synthesizeKey("o", {}, win);
++  EventUtils.synthesizeKey("l", {}, win);
++  EventUtils.synthesizeKey("o", {}, win);
++  EventUtils.synthesizeKey("r", {}, win);
++
++  yield onRuleViewFiltered;
++
++  info("check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(ruleView.element.children[0]._ruleEditor.rule.selectorText, "element", "First rule is inline element.");
++  is(ruleView.element.children[1]._ruleEditor.rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(ruleView.element.children[1]._ruleEditor.rule.textProps[1].editor.element.getAttribute("selected"),
++    "background-color text property is correctly highlighted.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_03.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_03.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_03.js
+@@ -0,0 +1,58 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly for rule selectors.
++
++let PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    background-color: #00F;',
++  '  }',
++  '  .testclass {',
++  '    width: 100%;',
++  '  }',
++  '</style>',
++  '<div id="testid" class="testclass">Styled Node</div>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8,test rule view search filter");
++
++  info("Creating the test document");
++  content.document.body.innerHTML = PAGE_CONTENT;
++
++  info("Opening the rule-view");
++  let {toolbox, inspector, view} = yield openRuleView();
++
++  info("Selecting the test node");
++  yield selectNode("#testid", inspector);
++
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("setting filter text to \"#test\"");
++
++  let searchField = ruleView.searchField;
++  let onRuleViewFilter = inspector.once("rule-view-filtered");;
++  searchField.focus();
++
++  let win = ruleView.doc.defaultView;
++  EventUtils.synthesizeKey("#", {}, win);
++  EventUtils.synthesizeKey("t", {}, win);
++  EventUtils.synthesizeKey("e", {}, win);
++  EventUtils.synthesizeKey("s", {}, win);
++  EventUtils.synthesizeKey("t", {}, win);
++
++  yield onRuleViewFilter;
++
++  info("check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(ruleView.element.children[0]._ruleEditor.rule.selectorText, "element", "First rule is inline element.");
++  is(ruleView.element.children[1]._ruleEditor.rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(ruleView.element.children[1]._ruleEditor.selectorText.children[0].getAttribute("selected"),
++    "#testid selector is highlighted.")
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_04.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_04.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_04.js
+@@ -0,0 +1,42 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly for keyframe rule selectors.
++
++const TEST_URI = TEST_URL_ROOT + "doc_keyframeanimation.html";
++
++add_task(function*() {
++  yield addTab(TEST_URI);
++
++  info("Opening the rule-view");
++  let {toolbox, inspector, view} = yield openRuleView();
++
++  info("Selecting the test node");
++  yield selectNode("#boxy", inspector);
++
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("setting filter text to \"20%\"");
++
++  let searchField = ruleView.searchField;
++  let onRuleViewFilter = inspector.once("rule-view-filtered");;
++  searchField.focus();
++
++  let win = ruleView.doc.defaultView;
++  EventUtils.synthesizeKey("2", {}, win);
++  EventUtils.synthesizeKey("0", {}, win);
++  EventUtils.synthesizeKey("%", {}, win);
++
++  yield onRuleViewFilter;
++
++  info("check that the correct rules are visible");
++  is(ruleView.element.children[0]._ruleEditor.rule.selectorText, "element", "First rule is inline element.");
++  is(ruleView.element.children[2].children[0]._ruleEditor.rule.domRule.keyText, "20%", "Second rule is 20%.");
++  ok(ruleView.element.children[2].children[0]._ruleEditor.selectorText.getAttribute("selected"),
++    "20% selector is highlighted.")
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_05.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_05.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_05.js
+@@ -0,0 +1,57 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly for multiple rule selectors.
++
++let PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  html, body, div {',
++  '    background-color: #00F;',
++  '  }',
++  '  .testclass {',
++  '    width: 100%;',
++  '  }',
++  '</style>',
++  '<div id="testid" class="testclass">Styled Node</div>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8,test rule view search filter");
++
++  info("Creating the test document");
++  content.document.body.innerHTML = PAGE_CONTENT;
++
++  info("Opening the rule-view");
++  let {toolbox, inspector, view} = yield openRuleView();
++
++  info("Selecting the test node");
++  yield selectNode("#testid", inspector);
++
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("setting filter text to \"body\"");
++
++  let searchField = ruleView.searchField;
++  let onRuleViewFilter = inspector.once("rule-view-filtered");;
++  searchField.focus();
++
++  let win = ruleView.doc.defaultView;
++  EventUtils.synthesizeKey("b", {}, win);
++  EventUtils.synthesizeKey("o", {}, win);
++  EventUtils.synthesizeKey("d", {}, win);
++  EventUtils.synthesizeKey("y", {}, win);
++
++  yield onRuleViewFilter;
++
++  info("check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(ruleView.element.children[0]._ruleEditor.rule.selectorText, "element", "First rule is inline element.");
++  is(ruleView.element.children[1]._ruleEditor.rule.selectorText, "html, body, div", "Second rule is html, body, div.");
++  ok(ruleView.element.children[1]._ruleEditor.selectorText.children[2].getAttribute("selected"),
++    "body selector is highlighted.")
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_06.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_06.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_06.js
+@@ -0,0 +1,74 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly for property line input.
++
++let PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    background-color: #FFF;',
++  '  }',
++  '  .testclass {',
++  '    background-color: #00F;',
++  '  }',
++  '</style>',
++  '<div id="testid" class="testclass">Styled Node</div>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8,test rule view search filter");
++
++  info("Creating the test document");
++  content.document.body.innerHTML = PAGE_CONTENT;
++
++  info("Opening the rule-view");
++  let {toolbox, inspector, view} = yield openRuleView();
++
++  info("Selecting the test node");
++  yield selectNode("#testid", inspector);
++
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("setting filter text to \"background-color:#00F\"");
++
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("rule-view-filtered");;
++  searchField.focus();
++
++  let win = ruleView.doc.defaultView;
++  EventUtils.synthesizeKey("b", {}, win);
++  EventUtils.synthesizeKey("a", {}, win);
++  EventUtils.synthesizeKey("c", {}, win);
++  EventUtils.synthesizeKey("k", {}, win);
++  EventUtils.synthesizeKey("g", {}, win);
++  EventUtils.synthesizeKey("r", {}, win);
++  EventUtils.synthesizeKey("o", {}, win);
++  EventUtils.synthesizeKey("u", {}, win);
++  EventUtils.synthesizeKey("n", {}, win);
++  EventUtils.synthesizeKey("d", {}, win);
++  EventUtils.synthesizeKey("-", {}, win);
++  EventUtils.synthesizeKey("c", {}, win);
++  EventUtils.synthesizeKey("o", {}, win);
++  EventUtils.synthesizeKey("l", {}, win);
++  EventUtils.synthesizeKey("o", {}, win);
++  EventUtils.synthesizeKey("r", {}, win);
++  EventUtils.synthesizeKey(":", {}, win);
++  EventUtils.synthesizeKey("#", {}, win);
++  EventUtils.synthesizeKey("0", {}, win);
++  EventUtils.synthesizeKey("0", {}, win);
++  EventUtils.synthesizeKey("F", {}, win);
++
++  yield onRuleViewFiltered;
++
++  info("check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(ruleView.element.children[0]._ruleEditor.rule.selectorText, "element", "First rule is inline element.");
++  is(ruleView.element.children[1]._ruleEditor.rule.selectorText, ".testclass", "Second rule is .testclass.");
++  ok(ruleView.element.children[1]._ruleEditor.rule.textProps[0].editor.element.getAttribute("selected"),
++    "background-color text property is correctly highlighted.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_07.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_07.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_07.js
+@@ -0,0 +1,57 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly for parsed property value.
++
++let PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    background-color: #00F;',
++  '  }',
++  '  .testclass {',
++  '    width: 100%;',
++  '  }',
++  '</style>',
++  '<div id="testid" class="testclass">Styled Node</div>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8,test rule view search filter");
++
++  info("Creating the test document");
++  content.document.body.innerHTML = PAGE_CONTENT;
++
++  info("Opening the rule-view");
++  let {toolbox, inspector, view} = yield openRuleView();
++
++  info("Selecting the test node");
++  yield selectNode("#testid", inspector);
++
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("setting filter text to \":00F\"");
++
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("rule-view-filtered");;
++  searchField.focus();
++
++  let win = ruleView.doc.defaultView;
++  EventUtils.synthesizeKey(":", {}, win);
++  EventUtils.synthesizeKey("0", {}, win);
++  EventUtils.synthesizeKey("0", {}, win);
++  EventUtils.synthesizeKey("F", {}, win);
++
++  yield onRuleViewFiltered;
++
++  info("check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(ruleView.element.children[0]._ruleEditor.rule.selectorText, "element", "First rule is inline element.");
++  is(ruleView.element.children[1]._ruleEditor.rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(ruleView.element.children[1]._ruleEditor.rule.textProps[0].editor.element.getAttribute("selected"),
++    "background-color text property is correctly highlighted.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_08.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_08.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_08.js
+@@ -0,0 +1,64 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly for parsed property name.
++
++let PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    background-color: #00F;',
++  '  }',
++  '  .testclass {',
++  '    width: 100%;',
++  '  }',
++  '</style>',
++  '<div id="testid" class="testclass">Styled Node</div>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8,test rule view search filter");
++
++  info("Creating the test document");
++  content.document.body.innerHTML = PAGE_CONTENT;
++
++  info("Opening the rule-view");
++  let {toolbox, inspector, view} = yield openRuleView();
++
++  info("Selecting the test node");
++  yield selectNode("#testid", inspector);
++
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("setting filter text to \"background:\"");
++
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("rule-view-filtered");;
++  searchField.focus();
++
++  let win = ruleView.doc.defaultView;
++  EventUtils.synthesizeKey("b", {}, win);
++  EventUtils.synthesizeKey("a", {}, win);
++  EventUtils.synthesizeKey("c", {}, win);
++  EventUtils.synthesizeKey("k", {}, win);
++  EventUtils.synthesizeKey("g", {}, win);
++  EventUtils.synthesizeKey("r", {}, win);
++  EventUtils.synthesizeKey("o", {}, win);
++  EventUtils.synthesizeKey("u", {}, win);
++  EventUtils.synthesizeKey("n", {}, win);
++  EventUtils.synthesizeKey("d", {}, win);
++  EventUtils.synthesizeKey(":", {}, win);
++
++  yield onRuleViewFiltered;
++
++  info("check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(ruleView.element.children[0]._ruleEditor.rule.selectorText, "element", "First rule is inline element.");
++  is(ruleView.element.children[1]._ruleEditor.rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(ruleView.element.children[1]._ruleEditor.rule.textProps[0].editor.element.getAttribute("selected"),
++    "background-color text property is correctly highlighted.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_09.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_09.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_09.js
+@@ -0,0 +1,54 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly for inline styles.
++
++let PAGE_CONTENT = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    width: 100%;',
++  '  }',
++  '</style>',
++  '<div id="testid" style="background-color:aliceblue">Styled Node</div>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8,test rule view search filter");
++
++  info("Creating the test document");
++  content.document.body.innerHTML = PAGE_CONTENT;
++
++  info("Opening the rule-view");
++  let {toolbox, inspector, view} = yield openRuleView();
++
++  info("Selecting the test node");
++  yield selectNode("#testid", inspector);
++
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("setting filter text to \"color\"");
++
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("rule-view-filtered");;
++  searchField.focus();
++
++  let win = ruleView.doc.defaultView;
++  EventUtils.synthesizeKey("c", {}, win);
++  EventUtils.synthesizeKey("o", {}, win);
++  EventUtils.synthesizeKey("l", {}, win);
++  EventUtils.synthesizeKey("o", {}, win);
++  EventUtils.synthesizeKey("r", {}, win);
++
++  yield onRuleViewFiltered;
++
++  info("check that the correct rules are visible");
++  is(ruleView.element.children.length, 1, "Should have 1 rule.");
++  is(ruleView.element.children[0]._ruleEditor.rule.selectorText, "element", "First rule is inline element.");
++  ok(ruleView.element.children[0]._ruleEditor.rule.textProps[0].editor.element.getAttribute("selected"),
++    "background-color text property is correctly highlighted.");
++}
+diff --git a/browser/locales/en-US/chrome/browser/devtools/styleinspector.dtd b/browser/locales/en-US/chrome/browser/devtools/styleinspector.dtd
+--- a/browser/locales/en-US/chrome/browser/devtools/styleinspector.dtd
++++ b/browser/locales/en-US/chrome/browser/devtools/styleinspector.dtd
+@@ -10,17 +10,17 @@
+ 
+ <!-- LOCALIZATION NOTE (browserStylesLabel): This is the label for the checkbox
+   -  that specifies whether the styles that are not from the user's stylesheet
+   -  should be displayed or not. -->
+ <!ENTITY browserStylesLabel    "Browser styles">
+ 
+ <!-- LOCALIZATION NOTE (userStylesSearch): This is the placeholder that goes in
+   -  the search box when no search term has been entered. -->
+-<!ENTITY userStylesSearch      "Search">
++<!ENTITY userStylesSearch      "Filter Styles">
+ 
+ <!-- LOCALIZATION NOTE (selectedElementLabel): This is the label for the path of
+   -  the highlighted element in the web page. This path is based on the document
+   -  tree. -->
+ <!ENTITY selectedElementLabel  "Selected element:">
+ 
+ <!-- LOCALIZATION NOTE (noPropertiesFound): In the case where there are no CSS
+   -  properties to display e.g. due to search criteria this message is
+diff --git a/browser/themes/linux/jar.mn b/browser/themes/linux/jar.mn
+--- a/browser/themes/linux/jar.mn
++++ b/browser/themes/linux/jar.mn
+@@ -393,16 +393,19 @@
+   skin/classic/browser/devtools/app-manager/error.svg                 (../shared/devtools/app-manager/images/error.svg)
+   skin/classic/browser/devtools/app-manager/plus.svg                  (../shared/devtools/app-manager/images/plus.svg)
+   skin/classic/browser/devtools/app-manager/remove.svg                (../shared/devtools/app-manager/images/remove.svg)
+   skin/classic/browser/devtools/app-manager/add.svg                   (../shared/devtools/app-manager/images/add.svg)
+   skin/classic/browser/devtools/app-manager/index-icons.svg           (../shared/devtools/app-manager/images/index-icons.svg)
+   skin/classic/browser/devtools/app-manager/rocket.svg                (../shared/devtools/app-manager/images/rocket.svg)
+   skin/classic/browser/devtools/app-manager/noise.png                 (../shared/devtools/app-manager/images/noise.png)
+   skin/classic/browser/devtools/app-manager/default-app-icon.png      (../shared/devtools/app-manager/images/default-app-icon.png)
++  skin/classic/browser/devtools/search-clear-failed.svg               (../shared/devtools/images/search-clear-failed.svg)
++  skin/classic/browser/devtools/search-clear-light.svg                (../shared/devtools/images/search-clear-light.svg)
++  skin/classic/browser/devtools/search-clear-dark.svg                 (../shared/devtools/images/search-clear-dark.svg)
+ #ifdef MOZ_SERVICES_SYNC
+   skin/classic/browser/sync-16.png
+   skin/classic/browser/sync-32.png
+   skin/classic/browser/sync-bg.png
+   skin/classic/browser/sync-128.png
+   skin/classic/browser/sync-desktopIcon.png
+   skin/classic/browser/sync-horizontalbar.png
+   skin/classic/browser/sync-mobileIcon.png
+diff --git a/browser/themes/osx/jar.mn b/browser/themes/osx/jar.mn
+--- a/browser/themes/osx/jar.mn
++++ b/browser/themes/osx/jar.mn
+@@ -524,17 +524,19 @@
+   skin/classic/browser/devtools/app-manager/error.svg                 (../shared/devtools/app-manager/images/error.svg)
+   skin/classic/browser/devtools/app-manager/plus.svg                  (../shared/devtools/app-manager/images/plus.svg)
+   skin/classic/browser/devtools/app-manager/remove.svg                (../shared/devtools/app-manager/images/remove.svg)
+   skin/classic/browser/devtools/app-manager/add.svg                   (../shared/devtools/app-manager/images/add.svg)
+   skin/classic/browser/devtools/app-manager/index-icons.svg           (../shared/devtools/app-manager/images/index-icons.svg)
+   skin/classic/browser/devtools/app-manager/rocket.svg                (../shared/devtools/app-manager/images/rocket.svg)
+   skin/classic/browser/devtools/app-manager/noise.png                 (../shared/devtools/app-manager/images/noise.png)
+   skin/classic/browser/devtools/app-manager/default-app-icon.png      (../shared/devtools/app-manager/images/default-app-icon.png)
+-
++  skin/classic/browser/devtools/search-clear-failed.svg               (../shared/devtools/images/search-clear-failed.svg)
++  skin/classic/browser/devtools/search-clear-light.svg                (../shared/devtools/images/search-clear-light.svg)
++  skin/classic/browser/devtools/search-clear-dark.svg                 (../shared/devtools/images/search-clear-dark.svg)
+ #ifdef MOZ_SERVICES_SYNC
+   skin/classic/browser/sync-16.png
+   skin/classic/browser/sync-32.png
+   skin/classic/browser/sync-bg.png
+   skin/classic/browser/sync-128.png
+   skin/classic/browser/sync-desktopIcon.png
+   skin/classic/browser/sync-horizontalbar.png
+   skin/classic/browser/sync-horizontalbar@2x.png
+diff --git a/browser/themes/shared/devtools/computedview.css b/browser/themes/shared/devtools/computedview.css
+--- a/browser/themes/shared/devtools/computedview.css
++++ b/browser/themes/shared/devtools/computedview.css
+@@ -148,17 +148,16 @@
+ }
+ 
+ .legendKey {
+   margin: 0 5px;
+ }
+ 
+ #root .devtools-toolbar {
+   width: 100%;
+-  border-bottom-width: 0;
+ }
+ 
+ .link {
+   padding: 0 3px;
+   cursor: pointer;
+   float: right;
+ }
+ 
+diff --git a/browser/themes/shared/devtools/images/search-clear-dark.svg b/browser/themes/shared/devtools/images/search-clear-dark.svg
+new file mode 100644
+--- /dev/null
++++ b/browser/themes/shared/devtools/images/search-clear-dark.svg
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<svg xmlns="http://www.w3.org/2000/svg"
++     xmlns:xlink="http://www.w3.org/1999/xlink"
++     x="0"
++     y="0"
++     width="32"
++     height="16"
++     viewBox="0 0 32 16">
++  <defs>
++    <path id="glyphShape-clear" d="M8,0C3.6,0,0,3.6,0,8c0,4.4,3.6,8,8,8s8-3.6,8-8C16,3.6,12.4,0,8,0 z M11.9,10.5l-1.4,1.4L8,9.4l-2.4,2.4l-1.4-1.4L6.6,8L4.2,5.6l1.4-1.4L8,6.6l2.4-2.4l1.4,1.4L9.4,8L11.9,10.5z"/>
++    <style type="text/css">
++      .icon-state-default { fill: #f5f7fa; fill-opacity: .6; }
++      .icon-state-pressed { fill: #7d7e80; fill-opacity: .8; }
++    </style>
++  </defs>
++  <use xlink:href="#glyphShape-clear" class="icon-state-default" />
++  <use xlink:href="#glyphShape-clear" class="icon-state-pressed" transform="translate(16)" />
++</svg>
+diff --git a/browser/themes/shared/devtools/images/search-clear-failed.svg b/browser/themes/shared/devtools/images/search-clear-failed.svg
+new file mode 100644
+--- /dev/null
++++ b/browser/themes/shared/devtools/images/search-clear-failed.svg
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<svg xmlns="http://www.w3.org/2000/svg"
++     xmlns:xlink="http://www.w3.org/1999/xlink"
++     x="0"
++     y="0"
++     width="32"
++     height="16"
++     viewBox="0 0 32 16">
++  <defs>
++    <path id="glyphShape-clear" d="M8,0C3.6,0,0,3.6,0,8c0,4.4,3.6,8,8,8s8-3.6,8-8C16,3.6,12.4,0,8,0 z M11.9,10.5l-1.4,1.4L8,9.4l-2.4,2.4l-1.4-1.4L6.6,8L4.2,5.6l1.4-1.4L8,6.6l2.4-2.4l1.4,1.4L9.4,8L11.9,10.5z"/>
++    <style type="text/css">
++      .icon-state-default { fill: #cc3d3d; fill-opacity: 1; }
++      .icon-state-pressed { fill: #802d2d; fill-opacity: 1; }
++    </style>
++  </defs>
++  <use xlink:href="#glyphShape-clear" class="icon-state-default" />
++  <use xlink:href="#glyphShape-clear" class="icon-state-pressed" transform="translate(16)" />
++</svg>
+diff --git a/browser/themes/shared/devtools/images/search-clear-light.svg b/browser/themes/shared/devtools/images/search-clear-light.svg
+new file mode 100644
+--- /dev/null
++++ b/browser/themes/shared/devtools/images/search-clear-light.svg
+@@ -0,0 +1,21 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<svg xmlns="http://www.w3.org/2000/svg"
++     xmlns:xlink="http://www.w3.org/1999/xlink"
++     x="0"
++     y="0"
++     width="32"
++     height="16"
++     viewBox="0 0 32 16">
++  <defs>
++    <path id="glyphShape-clear" d="M8,0C3.6,0,0,3.6,0,8c0,4.4,3.6,8,8,8s8-3.6,8-8C16,3.6,12.4,0,8,0 z M11.9,10.5l-1.4,1.4L8,9.4l-2.4,2.4l-1.4-1.4L6.6,8L4.2,5.6l1.4-1.4L8,6.6l2.4-2.4l1.4,1.4L9.4,8L11.9,10.5z"/>
++    <style type="text/css">
++      .icon-state-default { fill: #1d2126; fill-opacity: .5; }
++      .icon-state-pressed { fill: #1d2126; fill-opacity: .8; }
++    </style>
++  </defs>
++  <use xlink:href="#glyphShape-clear" class="icon-state-default" />
++  <use xlink:href="#glyphShape-clear" class="icon-state-pressed" transform="translate(16)" />
++</svg>
+diff --git a/browser/themes/shared/devtools/ruleview.css b/browser/themes/shared/devtools/ruleview.css
+--- a/browser/themes/shared/devtools/ruleview.css
++++ b/browser/themes/shared/devtools/ruleview.css
+@@ -1,12 +1,21 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
++/* CSS Variables specific to this panel that aren't defined by the themes */
++.theme-light {
++  --rule-highlight-background-color: #ffee99;
++}
++
++.theme-dark {
++  --rule-highlight-background-color: #594724;
++}
++
+ .ruleview {
+   height: 100%;
+ }
+ 
+ .ruleview-rule-source {
+   -moz-padding-start: 5px;
+   text-align: end;
+   float: right;
+@@ -210,16 +219,22 @@
+ .ruleview-property  > * {
+   vertical-align: middle;
+ }
+ 
+ .ruleview-property[dirty] {
+   border-left-color: var(--theme-highlight-green);
+ }
+ 
++.ruleview-property[selected],
++.ruleview-selector[selected],
++.ruleview-selector > span[selected] {
++  background-color: var(--rule-highlight-background-color);
++}
++
+ .ruleview-namecontainer > .ruleview-propertyname,
+ .ruleview-propertycontainer > .ruleview-propertyvalue {
+   border-bottom: 1px dashed transparent;
+ }
+ 
+ .ruleview-namecontainer:hover > .ruleview-propertyname,
+ .ruleview-propertycontainer:hover > .ruleview-propertyvalue {
+   border-bottom-color: hsl(0,0%,50%);
+diff --git a/browser/themes/shared/devtools/toolbars.inc.css b/browser/themes/shared/devtools/toolbars.inc.css
+--- a/browser/themes/shared/devtools/toolbars.inc.css
++++ b/browser/themes/shared/devtools/toolbars.inc.css
+@@ -4,16 +4,31 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ %endif
+ %filter substitution
+ %define smallSeparatorDark linear-gradient(transparent 15%, #5a6169 15%, #5a6169 85%, transparent 85%)
+ %define smallSeparatorLight linear-gradient(transparent 15%, #aaa 15%, #aaa 85%, transparent 85%)
+ %define solidSeparatorDark linear-gradient(#2d5b7d, #2d5b7d)
+ %define solidSeparatorLight linear-gradient(#aaa, #aaa)
+ 
++/* CSS Variables specific to the devtools toolbar that aren't defined by the themes */
++.theme-light {
++  --searchbox-background-color: #ffee99;
++  --searchbox-border-color: #ffbf00;
++  --searcbox-no-match-background-color: #ffe5e5;
++  --searcbox-no-match-border-color: #e52e2e;
++}
++
++.theme-dark {
++  --searchbox-background-color: #4d4222;
++  --searchbox-border-color: #d99f2b;
++  --searcbox-no-match-background-color: #402325;
++  --searcbox-no-match-border-color: #cc3d3d;
++}
++
+ /* Toolbars */
+ .devtools-toolbar,
+ .devtools-sidebar-tabs tabs,
+ .devtools-sidebar-alltabs {
+   -moz-appearance: none;
+   padding: 0;
+   border-width: 0;
+   border-bottom-width: 1px;
+@@ -322,53 +337,114 @@
+   border-color: var(--theme-splitter-color);
+ }
+ 
+ .devtools-searchinput {
+   margin-top: 1px;
+   margin-bottom: 1px;
+   padding: 0;
+   -moz-padding-start: 22px;
+-  -moz-padding-end: 12px;
++  -moz-padding-end: 4px;
+   background-position: 8px center;
+   background-size: 11px 11px;
+   background-repeat: no-repeat;
+   font-size: inherit;
+ }
+ 
+ .theme-dark .devtools-searchinput {
+   background-image: url(magnifying-glass.png);
+ }
+ 
+ .theme-light .devtools-searchinput {
+   background-image: url(magnifying-glass-light.png);
+ }
+ 
++.devtools-searchinput:-moz-locale-dir(rtl) {
++  background-position: calc(100% - 8px) center;
++}
++
++.devtools-searchinput > .textbox-input-box > .textbox-search-icons > .textbox-search-icon {
++  visibility: hidden;
++}
++
++.devtools-rule-searchbox {
++  -moz-box-flex: 1;
++  padding-right: 23px;
++  width: 100%;
++  font: inherit;
++}
++
++.devtools-rule-searchbox[filled] {
++  background-color: var(--searchbox-background-color);
++  border-color: var(--searchbox-border-color);
++}
++
++.devtools-style-searchbox-no-match {
++  background-color: var(--searcbox-no-match-background-color) !important;
++  border-color: var(--searcbox-no-match-border-color) !important;
++}
++
++.devtools-no-search-result {
++  border-color: var(--theme-highlight-red) !important;
++}
++
++.devtools-searchinput-clear {
++  position: absolute;
++  top: 3.5px;
++  right: 11px;
++  padding: 0;
++  border: 0;
++  width: 16px;
++  height: 16px;
++  background-position: 0 0;
++  background-repeat: no-repeat;
++  background-color: transparent;
++  display: none;
++}
++
++.theme-dark .devtools-searchinput-clear {
++  background-image: url("chrome://browser/skin/devtools/search-clear-dark.svg");
++}
++
++.theme-light .devtools-searchinput-clear {
++  background-image: url("chrome://browser/skin/devtools/search-clear-light.svg");
++}
++
++.devtools-style-searchbox-no-match + .devtools-searchinput-clear {
++  background-image: url("chrome://browser/skin/devtools/search-clear-failed.svg") !important;
++}
++
++.devtools-searchinput-clear:hover {
++  background-position: -16px 0;
++}
++
++.theme-dark .devtools-searchinput > .textbox-input-box > .textbox-search-icons > .textbox-search-clear {
++  list-style-image: url("chrome://browser/skin/devtools/search-clear-dark.svg");
++  -moz-image-region: rect(0, 16px, 16px, 0);
++}
++
++.theme-light .devtools-searchinput > .textbox-input-box > .textbox-search-icons > .textbox-search-clear {
++  list-style-image: url("chrome://browser/skin/devtools/search-clear-light.svg");
++  -moz-image-region: rect(0, 16px, 16px, 0);
++}
++
++.devtools-searchinput > .textbox-input-box > .textbox-search-icons > .textbox-search-clear:hover {
++  -moz-image-region: rect(0, 32px, 16px, 16px);
++}
++
+ @media (min-resolution: 2dppx) {
+   .theme-dark .devtools-searchinput {
+     background-image: url(magnifying-glass@2x.png);
+   }
+ 
+   .theme-light .devtools-searchinput {
+     background-image: url(magnifying-glass-light@2x.png);
+   }
+ }
+ 
+-.devtools-searchinput:-moz-locale-dir(rtl) {
+-  background-position: calc(100% - 8px) center;
+-}
+-
+-.devtools-searchinput > .textbox-input-box > .textbox-search-icons {
+-  display: none;
+-}
+-
+-.devtools-no-search-result {
+-  border-color: var(--theme-highlight-red) !important;
+-}
+-
+ /* Close button */
+ 
+ .devtools-closebutton {
+   -moz-appearance: none;
+   border: none;
+   margin: 0 4px;
+   min-width: 16px;
+   width: 16px;
+diff --git a/browser/themes/windows/jar.mn b/browser/themes/windows/jar.mn
+--- a/browser/themes/windows/jar.mn
++++ b/browser/themes/windows/jar.mn
+@@ -430,17 +430,19 @@
+         skin/classic/browser/devtools/app-manager/error.svg                 (../shared/devtools/app-manager/images/error.svg)
+         skin/classic/browser/devtools/app-manager/plus.svg                  (../shared/devtools/app-manager/images/plus.svg)
+         skin/classic/browser/devtools/app-manager/remove.svg                (../shared/devtools/app-manager/images/remove.svg)
+         skin/classic/browser/devtools/app-manager/add.svg                   (../shared/devtools/app-manager/images/add.svg)
+         skin/classic/browser/devtools/app-manager/index-icons.svg           (../shared/devtools/app-manager/images/index-icons.svg)
+         skin/classic/browser/devtools/app-manager/rocket.svg                (../shared/devtools/app-manager/images/rocket.svg)
+         skin/classic/browser/devtools/app-manager/noise.png                 (../shared/devtools/app-manager/images/noise.png)
+         skin/classic/browser/devtools/app-manager/default-app-icon.png      (../shared/devtools/app-manager/images/default-app-icon.png)
+-
++        skin/classic/browser/devtools/search-clear-failed.svg               (../shared/devtools/images/search-clear-failed.svg)
++        skin/classic/browser/devtools/search-clear-light.svg                (../shared/devtools/images/search-clear-light.svg)
++        skin/classic/browser/devtools/search-clear-dark.svg                 (../shared/devtools/images/search-clear-dark.svg)
+ #ifdef MOZ_SERVICES_SYNC
+         skin/classic/browser/sync-16.png
+         skin/classic/browser/sync-32.png
+         skin/classic/browser/sync-128.png
+         skin/classic/browser/sync-bg.png
+         skin/classic/browser/sync-desktopIcon.png
+         skin/classic/browser/sync-horizontalbar.png
+         skin/classic/browser/sync-horizontalbar-XPVista7.png
+@@ -906,16 +908,19 @@
+         skin/classic/aero/browser/devtools/app-manager/error.svg                 (../shared/devtools/app-manager/images/error.svg)
+         skin/classic/aero/browser/devtools/app-manager/plus.svg                  (../shared/devtools/app-manager/images/plus.svg)
+         skin/classic/aero/browser/devtools/app-manager/remove.svg                (../shared/devtools/app-manager/images/remove.svg)
+         skin/classic/aero/browser/devtools/app-manager/add.svg                   (../shared/devtools/app-manager/images/add.svg)
+         skin/classic/aero/browser/devtools/app-manager/index-icons.svg           (../shared/devtools/app-manager/images/index-icons.svg)
+         skin/classic/aero/browser/devtools/app-manager/rocket.svg                (../shared/devtools/app-manager/images/rocket.svg)
+         skin/classic/aero/browser/devtools/app-manager/noise.png                 (../shared/devtools/app-manager/images/noise.png)
+         skin/classic/aero/browser/devtools/app-manager/default-app-icon.png      (../shared/devtools/app-manager/images/default-app-icon.png)
++        skin/classic/aero/browser/devtools/search-clear-failed.svg               (../shared/devtools/images/search-clear-failed.svg)
++        skin/classic/aero/browser/devtools/search-clear-light.svg                (../shared/devtools/images/search-clear-light.svg)
++        skin/classic/aero/browser/devtools/search-clear-dark.svg                 (../shared/devtools/images/search-clear-dark.svg)
+ #ifdef MOZ_SERVICES_SYNC
+         skin/classic/aero/browser/sync-16.png
+         skin/classic/aero/browser/sync-32.png
+         skin/classic/aero/browser/sync-128.png
+         skin/classic/aero/browser/sync-bg.png
+         skin/classic/aero/browser/sync-desktopIcon.png
+         skin/classic/aero/browser/sync-horizontalbar.png
+         skin/classic/aero/browser/sync-horizontalbar-XPVista7.png
