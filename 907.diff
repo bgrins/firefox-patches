@@ -1,6 +1,9 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  a46e0f1e5f17ba6f7f41e03e832af983c63dc91c
+# Date 1428448436 25200
+#      Tue Apr 07 16:13:56 2015 -0700
+# Node ID 5848128e0ba14869f7ad7e455ca71fe7ef6fc6fc
+# Parent  2fc73b49bbc079186930c26de1cac3bd9e154bca
 Bug 1150215 - Add devtools test for talos
 
 diff --git a/talos/page_load_test/devtools/addon/chrome.manifest b/talos/page_load_test/devtools/addon/chrome.manifest
@@ -8,8 +11,8 @@ new file mode 100644
 --- /dev/null
 +++ b/talos/page_load_test/devtools/addon/chrome.manifest
 @@ -0,0 +1,2 @@
-+content devtools content/
-+overlay chrome://browser/content/browser.xul chrome://devtools/content/devtools.overlay.xul
++content damp content/
++overlay chrome://browser/content/browser.xul chrome://damp/content/damp.overlay.xul
 diff --git a/talos/page_load_test/devtools/addon/content/Profiler.js b/talos/page_load_test/devtools/addon/content/Profiler.js
 new file mode 100644
 --- /dev/null
@@ -23,6 +26,146 @@ new file mode 100644
 +//         - talos/scripts/Profiler.js
 +//         - talos/pageloader/chrome/Profiler.js
 +//         - talos/page_load_test/devtools/addon/content/Profiler.js
++//         - talos/page_load_test/tart/addon/content/Profiler.js
++//         - talos/startup_test/tresize/addon/content/Profiler.js
++//
++//  - Please keep these copies in sync.
++//  - Please make sure your changes apply cleanly to all use cases.
++
++// Finer grained profiler control
++//
++// Use this object to pause and resume the profiler so that it only profiles the
++// relevant parts of our tests.
++var Profiler;
++
++(function(){
++  var _profiler;
++
++  // If this script is loaded in a framescript context, there won't be a
++  // document object, so just use a fallback value in that case.
++  var test_name = this.document ? this.document.location.pathname : "unknown";
++
++  // Whether Profiler has been initialized. Until that happens, most calls
++  // will be ignored.
++  var enabled = false;
++
++  // The subtest name that beginTest() was called with.
++  var currentTest = "";
++
++  // Profiling settings.
++  var profiler_interval, profiler_entries, profiler_threadsArray, profiler_dir;
++
++  try {
++    // Outside of talos, this throws a security exception which no-op this file.
++    // (It's not required nor allowed for addons since Firefox 17)
++    // It's used inside talos from non-privileged pages (like during tscroll),
++    // and it works because talos disables all/most security measures.
++    netscape.security.PrivilegeManager.enablePrivilege('UniversalXPConnect');
++  } catch (e) {}
++
++  try {
++    _profiler = Components.classes["@mozilla.org/tools/profiler;1"].getService(Components.interfaces.nsIProfiler);
++  } catch (ex) { (typeof(dumpLog) == "undefined" ? dump : dumpLog)(ex + "\n"); }
++
++  // Parses an url query string into a JS object.
++  function searchToObject(locationSearch) {
++    var pairs = locationSearch.substring(1).split("&");
++    var result = {};
++
++    for (var i in pairs) {
++      if (pairs[i] !== "") {
++        var pair = pairs[i].split("=");
++        result[decodeURIComponent(pair[0])] = decodeURIComponent(pair[1] || "");
++      }
++    }
++
++    return result;
++  }
++
++  Profiler = {
++    /**
++     * Initialize the profiler using profiler settings supplied in a JS object.
++     * The following properties on the object are respected:
++     *  - sps_profile_interval
++     *  - sps_profile_entries
++     *  - sps_profile_threads
++     *  - sps_profile_dir
++     */
++    initFromObject: function Profiler__initFromObject (obj) {
++      if (obj &&
++          ("sps_profile_dir" in obj) && typeof obj.sps_profile_dir == "string" &&
++          ("sps_profile_interval" in obj) && Number.isFinite(obj.sps_profile_interval * 1) &&
++          ("sps_profile_entries" in obj) && Number.isFinite(obj.sps_profile_entries * 1) &&
++          ("sps_profile_threads" in obj) && typeof obj.sps_profile_threads == "string") {
++        profiler_interval = obj.sps_profile_interval;
++        profiler_entries = obj.sps_profile_entries;
++        profiler_threadsArray = obj.sps_profile_threads.split(",");
++        profiler_dir = obj.sps_profile_dir;
++        enabled = true;
++      }
++    },
++    initFromURLQueryParams: function Profiler__initFromURLQueryParams (locationSearch) {
++      this.initFromObject(searchToObject(locationSearch));
++    },
++    beginTest: function Profiler__beginTest (testName) {
++      currentTest = testName;
++      if (_profiler && enabled) {
++        _profiler.StartProfiler(profiler_entries, profiler_interval,
++                                ["js", "leaf", "stackwalk", "threads"], 4,
++                                profiler_threadsArray, profiler_threadsArray.length);
++        if (_profiler.PauseSampling) {
++          _profiler.PauseSampling();
++        }
++      }
++    },
++    finishTest: function Profiler__finishTest () {
++      if (_profiler && enabled) {
++        _profiler.dumpProfileToFile(profiler_dir + "/" + currentTest + ".sps");
++        _profiler.StopProfiler();
++      }
++    },
++    finishStartupProfiling: function Profiler__finishStartupProfiling () {
++      if (_profiler && enabled) {
++        _profiler.dumpProfileToFile(profiler_dir + "/startup.sps");
++        _profiler.StopProfiler();
++      }
++    },
++    resume: function Profiler__resume (name, explicit) {
++      if (_profiler) {
++        if (_profiler.ResumeSampling) {
++          _profiler.ResumeSampling();
++        }
++        _profiler.AddMarker(explicit ? name : 'Start of test "' + (name || test_name) + '"');
++      }
++    },
++    pause: function Profiler__pause (name, explicit) {
++      if (_profiler) {
++        if (_profiler.PauseSampling) {
++          _profiler.PauseSampling();
++        }
++        _profiler.AddMarker(explicit ? name : 'End of test "' + (name || test_name) + '"');
++      }
++    },
++    mark: function Profiler__mark (marker, explicit) {
++      if (_profiler) {
++        _profiler.AddMarker(explicit ? marker : 'Profiler: "' + (marker || test_name) + '"');
++      }
++    }
++  };
++})();
+diff --git a/talos/page_load_test/devtools/addon/content/Profiler.js.orig b/talos/page_load_test/devtools/addon/content/Profiler.js.orig
+new file mode 100644
+--- /dev/null
++++ b/talos/page_load_test/devtools/addon/content/Profiler.js.orig
+@@ -0,0 +1,135 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// - NOTE: This file is duplicated verbatim at:
++//         - talos/scripts/Profiler.js
++//         - talos/pageloader/chrome/Profiler.js
++//         - talos/page_load_test/damp/addon/content/Profiler.js
 +//         - talos/page_load_test/tart/addon/content/Profiler.js
 +//         - talos/startup_test/tresize/addon/content/Profiler.js
 +//
@@ -169,7 +312,7 @@ new file mode 100644
 +  // dispatch an event to the framescript which will take it from there.
 +  doneCallback = doneCallback || function dummy(){};
 +  dispatchEvent(
-+    new CustomEvent("devtools@mozilla.org:chrome-exec-event", {
++    new CustomEvent("damp@mozilla.org:chrome-exec-event", {
 +      bubbles: true,
 +      detail: {
 +        command: {
@@ -314,10 +457,10 @@ new file mode 100644
 +
 +addEventListener("load", init);
 \ No newline at end of file
-diff --git a/talos/page_load_test/devtools/addon/content/devtools.html b/talos/page_load_test/devtools/addon/content/devtools.html
+diff --git a/talos/page_load_test/devtools/addon/content/damp.html b/talos/page_load_test/devtools/addon/content/damp.html
 new file mode 100644
 --- /dev/null
-+++ b/talos/page_load_test/devtools/addon/content/devtools.html
++++ b/talos/page_load_test/devtools/addon/content/damp.html
 @@ -0,0 +1,78 @@
 +<html>
 +<head>
@@ -397,10 +540,10 @@ new file mode 100644
 +<div id="show-during-run" style="display:none">Testing in progress ...</div>
 +</body>
 +</html>
-diff --git a/talos/page_load_test/devtools/addon/content/devtools.js b/talos/page_load_test/devtools/addon/content/devtools.js
+diff --git a/talos/page_load_test/devtools/addon/content/damp.js b/talos/page_load_test/devtools/addon/content/damp.js
 new file mode 100644
 --- /dev/null
-+++ b/talos/page_load_test/devtools/addon/content/devtools.js
++++ b/talos/page_load_test/devtools/addon/content/damp.js
 @@ -0,0 +1,229 @@
 +
 +Components.utils.import("resource:///modules/devtools/gDevTools.jsm");
@@ -631,16 +774,16 @@ new file mode 100644
 +    return this._startTest();
 +  }
 +}
-diff --git a/talos/page_load_test/devtools/addon/content/devtools.overlay.xul b/talos/page_load_test/devtools/addon/content/devtools.overlay.xul
+diff --git a/talos/page_load_test/devtools/addon/content/damp.overlay.xul b/talos/page_load_test/devtools/addon/content/damp.overlay.xul
 new file mode 100644
 --- /dev/null
-+++ b/talos/page_load_test/devtools/addon/content/devtools.overlay.xul
++++ b/talos/page_load_test/devtools/addon/content/damp.overlay.xul
 @@ -0,0 +1,54 @@
 +<?xml version="1.0"?>
 +<overlay id="Scrapper-Overlay" xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
 +
 +<script type="application/x-javascript" src="Profiler.js" />
-+<script type="application/x-javascript" src="devtools.js" />
++<script type="application/x-javascript" src="damp.js" />
 +<script type="application/x-javascript">
 +
 +(function(){
@@ -648,7 +791,7 @@ new file mode 100644
 +  const Ci = Components.interfaces;
 +  var prefs = Cc["@mozilla.org/preferences-service;1"].getService(Ci.nsIPrefBranch);
 +
-+  const PREFIX = "devtools@mozilla.org:";
++  const PREFIX = "damp@mozilla.org:";
 +
 +  // "services" which the framescript can execute at the chrome process
 +  var proxiedServices = {
@@ -664,9 +807,9 @@ new file mode 100644
 +  };
 +
 +  var groupMM = window.getGroupMessageManager("browsers");
-+  groupMM.loadFrameScript("chrome://devtools/content/framescript.js", true);
++  groupMM.loadFrameScript("chrome://damp/content/framescript.js", true);
 +
-+  // listener/executor on the chrome process for devtools.html
++  // listener/executor on the chrome process for damp.html
 +  groupMM.addMessageListener(PREFIX + "chrome-exec-message", function listener(m) {
 +    function sendResult(result) {
 +      groupMM.broadcastAsyncMessage(PREFIX + "chrome-exec-reply", {
@@ -696,10 +839,10 @@ new file mode 100644
 +++ b/talos/page_load_test/devtools/addon/content/framescript.js
 @@ -0,0 +1,24 @@
 +(function() {
-+  const PREFIX = "devtools@mozilla.org:";
++  const PREFIX = "damp@mozilla.org:";
 +
 +  addEventListener(PREFIX + "chrome-exec-event", function (e) {
-+    if (content.document.documentURI.indexOf("chrome://devtools/content/devtools.html")) {
++    if (content.document.documentURI.indexOf("chrome://damp/content/damp.html")) {
 +      // Can have url fragment. Backward compatible version of !str.startsWidth("prefix")
 +      throw new Error("Cannot be used outside of DAMP's launch page");
 +    }
@@ -5934,7 +6077,7 @@ new file mode 100644
 +
 +<!-- Optional Items -->
 +<em:creator>Brian Grinstead</em:creator>
-+<em:description>Bug 1150215.  To run: navigate to chrome://devtools/content/devtools.html</em:description>
++<em:description>Bug 1150215.  To run: navigate to chrome://damp/content/damp.html</em:description>
 +<em:homepageURL>https://bugzilla.mozilla.org/show_bug.cgi?id=1150215</em:homepageURL>
 +</Description></RDF>
 diff --git a/talos/page_load_test/devtools/damp.manifest b/talos/page_load_test/devtools/damp.manifest
@@ -5942,7 +6085,7 @@ new file mode 100644
 --- /dev/null
 +++ b/talos/page_load_test/devtools/damp.manifest
 @@ -0,0 +1,1 @@
-+% chrome://devtools/content/devtools.html
++% chrome://damp/content/damp.html
 diff --git a/talos/page_load_test/tart/addon/content/Profiler.js b/talos/page_load_test/tart/addon/content/Profiler.js
 --- a/talos/page_load_test/tart/addon/content/Profiler.js
 +++ b/talos/page_load_test/tart/addon/content/Profiler.js
