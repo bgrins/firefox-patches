@@ -6,20 +6,64 @@ Bug 1121528 - Avoid the inspector going blank when quickly navigating
 diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
 --- a/browser/devtools/inspector/inspector-panel.js
 +++ b/browser/devtools/inspector/inspector-panel.js
-@@ -256,18 +256,18 @@ InspectorPanel.prototype = {
+@@ -218,57 +218,58 @@ InspectorPanel.prototype = {
+ 
+   /**
+    * Return a promise that will resolve to the default node for selection.
+    */
+   _getDefaultNodeForSelection: function() {
+     if (this._defaultNode) {
+       return this._defaultNode;
+     }
+-    let walker = this.walker;
+     let rootNode = null;
+     let pendingSelection = this._pendingSelection;
+ 
+     // A helper to tell if the target has or is about to navigate.
+     // this._pendingSelection changes on "will-navigate" and "new-root" events.
+     let hasNavigated = () => pendingSelection !== this._pendingSelection;
+ 
+     // If available, set either the previously selected node or the body
+     // as default selected, else set documentElement
+-    return walker.getRootNode().then(aRootNode => {
++    return this.walker.getRootNode().then(aRootNode => {
+       if (hasNavigated()) {
+         return promise.reject("navigated; resolution of _defaultNode aborted");
+       }
+ 
+       rootNode = aRootNode;
+       if (this.selectionCssSelector) {
+-        return walker.querySelector(rootNode, this.selectionCssSelector);
++        return this.walker.querySelector(rootNode, this.selectionCssSelector);
+       }
+     }).then(front => {
+       if (hasNavigated()) {
          return promise.reject("navigated; resolution of _defaultNode aborted");
        }
  
        if (front) {
          return front;
        }
-       return this.walker.documentElement(this.walker.rootNode);
+-      return walker.querySelector(rootNode, "body");
++      return this.walker.querySelector(rootNode, "body");
+     }).then(front => {
+       if (hasNavigated()) {
+         return promise.reject("navigated; resolution of _defaultNode aborted");
+       }
+ 
+       if (front) {
+         return front;
+       }
+-      return this.walker.documentElement(this.walker.rootNode);
++
++      return this.walker.documentElement();
      }).then(node => {
 -      if (walker !== this.walker) {
 -        promise.reject(null);
-+      if (!node || walker !== this.walker) {
++      if (hasNavigated()) {
 +        return promise.reject("navigated; resolution of _defaultNode aborted");
        }
++
        this._defaultNode = node;
        return node;
      });
@@ -27,31 +71,56 @@ diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/in
  
    /**
     * Target getter.
+    */
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -841,18 +841,19 @@ MarkupView.prototype = {
+     }
+ 
+     return this._waitForChildren().then(() => {
+       if (this._destroyer) {
+         return promise.reject("markupview destroyed");
+       }
+       return this._ensureVisible(aNode);
+     }).then(() => {
+-      // Why is this not working?
+-      this.layoutHelpers.scrollIntoViewIfNeeded(this.getContainer(aNode).editor.elt, centered);
++      if (!this._destroyer) {
++        this.layoutHelpers.scrollIntoViewIfNeeded(this.getContainer(aNode).editor.elt, centered);
++      }
+     }, e => {
+       // Only report this rejection as an error if the panel hasn't been
+       // destroyed in the meantime.
+       if (!this._destroyer) {
+         console.error(e);
+       } else {
+         console.warn("Could not show the node, the markup-view was destroyed " +
+           "while waiting for children");
 diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
 --- a/toolkit/devtools/server/actors/inspector.js
 +++ b/toolkit/devtools/server/actors/inspector.js
-@@ -269,16 +269,20 @@ var NodeActor = exports.NodeActor = prot
-       } else {
-         form.shortValue = this.rawNode.nodeValue;
-       }
+@@ -320,17 +320,18 @@ var NodeActor = exports.NodeActor = prot
+     return CssLogic.getComputedStyle(this.rawNode);
+   },
+ 
+   /**
+    * Is the node's display computed style value other than "none"
+    */
+   get isDisplayed() {
+     // Consider all non-element nodes as displayed.
+-    if (this.rawNode.nodeType !== Ci.nsIDOMNode.ELEMENT_NODE ||
++    if (isNodeDead(this) ||
++        this.rawNode.nodeType !== Ci.nsIDOMNode.ELEMENT_NODE ||
+         this.isAfterPseudoElement ||
+         this.isBeforePseudoElement) {
+       return true;
      }
  
-     return form;
-   },
- 
-+  isDead: function() {
-+    return !this.rawNode || Cu.isDeadWrapper(this.rawNode);
-+  },
-+
-   get isBeforePseudoElement() {
-     return this.rawNode.nodeName === "_moz_generated_content_before"
-   },
- 
-   get isAfterPseudoElement() {
-     return this.rawNode.nodeName === "_moz_generated_content_after"
-   },
- 
-@@ -1358,49 +1362,61 @@ var WalkerActor = protocol.ActorClass({
+     let style = this.computedStyle;
+     if (!style) {
+       return true;
+@@ -1358,32 +1359,33 @@ var WalkerActor = protocol.ActorClass({
    /**
     * Return the document node that contains the given node,
     * or the root node if no node is specified.
@@ -60,16 +129,12 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     *        return the root.
     */
    document: method(function(node) {
-+    if (node && node.isDead()) {
-+      return null;
-+    }
-+
-     let doc = node ? nodeDocument(node.rawNode) : this.rootDoc;
+-    let doc = node ? nodeDocument(node.rawNode) : this.rootDoc;
++    let doc = isNodeDead(node) ? this.rootDoc : nodeDocument(node.rawNode);
      return this._ref(doc);
    }, {
      request: { node: Arg(0, "nullable:domnode") },
--    response: { node: RetVal("domnode") },
-+    response: { node: RetVal("nullable:domnode") },
+     response: { node: RetVal("domnode") },
    }),
  
    /**
@@ -80,21 +145,18 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     *        to use the root document.
     */
    documentElement: method(function(node) {
-+    if (node.isDead()) {
-+      return null;
-+    }
-+
-     let elt = node ? nodeDocument(node.rawNode).documentElement : this.rootDoc.documentElement;
+-    let elt = node ? nodeDocument(node.rawNode).documentElement : this.rootDoc.documentElement;
++    let elt = isNodeDead(node) ? this.rootDoc.documentElement :
++                                 nodeDocument(node.rawNode).documentElement;
      return this._ref(elt);
    }, {
      request: { node: Arg(0, "nullable:domnode") },
--    response: { node: RetVal("domnode") },
-+    response: { node: RetVal("nullable:domnode") },
+     response: { node: RetVal("domnode") },
    }),
  
    /**
     * Return all parents of the given node, ordered from immediate parent
-    * to root.
+@@ -1391,16 +1393,20 @@ var WalkerActor = protocol.ActorClass({
     * @param NodeActor node
     *    The node whose parents are requested.
     * @param object options
@@ -103,7 +165,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     *      document as the node.
     */
    parents: method(function(node, options={}) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return [];
 +    }
 +
@@ -115,7 +177,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
          break;
        }
        parents.push(this._ref(cur));
-@@ -1463,16 +1479,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -1463,16 +1469,20 @@ var WalkerActor = protocol.ActorClass({
      request: { node: Arg(0, "domnode") },
      response: {},
    }),
@@ -124,7 +186,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     * Release actors for a node and all child nodes.
     */
    releaseNode: method(function(node, options={}) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return;
 +    }
 +
@@ -136,7 +198,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      if (node.retained) {
        // Forcing a retained node to go away.
        this._retainedOrphans.delete(node);
-@@ -1540,16 +1560,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -1540,16 +1550,20 @@ var WalkerActor = protocol.ActorClass({
     *       https://developer.mozilla.org/en-US/docs/Web/API/NodeFilter.
     *
     * @returns an object with three items:
@@ -145,7 +207,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     *    nodes: Child nodes returned by the request.
     */
    children: method(function(node, options={}) {
-+    if (!node || node.isDead()) {
++    if (isNodeDead(node)) {
 +      return { hasFirst: true, hasLast: true, nodes: [] };
 +    }
 +
@@ -157,7 +219,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
        maxNodes = Number.MAX_VALUE;
      }
  
-@@ -1634,16 +1658,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -1634,16 +1648,20 @@ var WalkerActor = protocol.ActorClass({
     *       https://developer.mozilla.org/en-US/docs/Web/API/NodeFilter.
     *
     * @returns an object with three items:
@@ -166,7 +228,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     *    nodes: Child nodes returned by the request.
     */
    siblings: method(function(node, options={}) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return { hasFirst: true, hasLast: true, nodes: [] };
 +    }
 +
@@ -178,7 +240,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
          nodes: [node]
        };
      }
-@@ -1660,31 +1688,39 @@ var WalkerActor = protocol.ActorClass({
+@@ -1660,31 +1678,39 @@ var WalkerActor = protocol.ActorClass({
     * might be inefficient, be careful.
     *
     * @param object options
@@ -187,7 +249,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     *       https://developer.mozilla.org/en-US/docs/Web/API/NodeFilter.
     */
    nextSibling: method(function(node, options={}) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return null;
 +    }
 +
@@ -206,7 +268,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     *       https://developer.mozilla.org/en-US/docs/Web/API/NodeFilter.
     */
    previousSibling: method(function(node, options={}) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return null;
 +    }
 +
@@ -218,7 +280,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
    /**
     * Helper function for the `children` method: Read forward in the sibling
     * list into an array with `count` items, including the current node.
-@@ -1736,21 +1772,21 @@ var WalkerActor = protocol.ActorClass({
+@@ -1736,21 +1762,21 @@ var WalkerActor = protocol.ActorClass({
    /**
     * Return the first node in the document that matches the given selector.
     * See https://developer.mozilla.org/en-US/docs/Web/API/Element.querySelector
@@ -230,7 +292,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
 -    if (!baseNode) {
 -      return {}
 -    };
-+    if (!baseNode || baseNode.isDead()) {
++    if (isNodeDead(baseNode)) {
 +      return {};
 +    }
 +
@@ -244,7 +306,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
    }, {
      request: {
        node: Arg(0, "domnode"),
-@@ -1926,16 +1962,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -1926,16 +1952,20 @@ var WalkerActor = protocol.ActorClass({
     *    Options object:
     *    `parents`: True if the pseudo-class should be added
     *      to parent nodes.
@@ -253,7 +315,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     *    be queued for any changed nodes.
     */
    addPseudoClassLock: method(function(node, pseudo, options={}) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return;
 +    }
 +
@@ -265,7 +327,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
  
      let walker = this.getDocumentWalker(node.rawNode);
      let cur;
-@@ -1980,23 +2020,31 @@ var WalkerActor = protocol.ActorClass({
+@@ -1980,23 +2010,31 @@ var WalkerActor = protocol.ActorClass({
        let { attach } = require("sdk/content/mod");
        let style = Style({source: HELPER_SHEET, type: "agent" });
        attach(style, win);
@@ -274,7 +336,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
    },
  
    hideNode: method(function(node) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return;
 +    }
 +
@@ -285,7 +347,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
    }),
  
    unhideNode: method(function(node) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return;
 +    }
 +
@@ -297,7 +359,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
    /**
     * Remove a pseudo-class lock from a node.
     *
-@@ -2007,16 +2055,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -2007,16 +2045,20 @@ var WalkerActor = protocol.ActorClass({
     *    Options object:
     *    `parents`: True if the pseudo-class should be removed
     *      from parent nodes.
@@ -306,7 +368,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     *    will be emitted for any changed nodes.
     */
    removePseudoClassLock: method(function(node, pseudo, options={}) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return;
 +    }
 +
@@ -318,7 +380,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
  
      let walker = this.getDocumentWalker(node.rawNode);
      let cur;
-@@ -2046,16 +2098,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -2046,16 +2088,20 @@ var WalkerActor = protocol.ActorClass({
      return true;
    },
  
@@ -327,7 +389,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     * @param {NodeActor} node Optional node to clear pseudo-classes on
     */
    clearPseudoClassLocks: method(function(node) {
-+    if (node && node.isDead()) {
++    if (isNodeDead(node)) {
 +      return;
 +    }
 +
@@ -339,7 +401,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
        for (let locked of this._activePseudoClassLocks) {
          DOMUtils.clearPseudoClassLocks(locked.rawNode);
          this._activePseudoClassLocks.delete(locked);
-@@ -2068,16 +2124,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -2068,16 +2114,20 @@ var WalkerActor = protocol.ActorClass({
      },
      response: {}
    }),
@@ -348,7 +410,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     * Get a node's innerHTML property.
     */
    innerHTML: method(function(node) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return "";
 +    }
 +
@@ -360,7 +422,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      response: {
        value: RetVal("longstring")
      }
-@@ -2085,16 +2145,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -2085,16 +2135,20 @@ var WalkerActor = protocol.ActorClass({
  
    /**
     * Set a node's innerHTML property.
@@ -369,7 +431,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     * @param {string} value The piece of HTML content.
     */
    setInnerHTML: method(function(node, value) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return;
 +    }
 +
@@ -381,7 +443,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      request: {
        node: Arg(0, "domnode"),
        value: Arg(1, "string"),
-@@ -2103,16 +2167,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -2103,16 +2157,20 @@ var WalkerActor = protocol.ActorClass({
    }),
  
    /**
@@ -390,7 +452,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     * @param {NodeActor} node The node.
     */
    outerHTML: method(function(node) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return "";
 +    }
 +
@@ -402,7 +464,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      response: {
        value: RetVal("longstring")
      }
-@@ -2120,16 +2188,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -2120,16 +2178,20 @@ var WalkerActor = protocol.ActorClass({
  
    /**
     * Set a node's outerHTML property.
@@ -411,7 +473,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     * @param {string} value The piece of HTML content.
     */
    setOuterHTML: method(function(node, value) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return;
 +    }
 +
@@ -423,7 +485,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      // creates an extra <head> tag, and document.head.outerHTML creates
      // an extra <body>.  So instead we will call replaceChild with the
      // parsed DOM, assuming that they aren't trying to set both tags at once.
-@@ -2180,16 +2252,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -2180,16 +2242,20 @@ var WalkerActor = protocol.ActorClass({
     * Insert adjacent HTML to a node.
     *
     * @param {Node} node
@@ -432,7 +494,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     * @param {string} value The HTML content.
     */
    insertAdjacentHTML: method(function(node, position, value) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return {node: [], newParents: []}
 +    }
 +
@@ -444,7 +506,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      }
  
      let isInsertAsSibling = position === "beforeBegin" ||
-@@ -2259,18 +2335,24 @@ var WalkerActor = protocol.ActorClass({
+@@ -2259,18 +2325,24 @@ var WalkerActor = protocol.ActorClass({
  
    /**
     * Removes a node from its parent node.
@@ -454,7 +516,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     */
    removeNode: method(function(node) {
 -    if (this.isDocumentOrDocumentElementNode(node))
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return null;
 +    }
 +
@@ -470,7 +532,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      request: {
        node: Arg(0, "domnode")
      },
-@@ -2282,18 +2364,19 @@ var WalkerActor = protocol.ActorClass({
+@@ -2282,18 +2354,19 @@ var WalkerActor = protocol.ActorClass({
    /**
     * Removes an array of nodes from their parent node.
     *
@@ -481,7 +543,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      for (let node of nodes) {
 -      if (this.isDocumentOrDocumentElementNode(node))
 -        throw Error("Cannot remove document or document elements.");
-+      if (node.isDead() || this.isDocumentOrDocumentElementNode(node)) {
++      if (isNodeDead(node) || this.isDocumentOrDocumentElementNode(node)) {
 +        throw Error("Cannot remove document, document elements or dead nodes");
 +      }
      }
@@ -492,7 +554,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      }
    }, {
      request: {
-@@ -2301,16 +2384,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -2301,16 +2374,20 @@ var WalkerActor = protocol.ActorClass({
      },
      response: {}
    }),
@@ -501,7 +563,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     * Insert a node into the DOM.
     */
    insertBefore: method(function(node, parent, sibling) {
-+    if (node.isDead() || parent.isDead() || (sibling && sibling.isDead())) {
++    if (isNodeDead(node) || isNodeDead(parent) || isNodeDead(sibling)) {
 +      return null;
 +    }
 +
@@ -513,7 +575,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
        sibling: Arg(2, "nullable:domnode")
      },
      response: {}
-@@ -2318,16 +2405,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -2318,16 +2395,20 @@ var WalkerActor = protocol.ActorClass({
  
    /**
     * Editing a node's tagname actually means creating a new node with the same
@@ -522,7 +584,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     * informing the consumers about changes.
     */
    editTagName: method(function(node, tagName) {
-+    if (node.isDead()) {
++    if (isNodeDead(node)) {
 +      return;
 +    }
 +
@@ -534,7 +596,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      try {
        newNode = nodeDocument(oldNode).createElement(tagName);
      } catch(x) {
-@@ -2654,17 +2745,20 @@ var WalkerActor = protocol.ActorClass({
+@@ -2654,17 +2735,20 @@ var WalkerActor = protocol.ActorClass({
      // Otherwise the top of the tree is rootDoc, hence rawNode is in rootDoc
      return true;
    },
@@ -544,7 +606,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     */
    isInDOMTree: method(function(node) {
 -    return node ? this._isInDOMTree(node.rawNode) : false;
-+    if (!node || node.isDead()) {
++    if (isNodeDead(node)) {
 +      return false;
 +    }
 +    return this._isInDOMTree(node.rawNode);
@@ -556,7 +618,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
    /**
     * Given an ObjectActor (identified by its ID), commonly used in the debugger,
     * webconsole and variablesView, return the corresponding inspector's NodeActor
-@@ -3331,16 +3425,19 @@ var InspectorFront = exports.InspectorFr
+@@ -3331,19 +3415,26 @@ var InspectorFront = exports.InspectorFr
      impl: "_getPageStyle"
    })
  });
@@ -571,8 +633,38 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
    return node.ownerDocument || (node.nodeType == Ci.nsIDOMNode.DOCUMENT_NODE ? node : null);
  }
  
++function isNodeDead(node) {
++  return !node || !node.rawNode || Cu.isDeadWrapper(node.rawNode);
++}
++
  /**
   * Wrapper for inDeepTreeWalker.  Adds filtering to the traversal methods.
   * See inDeepTreeWalker for more information about the methods.
   *
   * @param {DOMNode} node
+  * @param {Window} rootWin
+  * @param {Int} whatToShow See Ci.nsIDOMNodeFilter / inIDeepTreeWalker for options.
+  * @param {Function} filter A custom filter function Taking in a DOMNode
+diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/actors/styles.js
+--- a/toolkit/devtools/server/actors/styles.js
++++ b/toolkit/devtools/server/actors/styles.js
+@@ -1011,17 +1011,18 @@ var StyleRuleActor = protocol.ActorClass
+       case Ci.nsIDOMCSSRule.STYLE_RULE:
+         form.selectors = CssLogic.getSelectors(this.rawRule);
+         form.cssText = this.rawStyle.cssText || "";
+         break;
+       case ELEMENT_STYLE:
+         // Elements don't have a parent stylesheet, and therefore
+         // don't have an associated URI.  Provide a URI for
+         // those.
+-        form.href = this.rawNode.ownerDocument.location.href;
++        let location = this.rawNode.ownerDocument.location;
++        form.href = location ? location.href : null;
+         form.cssText = this.rawStyle.cssText || "";
+         break;
+       case Ci.nsIDOMCSSRule.CHARSET_RULE:
+         form.encoding = this.rawRule.encoding;
+         break;
+       case Ci.nsIDOMCSSRule.IMPORT_RULE:
+         form.href = this.rawRule.href;
+         break;
