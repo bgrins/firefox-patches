@@ -1,0 +1,433 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  026db6918fdf65e67859adec8eef0789a554edf7
+Bug 1036324 - Failing test case for markup view load events
+
+diff --git a/browser/devtools/inspector/test/doc_frame_script.js b/browser/devtools/inspector/test/doc_frame_script.js
+--- a/browser/devtools/inspector/test/doc_frame_script.js
++++ b/browser/devtools/inspector/test/doc_frame_script.js
+@@ -10,20 +10,16 @@
+ // then execute code upon receiving, and immediately send back a message.
+ // This is so that chrome test code can execute code in content and wait for a
+ // response.
+ // Some listeners do not send a response message back.
+ 
+ let {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
+ let {LayoutHelpers} = Cu.import("resource://gre/modules/devtools/LayoutHelpers.jsm", {});
+ let DOMUtils = Cc["@mozilla.org/inspector/dom-utils;1"].getService(Ci.inIDOMUtils);
+-let loader = Cc["@mozilla.org/moz/jssubscript-loader;1"]
+-            .getService(Ci.mozIJSSubScriptLoader);
+-let EventUtils = {};
+-loader.loadSubScript("chrome://marionette/content/EventUtils.js", EventUtils);
+ 
+ /**
+  * If the test page creates and triggeres the custom event
+  * "test-page-processing-done", then the Test:TestPageProcessingDone message
+  * will be sent to the parent process for tests to wait for this event if needed.
+  */
+ addEventListener("DOMWindowCreated", () => {
+   content.addEventListener("test-page-processing-done", () => {
+@@ -228,65 +224,16 @@ addMessageListener("Test:GetAllAdjustedQ
+   for (let boxType of ["content", "padding", "border", "margin"]) {
+     regions[boxType] = helper.getAdjustedQuads(node, boxType);
+   }
+ 
+   sendAsyncMessage("Test:GetAllAdjustedQuads", regions);
+ });
+ 
+ /**
+- * Synthesize a mouse event on an element. This handler doesn't send a message
+- * back. Consumers should listen to specific events on the inspector/highlighter
+- * to know when the event got synthesized.
+- * @param {Object} msg The msg.data part expects the following properties:
+- * - {Number} x
+- * - {Number} y
+- * - {Boolean} center If set to true, x/y will be ignored and
+- *             synthesizeMouseAtCenter will be used instead
+- * - {Object} options Other event options
+- * - {String} selector An optional selector that will be used to find the node to
+- *            synthesize the event on, if msg.objects doesn't contain the CPOW.
+- * The msg.objects part should be the element.
+- * @param {Object} data Event detail properties:
+- */
+-addMessageListener("Test:SynthesizeMouse", function(msg) {
+-  let {x, y, center, options, selector} = msg.data;
+-  let {node} = msg.objects;
+-
+-  if (!node && selector) {
+-    node = superQuerySelector(selector);
+-  }
+-
+-  if (center) {
+-    EventUtils.synthesizeMouseAtCenter(node, options, node.ownerDocument.defaultView);
+-  } else {
+-    EventUtils.synthesizeMouse(node, x, y, options, node.ownerDocument.defaultView);
+-  }
+-
+-  // Most consumers won't need to listen to this message, unless they want to
+-  // wait for the mouse event to be synthesized and don't have another event
+-  // to listen to instead.
+-  sendAsyncMessage("Test:SynthesizeMouse");
+-});
+-
+-/**
+- * Synthesize a key event for an element. This handler doesn't send a message
+- * back. Consumers should listen to specific events on the inspector/highlighter
+- * to know when the event got synthesized.
+- * @param  {Object} msg The msg.data part expects the following properties:
+- * - {String} key
+- * - {Object} options
+- */
+-addMessageListener("Test:SynthesizeKey", function(msg) {
+-  let {key, options} = msg.data;
+-
+-  EventUtils.synthesizeKey(key, options, content);
+-});
+-
+-/**
+  * Check that an element currently has a pseudo-class lock.
+  * @param {Object} msg The msg.data part expects the following properties:
+  * - {String} pseudo The pseudoclass to check for
+  * The msg.objects part should be the element.
+  * @param {Object}
+  * @return {Boolean}
+  */
+ addMessageListener("Test:HasPseudoClassLock", function(msg) {
+diff --git a/browser/devtools/inspector/test/head.js b/browser/devtools/inspector/test/head.js
+--- a/browser/devtools/inspector/test/head.js
++++ b/browser/devtools/inspector/test/head.js
+@@ -14,16 +14,17 @@ const Cc = Components.classes;
+ // });
+ 
+ // Uncomment this pref to dump all devtools emitted events to the console.
+ // Services.prefs.setBoolPref("devtools.dump.emit", true);
+ 
+ const TEST_URL_ROOT = "http://example.com/browser/browser/devtools/inspector/test/";
+ const ROOT_TEST_DIR = getRootDirectory(gTestPath);
+ const FRAME_SCRIPT_URL = ROOT_TEST_DIR + "doc_frame_script.js";
++const COMMON_FRAME_SCRIPT_URL = "chrome://browser/content/devtools/frame-script-utils.js";
+ const { Promise: promise } = Cu.import("resource://gre/modules/Promise.jsm", {});
+ 
+ // All test are asynchronous
+ waitForExplicitFinish();
+ 
+ let {TargetFactory, require} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {}).devtools;
+ let {console} = Cu.import("resource://gre/modules/devtools/Console.jsm", {});
+ 
+@@ -67,16 +68,19 @@ let addTab = Task.async(function* (url) 
+   window.focus();
+ 
+   let tab = gBrowser.selectedTab = gBrowser.addTab(url);
+   let browser = tab.linkedBrowser;
+ 
+   info("Loading the helper frame script " + FRAME_SCRIPT_URL);
+   browser.messageManager.loadFrameScript(FRAME_SCRIPT_URL, false);
+ 
++  info("Loading the helper frame script " + COMMON_FRAME_SCRIPT_URL);
++  browser.messageManager.loadFrameScript(COMMON_FRAME_SCRIPT_URL, false);
++
+   yield once(browser, "load", true);
+   info("URL '" + url + "' loading complete");
+ 
+   return tab;
+ });
+ 
+ /**
+  * Simple DOM node accesor function that takes either a node or a string css
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -2135,17 +2135,17 @@ MarkupElementContainer.prototype = Herit
+         data.data.string().then(str => {
+           let res = {data: str, size: data.size};
+           // Resolving the data promise and, to always keep tooltipData.data
+           // as a promise, create a new one that resolves immediately
+           def.resolve(res);
+           this.tooltipData.data = promise.resolve(res);
+         });
+       }, () => {
+-        this.tooltipData.data = promise.reject();
++        this.tooltipData.data = promise.resolve({});
+       });
+     }
+   },
+ 
+   /**
+    * Executed by MarkupView._isImagePreviewTarget which is itself called when the
+    * mouse hovers over a target in the markup-view.
+    * Checks if the target is indeed something we want to have an image tooltip
+@@ -2155,19 +2155,21 @@ MarkupElementContainer.prototype = Herit
+    * to decide if/when to show the tooltip
+    */
+   isImagePreviewTarget: function(target, tooltip) {
+     if (!this.tooltipData || this.tooltipData.target !== target) {
+       return promise.reject();
+     }
+ 
+     return this.tooltipData.data.then(({data, size}) => {
+-      tooltip.setImageContent(data, size);
+-    }, () => {
+-      tooltip.setBrokenImageContent();
++      if (data && size) {
++        tooltip.setImageContent(data, size);
++      } else {
++        tooltip.setBrokenImageContent();
++      }
+     });
+   },
+ 
+   copyImageDataUri: function() {
+     // We need to send again a request to gettooltipData even if one was sent for
+     // the tooltip, because we want the full-size image
+     this.node.getImageData().then(data => {
+       data.data.string().then(str => {
+diff --git a/browser/devtools/markupview/test/browser.ini b/browser/devtools/markupview/test/browser.ini
+--- a/browser/devtools/markupview/test/browser.ini
++++ b/browser/devtools/markupview/test/browser.ini
+@@ -63,16 +63,17 @@ skip-if = e10s # Bug 1040751 - CodeMirro
+ [browser_markupview_events_jquery_1.6.js]
+ skip-if = e10s # Bug 1040751 - CodeMirror editor.destroy() isn't e10s compatible
+ [browser_markupview_events_jquery_1.7.js]
+ skip-if = e10s # Bug 1040751 - CodeMirror editor.destroy() isn't e10s compatible
+ [browser_markupview_events_jquery_1.11.1.js]
+ skip-if = e10s # Bug 1040751 - CodeMirror editor.destroy() isn't e10s compatible
+ [browser_markupview_events_jquery_2.1.1.js]
+ skip-if = e10s # Bug 1040751 - CodeMirror editor.destroy() isn't e10s compatible
++[browser_markupview_load_01.js]
+ [browser_markupview_html_edit_01.js]
+ [browser_markupview_html_edit_02.js]
+ [browser_markupview_html_edit_03.js]
+ [browser_markupview_image_tooltip.js]
+ [browser_markupview_keybindings_01.js]
+ [browser_markupview_keybindings_02.js]
+ [browser_markupview_mutation_01.js]
+ [browser_markupview_mutation_02.js]
+diff --git a/browser/devtools/markupview/test/browser_markupview_load_01.js b/browser/devtools/markupview/test/browser_markupview_load_01.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/markupview/test/browser_markupview_load_01.js
+@@ -0,0 +1,60 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++Cu.import("resource://gre/modules/Services.jsm");
++
++const server = createTestHTTPServer();
++
++// Test page load events.
++const TEST_URL = "data:text/html," +
++  "<!DOCTYPE html>" +
++  "<head><meta charset='utf-8' /></head>" +
++  "<body>" +
++  "<p>Slow script</p>" +
++  "<img src='http://localhost:" + server.identity.primaryPort + "/slow.gif' /></script>" +
++  "</body>" +
++  "</html>";
++
++add_task(function*() {
++  let tab = yield addTab(TEST_URL);
++  let {inspector} = yield openInspector();
++
++  ok (inspector.markup, "There is a markup view");
++
++  let domContentLoaded = waitForLinkedBrowserEvent(tab, "DOMContentLoaded");
++  let pageLoaded = waitForLinkedBrowserEvent(tab, "load");
++
++  reloadTab();
++
++  yield domContentLoaded;
++
++  // XXX: Test passes if this is commented out.
++  yield chooseWithInspectElementContextMenu("img");
++
++  yield pageLoaded;
++  yield inspector.once("markuploaded");
++
++  ok (inspector.markup, "There is a markup view");
++  is (inspector.markup._elt.children.length, 1, "The markup view is rendering");
++});
++
++function* chooseWithInspectElementContextMenu(selector) {
++  yield executeInContent("Test:SynthesizeMouse", {
++    center: true,
++    selector: selector,
++    options: {type: "contextmenu", button: 2}
++  });
++  executeInContent("Test:SynthesizeKey", {key: "Q", options: {}});
++}
++
++function waitForLinkedBrowserEvent(tab, event) {
++  let def = promise.defer();
++  tab.linkedBrowser.addEventListener(event, function cb() {
++    tab.linkedBrowser.removeEventListener(event, cb, true);
++    def.resolve();
++  }, true);
++  return def.promise;
++}
+diff --git a/browser/devtools/markupview/test/head.js b/browser/devtools/markupview/test/head.js
+--- a/browser/devtools/markupview/test/head.js
++++ b/browser/devtools/markupview/test/head.js
+@@ -168,16 +168,23 @@ function executeInContent(name, data={},
+   if (expectResponse) {
+     return waitForContentMessage(name);
+   } else {
+     return promise.resolve();
+   }
+ }
+ 
+ /**
++ * Reload the current tab location.
++ */
++function reloadTab() {
++  return executeInContent("devtools:test:reload", {}, {}, false);
++}
++
++/**
+  * Simple DOM node accesor function that takes either a node or a string css
+  * selector as argument and returns the corresponding node
+  * @param {String|DOMNode} nodeOrSelector
+  * @return {DOMNode|CPOW} Note that in e10s mode a CPOW object is returned which
+  * doesn't implement *all* of the DOMNode's properties
+  */
+ function getNode(nodeOrSelector) {
+   info("Getting the node for '" + nodeOrSelector + "'");
+@@ -642,8 +649,43 @@ function* waitForMultipleChildrenUpdates
+   // As long as child updates are queued up while we wait for an update already
+   // wait again
+   if (inspector.markup._queuedChildUpdates &&
+       inspector.markup._queuedChildUpdates.size) {
+     yield waitForChildrenUpdated(inspector);
+     return yield waitForMultipleChildrenUpdates(inspector);
+   }
+ }
++
++function createTestHTTPServer() {
++  const {HttpServer} = Cu.import("resource://testing-common/httpd.js", {});
++  let server = new HttpServer();
++  server.registerContentType("js", "text/javascript");
++  server.registerPathHandler("/slow.js", function (metadata, response) {
++    info ("Script has been requested");
++    response.processAsync();
++    setTimeout(() => {
++      info ("Script is responding");
++      response.finish();
++    }, 500);
++  });
++
++  server.registerContentType("gif", "image/gif");
++  server.registerPathHandler("/slow.gif", function (metadata, response) {
++    info ("Image has been requested");
++    response.processAsync();
++    setTimeout(() => {
++      info ("Image is responding");
++      response.finish();
++    }, 500);
++  });
++
++  registerCleanupFunction(function* cleanup() {
++    let destroyed = promise.defer();
++    server.stop(() => {
++      destroyed.resolve();
++    });
++    yield destroyed.promise;
++  });
++
++  server.start(-1);
++  return server;
++}
+diff --git a/browser/devtools/shared/frame-script-utils.js b/browser/devtools/shared/frame-script-utils.js
+--- a/browser/devtools/shared/frame-script-utils.js
++++ b/browser/devtools/shared/frame-script-utils.js
+@@ -1,18 +1,21 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+-const Cu = Components.utils;
+-
++const {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
+ const { devtools } = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
+ devtools.lazyImporter(this, "promise", "resource://gre/modules/Promise.jsm", "Promise");
+ devtools.lazyImporter(this, "Task", "resource://gre/modules/Task.jsm", "Task");
++const loader = Cc["@mozilla.org/moz/jssubscript-loader;1"]
++            .getService(Ci.mozIJSSubScriptLoader);
++let EventUtils = {};
++loader.loadSubScript("chrome://marionette/content/EventUtils.js", EventUtils);
+ 
+ addMessageListener("devtools:test:history", function ({ data }) {
+   content.history[data.direction]();
+ });
+ 
+ addMessageListener("devtools:test:navigate", function ({ data }) {
+   content.location = data.location;
+ });
+@@ -185,16 +188,65 @@ addMessageListener("devtools:test:setAtt
+   }
+ 
+   node.setAttribute(attributeName, attributeValue);
+ 
+   sendAsyncMessage("devtools:test:setAttribute");
+ });
+ 
+ /**
++ * Synthesize a mouse event on an element. This handler doesn't send a message
++ * back. Consumers should listen to specific events on the inspector/highlighter
++ * to know when the event got synthesized.
++ * @param {Object} msg The msg.data part expects the following properties:
++ * - {Number} x
++ * - {Number} y
++ * - {Boolean} center If set to true, x/y will be ignored and
++ *             synthesizeMouseAtCenter will be used instead
++ * - {Object} options Other event options
++ * - {String} selector An optional selector that will be used to find the node to
++ *            synthesize the event on, if msg.objects doesn't contain the CPOW.
++ * The msg.objects part should be the element.
++ * @param {Object} data Event detail properties:
++ */
++addMessageListener("Test:SynthesizeMouse", function(msg) {
++  let {x, y, center, options, selector} = msg.data;
++  let {node} = msg.objects;
++
++  if (!node && selector) {
++    node = superQuerySelector(selector);
++  }
++
++  if (center) {
++    EventUtils.synthesizeMouseAtCenter(node, options, node.ownerDocument.defaultView);
++  } else {
++    EventUtils.synthesizeMouse(node, x, y, options, node.ownerDocument.defaultView);
++  }
++
++  // Most consumers won't need to listen to this message, unless they want to
++  // wait for the mouse event to be synthesized and don't have another event
++  // to listen to instead.
++  sendAsyncMessage("Test:SynthesizeMouse");
++});
++
++/**
++ * Synthesize a key event for an element. This handler doesn't send a message
++ * back. Consumers should listen to specific events on the inspector/highlighter
++ * to know when the event got synthesized.
++ * @param  {Object} msg The msg.data part expects the following properties:
++ * - {String} key
++ * - {Object} options
++ */
++addMessageListener("Test:SynthesizeKey", function(msg) {
++  let {key, options} = msg.data;
++
++  EventUtils.synthesizeKey(key, options, content);
++});
++
++/**
+  * Like document.querySelector but can go into iframes too.
+  * ".container iframe || .sub-container div" will first try to find the node
+  * matched by ".container iframe" in the root document, then try to get the
+  * content document inside it, and then try to match ".sub-container div" inside
+  * this document.
+  * Any selector coming before the || separator *MUST* match a frame node.
+  * @param {String} superSelector.
+  * @return {DOMNode} The node, or null if not found.
