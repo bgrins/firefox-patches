@@ -1,0 +1,1327 @@
+# HG changeset patch
+# Parent f2cdab51407b0d333aae8ddd7fb70cf9c2209b52
+# User Patrick Brosset <pbrosset@mozilla.com>
+
+diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
+--- a/browser/devtools/inspector/inspector-panel.js
++++ b/browser/devtools/inspector/inspector-panel.js
+@@ -259,22 +259,22 @@ InspectorPanel.prototype = {
+     this.isDirty = true;
+   },
+ 
+   /**
+    * Hooks the searchbar to show result and auto completion suggestions.
+    */
+   setupSearchBox: function InspectorPanel_setupSearchBox() {
+     // Initiate the selectors search object.
+-    if (this.searchSuggestions) {
+-      this.searchSuggestions.destroy();
+-      this.searchSuggestions = null;
++    if (this.search) {
++      this.search.destroy();
++      this.search = null;
+     }
+     this.searchBox = this.panelDoc.getElementById("inspector-searchbox");
+-    this.searchSuggestions = new SelectorSearch(this, this.searchBox);
++    this.search = new SelectorSearch(this, this.searchBox);
+   },
+ 
+   /**
+    * Build the sidebar.
+    */
+   setupSidebar: function InspectorPanel_setupSidebar() {
+     let tabbox = this.panelDoc.querySelector("#inspector-sidebar");
+     this.sidebar = new ToolSidebar(tabbox, this, "inspector");
+@@ -503,32 +503,32 @@ InspectorPanel.prototype = {
+ 
+     this.sidebar.off("select", this._setDefaultSidebar);
+     this.sidebar.destroy();
+     this.sidebar = null;
+ 
+     this.nodemenu.removeEventListener("popupshowing", this._setupNodeMenu, true);
+     this.nodemenu.removeEventListener("popuphiding", this._resetNodeMenu, true);
+     this.breadcrumbs.destroy();
+-    this.searchSuggestions.destroy();
+-    this.searchBox = null;
+     this.selection.off("new-node-front", this.onNewSelection);
+     this.selection.off("before-new-node", this.onBeforeNewSelection);
+     this.selection.off("before-new-node-front", this.onBeforeNewSelection);
+     this.selection.off("detached-front", this.onDetached);
+     this._panelDestroyer = this._destroyMarkup();
+     this.panelWin.inspector = null;
+     this.target = null;
+     this.panelDoc = null;
+     this.panelWin = null;
+     this.breadcrumbs = null;
+-    this.searchSuggestions = null;
+     this.lastNodemenuItem = null;
+     this.nodemenu = null;
+     this._toolbox = null;
++    this.search.destroy();
++    this.search = null;
++    this.searchBox = null;
+ 
+     return this._panelDestroyer;
+   },
+ 
+   /**
+    * Show the node menu.
+    */
+   showNodeMenu: function InspectorPanel_showNodeMenu(aButton, aPosition, aExtraItems) {
+diff --git a/browser/devtools/inspector/selector-search.js b/browser/devtools/inspector/selector-search.js
+--- a/browser/devtools/inspector/selector-search.js
++++ b/browser/devtools/inspector/selector-search.js
+@@ -1,506 +1,86 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const promise = require("devtools/toolkit/deprecated-sync-thenables");
+-
+-loader.lazyGetter(this, "AutocompletePopup", () => require("devtools/shared/autocomplete-popup").AutocompletePopup);
+-
+-// Maximum number of selector suggestions shown in the panel.
+-const MAX_SUGGESTIONS = 15;
++const EventEmitter = require("devtools/toolkit/event-emitter");
+ 
+ /**
+- * Converts any input box on a page to a CSS selector search and suggestion box.
++ * Converts any input field into a document search box.
+  *
+- * @constructor
+- * @param InspectorPanel aInspector
+- *        The InspectorPanel whose `walker` attribute should be used for
+- *        document traversal.
+- * @param nsiInputElement aInputNode
+- *        The input element to which the panel will be attached and from where
+- *        search input will be taken.
++ * @param {InspectorPanel} inspector The InspectorPanel whose `walker` attribute
++ * should be used for document traversal.
++ * @param {DomNode} input The input element to which the panel will be attached
++ * and from where search input will be taken.
++ *
++ * Emits the following events:
++ * - search-cleared: when the search box is emptied
++ * - search-no-result: when a search is made that yields no result
++ * - search-result: when a search is made and a result is selected
+  */
+-function SelectorSearch(aInspector, aInputNode) {
+-  this.inspector = aInspector;
+-  this.searchBox = aInputNode;
+-  this.panelDoc = this.searchBox.ownerDocument;
++function SelectorSearch(inspector, input) {
++  this.inspector = inspector;
++  this.searchBox = input;
++  this._lastSearched = null;
+ 
+-  // initialize variables.
+-  this._lastSearched = null;
+-  this._lastValidSearch = "";
+-  this._lastToLastValidSearch = null;
+-  this._searchResults = null;
+-  this._searchSuggestions = {};
+-  this._searchIndex = 0;
+-
+-  // bind!
+-  this._showPopup = this._showPopup.bind(this);
+-  this._onHTMLSearch = this._onHTMLSearch.bind(this);
+-  this._onSearchKeypress = this._onSearchKeypress.bind(this);
+-  this._onListBoxKeypress = this._onListBoxKeypress.bind(this);
+-
+-  // Options for the AutocompletePopup.
+-  let options = {
+-    panelId: "inspector-searchbox-panel",
+-    listBoxId: "searchbox-panel-listbox",
+-    autoSelect: true,
+-    position: "before_start",
+-    direction: "ltr",
+-    theme: "auto",
+-    onClick: this._onListBoxKeypress,
+-    onKeypress: this._onListBoxKeypress
+-  };
+-  this.searchPopup = new AutocompletePopup(this.panelDoc, options);
+-
+-  // event listeners.
+-  this.searchBox.addEventListener("command", this._onHTMLSearch, true);
+-  this.searchBox.addEventListener("keypress", this._onSearchKeypress, true);
++  this._onKeyPress = this._onKeyPress.bind(this);
++  this.searchBox.addEventListener("keypress", this._onKeyPress, true);
+ 
+   // For testing, we need to be able to wait for the most recent node request
+   // to finish.  Tests can watch this promise for that.
+   this._lastQuery = promise.resolve(null);
++
++  EventEmitter.decorate(this);
+ }
+ 
+ exports.SelectorSearch = SelectorSearch;
+ 
+ SelectorSearch.prototype = {
+-
+   get walker() this.inspector.walker,
+ 
+-  // The possible states of the query.
+-  States: {
+-    CLASS: "class",
+-    ID: "id",
+-    TAG: "tag",
++  destroy: function() {
++    this.searchBox.removeEventListener("keypress", this._onKeyPress, true);
++    this.searchBox = null;
+   },
+ 
+-  // The current state of the query.
+-  _state: null,
++  _onSearch: function() {
++    let query = this.searchBox.value;
+ 
+-  // The query corresponding to last state computation.
+-  _lastStateCheckAt: null,
+-
+-  /**
+-   * Computes the state of the query. State refers to whether the query
+-   * currently requires a class suggestion, or a tag, or an Id suggestion.
+-   * This getter will effectively compute the state by traversing the query
+-   * character by character each time the query changes.
+-   *
+-   * @example
+-   *        '#f' requires an Id suggestion, so the state is States.ID
+-   *        'div > .foo' requires class suggestion, so state is States.CLASS
+-   */
+-  get state() {
+-    if (!this.searchBox || !this.searchBox.value) {
+-      return null;
+-    }
+-
+-    let query = this.searchBox.value;
+-    if (this._lastStateCheckAt == query) {
+-      // If query is the same, return early.
+-      return this._state;
+-    }
+-    this._lastStateCheckAt = query;
+-
+-    this._state = null;
+-    let subQuery = "";
+-    // Now we iterate over the query and decide the state character by character.
+-    // The logic here is that while iterating, the state can go from one to
+-    // another with some restrictions. Like, if the state is Class, then it can
+-    // never go to Tag state without a space or '>' character; Or like, a Class
+-    // state with only '.' cannot go to an Id state without any [a-zA-Z] after
+-    // the '.' which means that '.#' is a selector matching a class name '#'.
+-    // Similarily for '#.' which means a selctor matching an id '.'.
+-    for (let i = 1; i <= query.length; i++) {
+-      // Calculate the state.
+-      subQuery = query.slice(0, i);
+-      let [secondLastChar, lastChar] = subQuery.slice(-2);
+-      switch (this._state) {
+-        case null:
+-          // This will happen only in the first iteration of the for loop.
+-          lastChar = secondLastChar;
+-        case this.States.TAG:
+-          this._state = lastChar == "."
+-            ? this.States.CLASS
+-            : lastChar == "#"
+-              ? this.States.ID
+-              : this.States.TAG;
+-          break;
+-
+-        case this.States.CLASS:
+-          if (subQuery.match(/[\.]+[^\.]*$/)[0].length > 2) {
+-            // Checks whether the subQuery has atleast one [a-zA-Z] after the '.'.
+-            this._state = (lastChar == " " || lastChar == ">")
+-            ? this.States.TAG
+-            : lastChar == "#"
+-              ? this.States.ID
+-              : this.States.CLASS;
+-          }
+-          break;
+-
+-        case this.States.ID:
+-          if (subQuery.match(/[#]+[^#]*$/)[0].length > 2) {
+-            // Checks whether the subQuery has atleast one [a-zA-Z] after the '#'.
+-            this._state = (lastChar == " " || lastChar == ">")
+-            ? this.States.TAG
+-            : lastChar == "."
+-              ? this.States.CLASS
+-              : this.States.ID;
+-          }
+-          break;
+-      }
+-    }
+-    return this._state;
+-  },
+-
+-  /**
+-   * Removes event listeners and cleans up references.
+-   */
+-  destroy: function() {
+-    // event listeners.
+-    this.searchBox.removeEventListener("command", this._onHTMLSearch, true);
+-    this.searchBox.removeEventListener("keypress", this._onSearchKeypress, true);
+-    this.searchPopup.destroy();
+-    this.searchPopup = null;
+-    this.searchBox = null;
+-    this.panelDoc = null;
+-    this._searchResults = null;
+-    this._searchSuggestions = null;
+-  },
+-
+-  _selectResult: function(index) {
+-    return this._searchResults.item(index).then(node => {
+-      this.inspector.selection.setNodeFront(node, "selectorsearch");
+-    });
+-  },
+-
+-  /**
+-   * The command callback for the input box. This function is automatically
+-   * invoked as the user is typing if the input box type is search.
+-   */
+-  _onHTMLSearch: function() {
+-    let query = this.searchBox.value;
+-    if (query == this._lastSearched) {
+-      return;
+-    }
+     this._lastSearched = query;
+-    this._searchResults = [];
+-    this._searchIndex = 0;
+ 
+     if (query.length == 0) {
+-      this._lastValidSearch = "";
+       this.searchBox.removeAttribute("filled");
+       this.searchBox.classList.remove("devtools-no-search-result");
+-      if (this.searchPopup.isOpen) {
+-        this.searchPopup.hidePopup();
+-      }
++      this.emit("search-cleared");
+       return;
+     }
+ 
+     this.searchBox.setAttribute("filled", true);
+-    let queryList = null;
+ 
+-    this._lastQuery = this.walker.querySelectorAll(this.walker.rootNode, query).then(list => {
+-      return list;
+-    }, (err) => {
+-      // Failures are ok here, just use a null item list;
+-      return null;
+-    }).then(queryList => {
++    this._lastQuery = this.walker.search(query).then(res => {
+       // Value has changed since we started this request, we're done.
+       if (query != this.searchBox.value) {
+-        if (queryList) {
+-          queryList.release();
+-        }
+-        return promise.reject(null);
++        return;
+       }
+ 
+-      this._searchResults = queryList || [];
+-      if (this._searchResults && this._searchResults.length > 0) {
+-        this._lastValidSearch = query;
+-        // Even though the selector matched atleast one node, there is still
+-        // possibility of suggestions.
+-        if (query.match(/[\s>+]$/)) {
+-          // If the query has a space or '>' at the end, create a selector to match
+-          // the children of the selector inside the search box by adding a '*'.
+-          this._lastValidSearch += "*";
+-        }
+-        else if (query.match(/[\s>+][\.#a-zA-Z][\.#>\s+]*$/)) {
+-          // If the query is a partial descendant selector which does not matches
+-          // any node, remove the last incomplete part and add a '*' to match
+-          // everything. For ex, convert 'foo > b' to 'foo > *' .
+-          let lastPart = query.match(/[\s>+][\.#a-zA-Z][^>\s+]*$/)[0];
+-          this._lastValidSearch = query.slice(0, -1 * lastPart.length + 1) + "*";
+-        }
++      if (res) {
++        this.inspector.selection.setNodeFront(res.node, "selectorsearch");
++        this.searchBox.classList.remove("devtools-no-search-result");
+ 
+-        if (!query.slice(-1).match(/[\.#\s>+]/)) {
+-          // Hide the popup if we have some matching nodes and the query is not
+-          // ending with [.# >] which means that the selector is not at the
+-          // beginning of a new class, tag or id.
+-          if (this.searchPopup.isOpen) {
+-            this.searchPopup.hidePopup();
+-          }
+-          this.searchBox.classList.remove("devtools-no-search-result");
+-
+-          return this._selectResult(0);
+-        }
+-        return this._selectResult(0).then(() => {
+-          this.searchBox.classList.remove("devtools-no-search-result");
+-        }).then(() => this.showSuggestions());
++        res.query = query;
++        this.emit("search-result", res);
++      } else {
++        this.searchBox.classList.add("devtools-no-search-result");
++        this.emit("search-no-result");
+       }
+-      if (query.match(/[\s>+]$/)) {
+-        this._lastValidSearch = query + "*";
+-      }
+-      else if (query.match(/[\s>+][\.#a-zA-Z][\.#>\s+]*$/)) {
+-        let lastPart = query.match(/[\s+>][\.#a-zA-Z][^>\s+]*$/)[0];
+-        this._lastValidSearch = query.slice(0, -1 * lastPart.length + 1) + "*";
+-      }
+-      this.searchBox.classList.add("devtools-no-search-result");
+-      return this.showSuggestions();
+     });
+   },
+ 
+-  /**
+-   * Handles keypresses inside the input box.
+-   */
+-  _onSearchKeypress: function(aEvent) {
+-    let query = this.searchBox.value;
+-    switch(aEvent.keyCode) {
+-      case aEvent.DOM_VK_RETURN:
+-        if (query == this._lastSearched && this._searchResults) {
+-          this._searchIndex = (this._searchIndex + 1) % this._searchResults.length;
+-        }
+-        else {
+-          this._onHTMLSearch();
+-          return;
+-        }
+-        break;
+-
+-      case aEvent.DOM_VK_UP:
+-        if (this.searchPopup.isOpen && this.searchPopup.itemCount > 0) {
+-          this.searchPopup.focus();
+-          if (this.searchPopup.selectedIndex == this.searchPopup.itemCount - 1) {
+-            this.searchPopup.selectedIndex =
+-              Math.max(0, this.searchPopup.itemCount - 2);
+-          }
+-          else {
+-            this.searchPopup.selectedIndex = this.searchPopup.itemCount - 1;
+-          }
+-          this.searchBox.value = this.searchPopup.selectedItem.label;
+-        }
+-        else if (--this._searchIndex < 0) {
+-          this._searchIndex = this._searchResults.length - 1;
+-        }
+-        break;
+-
+-      case aEvent.DOM_VK_DOWN:
+-        if (this.searchPopup.isOpen && this.searchPopup.itemCount > 0) {
+-          this.searchPopup.focus();
+-          this.searchPopup.selectedIndex = 0;
+-          this.searchBox.value = this.searchPopup.selectedItem.label;
+-        }
+-        this._searchIndex = (this._searchIndex + 1) % this._searchResults.length;
+-        break;
+-
+-      case aEvent.DOM_VK_TAB:
+-        if (this.searchPopup.isOpen &&
+-            this.searchPopup.getItemAtIndex(this.searchPopup.itemCount - 1)
+-                .preLabel == query) {
+-          this.searchPopup.selectedIndex = this.searchPopup.itemCount - 1;
+-          this.searchBox.value = this.searchPopup.selectedItem.label;
+-          this._onHTMLSearch();
+-        }
+-        break;
+-
+-      case aEvent.DOM_VK_BACK_SPACE:
+-      case aEvent.DOM_VK_DELETE:
+-        // need to throw away the lastValidSearch.
+-        this._lastToLastValidSearch = null;
+-        // This gets the most complete selector from the query. For ex.
+-        // '.foo.ba' returns '.foo' , '#foo > .bar.baz' returns '#foo > .bar'
+-        // '.foo +bar' returns '.foo +' and likewise.
+-        this._lastValidSearch = (query.match(/(.*)[\.#][^\.# ]{0,}$/) ||
+-                                 query.match(/(.*[\s>+])[a-zA-Z][^\.# ]{0,}$/) ||
+-                                 ["",""])[1];
+-        return;
+-
+-      default:
+-        return;
++  _onKeyPress: function(event) {
++    if (event.keyCode === event.DOM_VK_RETURN) {
++      this._onSearch();
+     }
+-
+-    aEvent.preventDefault();
+-    aEvent.stopPropagation();
+-    if (this._searchResults && this._searchResults.length > 0) {
+-      this._lastQuery = this._selectResult(this._searchIndex);
+-    }
+-  },
+-
+-  /**
+-   * Handles keypress and mouse click on the suggestions richlistbox.
+-   */
+-  _onListBoxKeypress: function(aEvent) {
+-    switch(aEvent.keyCode || aEvent.button) {
+-      case aEvent.DOM_VK_RETURN:
+-      case aEvent.DOM_VK_TAB:
+-      case 0: // left mouse button
+-        aEvent.stopPropagation();
+-        aEvent.preventDefault();
+-        this.searchBox.value = this.searchPopup.selectedItem.label;
+-        this.searchBox.focus();
+-        this._onHTMLSearch();
+-        break;
+-
+-      case aEvent.DOM_VK_UP:
+-        if (this.searchPopup.selectedIndex == 0) {
+-          this.searchPopup.selectedIndex = -1;
+-          aEvent.stopPropagation();
+-          aEvent.preventDefault();
+-          this.searchBox.focus();
+-        }
+-        else {
+-          let index = this.searchPopup.selectedIndex;
+-          this.searchBox.value = this.searchPopup.getItemAtIndex(index - 1).label;
+-        }
+-        break;
+-
+-      case aEvent.DOM_VK_DOWN:
+-        if (this.searchPopup.selectedIndex == this.searchPopup.itemCount - 1) {
+-          this.searchPopup.selectedIndex = -1;
+-          aEvent.stopPropagation();
+-          aEvent.preventDefault();
+-          this.searchBox.focus();
+-        }
+-        else {
+-          let index = this.searchPopup.selectedIndex;
+-          this.searchBox.value = this.searchPopup.getItemAtIndex(index + 1).label;
+-        }
+-        break;
+-
+-      case aEvent.DOM_VK_BACK_SPACE:
+-        aEvent.stopPropagation();
+-        aEvent.preventDefault();
+-        this.searchBox.focus();
+-        if (this.searchBox.selectionStart > 0) {
+-          this.searchBox.value =
+-            this.searchBox.value.substring(0, this.searchBox.selectionStart - 1);
+-        }
+-        this._lastToLastValidSearch = null;
+-        let query = this.searchBox.value;
+-        this._lastValidSearch = (query.match(/(.*)[\.#][^\.# ]{0,}$/) ||
+-                                 query.match(/(.*[\s>+])[a-zA-Z][^\.# ]{0,}$/) ||
+-                                 ["",""])[1];
+-        this._onHTMLSearch();
+-        break;
+-    }
+-  },
+-
+-  /**
+-   * Populates the suggestions list and show the suggestion popup.
+-   */
+-  _showPopup: function(aList, aFirstPart, aState) {
+-    let total = 0;
+-    let query = this.searchBox.value;
+-    let items = [];
+-
+-    for (let [value, count, state] of aList) {
+-      // for cases like 'div ' or 'div >' or 'div+'
+-      if (query.match(/[\s>+]$/)) {
+-        value = query + value;
+-      }
+-      // for cases like 'div #a' or 'div .a' or 'div > d' and likewise
+-      else if (query.match(/[\s>+][\.#a-zA-Z][^\s>+\.#]*$/)) {
+-        let lastPart = query.match(/[\s>+][\.#a-zA-Z][^>\s+\.#]*$/)[0];
+-        value = query.slice(0, -1 * lastPart.length + 1) + value;
+-      }
+-      // for cases like 'div.class' or '#foo.bar' and likewise
+-      else if (query.match(/[a-zA-Z][#\.][^#\.\s+>]*$/)) {
+-        let lastPart = query.match(/[a-zA-Z][#\.][^#\.\s>+]*$/)[0];
+-        value = query.slice(0, -1 * lastPart.length + 1) + value;
+-      }
+-
+-      let item = {
+-        preLabel: query,
+-        label: value,
+-        count: count
+-      };
+-
+-      // In case of tagNames, change te case to small
+-      if (value.match(/.*[\.#][^\.#]{0,}$/) == null) {
+-        item.label = value.toLowerCase();
+-      }
+-
+-      // In case the query's state is tag and the item's state is id or class
+-      // adjust the preLabel
+-      if (aState === this.States.TAG && state === this.States.CLASS) {
+-        item.preLabel = "." + item.preLabel;
+-      }
+-      if (aState === this.States.TAG && state === this.States.ID) {
+-        item.preLabel = "#" + item.preLabel;
+-      }
+-
+-      items.unshift(item);
+-      if (++total > MAX_SUGGESTIONS - 1) {
+-        break;
+-      }
+-    }
+-    if (total > 0) {
+-      this.searchPopup.setItems(items);
+-      this.searchPopup.openPopup(this.searchBox);
+-    }
+-    else {
+-      this.searchPopup.hidePopup();
+-    }
+-  },
+-
+-  /**
+-   * Suggests classes,ids and tags based on the user input as user types in the
+-   * searchbox.
+-   */
+-  showSuggestions: function() {
+-    let query = this.searchBox.value;
+-    let state = this.state;
+-    let firstPart = "";
+-
+-    if (state == this.States.TAG) {
+-      // gets the tag that is being completed. For ex. 'div.foo > s' returns 's',
+-      // 'di' returns 'di' and likewise.
+-      firstPart = (query.match(/[\s>+]?([a-zA-Z]*)$/) || ["", query])[1];
+-      query = query.slice(0, query.length - firstPart.length);
+-    }
+-    else if (state == this.States.CLASS) {
+-      // gets the class that is being completed. For ex. '.foo.b' returns 'b'
+-      firstPart = query.match(/\.([^\.]*)$/)[1];
+-      query = query.slice(0, query.length - firstPart.length - 1);
+-    }
+-    else if (state == this.States.ID) {
+-      // gets the id that is being completed. For ex. '.foo#b' returns 'b'
+-      firstPart = query.match(/#([^#]*)$/)[1];
+-      query = query.slice(0, query.length - firstPart.length - 1);
+-    }
+-    // TODO: implement some caching so that over the wire request is not made
+-    // everytime.
+-    if (/[\s+>~]$/.test(query)) {
+-      query += "*";
+-    }
+-
+-    this._currentSuggesting = query;
+-    return this.walker.getSuggestionsForQuery(query, firstPart, state).then(result => {
+-      if (this._currentSuggesting != result.query) {
+-        // This means that this response is for a previous request and the user
+-        // as since typed something extra leading to a new request.
+-        return;
+-      }
+-      this._lastToLastValidSearch = this._lastValidSearch;
+-
+-      if (state == this.States.CLASS) {
+-        firstPart = "." + firstPart;
+-      }
+-      else if (state == this.States.ID) {
+-        firstPart = "#" + firstPart;
+-      }
+-
+-      this._showPopup(result.suggestions, firstPart, state);
+-    });
+   }
+ };
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -90,16 +90,24 @@ function MarkupView(aInspector, aFrame, 
+   this._onNewSelection();
+ 
+   this._boundKeyDown = this._onKeyDown.bind(this);
+   this._frame.contentWindow.addEventListener("keydown", this._boundKeyDown, false);
+ 
+   this._boundFocus = this._onFocus.bind(this);
+   this._frame.addEventListener("focus", this._boundFocus, false);
+ 
++  // Listen to inspector search to highlight results
++  this._unhighlightSearchResult = this._unhighlightSearchResult.bind(this);
++  this._highlightSearchResult = this._highlightSearchResult.bind(this);
++  let search = this._inspector.search;
++  search.on("search-cleared", this._unhighlightSearchResult);
++  search.on("search-no-result", this._unhighlightSearchResult);
++  search.on("search-result", this._highlightSearchResult);
++
+   this._initPreview();
+   this._initTooltips();
+   this._initHighlighter();
+ 
+   EventEmitter.decorate(this);
+ }
+ 
+ exports.MarkupView = MarkupView;
+@@ -191,16 +199,32 @@ MarkupView.prototype = {
+ 
+     this._showBoxModel(nodeFront, options);
+ 
+     this._briefBoxModelTimer = this._frame.contentWindow.setTimeout(() => {
+       this._hideBoxModel();
+     }, NEW_SELECTION_HIGHLIGHTER_TIMER);
+   },
+ 
++  _highlightSearchResult: function(event, {node, type, matched, query}) {
++    this._unhighlightSearchResult();
++
++    // Search results are selected in the view, so wait for updates
++    this._waitForChildren().then(() => {
++      let editor = this.getContainer(node).editor;
++      if (editor.highlightPart) {
++        editor.highlightPart(type, matched, query);
++      }
++    });
++  },
++
++  _unhighlightSearchResult: function() {
++    this.doc.defaultView.getSelection().removeAllRanges();
++  },
++
+   template: function(aName, aDest, aOptions={stack: "markup-view.xhtml"}) {
+     let node = this.doc.getElementById("template-" + aName).cloneNode(true);
+     node.removeAttribute("id");
+     template(node, aDest, aOptions);
+     return node;
+   },
+ 
+   /**
+@@ -1109,16 +1133,21 @@ MarkupView.prototype = {
+ 
+     this.walker.off("mutations", this._boundMutationObserver)
+     this._boundMutationObserver = null;
+ 
+     this._elt.removeEventListener("mousemove", this._onMouseMove, false);
+     this._elt.removeEventListener("mouseleave", this._onMouseLeave, false);
+     this._elt = null;
+ 
++    let search = this._inspector.search;
++    search.off("search-cleared", this._unhighlightSearchResult);
++    search.off("search-no-result", this._unhighlightSearchResult);
++    search.off("search-result", this._highlightSearchResult);
++
+     for (let [key, container] of this._containers) {
+       container.destroy();
+     }
+     this._containers = null;
+ 
+     this.tooltip.destroy();
+     this.tooltip = null;
+ 
+@@ -1649,18 +1678,20 @@ DoctypeEditor.prototype = {
+  * Creates a simple text editor node, used for TEXT and COMMENT
+  * nodes.
+  *
+  * @param MarkupContainer aContainer The container owning this editor.
+  * @param DOMNode aNode The node being edited.
+  * @param string aTemplate The template id to use to build the editor.
+  */
+ function TextEditor(aContainer, aNode, aTemplate) {
++  this.doc = aContainer.doc;
+   this.node = aNode;
+   this._selected = false;
++  this.updating = promise.resolve();
+ 
+   aContainer.markup.template(aTemplate, this);
+ 
+   editableField({
+     element: this.value,
+     stopOnReturn: true,
+     trigger: "dblclick",
+     multiline: true,
+@@ -1704,28 +1735,44 @@ TextEditor.prototype = {
+       let text = this.node.shortValue;
+       // XXX: internationalize the elliding
+       if (this.node.incompleteValue) {
+         text += "…";
+       }
+       this.value.textContent = text;
+     } else {
+       let longstr = null;
+-      this.node.getNodeValue().then(ret => {
++      this.updating = this.node.getNodeValue().then(ret => {
+         longstr = ret;
+         return longstr.string();
+       }).then(str => {
+         longstr.release().then(null, console.error);
+         if (this.selected) {
+           this.value.textContent = str;
+         }
+       }).then(null, console.error);
+     }
+   },
+ 
++  highlightPart: function(type, value, part) {
++    // Make sure the highlight is done after update to avoid race conditions
++    this.updating.then(() => {
++      let range = this.doc.createRange();
++      let textNode = this.value.firstChild;
++
++      let start = textNode.textContent.toLowerCase().indexOf(part.toLowerCase());
++      let end = start + part.length;
++
++      range.setStart(textNode, start);
++      range.setEnd(textNode, end);
++
++      this.doc.defaultView.getSelection().addRange(range);
++    });
++  },
++
+   destroy: function() {}
+ };
+ 
+ /**
+  * Creates an editor for an Element node.
+  *
+  * @param MarkupContainer aContainer The container owning this editor.
+  * @param Element aNode The node being edited.
+@@ -1840,16 +1887,30 @@ ElementEditor.prototype = {
+    * @param string attrName The name of the attribute to get the element for
+    * @return DOMElement
+    */
+   getAttributeElement: function(attrName) {
+     return this.attrList.querySelector(
+       ".attreditor[data-attr=" + attrName + "] .attr-value");
+   },
+ 
++  /**
++   * Get the element used for one of the attributes of this element given its
++   * value
++   * @param string attrValue The value of the attribute to get the element for
++   * @return DOMElement
++   */
++  getAttributeElementByValue: function(attrValue) {
++    for (let attr of this.attrList.querySelectorAll(".attr-value")) {
++      if (attr.textContent === attrValue) {
++        return attr;
++      }
++    }
++  },
++
+   _createAttribute: function(aAttr, aBefore = null) {
+     // Create the template editor, which will save some variables here.
+     let data = {
+       attrName: aAttr.name,
+     };
+     this.template("attribute", data);
+     var {attr, inner, name, val} = data;
+ 
+@@ -2036,16 +2097,54 @@ ElementEditor.prototype = {
+         this.markup.setNodeExpanded(this.node, newContainer.expanded);
+         if (newContainer.selected) {
+           this.markup.navigate(this.container);
+         }
+       });
+     }).then(null, console.error);
+   },
+ 
++  highlightPart: function(type, value, part) {
++    if (type === "selector") {
++      // No need to highlight anything if the type is selector
++      return;
++    }
++
++    // FIXME: if the node isn't imported yet, we have a race condition and the
++    // range isn't visible
++
++    let range = this.doc.createRange();
++
++    // Get the node that contains the part
++    let node;
++    switch (type) {
++      case "attributeValue":
++        node = this.getAttributeElementByValue(value);
++        break;
++      case "attributeName":
++        node = this.getAttributeElement(value)
++          .parentNode.querySelector(".attr-name");
++        break;
++      case "tag":
++        node = this.tag;
++        break;
++    }
++
++    // Get the textnode to set the range in
++    node = node.firstChild;
++
++    let start = node.textContent.toLowerCase().indexOf(part.toLowerCase());
++    let end = start + part.length;
++
++    range.setStart(node, start);
++    range.setEnd(node, end);
++
++    this.doc.defaultView.getSelection().addRange(range);
++  },
++
+   destroy: function() {}
+ };
+ 
+ function nodeDocument(node) {
+   return node.ownerDocument ||
+     (node.nodeType == Ci.nsIDOMNode.DOCUMENT_NODE ? node : null);
+ }
+ 
+diff --git a/toolkit/devtools/server/actors/document-search.js b/toolkit/devtools/server/actors/document-search.js
+new file mode 100644
+--- /dev/null
++++ b/toolkit/devtools/server/actors/document-search.js
+@@ -0,0 +1,274 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++/**
++ * The document-search module provides a simple API to index and search strings
++ * and elements inside a given document.
++ * It indexes tag names, attribute names and values, and text contents.
++ * It provides a simple search function that returns a list of nodes that
++ * matched.
++ */
++
++const {Ci, Cu} = require("chrome");
++Cu.importGlobalProperties(['CSS']);
++
++/**
++ * The DocumentIndex class indexes the given document provides the data.
++ * The document is only indexed the first time the data is accessed and will be
++ * re-indexed when the data is accessed if markup-mutations were observed in the
++ * meantime.
++ *
++ * Usage example:
++ * let index = new DocumentIndex(doc);
++ * index.data; // returns the indexed data as a Map of with strings as keys
++ * index.destroy();
++ *
++ * @param {Document} doc The document to be indexed
++ */
++function DocumentIndex(doc) {
++  this.doc = doc;
++
++  // Kill the index when mutations occur, the next data get will re-index
++  this.observer = new doc.defaultView.MutationObserver(() => this._data = null);
++  this.observer.observe(doc, {
++    attributes: true,
++    characterData: true,
++    childList: true,
++    subtree: true
++  });
++}
++
++DocumentIndex.prototype = {
++  /**
++   * Destroy this instance, releasing all data and references
++   */
++  destroy: function() {
++    this.observer.disconnect();
++    this.observer = null;
++    this.doc = null;
++  },
++
++  /**
++   * Get the indexed data
++   * This getter also indexes if it hasn't been done yet or if the state is
++   * dirty
++   */
++  get data() {
++    if (!this._data) {
++      this.index();
++    }
++    return this._data;
++  },
++
++  _addToIndex: function(type, node, value) {
++    // Initialize data if needed
++    if (!this._data) {
++      this._data = new Map();
++    }
++
++    // Add an entry for this value if there isn't one
++    let entry = this._data.get(value);
++    if (!entry) {
++      this._data.set(value, []);
++    }
++
++    // Add the type/node to the list
++    this._data.get(value).push({
++      type: type,
++      node: node
++    });
++  },
++
++  index: function() {
++    let filter = Ci.nsIDOMNodeFilter.SHOW_COMMENT |
++                 Ci.nsIDOMNodeFilter.SHOW_ELEMENT |
++                 Ci.nsIDOMNodeFilter.SHOW_TEXT;
++    let walker = this.doc.createTreeWalker(this.doc, filter, {
++      acceptNode: node => {
++        if (node.nodeType === 3) {
++          // Only accept text nodes if they're not empty
++          if (node.textContent.trim() !== "") {
++            return Ci.nsIDOMNodeFilter.FILTER_ACCEPT;
++          }
++        } else {
++          // Accept all element and comment nodes
++          return Ci.nsIDOMNodeFilter.FILTER_ACCEPT;
++        }
++      }
++    });
++
++    while (walker.nextNode()) {
++      let node = walker.currentNode;
++
++      if (node.nodeType === 1) {
++        // For each element node, we get the tagname and all attributes names
++        // and values
++        this._addToIndex("tag", node, node.localName);
++        for (let {name, value} of node.attributes) {
++          this._addToIndex("attributeName", node, name);
++          this._addToIndex("attributeValue", node, value);
++        }
++      } else {
++        // For comments and text nodes, we get the text
++        this._addToIndex("text", node, node.textContent.trim());
++      }
++    }
++  }
++};
++
++exports.DocumentIndex = DocumentIndex;
++
++/**
++ * The DocumentSearch class provides a way to search an indexed document as well
++ * as find elements that match a given css selector.
++ *
++ * Usage example:
++ * let s = new DocumentSearch(doc);
++ * let res = s.search("lang", index);
++ * for (let {matched, results} of res) {
++ *   for (let {node, type} of results) {
++ *     console.log("The query matched a node's " + type);
++ *     console.log("String matched: " + matched);
++ *     console.log("Node that matched", node);
++ *    }
++ * }
++ * s.destroy();
++ *
++ * @param {Document} doc The document to be searched
++ *
++ * XXX: Doesn't work with iframes and when page is reloaded.
++ */
++function DocumentSearch(doc) {
++  this.doc = doc;
++  this.index = new DocumentIndex(this.doc);
++}
++
++DocumentSearch.prototype = {
++  destroy: function() {
++    this.index.destroy();
++    this.doc = null;
++  },
++
++  _addResult: function(node, type, matched, results) {
++    if (!results.has(node)) {
++      results.set(node, []);
++    }
++
++    let matches = results.get(node);
++
++    // Do not add if the exact same result is already in the list
++    let isKnown = false;
++    for (let match of matches) {
++      if (match.type === type && match.matched === matched) {
++        isKnown = true;
++        break;
++      }
++    }
++
++    if (!isKnown) {
++      matches.push({
++        matched: matched,
++        type: type
++      });
++    }
++  },
++
++  _searchIndex: function(query, options, results) {
++    for (let [matched, res] of this.index.data) {
++      if (options.searchMethod(query, matched)) {
++        // Filtering out all unwanted types
++        res = res.filter(entry => options.types.indexOf(entry.type) !== -1);
++        if (res.length) {
++          res.forEach(({node, type}) => {
++            this._addResult(node, type, matched, results);
++          });
++        }
++      }
++    }
++  },
++
++  _searchSelectors: function(query, options, results) {
++    // If the query is just one "word", no need to search because _searchIndex
++    // will lead the same results since it has access to tagnames anyway
++    let isSelector = query.match(/[ >~.#\[\]]/);
++    if (options.types.indexOf("selector") === -1 || !isSelector) {
++      return;
++    }
++
++    let nodes = [];
++    try {
++      nodes = [...this.doc.querySelectorAll(query)];
++    } catch (e) {
++      // Errors are ok, an invalid selector was probably provided
++    }
++    for (let node of nodes) {
++      let lastPart = query.split(/[ ~>]/).pop();
++      let matched = node.localName;
++      let type = "selector";
++
++      this._addResult(node, type, matched, results);
++    }
++  },
++
++  /**
++   * Search the document
++   * @param {String} query What to search for
++   * @param {Object} options The following options are accepted:
++   * - searchMethod {String} one of DocumentSearch.SEARCH_METHOD_*
++   *   defaults to DocumentSearch.SEARCH_METHOD_CONTAINS (does not apply to
++   *   selector search type)
++   * - types {Array} a list of things to search for (tag, text, attributes, etc)
++   *   defaults to DocumentSearch.ALL_RESULTS_TYPES
++   * @return {Array} An array is returned with each item being an object like:
++   * {
++   *   node: <the dom node that matched>,
++   *   matched: <the string that matched within that node>,
++   *   type: <the type of match: one of DocumentSearch.ALL_RESULTS_TYPES>
++   * }
++   */
++  search: function(query, options={}) {
++    options.searchMethod = options.searchMethod || DocumentSearch.SEARCH_METHOD_CONTAINS;
++    options.types = options.types || DocumentSearch.ALL_RESULTS_TYPES;
++
++    // Store results in a map indexed by nodes to avoid duplicate results
++    let results = new Map();
++
++    // Search through the indexed data
++    this._searchIndex(query, options, results);
++    // Search with querySelectorAll
++    this._searchSelectors(query, options, results);
++
++    // Make a usable output
++    let resultList = [];
++    for (let [node, matches] of results) {
++      for (let {type, matched} of matches) {
++        resultList.push({
++          node: node,
++          type: type,
++          matched: matched
++        });
++      }
++    }
++
++    // Sort the resulting nodes by order of appearance in the DOM
++    resultList.sort((a,b) => {
++      return a.node.compareDocumentPosition(b.node) & 4 ? -1 : 1;
++    });
++
++    return resultList;
++  }
++};
++
++DocumentSearch.SEARCH_METHOD_CONTAINS = (query, candidate) => {
++  return candidate.toLowerCase().indexOf(query.toLowerCase()) !== -1;
++};
++DocumentSearch.SEARCH_METHOD_STARTSWITH = (query, candidate) => {
++  return candidate.toLowerCase().startsWith(query.toLowerCase());
++};
++DocumentSearch.ALL_RESULTS_TYPES = ["tag", "text", "attributeName",
++                                    "attributeValue", "selector"];
++
++exports.DocumentSearch = DocumentSearch;
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -57,16 +57,17 @@ const {Arg, Option, method, RetVal, type
+ const {LongStringActor, ShortLongString} = require("devtools/server/actors/string");
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const object = require("sdk/util/object");
+ const events = require("sdk/event/core");
+ const {Unknown} = require("sdk/platform/xpcom");
+ const {Class} = require("sdk/core/heritage");
+ const {PageStyleActor} = require("devtools/server/actors/styles");
+ const {HighlighterActor} = require("devtools/server/actors/highlighter");
++const {DocumentSearch} = require("devtools/server/actors/document-search");
+ 
+ const PSEUDO_CLASSES = [":hover", ":active", ":focus"];
+ const HIDDEN_CLASS = "__fx-devtools-hide-shortcut__";
+ const XHTML_NS = "http://www.w3.org/1999/xhtml";
+ const IMAGE_FETCHING_TIMEOUT = 500;
+ // The possible completions to a ':' with added score to give certain values
+ // some preference.
+ const PSEUDO_SELECTORS = [
+@@ -94,17 +95,16 @@ const PSEUDO_SELECTORS = [
+   [":empty", 0],
+   [":target", 0],
+   [":enabled", 0],
+   [":disabled", 0],
+   [":checked", 1],
+   ["::selection", 0]
+ ];
+ 
+-
+ let HELPER_SHEET = ".__fx-devtools-hide-shortcut__ { visibility: hidden !important } ";
+ HELPER_SHEET += ":-moz-devtools-highlighted { outline: 2px dashed #F06!important; outline-offset: -2px!important } ";
+ 
+ Cu.import("resource://gre/modules/devtools/LayoutHelpers.jsm");
+ 
+ loader.lazyImporter(this, "gDevTools", "resource:///modules/devtools/gDevTools.jsm");
+ 
+ loader.lazyGetter(this, "DOMParser", function() {
+@@ -634,16 +634,22 @@ types.addDictType("disconnectedNodeArray
+   nodes: "array:domnode",
+ 
+   // Nodes that are needed to connect those nodes to the root.
+   newParents: "array:domnode"
+ });
+ 
+ types.addDictType("dommutation", {});
+ 
++types.addDictType("searchresult", {
++  node: "disconnectedNode",
++  type: "string",
++  matched: "string"
++});
++
+ /**
+  * Server side of a node list as returned by querySelectorAll()
+  */
+ var NodeListActor = exports.NodeListActor = protocol.ActorClass({
+   typeName: "domnodelist",
+ 
+   initialize: function(walker, nodeList) {
+     protocol.Actor.prototype.initialize.call(this);
+@@ -812,16 +818,18 @@ var WalkerActor = protocol.ActorClass({
+     this.rootWin = tabActor.window;
+     this.rootDoc = this.rootWin.document;
+     this._refMap = new Map();
+     this._pendingMutations = [];
+     this._activePseudoClassLocks = new Set();
+ 
+     this.layoutHelpers = new LayoutHelpers(this.rootWin);
+ 
++    this.documentSearch = new DocumentSearch(this.rootDoc);
++
+     // Nodes which have been removed from the client's known
+     // ownership tree are considered "orphaned", and stored in
+     // this set.
+     this._orphaned = new Set();
+ 
+     // The client can tell the walker that it is interested in a node
+     // even when it is orphaned with the `retainNode` method.  This
+     // list contains orphaned nodes that were so retained.
+@@ -851,16 +859,17 @@ var WalkerActor = protocol.ActorClass({
+     return "[WalkerActor " + this.actorID + "]";
+   },
+ 
+   destroy: function() {
+     this._hoveredNode = null;
+     this.clearPseudoClassLocks();
+     this._activePseudoClassLocks = null;
+     this.rootDoc = null;
++    this.documentSearch.destroy();
+     events.emit(this, "destroyed");
+     protocol.Actor.prototype.destroy.call(this);
+   },
+ 
+   release: method(function() {}, { release: true }),
+ 
+   unmanage: function(actor) {
+     if (actor instanceof NodeActor) {
+@@ -1346,16 +1355,63 @@ var WalkerActor = protocol.ActorClass({
+       selector: Arg(1)
+     },
+     response: {
+       list: RetVal("domnodelist")
+     }
+   }),
+ 
+   /**
++   * Incrementally search the document for a given string. Results will be
++   * searched with the document-search module (searches through tag names,
++   * attribute names and values, and text contents).
++   * Only 1 result is sent back, and calling the method again with the same
++   * query will send the next result. When there are no more results to be sent
++   * back, null is sent
++   * @param {String} query
++   * @param {Object} options The only supported option is "reset" which forces
++   * a new search even if the same query is passed
++   */
++  search: method(function(query, options) {
++    // Search if no search has been done before, or if asked to reset or if the
++    // query has changed
++    if (this._lastSearch !== query || options.reset) {
++      this._lastSearch = query;
++      this._lastSearchIndex = 0;
++      this._lastSearchResults = this.documentSearch.search(query);
++    }
++
++    if (!this._lastSearchResults.length) {
++      return null;
++    }
++
++    let res = this._lastSearchResults[this._lastSearchIndex];
++
++    // Move search result cursor and cycle if necessary
++    this._lastSearchIndex ++;
++    if (this._lastSearchIndex === this._lastSearchResults.length) {
++      this._lastSearchIndex = 0;
++    }
++
++    return {
++      node: this.attachElement(res.node),
++      type: res.type,
++      matched: res.matched
++    };
++  }, {
++    request: {
++      query: Arg(0),
++      reset: Option(1, "boolean")
++    },
++    response: {
++      node: RetVal("nullable:searchresult")
++    }
++  }),
++
++  /**
+    * Returns a list of matching results for CSS selector autocompletion.
+    *
+    * @param string query
+    *        The selector query being completed
+    * @param string completing
+    *        The exact token being completed out of the query
+    * @param string selectorState
+    *        One of "pseudo", "id", "tag", "class", "null"
+@@ -2240,16 +2296,30 @@ var WalkerFront = exports.WalkerFront = 
+   getNodeActorFromObjectActor: protocol.custom(function(objectActorID) {
+     return this._getNodeActorFromObjectActor(objectActorID).then(response => {
+       return response ? response.node : null;
+     });
+   }, {
+     impl: "_getNodeActorFromObjectActor"
+   }),
+ 
++  search: protocol.custom(function(query) {
++    return this._search(query).then(response => {
++      if (response) {
++        return {
++          type: response.type,
++          matched: response.matched,
++          node: response.node.node
++        };
++      }
++    });
++  }, {
++    impl: "_search"
++  }),
++
+   _releaseFront: function(node, force) {
+     if (node.retained && !force) {
+       node.reparent(null);
+       this._retainedOrphans.add(node);
+       return;
+     }
+ 
+     if (node.retained) {
