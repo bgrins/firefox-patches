@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  fc56554ea439e01e2a92e4fd902dd5c931b6624b
+# Parent  7d8051a8dd014f26df66856ea1c19e961499c44c
 Bug 835896 - Inspector searchbox should also provide a way to search plain text on the page
 
 diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
@@ -33,7 +33,7 @@ diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/in
    setupSidebar: function InspectorPanel_setupSidebar() {
      let tabbox = this.panelDoc.querySelector("#inspector-sidebar");
      this.sidebar = new ToolSidebar(tabbox, this, "inspector", {
-@@ -581,29 +581,29 @@ InspectorPanel.prototype = {
+@@ -581,32 +581,32 @@ InspectorPanel.prototype = {
      this.sidebar = null;
  
      this.nodemenu.removeEventListener("popupshowing", this._setupNodeMenu, true);
@@ -43,9 +43,7 @@ diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/in
        this.onPaneToggleButtonClicked);
      this._paneToggleButton = null;
 -    this.searchSuggestions.destroy();
-+    this.search.destroy();
-+    this.search = null;
-     this.searchBox = null;
+-    this.searchBox = null;
      this.selection.off("new-node-front", this.onNewSelection);
      this.selection.off("before-new-node", this.onBeforeNewSelection);
      this.selection.off("before-new-node-front", this.onBeforeNewSelection);
@@ -60,11 +58,17 @@ diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/in
      this.lastNodemenuItem = null;
      this.nodemenu = null;
      this._toolbox = null;
++    this.search.destroy();
++    this.search = null;
++    this.searchBox = null;
  
      this._panelDestroyer = promise.all([
        sidebarDestroyer,
        markupDestroyer
      ]);
+ 
+     return this._panelDestroyer;
+   },
 diff --git a/browser/devtools/inspector/selector-search.js b/browser/devtools/inspector/selector-search.js
 --- a/browser/devtools/inspector/selector-search.js
 +++ b/browser/devtools/inspector/selector-search.js
@@ -742,11 +746,32 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      }
  
      if (node.retained) {
+@@ -3449,16 +3520,20 @@ DocumentWalker.prototype = {
+   get whatToShow() this.walker.whatToShow,
+   get currentNode() this.walker.currentNode,
+   set currentNode(aVal) this.walker.currentNode = aVal,
+ 
+   parentNode: function() {
+     return this.walker.parentNode();
+   },
+ 
++  nextNode: function() {
++    return this.walker.nextNode();
++  },
++
+   firstChild: function() {
+     let node = this.walker.currentNode;
+     if (!node)
+       return null;
+ 
+     let firstChild = this.walker.firstChild();
+     while (firstChild && this.filter(firstChild) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
+       firstChild = this.walker.nextSibling();
 diff --git a/toolkit/devtools/server/actors/utils/document-search.js b/toolkit/devtools/server/actors/utils/document-search.js
 new file mode 100644
 --- /dev/null
 +++ b/toolkit/devtools/server/actors/utils/document-search.js
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,254 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -779,15 +804,15 @@ new file mode 100644
 + */
 +function DocumentIndex(walker) {
 +  this.walker = walker;
-+  this.doc = walker.rootDoc;
 +
-+  // Kill the index when mutations occur, the next data get will re-index
-+  this.observer = new this.doc.defaultView.MutationObserver(() => this._data = null);
-+  this.observer.observe(this.doc, {
-+    attributes: true,
-+    characterData: true,
-+    childList: true,
-+    subtree: true
++  // Kill the index when mutations occur, the next data get will re-index.
++
++  // XXX: This is limited because the walker won't emit mutations for documents
++  // that aren't used in other tools.  We will need probably need to set up observers
++  // using the tabActors windows and listen for frame load and unload.
++
++  this.walker.on("new-mutations", () => {
++    this._data = null;
 +  });
 +}
 +
@@ -795,10 +820,10 @@ new file mode 100644
 +  /**
 +   * Destroy this instance, releasing all data and references
 +   */
-+  destroy: function() {
-+    this.observer.disconnect();
-+    this.observer = null;
-+    this.doc = null;
++  destroy: function() { },
++
++  get doc() {
++    return this.walker.rootDoc;
 +  },
 +
 +  /**
@@ -808,17 +833,13 @@ new file mode 100644
 +   */
 +  get data() {
 +    if (!this._data) {
++      this._data = new Map();
 +      this.index();
 +    }
 +    return this._data;
 +  },
 +
 +  _addToIndex: function(type, node, value) {
-+    // Initialize data if needed
-+    if (!this._data) {
-+      this._data = new Map();
-+    }
-+
 +    // Add an entry for this value if there isn't one
 +    let entry = this._data.get(value);
 +    if (!entry) {
@@ -833,25 +854,9 @@ new file mode 100644
 +  },
 +
 +  index: function() {
-+    let filter = Ci.nsIDOMNodeFilter.SHOW_COMMENT |
-+                 Ci.nsIDOMNodeFilter.SHOW_ELEMENT |
-+                 Ci.nsIDOMNodeFilter.SHOW_TEXT;
-+    let walker = this.doc.createTreeWalker(this.doc, filter, {
-+      acceptNode: node => {
-+        if (node.nodeType === 3) {
-+          // Only accept text nodes if they're not empty
-+          if (node.textContent.trim() !== "") {
-+            return Ci.nsIDOMNodeFilter.FILTER_ACCEPT;
-+          }
-+        } else {
-+          // Accept all element and comment nodes
-+          return Ci.nsIDOMNodeFilter.FILTER_ACCEPT;
-+        }
-+      }
-+    });
-+
-+    while (walker.nextNode()) {
-+      let node = walker.currentNode;
++    let documentWalker = this.walker.getDocumentWalker(this.doc);
++    while (documentWalker.nextNode()) {
++      let node = documentWalker.currentNode;
 +
 +      if (node.nodeType === 1) {
 +        // For each element node, we get the tagname and all attributes names
@@ -861,7 +866,7 @@ new file mode 100644
 +          this._addToIndex("attributeName", node, name);
 +          this._addToIndex("attributeValue", node, value);
 +        }
-+      } else {
++      } else if (node.textContent && node.textContent.trim().length) {
 +        // For comments and text nodes, we get the text
 +        this._addToIndex("text", node, node.textContent.trim());
 +      }
@@ -888,8 +893,6 @@ new file mode 100644
 + * s.destroy();
 + *
 + * @param {Document} doc The document to be searched
-+ *
-+ * XXX: Doesn't work with iframes and when page is reloaded.
 + */
 +function DocumentSearch(doc) {
 +  this.doc = doc;
@@ -949,6 +952,7 @@ new file mode 100644
 +    }
 +
 +    let nodes = [];
++
 +    try {
 +      nodes = [...this.doc.querySelectorAll(query)];
 +    } catch (e) {
