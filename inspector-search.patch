@@ -1,7 +1,8 @@
 # HG changeset patch
 # Parent f2cdab51407b0d333aae8ddd7fb70cf9c2209b52
 # User Patrick Brosset <pbrosset@mozilla.com>
-# Parent  310a0f53aa4733fb87a1b9a33eb01146ef667795
+# Parent  fc56554ea439e01e2a92e4fd902dd5c931b6624b
+Bug 835896 - Inspector searchbox should also provide a way to search plain text on the page
 
 diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
 --- a/browser/devtools/inspector/inspector-panel.js
@@ -33,7 +34,7 @@ diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/in
    setupSidebar: function InspectorPanel_setupSidebar() {
      let tabbox = this.panelDoc.querySelector("#inspector-sidebar");
      this.sidebar = new ToolSidebar(tabbox, this, "inspector", {
-@@ -577,29 +577,29 @@ InspectorPanel.prototype = {
+@@ -581,29 +581,29 @@ InspectorPanel.prototype = {
      this.sidebar = null;
  
      this.nodemenu.removeEventListener("popupshowing", this._setupNodeMenu, true);
@@ -68,59 +69,148 @@ diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/in
 diff --git a/browser/devtools/inspector/selector-search.js b/browser/devtools/inspector/selector-search.js
 --- a/browser/devtools/inspector/selector-search.js
 +++ b/browser/devtools/inspector/selector-search.js
-@@ -220,16 +220,31 @@ SelectorSearch.prototype = {
-       }
-       this.emit("processing-done");
-       return;
-     }
+@@ -8,32 +8,117 @@ const { Cu } = require("chrome");
  
-     this.searchBox.setAttribute("filled", true);
-     let queryList = null;
+ const promise = require("resource://gre/modules/Promise.jsm").Promise;
+ loader.lazyGetter(this, "EventEmitter", () => require("devtools/toolkit/event-emitter"));
+ loader.lazyGetter(this, "AutocompletePopup", () => require("devtools/shared/autocomplete-popup").AutocompletePopup);
  
+ // Maximum number of selector suggestions shown in the panel.
+ const MAX_SUGGESTIONS = 15;
+ 
++
++/**
++ * Converts any input field into a document search box.
++ *
++ * @param {InspectorPanel} inspector The InspectorPanel whose `walker` attribute
++ * should be used for document traversal.
++ * @param {DomNode} input The input element to which the panel will be attached
++ * and from where search input will be taken.
++ *
++ * Emits the following events:
++ * - search-cleared: when the search box is emptied
++ * - search-no-result: when a search is made that yields no result
++ * - search-result: when a search is made and a result is selected
++ */
++function SelectorSearch(inspector, input) {
++  this.inspector = inspector;
++  this.searchBox = input;
++  this._lastSearched = null;
++
++  this._onKeyPress = this._onKeyPress.bind(this);
++  this.searchBox.addEventListener("keypress", this._onKeyPress, true);
++
++  // For testing, we need to be able to wait for the most recent node request
++  // to finish.  Tests can watch this promise for that.
++  this._lastQuery = promise.resolve(null);
++
++  EventEmitter.decorate(this);
++}
++
++exports.SelectorSearch = SelectorSearch;
++
++SelectorSearch.prototype = {
++  get walker() this.inspector.walker,
++
++  destroy: function() {
++    this.searchBox.removeEventListener("keypress", this._onKeyPress, true);
++    this.searchBox = null;
++  },
++
++  _onSearch: function() {
++    let query = this.searchBox.value;
++
++    this._lastSearched = query;
++
++    if (query.length == 0) {
++      this.searchBox.removeAttribute("filled");
++      this.searchBox.classList.remove("devtools-no-search-result");
++      this.emit("search-cleared");
++      return;
++    }
++
++    this.searchBox.setAttribute("filled", true);
++
 +    this._lastQuery = this.walker.search(query).then(res => {
++      // Value has changed since we started this request, we're done.
++      if (query != this.searchBox.value) {
++        return;
++      }
++
 +      if (res) {
 +        this.inspector.selection.setNodeFront(res.node, "selectorsearch");
 +        this.searchBox.classList.remove("devtools-no-search-result");
++
 +        res.query = query;
 +        this.emit("search-result", res);
 +      } else {
 +        this.searchBox.classList.add("devtools-no-search-result");
 +        this.emit("search-no-result");
 +      }
-+    }).then(() => this.emit("processing-done"), Cu.reportError);
++    });
++  },
 +
-+    return;
++  _onKeyPress: function(event) {
++    if (event.keyCode === event.DOM_VK_RETURN) {
++      this._onSearch();
++    }
++  }
++};
 +
 +
-     this._lastQuery = this._queryNodes(query).then(list => {
-       return list;
-     }, (err) => {
-       // Failures are ok here, just use a null item list;
-       return null;
-     }).then(queryList => {
-       // Value has changed since we started this request, we're done.
-       if (query != this.searchBox.value) {
-@@ -286,16 +301,19 @@ SelectorSearch.prototype = {
++
++
++
++// XXX: Here is the autocomplete part
++
+ /**
+  * Converts any input box on a page to a CSS selector search and suggestion box.
+  *
+  * Emits 'processing-done' event when it is done processing the current
+  * keypress, search request or selection from the list, whether that led to a
+  * search or not.
+  *
+  * @constructor
+  * @param InspectorPanel aInspector
+  *        The InspectorPanel whose `walker` attribute should be used for
+  *        document traversal.
+  * @param nsiInputElement aInputNode
+  *        The input element to which the panel will be attached and from where
+  *        search input will be taken.
+  */
+-function SelectorSearch(aInspector, aInputNode) {
++function SelectorSearch2(aInspector, aInputNode) {
+   this.inspector = aInspector;
+   this.searchBox = aInputNode;
+   this.panelDoc = this.searchBox.ownerDocument;
  
-   /**
-    * Handles keypresses inside the input box.
-    */
-   _onSearchKeypress: function(aEvent) {
-     let query = this.searchBox.value;
-     switch(aEvent.keyCode) {
-       case aEvent.DOM_VK_RETURN:
-+        this._onHTMLSearch();
-+        return;
-+        // XXX: Rebase change
-         if (query == this._lastSearched && this._searchResults) {
-           this._searchIndex = (this._searchIndex + 1) % this._searchResults.length;
-         }
-         else {
-           this._onHTMLSearch();
-           return;
-         }
-         break;
-@@ -440,37 +458,37 @@ SelectorSearch.prototype = {
+   // initialize variables.
+   this._lastSearched = null;
+   this._lastValidSearch = "";
+   this._lastToLastValidSearch = null;
+@@ -65,19 +150,19 @@ function SelectorSearch(aInspector, aInp
+   this.searchBox.addEventListener("keypress", this._onSearchKeypress, true);
+ 
+   // For testing, we need to be able to wait for the most recent node request
+   // to finish.  Tests can watch this promise for that.
+   this._lastQuery = promise.resolve(null);
+   EventEmitter.decorate(this);
+ }
+ 
+-exports.SelectorSearch = SelectorSearch;
++exports.SelectorSearch2 = SelectorSearch2;
+ 
+-SelectorSearch.prototype = {
++SelectorSearch2.prototype = {
+ 
+   get walker() this.inspector.walker,
+ 
+   // The possible states of the query.
+   States: {
+     CLASS: "class",
+     ID: "id",
+     TAG: "tag",
+@@ -440,37 +525,37 @@ SelectorSearch.prototype = {
          let lastPart = query.match(/[\s>+][\.#a-zA-Z][^>\s+\.#]*$/)[0];
          value = query.slice(0, -1 * lastPart.length + 1) + value;
        }
@@ -171,7 +261,7 @@ diff --git a/browser/devtools/inspector/selector-search.js b/browser/devtools/in
      if (total > 0) {
        this.searchPopup.setItems(items);
        this.searchPopup.openPopup(this.searchBox);
-@@ -481,19 +499,19 @@ SelectorSearch.prototype = {
+@@ -481,19 +566,19 @@ SelectorSearch.prototype = {
    },
  
    /**
@@ -193,7 +283,7 @@ diff --git a/browser/devtools/inspector/selector-search.js b/browser/devtools/in
      }
      else if (state == this.States.CLASS) {
        // gets the class that is being completed. For ex. '.foo.b' returns 'b'
-@@ -505,29 +523,29 @@ SelectorSearch.prototype = {
+@@ -505,29 +590,29 @@ SelectorSearch.prototype = {
        firstPart = query.match(/#([^#]*)$/)[1];
        query = query.slice(0, query.length - firstPart.length - 1);
      }
