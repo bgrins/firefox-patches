@@ -1,0 +1,448 @@
+# HG changeset patch
+# User Tim Nguyen <ntim.bugs@gmail.com>
+# Date 1428103079 -7200
+#      Sat Apr 04 01:17:59 2015 +0200
+# Node ID c530769e54bd8e3ddecfb38d0b8a0c354ddb44a8
+# Parent  a787c9daa1b9cbcf4bded8bda36e06c520218f4f
+Bug 1089428 - Allow script injection into source editor component. r=bgrins
+
+diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceeditor/editor.js
+--- a/browser/devtools/sourceeditor/editor.js
++++ b/browser/devtools/sourceeditor/editor.js
+@@ -215,16 +215,21 @@ function Editor(config) {
+       return;
+     }
+ 
+     var num = cm.getOption("indentUnit");
+     if (cm.getCursor().ch !== 0) num -= 1;
+     cm.replaceSelection(" ".repeat(num), "end", "+input");
+   };
+ 
++  // Allow add-ons to inject scripts for their editor instances
++  if (!this.config.externalScripts) {
++    this.config.externalScripts = [];
++  }
++
+   events.decorate(this);
+ }
+ 
+ Editor.prototype = {
+   container: null,
+   version: null,
+   config: null,
+ 
+@@ -253,19 +258,21 @@ Editor.prototype = {
+       // and its dependencies into its DOM.
+ 
+       env.removeEventListener("load", onLoad, true);
+       let win = env.contentWindow.wrappedJSObject;
+ 
+       if (!this.config.themeSwitching)
+         win.document.documentElement.setAttribute("force-theme", "light");
+ 
+-      CM_SCRIPTS.forEach((url) =>
+-        Services.scriptloader.loadSubScript(url, win, "utf8"));
+-
++      let scriptsToInject = CM_SCRIPTS.concat(this.config.externalScripts);
++      scriptsToInject.forEach((url) => {
++        if (url.startsWith("chrome://"))
++          Services.scriptloader.loadSubScript(url, win, "utf8");
++      });
+       // Replace the propertyKeywords, colorKeywords and valueKeywords
+       // properties of the CSS MIME type with the values provided by Gecko.
+       let cssSpec = win.CodeMirror.resolveMode("text/css");
+       cssSpec.propertyKeywords = cssProperties;
+       cssSpec.colorKeywords = cssColors;
+       cssSpec.valueKeywords = cssValues;
+       win.CodeMirror.defineMIME("text/css", cssSpec);
+ 
+@@ -330,16 +337,21 @@ Editor.prototype = {
+       this._prefObserver.on(EXPAND_TAB, this.reloadPreferences);
+       this._prefObserver.on(KEYMAP, this.reloadPreferences);
+       this._prefObserver.on(AUTO_CLOSE, this.reloadPreferences);
+       this._prefObserver.on(AUTOCOMPLETE, this.reloadPreferences);
+       this._prefObserver.on(DETECT_INDENT, this.reloadPreferences);
+       this._prefObserver.on(ENABLE_CODE_FOLDING, this.reloadPreferences);
+ 
+       this.reloadPreferences();
++
++      win.editor = this;
++      let editorReadyEvent = new win.CustomEvent("editorReady");
++      win.dispatchEvent(editorReadyEvent);
++
+       def.resolve();
+     };
+ 
+     env.addEventListener("load", onLoad, true);
+     env.setAttribute("src", CM_IFRAME);
+     el.appendChild(env);
+ 
+     this.once("destroy", () => el.removeChild(env));
+diff --git a/browser/devtools/sourceeditor/test/browser.ini b/browser/devtools/sourceeditor/test/browser.ini
+--- a/browser/devtools/sourceeditor/test/browser.ini
++++ b/browser/devtools/sourceeditor/test/browser.ini
+@@ -4,16 +4,18 @@ subsuite = devtools
+ support-files =
+   cm_comment_test.js
+   cm_doc_test.js
+   cm_driver.js
+   cm_emacs_test.js
+   cm_mode_test.css
+   cm_mode_test.js
+   cm_multi_test.js
++  cm_mode_ruby.js
++  cm_script_injection_test.js
+   cm_search_test.js
+   cm_sublime_test.js
+   cm_test.js
+   cm_vim_test.js
+   codemirror.html
+   css_statemachine_testcases.css
+   css_statemachine_tests.json
+   css_autocompletion_tests.json
+@@ -26,16 +28,17 @@ support-files =
+ [browser_editor_autocomplete_js.js]
+ [browser_editor_basic.js]
+ [browser_editor_cursor.js]
+ [browser_editor_goto_line.js]
+ [browser_editor_history.js]
+ [browser_editor_markers.js]
+ [browser_editor_movelines.js]
+ [browser_editor_prefs.js]
++[browser_editor_script_injection.js]
+ [browser_editor_addons.js]
+ [browser_codemirror.js]
+ [browser_css_autocompletion.js]
+ [browser_css_getInfo.js]
+ [browser_css_statemachine.js]
+ [browser_detectindent.js]
+ [browser_vimemacs.js]
+ skip-if = os == 'linux'&&debug # bug 981707
+diff --git a/browser/devtools/sourceeditor/test/browser_editor_script_injection.js b/browser/devtools/sourceeditor/test/browser_editor_script_injection.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/sourceeditor/test/browser_editor_script_injection.js
+@@ -0,0 +1,23 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++add_task(function*() {
++  yield runTest();
++});
++
++function* runTest() {
++  const baseURL = "chrome://mochitests/content/browser/browser/devtools/sourceeditor/test"
++  const injectedText = "Script successfully injected !";
++
++  let {ed, win} = yield setup(null, {
++    mode: "ruby",
++    externalScripts: [`${baseURL}/cm_script_injection_test.js`,
++                      `${baseURL}/cm_mode_ruby.js`]
++  });
++
++  is(ed.getText(), injectedText, "The text has been injected");
++  is(ed.getOption("mode"), "ruby", "The ruby mode is correctly set");
++  teardown(ed, win);
++}
+\ No newline at end of file
+diff --git a/browser/devtools/sourceeditor/test/cm_mode_ruby.js b/browser/devtools/sourceeditor/test/cm_mode_ruby.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/sourceeditor/test/cm_mode_ruby.js
+@@ -0,0 +1,285 @@
++// CodeMirror, copyright (c) by Marijn Haverbeke and others
++// Distributed under an MIT license: http://codemirror.net/LICENSE
++
++(function(mod) {
++  if (typeof exports == "object" && typeof module == "object") // CommonJS
++    mod(require("../../lib/codemirror"));
++  else if (typeof define == "function" && define.amd) // AMD
++    define(["../../lib/codemirror"], mod);
++  else // Plain browser env
++    mod(CodeMirror);
++})(function(CodeMirror) {
++"use strict";
++
++CodeMirror.defineMode("ruby", function(config) {
++  function wordObj(words) {
++    var o = {};
++    for (var i = 0, e = words.length; i < e; ++i) o[words[i]] = true;
++    return o;
++  }
++  var keywords = wordObj([
++    "alias", "and", "BEGIN", "begin", "break", "case", "class", "def", "defined?", "do", "else",
++    "elsif", "END", "end", "ensure", "false", "for", "if", "in", "module", "next", "not", "or",
++    "redo", "rescue", "retry", "return", "self", "super", "then", "true", "undef", "unless",
++    "until", "when", "while", "yield", "nil", "raise", "throw", "catch", "fail", "loop", "callcc",
++    "caller", "lambda", "proc", "public", "protected", "private", "require", "load",
++    "require_relative", "extend", "autoload", "__END__", "__FILE__", "__LINE__", "__dir__"
++  ]);
++  var indentWords = wordObj(["def", "class", "case", "for", "while", "module", "then",
++                             "catch", "loop", "proc", "begin"]);
++  var dedentWords = wordObj(["end", "until"]);
++  var matching = {"[": "]", "{": "}", "(": ")"};
++  var curPunc;
++
++  function chain(newtok, stream, state) {
++    state.tokenize.push(newtok);
++    return newtok(stream, state);
++  }
++
++  function tokenBase(stream, state) {
++    curPunc = null;
++    if (stream.sol() && stream.match("=begin") && stream.eol()) {
++      state.tokenize.push(readBlockComment);
++      return "comment";
++    }
++    if (stream.eatSpace()) return null;
++    var ch = stream.next(), m;
++    if (ch == "`" || ch == "'" || ch == '"') {
++      return chain(readQuoted(ch, "string", ch == '"' || ch == "`"), stream, state);
++    } else if (ch == "/") {
++      var currentIndex = stream.current().length;
++      if (stream.skipTo("/")) {
++        var search_till = stream.current().length;
++        stream.backUp(stream.current().length - currentIndex);
++        var balance = 0;  // balance brackets
++        while (stream.current().length < search_till) {
++          var chchr = stream.next();
++          if (chchr == "(") balance += 1;
++          else if (chchr == ")") balance -= 1;
++          if (balance < 0) break;
++        }
++        stream.backUp(stream.current().length - currentIndex);
++        if (balance == 0)
++          return chain(readQuoted(ch, "string-2", true), stream, state);
++      }
++      return "operator";
++    } else if (ch == "%") {
++      var style = "string", embed = true;
++      if (stream.eat("s")) style = "atom";
++      else if (stream.eat(/[WQ]/)) style = "string";
++      else if (stream.eat(/[r]/)) style = "string-2";
++      else if (stream.eat(/[wxq]/)) { style = "string"; embed = false; }
++      var delim = stream.eat(/[^\w\s=]/);
++      if (!delim) return "operator";
++      if (matching.propertyIsEnumerable(delim)) delim = matching[delim];
++      return chain(readQuoted(delim, style, embed, true), stream, state);
++    } else if (ch == "#") {
++      stream.skipToEnd();
++      return "comment";
++    } else if (ch == "<" && (m = stream.match(/^<-?[\`\"\']?([a-zA-Z_?]\w*)[\`\"\']?(?:;|$)/))) {
++      return chain(readHereDoc(m[1]), stream, state);
++    } else if (ch == "0") {
++      if (stream.eat("x")) stream.eatWhile(/[\da-fA-F]/);
++      else if (stream.eat("b")) stream.eatWhile(/[01]/);
++      else stream.eatWhile(/[0-7]/);
++      return "number";
++    } else if (/\d/.test(ch)) {
++      stream.match(/^[\d_]*(?:\.[\d_]+)?(?:[eE][+\-]?[\d_]+)?/);
++      return "number";
++    } else if (ch == "?") {
++      while (stream.match(/^\\[CM]-/)) {}
++      if (stream.eat("\\")) stream.eatWhile(/\w/);
++      else stream.next();
++      return "string";
++    } else if (ch == ":") {
++      if (stream.eat("'")) return chain(readQuoted("'", "atom", false), stream, state);
++      if (stream.eat('"')) return chain(readQuoted('"', "atom", true), stream, state);
++
++      // :> :>> :< :<< are valid symbols
++      if (stream.eat(/[\<\>]/)) {
++        stream.eat(/[\<\>]/);
++        return "atom";
++      }
++
++      // :+ :- :/ :* :| :& :! are valid symbols
++      if (stream.eat(/[\+\-\*\/\&\|\:\!]/)) {
++        return "atom";
++      }
++
++      // Symbols can't start by a digit
++      if (stream.eat(/[a-zA-Z$@_\xa1-\uffff]/)) {
++        stream.eatWhile(/[\w$\xa1-\uffff]/);
++        // Only one ? ! = is allowed and only as the last character
++        stream.eat(/[\?\!\=]/);
++        return "atom";
++      }
++      return "operator";
++    } else if (ch == "@" && stream.match(/^@?[a-zA-Z_\xa1-\uffff]/)) {
++      stream.eat("@");
++      stream.eatWhile(/[\w\xa1-\uffff]/);
++      return "variable-2";
++    } else if (ch == "$") {
++      if (stream.eat(/[a-zA-Z_]/)) {
++        stream.eatWhile(/[\w]/);
++      } else if (stream.eat(/\d/)) {
++        stream.eat(/\d/);
++      } else {
++        stream.next(); // Must be a special global like $: or $!
++      }
++      return "variable-3";
++    } else if (/[a-zA-Z_\xa1-\uffff]/.test(ch)) {
++      stream.eatWhile(/[\w\xa1-\uffff]/);
++      stream.eat(/[\?\!]/);
++      if (stream.eat(":")) return "atom";
++      return "ident";
++    } else if (ch == "|" && (state.varList || state.lastTok == "{" || state.lastTok == "do")) {
++      curPunc = "|";
++      return null;
++    } else if (/[\(\)\[\]{}\\;]/.test(ch)) {
++      curPunc = ch;
++      return null;
++    } else if (ch == "-" && stream.eat(">")) {
++      return "arrow";
++    } else if (/[=+\-\/*:\.^%<>~|]/.test(ch)) {
++      var more = stream.eatWhile(/[=+\-\/*:\.^%<>~|]/);
++      if (ch == "." && !more) curPunc = ".";
++      return "operator";
++    } else {
++      return null;
++    }
++  }
++
++  function tokenBaseUntilBrace(depth) {
++    if (!depth) depth = 1;
++    return function(stream, state) {
++      if (stream.peek() == "}") {
++        if (depth == 1) {
++          state.tokenize.pop();
++          return state.tokenize[state.tokenize.length-1](stream, state);
++        } else {
++          state.tokenize[state.tokenize.length - 1] = tokenBaseUntilBrace(depth - 1);
++        }
++      } else if (stream.peek() == "{") {
++        state.tokenize[state.tokenize.length - 1] = tokenBaseUntilBrace(depth + 1);
++      }
++      return tokenBase(stream, state);
++    };
++  }
++  function tokenBaseOnce() {
++    var alreadyCalled = false;
++    return function(stream, state) {
++      if (alreadyCalled) {
++        state.tokenize.pop();
++        return state.tokenize[state.tokenize.length-1](stream, state);
++      }
++      alreadyCalled = true;
++      return tokenBase(stream, state);
++    };
++  }
++  function readQuoted(quote, style, embed, unescaped) {
++    return function(stream, state) {
++      var escaped = false, ch;
++
++      if (state.context.type === 'read-quoted-paused') {
++        state.context = state.context.prev;
++        stream.eat("}");
++      }
++
++      while ((ch = stream.next()) != null) {
++        if (ch == quote && (unescaped || !escaped)) {
++          state.tokenize.pop();
++          break;
++        }
++        if (embed && ch == "#" && !escaped) {
++          if (stream.eat("{")) {
++            if (quote == "}") {
++              state.context = {prev: state.context, type: 'read-quoted-paused'};
++            }
++            state.tokenize.push(tokenBaseUntilBrace());
++            break;
++          } else if (/[@\$]/.test(stream.peek())) {
++            state.tokenize.push(tokenBaseOnce());
++            break;
++          }
++        }
++        escaped = !escaped && ch == "\\";
++      }
++      return style;
++    };
++  }
++  function readHereDoc(phrase) {
++    return function(stream, state) {
++      if (stream.match(phrase)) state.tokenize.pop();
++      else stream.skipToEnd();
++      return "string";
++    };
++  }
++  function readBlockComment(stream, state) {
++    if (stream.sol() && stream.match("=end") && stream.eol())
++      state.tokenize.pop();
++    stream.skipToEnd();
++    return "comment";
++  }
++
++  return {
++    startState: function() {
++      return {tokenize: [tokenBase],
++              indented: 0,
++              context: {type: "top", indented: -config.indentUnit},
++              continuedLine: false,
++              lastTok: null,
++              varList: false};
++    },
++
++    token: function(stream, state) {
++      if (stream.sol()) state.indented = stream.indentation();
++      var style = state.tokenize[state.tokenize.length-1](stream, state), kwtype;
++      var thisTok = curPunc;
++      if (style == "ident") {
++        var word = stream.current();
++        style = state.lastTok == "." ? "property"
++          : keywords.propertyIsEnumerable(stream.current()) ? "keyword"
++          : /^[A-Z]/.test(word) ? "tag"
++          : (state.lastTok == "def" || state.lastTok == "class" || state.varList) ? "def"
++          : "variable";
++        if (style == "keyword") {
++          thisTok = word;
++          if (indentWords.propertyIsEnumerable(word)) kwtype = "indent";
++          else if (dedentWords.propertyIsEnumerable(word)) kwtype = "dedent";
++          else if ((word == "if" || word == "unless") && stream.column() == stream.indentation())
++            kwtype = "indent";
++          else if (word == "do" && state.context.indented < state.indented)
++            kwtype = "indent";
++        }
++      }
++      if (curPunc || (style && style != "comment")) state.lastTok = thisTok;
++      if (curPunc == "|") state.varList = !state.varList;
++
++      if (kwtype == "indent" || /[\(\[\{]/.test(curPunc))
++        state.context = {prev: state.context, type: curPunc || style, indented: state.indented};
++      else if ((kwtype == "dedent" || /[\)\]\}]/.test(curPunc)) && state.context.prev)
++        state.context = state.context.prev;
++
++      if (stream.eol())
++        state.continuedLine = (curPunc == "\\" || style == "operator");
++      return style;
++    },
++
++    indent: function(state, textAfter) {
++      if (state.tokenize[state.tokenize.length-1] != tokenBase) return 0;
++      var firstChar = textAfter && textAfter.charAt(0);
++      var ct = state.context;
++      var closing = ct.type == matching[firstChar] ||
++        ct.type == "keyword" && /^(?:end|until|else|elsif|when|rescue)\b/.test(textAfter);
++      return ct.indented + (closing ? 0 : config.indentUnit) +
++        (state.continuedLine ? config.indentUnit : 0);
++    },
++
++    electricChars: "}de", // enD and rescuE
++    lineComment: "#"
++  };
++});
++
++CodeMirror.defineMIME("text/x-ruby", "ruby");
++
++});
+diff --git a/browser/devtools/sourceeditor/test/cm_script_injection_test.js b/browser/devtools/sourceeditor/test/cm_script_injection_test.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/sourceeditor/test/cm_script_injection_test.js
+@@ -0,0 +1,3 @@
++window.addEventListener("editorReady", function(event) {
++  editor.setText("Script successfully injected !");
++});
+\ No newline at end of file
