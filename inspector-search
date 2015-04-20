@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  3e73d9b001c38e4190a9d8bfa55099792b223b03
+# Parent  bc08f3773fb4fbe6e19e137111afb1f2b4f9c422
 Bug 835896 - Inspector searchbox should also provide a way to search plain text on the page
 
 diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
@@ -1458,7 +1458,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
  loader.lazyImporter(this, "gDevTools", "resource:///modules/devtools/gDevTools.jsm");
  
  loader.lazyGetter(this, "DOMParser", function() {
-@@ -985,16 +985,24 @@ types.addDictType("disconnectedNodeArray
+@@ -985,16 +985,23 @@ types.addDictType("disconnectedNodeArray
    nodes: "array:domnode",
  
    // Nodes that are needed to connect those nodes to the root.
@@ -1468,11 +1468,10 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
  types.addDictType("dommutation", {});
  
 +types.addDictType("searchresult", {
-+  node: "disconnectedNode",
-+  type: "string",
-+  resultsLength: "number",
-+  resultsIndex: "number",
-+  matched: "string"
++  list: "domnodelist",
++  metadata: "array:json"
++  // type: "string",
++  // matched: "string"
 +});
 +
  /**
@@ -1483,7 +1482,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
  
    initialize: function(walker, nodeList) {
      protocol.Actor.prototype.initialize.call(this);
-@@ -1164,16 +1172,18 @@ var WalkerActor = protocol.ActorClass({
+@@ -1164,16 +1171,18 @@ var WalkerActor = protocol.ActorClass({
      this.rootDoc = this.rootWin.document;
      this._refMap = new Map();
      this._pendingMutations = [];
@@ -1502,7 +1501,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      // The client can tell the walker that it is interested in a node
      // even when it is orphaned with the `retainNode` method.  This
      // list contains orphaned nodes that were so retained.
-@@ -1218,16 +1228,17 @@ var WalkerActor = protocol.ActorClass({
+@@ -1218,16 +1227,17 @@ var WalkerActor = protocol.ActorClass({
        this._destroyed = true;
  
        this.clearPseudoClassLocks();
@@ -1520,7 +1519,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      } catch(e) {
        console.error(e);
      }
-@@ -1854,16 +1865,77 @@ var WalkerActor = protocol.ActorClass({
+@@ -1854,16 +1864,58 @@ var WalkerActor = protocol.ActorClass({
        selector: Arg(0)
      },
      response: {
@@ -1544,40 +1543,19 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
 +
 +    // Search if no search has been done before, or if asked to reset or if the
 +    // query has changed
-+    if (this._lastSearch !== query || options.reset) {
-+      this._lastSearch = query;
-+      this._lastSearchIndex = -1;
-+      this._lastSearchResults = this.WalkerSearch.search(query);
-+    }
-+
-+    if (!this._lastSearchResults.length) {
-+      return null;
-+    }
-+
-+    // Move search result cursor and cycle if necessary
-+    if (options.reverse) {
-+      this._lastSearchIndex--;
-+    } else {
-+      this._lastSearchIndex++;
-+    }
-+
-+    if (this._lastSearchIndex >= this._lastSearchResults.length) {
-+      this._lastSearchIndex = 0;
-+    }
-+    if (this._lastSearchIndex < 0) {
-+      this._lastSearchIndex = this._lastSearchResults.length - 1;
-+    }
-+
-+    let res = this._lastSearchResults[this._lastSearchIndex];
-+
++    let results = this.WalkerSearch.search(query);
++    let nodeList = new NodeListActor(this, results.map(r=>r.node));
++    let nodeMetadata = results.map(result => {
++      return  {
++        type: result.type,
++        matched: result.matched,
++      }
++    });
 +
 +    return {
-+      node: this.attachElement(res.node),
-+      type: res.type,
-+      matched: res.matched,
-+      resultsLength: this._lastSearchResults.length,
-+      resultsIndex: this._lastSearchIndex + 1
-+    };
++      list: nodeList,
++      metadata: nodeMetadata
++    }
 +  }, {
 +    request: {
 +      query: Arg(0),
@@ -1585,7 +1563,9 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
 +      reverse: Option(1, "boolean")
 +    },
 +    response: {
-+      node: RetVal("nullable:searchresult")
++      list: RetVal("searchresult"),
++      // list: RetVal("domnodelist"),
++      // metadata: RetVal("array:searchresult")
 +    }
 +  }),
 +
@@ -1598,7 +1578,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     *        The exact token being completed out of the query
     * @param string selectorState
     *        One of "pseudo", "id", "tag", "class", "null"
-@@ -3045,16 +3117,95 @@ var WalkerFront = exports.WalkerFront = 
+@@ -3045,16 +3097,91 @@ var WalkerFront = exports.WalkerFront = 
    getStyleSheetOwnerNode: protocol.custom(function(styleSheetActorID) {
      return this._getStyleSheetOwnerNode(styleSheetActorID).then(response => {
        return response ? response.node : null;
@@ -1611,10 +1591,14 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
 +   * XXX: Document this
 +   */
 +  search: protocol.custom(Task.async(function*(query, options) {
-+
-+
 +    console.log("Search called on Front", options);
-+    let output;
++    let nodeList;
++    let metaData;
++    let searchType;
++
++    if (!this.searchData) {
++      this.searchData = {};
++    }
 +
 +    // Backwards compat.  Use selector only search if the new
 +    // search functionality isn't implemented, or if the caller
@@ -1623,65 +1607,57 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
 +    // it's actor has.  It'd be handy if we could check actorHasMethod here,
 +    // since this call is already async
 +    if (options.selectorOnly || !options.hasWalkerSearch) {
-+      if (!this.compatSearchData) {
-+        this.compatSearchData = {};
-+      }
-+
++      searchType = "selector";
 +      let response;
 +      if (options.hasMultiFrameSearch) {
-+        response = yield this.multiFrameQuerySelectorAll(query);
++        nodeList = yield this.multiFrameQuerySelectorAll(query);
 +      } else {
-+        response = yield this.querySelectorAll(this.rootNode, query);
++        nodeList = yield this.querySelectorAll(this.rootNode, query);
 +      }
-+
-+      if (this.compatSearchData._lastSearch !== query) {
-+        this.compatSearchData._lastSearch = query;
-+        this.compatSearchData._lastSearchIndex = -1;
-+        this.compatSearchData._lastSearchResults = response;
-+      }
-+
-+      if (!response.length) {
-+        return null;
-+      }
-+
-+      // Move search result cursor and cycle if necessary
-+      if (options.reverse) {
-+        this.compatSearchData._lastSearchIndex--;
-+      } else {
-+        this.compatSearchData._lastSearchIndex++;
-+      }
-+
-+      if (this.compatSearchData._lastSearchIndex >= this.compatSearchData._lastSearchResults.length) {
-+        this.compatSearchData._lastSearchIndex = 0;
-+      }
-+      if (this.compatSearchData._lastSearchIndex < 0) {
-+        this.compatSearchData._lastSearchIndex = this.compatSearchData._lastSearchResults.length - 1;
-+      }
-+
-+      let node = yield response.item(this.compatSearchData._lastSearchIndex);
-+
-+      console.log("Selector search returning", response, node, response.length);
-+      output = {
-+        type: "selector",
-+        matched: node.nodeName,
-+        node: node,
-+        resultsLength: response.length,
-+        resultsIndex: this.compatSearchData._lastSearchIndex + 1
-+      };
 +    } else {
-+      let response = yield this._search(query, options);
-+      if (response) {
-+        output = {
-+          type: response.type,
-+          matched: response.matched,
-+          node: response.node.node,
-+          resultsLength: response.resultsLength,
-+          resultsIndex: response.resultsIndex
-+        };
-+      }
++      searchType = "search";
++      let result = yield this._search(query, options);
++      nodeList = result.list;
++      metaData = result.metadata;
 +    }
 +
-+    return output;
++    // XXX: Bust cache if search options have changed also.
++    if (this.searchData._lastSearch !== query) {
++      this.searchData._lastSearch = query;
++      this.searchData._lastSearchIndex = -1;
++      this.searchData._lastSearchResults = nodeList;
++    }
++
++    if (!nodeList.length) {
++      return null;
++    }
++
++    // Move search result cursor and cycle if necessary
++    if (options.reverse) {
++      this.searchData._lastSearchIndex--;
++    } else {
++      this.searchData._lastSearchIndex++;
++    }
++
++    if (this.searchData._lastSearchIndex >=
++        this.searchData._lastSearchResults.length) {
++      this.searchData._lastSearchIndex = 0;
++    }
++    if (this.searchData._lastSearchIndex < 0) {
++      this.searchData._lastSearchIndex =
++        this.searchData._lastSearchResults.length - 1;
++    }
++
++    let node = yield nodeList.item(this.searchData._lastSearchIndex);
++
++    console.log("Selector search returning", nodeList, node);
++    return {
++      type: searchType,
++      matched: node.nodeName,
++      node: node,
++      resultsLength: nodeList.length,
++      resultsIndex: this.searchData._lastSearchIndex + 1
++    };
 +  }), {
 +    impl: "_search"
 +  }),
@@ -1694,7 +1670,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
      }
  
      if (node.retained) {
-@@ -3548,16 +3699,20 @@ DocumentWalker.prototype = {
+@@ -3548,16 +3675,20 @@ DocumentWalker.prototype = {
    get whatToShow() this.walker.whatToShow,
    get currentNode() this.walker.currentNode,
    set currentNode(aVal) this.walker.currentNode = aVal,
