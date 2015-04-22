@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  c0262092fed258760ba2c55975c0cac6020fa408
-dsfafdsa
+# Parent  f996215427273ee9a9a7c7c36230a4c6b2777e87
+Bug 1143224 - Firefox loads slow with liveload and grunt when netmonitor is opened
 
 diff --git a/browser/devtools/netmonitor/netmonitor-controller.js b/browser/devtools/netmonitor/netmonitor-controller.js
 --- a/browser/devtools/netmonitor/netmonitor-controller.js
@@ -25,7 +25,7 @@ diff --git a/browser/devtools/netmonitor/netmonitor-controller.js b/browser/devt
  
    /**
     * Connect to the current target client.
-@@ -534,38 +536,47 @@ NetworkEventsHandler.prototype = {
+@@ -534,21 +536,31 @@ NetworkEventsHandler.prototype = {
  
    /**
     * Disconnect from the client.
@@ -34,7 +34,7 @@ diff --git a/browser/devtools/netmonitor/netmonitor-controller.js b/browser/devt
      if (!this.client) {
        return;
      }
-+    this._sendQueuedEvents();
++    // this._sendQueuedEvents();
      dumpn("NetworkEventsHandler is disconnecting...");
      this.client.removeListener("networkEvent", this._onNetworkEvent);
      this.client.removeListener("networkEventUpdate", this._onNetworkEventUpdate);
@@ -57,17 +57,17 @@ diff --git a/browser/devtools/netmonitor/netmonitor-controller.js b/browser/devt
     * @param object aPacket
     *        The message received from the server.
     */
-   _onNetworkEvent: function(aType, aPacket) {
+@@ -556,16 +568,18 @@ NetworkEventsHandler.prototype = {
      if (aPacket.from != this.webConsoleClient.actor) {
        // Skip events from different console actors.
        return;
      }
  
--    let { actor, startedDateTime, method, url, isXHR } = aPacket.eventActor;
--    NetMonitorView.RequestsMenu.addRequest(actor, startedDateTime, method, url, isXHR);
--    window.emit(EVENTS.NETWORK_EVENT, actor);
-+    this._queuedEvents.push(aPacket.eventActor);
-+    this._sendQueuedEventsThrottled();
+     let { actor, startedDateTime, method, url, isXHR } = aPacket.eventActor;
+     NetMonitorView.RequestsMenu.addRequest(actor, startedDateTime, method, url, isXHR);
+     window.emit(EVENTS.NETWORK_EVENT, actor);
++    // this._queuedEvents.push(aPacket.eventActor);
++    // this._sendQueuedEventsThrottled();
    },
  
    /**
@@ -76,7 +76,7 @@ diff --git a/browser/devtools/netmonitor/netmonitor-controller.js b/browser/devt
     * @param string aType
     *        Message type.
     * @param object aPacket
-@@ -853,16 +864,35 @@ function whenDataAvailable(aDataStore, a
+@@ -853,16 +867,35 @@ function whenDataAvailable(aDataStore, a
  
    return deferred.promise;
  };
@@ -134,7 +134,34 @@ diff --git a/browser/devtools/shared/widgets/SideMenuWidget.jsm b/browser/devtoo
   * Note: this widget should be used in tandem with the WidgetMethods in
   * ViewHelpers.jsm.
   *
-@@ -95,16 +95,17 @@ SideMenuWidget.prototype = {
+@@ -47,16 +47,26 @@ this.SideMenuWidget = function SideMenuW
+   this._list.setAttribute("with-item-checkboxes", this._showItemCheckboxes);
+   this._list.setAttribute("with-group-checkboxes", this._showGroupCheckboxes);
+   this._list.setAttribute("tabindex", "0");
+   this._list.addEventListener("contextmenu", e => this._showContextMenu(e), false);
+   this._list.addEventListener("keypress", e => this.emit("keyPress", e), false);
+   this._list.addEventListener("mousedown", e => this.emit("mousePress", e), false);
+   this._parent.appendChild(this._list);
+ 
++  this._list.addEventListener("scroll", e => {
++    // If this scroll was initiated by a change then don't keep track of pinned state.
++    if (!this._scrollingToBottom) {
++      this._pinnedToBottom = this._list.scrollTop + this._list.clientHeight >= this._list.scrollHeight;
++    }
++    this._scrollingToBottom = false;
++  });
++
++  this._pinnedToBottom = true;
++
+   // Menu items can optionally be grouped.
+   this._groupsByName = new Map(); // Can't use a WeakMap because keys are strings.
+   this._orderedGroupElementsArray = [];
+   this._orderedMenuElementsArray = [];
+   this._itemsByElement = new Map();
+ 
+   // This widget emits events that can be handled in a MenuContainer.
+   EventEmitter.decorate(this);
+@@ -98,38 +108,46 @@ SideMenuWidget.prototype = {
     *        Some attached primitive/object. Custom options supported:
     *          - group: a string specifying the group to place this item into
     *          - checkboxState: the checked state of the checkbox, if shown
@@ -143,25 +170,59 @@ diff --git a/browser/devtools/shared/widgets/SideMenuWidget.jsm b/browser/devtoo
     *         The element associated with the displayed item.
     */
    insertItemAt: function(aIndex, aContents, aAttachment={}) {
-+    // console.trace();
++    let group = this._getMenuGroupForName(aAttachment.group);
++    let item = this._getMenuItemForGroup(group, aContents, aAttachment);
++    let element = item.insertSelfAt(aIndex);
++
++    if (this._shouldMaintainScrollAtBottom(aIndex)) {
++      this.window.requestAnimationFrame(() => {
++        if (this._shouldMaintainScrollAtBottom(aIndex)) {
++          this._scrollingToBottom = true;
++          this._list.scrollTop = this._list.scrollHeight;
++        }
++      });
++    }
++
++    return element;
++  },
++
++  _shouldMaintainScrollAtBottom: function(aIndex) {
      // Maintaining scroll position at the bottom when a new item is inserted
-     // depends on several factors (the order of testing is important to avoid
-     // needlessly expensive operations that may cause reflows):
+-    // depends on several factors (the order of testing is important to avoid
+-    // needlessly expensive operations that may cause reflows):
++    // depends on several factors:
      let maintainScrollAtBottom =
        // 1. The behavior should be enabled,
        this.autoscrollWithAppendedItems &&
        // 2. There shouldn't currently be any selected item in the list.
        !this._selectedItem &&
-@@ -468,17 +469,16 @@ SideMenuGroup.prototype = {
-    * Inserts this group in the parent container at the specified index.
+       // 3. The new item should be appended at the end of the list.
+-      (aIndex < 0 || aIndex >= this._orderedMenuElementsArray.length) &&
++      (aIndex < 0 || aIndex >= this._orderedMenuElementsArray.length - 1) &&
+       // 4. The list should already be scrolled at the bottom.
+-      (this._list.scrollTop + this._list.clientHeight >= this._list.scrollHeight);
++      this._pinnedToBottom;
+ 
+-    let group = this._getMenuGroupForName(aAttachment.group);
+-    let item = this._getMenuItemForGroup(group, aContents, aAttachment);
+-    let element = item.insertSelfAt(aIndex);
+-
+-    if (maintainScrollAtBottom) {
+-      this._list.scrollTop = this._list.scrollHeight;
+-    }
+-
+-    return element;
++    return maintainScrollAtBottom;
+   },
+ 
+   /**
+    * Returns the child node in this container situated at the specified index.
     *
     * @param number aIndex
-    *        The position in the container intended for this group.
-    */
-   insertSelfAt: function(aIndex) {
-     let ownerList = this.ownerView._list;
-     let groupsArray = this._orderedGroupElementsArray;
--
+    *        The position in the container intended for this item.
+    * @return nsIDOMNode
+@@ -490,16 +508,17 @@ SideMenuGroup.prototype = {
+ 
      if (aIndex >= 0) {
        ownerList.insertBefore(this._target, groupsArray[aIndex]);
        groupsArray.splice(aIndex, 0, this._target);
@@ -169,17 +230,17 @@ diff --git a/browser/devtools/shared/widgets/SideMenuWidget.jsm b/browser/devtoo
        ownerList.appendChild(this._target);
        groupsArray.push(this._target);
      }
++
    },
-@@ -577,26 +577,24 @@ SideMenuItem.prototype = {
-    * @param number aIndex
-    *        The position in the container intended for this item.
-    * @return nsIDOMNode
-    *         The element associated with the displayed item.
+ 
+   /**
+    * Finds the expected index of this group based on its name.
+    *
+    * @return number
+    *         The expected index.
     */
-   insertSelfAt: function(aIndex) {
-     let ownerList = this.ownerView._list;
-     let menuArray = this._orderedMenuElementsArray;
--
+@@ -599,18 +618,18 @@ SideMenuItem.prototype = {
+ 
      if (aIndex >= 0) {
        ownerList.insertBefore(this._container, ownerList.childNodes[aIndex]);
        menuArray.splice(aIndex, 0, this._target);
@@ -187,6 +248,7 @@ diff --git a/browser/devtools/shared/widgets/SideMenuWidget.jsm b/browser/devtoo
        ownerList.appendChild(this._container);
        menuArray.push(this._target);
      }
++
      this._itemsByElement.set(this._target, this);
 -
      return this._target;
