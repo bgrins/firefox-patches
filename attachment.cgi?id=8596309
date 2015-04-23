@@ -1,0 +1,268 @@
+exporting patch:
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Date 1399901734 18000
+#      Mon May 12 08:35:34 2014 -0500
+# Node ID c4f1bbb132c019424341a790042b5a7b820d04e1
+# Parent  da3e6557e0301899024eeaa24b0a43e837a409d7
+Bug 892935 - [markup view] if the content of a node is only text, we should expand the ellipsis;r=pbrosset
+
+diff --git a/browser/devtools/markupview/markup-view.js b/browser/devtools/markupview/markup-view.js
+--- a/browser/devtools/markupview/markup-view.js
++++ b/browser/devtools/markupview/markup-view.js
+@@ -1279,17 +1279,17 @@ MarkupView.prototype = {
+       }
+       aContainer.childrenDirty = false;
+       return promise.resolve(aContainer);
+     }
+ 
+     // If we're not expanded (or asked to update anyway), we're done for
+     // now.  Note that this will leave the childrenDirty flag set, so when
+     // expanded we'll refresh the child list.
+-    if (!(aContainer.expanded || expand)) {
++    if (!aContainer.expanded && !expand && !aContainer.node.singleTextChild) {
+       return promise.resolve(aContainer);
+     }
+ 
+     // We're going to issue a children request, make sure it includes the
+     // centered node.
+     let centered = this._checkSelectionVisible(aContainer);
+ 
+     // Children aren't updated yet, but clear the childrenDirty flag anyway.
+@@ -1355,16 +1355,21 @@ MarkupView.prototype = {
+     }
+     return promise.all([updatePromise for (updatePromise of this._queuedChildUpdates.values())]);
+   },
+ 
+   /**
+    * Return a list of the children to display for this container.
+    */
+   _getVisibleChildren: function(aContainer, aCentered) {
++    // If the backend has told us that there's only one child, just use that child.
++    if (aContainer.node.singleTextChild) {
++      return promise.resolve({ hasFirst: true, hasLast: true, nodes: [aContainer.node.singleTextChild]});
++    }
++
+     let maxChildren = aContainer.maxChildren || this.maxChildren;
+     if (maxChildren == -1) {
+       maxChildren = undefined;
+     }
+ 
+     return this.walker.children(aContainer.node, {
+       maxNodes: maxChildren,
+       center: aCentered
+@@ -1709,27 +1714,33 @@ MarkupContainer.prototype = {
+   _hasChildren: false,
+ 
+   get hasChildren() {
+     return this._hasChildren;
+   },
+ 
+   set hasChildren(aValue) {
+     this._hasChildren = aValue;
++    this.updateExpander();
++  },
++
++  updateExpander: function() {
+     if (!this.expander) {
+       return;
+     }
+ 
+-    if (aValue) {
++    let showExpander = this._hasChildren && !this.node.singleTextChild;
++    if (showExpander) {
+       this.expander.style.visibility = "visible";
+     } else {
+       this.expander.style.visibility = "hidden";
+     }
+   },
+ 
++
+   /**
+    * If the node has children, return the list of containers for all these
+    * children.
+    */
+   getChildContainers: function() {
+     if (!this.hasChildren) {
+       return null;
+     }
+@@ -2064,17 +2075,29 @@ function MarkupTextContainer(markupView,
+     this.editor = new TextEditor(this, node, "comment");
+   } else {
+     throw "Invalid node for MarkupTextContainer";
+   }
+ 
+   this.tagLine.appendChild(this.editor.elt);
+ }
+ 
+-MarkupTextContainer.prototype = Heritage.extend(MarkupContainer.prototype, {});
++MarkupTextContainer.prototype = Heritage.extend(MarkupContainer.prototype, {
++  update: function() {
++    MarkupContainer.prototype.update.call(this);
++
++    // Our parent node might have a text editor for this node too,
++    // let it know it should update.
++    let parentNode = this.node.parentNode();
++    if (parentNode.singleTextChild)  {
++      let parentContainer = this.markup.getContainer(parentNode);
++      parentContainer.update();
++    }
++  }
++});
+ 
+ /**
+  * An implementation of MarkupContainer for Elements that can contain
+  * child nodes.
+  * Allows editing of tag name, attributes, expanding / collapsing.
+  *
+  * @param MarkupView markupView
+  *        The markup view that owns this container.
+@@ -2092,17 +2115,16 @@ function MarkupElementContainer(markupVi
+ 
+   this.tagLine.appendChild(this.editor.elt);
+ 
+   // Prepare the image preview tooltip data if any
+   this._prepareImagePreview();
+ }
+ 
+ MarkupElementContainer.prototype = Heritage.extend(MarkupContainer.prototype, {
+-
+   _buildEventTooltipContent: function(target, tooltip) {
+     if (target.hasAttribute("data-event")) {
+       tooltip.hide(target);
+ 
+       this.node.getEventListenerInfo().then(listenerInfo => {
+         tooltip.setEventContent({
+           eventListenerInfos: listenerInfo,
+           toolbox: this.markup._inspector.toolbox
+@@ -2447,16 +2469,45 @@ ElementEditor.prototype = {
+         // Temporarily flash the attribute to highlight the change.
+         // But not if this is the first time the editor instance has
+         // been created.
+         if (this.initialized) {
+           this.flashAttribute(attr.name);
+         }
+       }
+     }
++
++    this.updateTextEditor();
++  },
++
++  /**
++   * Update the inline text editor in case of a single text child node.
++   * This ends up with two editors (one in the parent container and one in the
++   * node's container), but that lets us keep the "container per node"
++   * assumptions everywhere.
++   */
++  updateTextEditor: function() {
++    let node = this.node.singleTextChild;
++
++    if (this.textEditor && this.textEditor.node != node) {
++      this.elt.removeChild(this.textEditor.elt);
++      this.textEditor = null;
++    }
++
++    if (node && !this.textEditor) {
++      // Create a text editor added to this editor.
++      // This editor won't receive an update automatically, so we rely on
++      // child text editors to let us know that we need updating.
++      this.textEditor = new TextEditor(this.container, node, "text");
++      this.elt.insertBefore(this.textEditor.elt, this.elt.firstChild.nextSibling.nextSibling);
++    }
++
++    if (this.textEditor) {
++      this.textEditor.update();
++    }
+   },
+ 
+   _startModifyingAttributes: function() {
+     return this.node.startModifyingAttributes();
+   },
+ 
+   /**
+    * Get the element used for one of the attributes of this element
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -158,17 +158,17 @@ types.addDictType("imageData", {
+   // The original image dimensions
+   size: "json"
+ });
+ 
+ /**
+  * We only send nodeValue up to a certain size by default.  This stuff
+  * controls that size.
+  */
+-exports.DEFAULT_VALUE_SUMMARY_LENGTH = 50;
++exports.DEFAULT_VALUE_SUMMARY_LENGTH = 1000;
+ var gValueSummaryLength = exports.DEFAULT_VALUE_SUMMARY_LENGTH;
+ 
+ exports.getValueSummaryLength = function() {
+   return gValueSummaryLength;
+ };
+ 
+ exports.setValueSummaryLength = function(val) {
+   gValueSummaryLength = val;
+@@ -223,31 +223,39 @@ var NodeActor = exports.NodeActor = prot
+   // Returns the JSON representation of this object over the wire.
+   form: function(detail) {
+     if (detail === "actorid") {
+       return this.actorID;
+     }
+ 
+     let parentNode = this.walker.parentNode(this);
+ 
++    let singleTextChild = undefined;
++
++    if (this.rawNode.childNodes.length == 1 && this.rawNode.childNodes[0].nodeType === Ci.nsIDOMNode.TEXT_NODE) {
++      singleTextChild = this.walker._ref(this.rawNode.childNodes[0]);
++    }
++
+     let form = {
+       actor: this.actorID,
+       baseURI: this.rawNode.baseURI,
+       parent: parentNode ? parentNode.actorID : undefined,
+       nodeType: this.rawNode.nodeType,
+       namespaceURI: this.rawNode.namespaceURI,
+       nodeName: this.rawNode.nodeName,
+       numChildren: this.numChildren,
++      singleTextChild: singleTextChild ? singleTextChild.form() : undefined,
+ 
+       // doctype attributes
+       name: this.rawNode.name,
+       publicId: this.rawNode.publicId,
+       systemId: this.rawNode.systemId,
+ 
+       attrs: this.writeAttrs(),
++
+       isBeforePseudoElement: this.isBeforePseudoElement,
+       isAfterPseudoElement: this.isAfterPseudoElement,
+       isAnonymous: LayoutHelpers.isAnonymous(this.rawNode),
+       isNativeAnonymous: LayoutHelpers.isNativeAnonymous(this.rawNode),
+       isXBLAnonymous: LayoutHelpers.isXBLAnonymous(this.rawNode),
+       isShadowAnonymous: LayoutHelpers.isShadowAnonymous(this.rawNode),
+       pseudoClassLocks: this.writePseudoClassLocks(),
+ 
+@@ -748,16 +756,22 @@ let NodeFront = protocol.FrontClass(Node
+ 
+     if (form.parent) {
+       // Get the owner actor for this actor (the walker), and find the
+       // parent node of this actor from it, creating a standin node if
+       // necessary.
+       let parentNodeFront = ctx.marshallPool().ensureParentFront(form.parent);
+       this.reparent(parentNodeFront);
+     }
++
++    if (form.singleTextChild) {
++      this.singleTextChild = types.getType("domnode").read(form.singleTextChild, ctx);
++    } else {
++      this.singleTextChild = undefined;
++    }
+   },
+ 
+   /**
+    * Returns the parent NodeFront for this NodeFront.
+    */
+   parentNode: function() {
+     return this._parent;
+   },
