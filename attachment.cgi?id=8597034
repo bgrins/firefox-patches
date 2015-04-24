@@ -1,0 +1,463 @@
+diff --git a/dom/events/EventListenerManager.cpp b/dom/events/EventListenerManager.cpp
+--- a/dom/events/EventListenerManager.cpp
++++ b/dom/events/EventListenerManager.cpp
+@@ -374,16 +374,20 @@ EventListenerManager::AddEventListenerIn
+     if (window) {
+       window->SetHasGamepadEventListener();
+     }
+ #endif
+   }
+   if (aTypeAtom && mTarget) {
+     mTarget->EventListenerAdded(aTypeAtom);
+   }
++
++  if (mIsMainThreadELM && mTarget) {
++    EventListenerService::NotifyAboutMainThreadListenerChange(mTarget);
++  }
+ }
+ 
+ bool
+ EventListenerManager::IsDeviceType(uint32_t aType)
+ {
+   switch (aType) {
+     case NS_DEVICE_ORIENTATION:
+     case NS_DEVICE_MOTION:
+@@ -491,16 +495,19 @@ EventListenerManager::RemoveEventListene
+         nsRefPtr<EventListenerManager> kungFuDeathGrip(this);
+         mListeners.RemoveElementAt(i);
+         --count;
+         mNoListenerForEvent = NS_EVENT_NULL;
+         mNoListenerForEventAtom = nullptr;
+         if (mTarget && aUserType) {
+           mTarget->EventListenerRemoved(aUserType);
+         }
++        if (mIsMainThreadELM && mTarget) {
++          EventListenerService::NotifyAboutMainThreadListenerChange(mTarget);
++        }
+ 
+         if (!deviceType
+ #ifdef MOZ_B2G
+             && !timeChangeEvent && !networkEvent
+ #endif // MOZ_B2G
+             ) {
+           return;
+         }
+@@ -624,16 +631,19 @@ EventListenerManager::SetEventHandlerInt
+ 
+     bool same = jsEventHandler->GetTypedEventHandler() == aTypedHandler;
+     // Possibly the same listener, but update still the context and scope.
+     jsEventHandler->SetHandler(aTypedHandler);
+     if (mTarget && !same && aName) {
+       mTarget->EventListenerRemoved(aName);
+       mTarget->EventListenerAdded(aName);
+     }
++    if (mIsMainThreadELM && mTarget) {
++      EventListenerService::NotifyAboutMainThreadListenerChange(mTarget);
++    }
+   }
+ 
+   // Set flag to indicate possible need for compilation later
+   listener->mHandlerIsString = !aTypedHandler.HasEventHandler();
+   if (aPermitUntrustedEvents) {
+     listener->mFlags.mAllowUntrustedEvents = true;
+   }
+ 
+@@ -751,16 +761,19 @@ EventListenerManager::RemoveEventHandler
+ 
+   if (listener) {
+     mListeners.RemoveElementAt(uint32_t(listener - &mListeners.ElementAt(0)));
+     mNoListenerForEvent = NS_EVENT_NULL;
+     mNoListenerForEventAtom = nullptr;
+     if (mTarget && aName) {
+       mTarget->EventListenerRemoved(aName);
+     }
++    if (mIsMainThreadELM && mTarget) {
++      EventListenerService::NotifyAboutMainThreadListenerChange(mTarget);
++    }
+   }
+ }
+ 
+ nsresult
+ EventListenerManager::CompileEventHandlerInternal(Listener* aListener,
+                                                   const nsAString* aBody,
+                                                   Element* aElement)
+ {
+diff --git a/dom/events/EventListenerService.cpp b/dom/events/EventListenerService.cpp
+--- a/dom/events/EventListenerService.cpp
++++ b/dom/events/EventListenerService.cpp
+@@ -10,16 +10,18 @@
+ #include "mozilla/JSEventHandler.h"
+ #include "mozilla/Maybe.h"
+ #include "nsCOMArray.h"
+ #include "nsDOMClassInfoID.h"
+ #include "nsIXPConnect.h"
+ #include "nsJSUtils.h"
+ #include "nsMemory.h"
+ #include "nsServiceManagerUtils.h"
++#include "nsArray.h"
++#include "nsThreadUtils.h"
+ 
+ namespace mozilla {
+ 
+ using namespace dom;
+ 
+ /******************************************************************************
+  * mozilla::EventListenerInfo
+  ******************************************************************************/
+@@ -122,16 +124,31 @@ EventListenerInfo::ToSource(nsAString& a
+       if (autoStr.init(cx, str)) {
+         aResult.Assign(autoStr);
+       }
+     }
+   }
+   return NS_OK;
+ }
+ 
++EventListenerService*
++EventListenerService::sInstance = nullptr;
++
++EventListenerService::EventListenerService()
++{
++  MOZ_ASSERT(!sInstance);
++  sInstance = this;
++}
++
++EventListenerService::~EventListenerService()
++{
++  MOZ_ASSERT(sInstance == this);
++  sInstance = nullptr;
++}
++
+ NS_IMETHODIMP
+ EventListenerService::GetListenerInfoFor(nsIDOMEventTarget* aEventTarget,
+                                          uint32_t* aCount,
+                                          nsIEventListenerInfo*** aOutArray)
+ {
+   NS_ENSURE_ARG_POINTER(aEventTarget);
+   *aCount = 0;
+   *aOutArray = nullptr;
+@@ -283,16 +300,67 @@ EventListenerService::RemoveListenerForA
+ 
+   EventListenerManager* manager = eventTarget->GetExistingListenerManager();
+   if (manager) {
+     manager->RemoveListenerForAllEvents(aListener, aUseCapture, aSystemEventGroup);
+   }
+   return NS_OK;
+ }
+ 
++NS_IMETHODIMP
++EventListenerService::AddListenerChangeListener(nsIListenerChangeListener* aListener)
++{
++  if (!mChangeListeners.Contains(aListener)) {
++    mChangeListeners.AppendElement(aListener);
++  }
++  return NS_OK;
++};
++
++
++NS_IMETHODIMP
++EventListenerService::RemoveListenerChangeListener(nsIListenerChangeListener* aListener)
++{
++  mChangeListeners.RemoveElement(aListener);
++  return NS_OK;
++};
++
++void
++EventListenerService::NotifyAboutMainThreadListenerChangeInternal(dom::EventTarget* aTarget)
++{
++  MOZ_ASSERT(NS_IsMainThread());
++  if (!mChangeListeners.IsEmpty()) {
++    if (!mPendingListenerChanges) {
++      mPendingListenerChanges = nsArrayBase::Create();
++      nsCOMPtr<nsIRunnable> runnable = NS_NewRunnableMethod(this,
++        &EventListenerService::NotifyPendingChanges);
++      NS_DispatchToCurrentThread(runnable);
++    }
++
++    if (!mPendingListenerChangesSet.Get(aTarget)) {
++      mPendingListenerChanges->AppendElement(aTarget, false);
++      mPendingListenerChangesSet.Put(aTarget, true);
++    }
++  }
++}
++
++void
++EventListenerService::NotifyPendingChanges()
++{
++  nsCOMPtr<nsIMutableArray> changes;
++  mPendingListenerChanges.swap(changes);
++  mPendingListenerChangesSet.Clear();
++
++  nsTObserverArray<nsCOMPtr<nsIListenerChangeListener>>::EndLimitedIterator
++    iter(mChangeListeners);
++  while (iter.HasMore()) {
++    nsCOMPtr<nsIListenerChangeListener> listener = iter.GetNext();
++    listener->ListenersChanged(changes);
++  }
++}
++
+ } // namespace mozilla
+ 
+ nsresult
+ NS_NewEventListenerService(nsIEventListenerService** aResult)
+ {
+   *aResult = new mozilla::EventListenerService();
+   NS_ADDREF(*aResult);
+   return NS_OK;
+diff --git a/dom/events/EventListenerService.h b/dom/events/EventListenerService.h
+--- a/dom/events/EventListenerService.h
++++ b/dom/events/EventListenerService.h
+@@ -8,18 +8,25 @@
+ 
+ #include "jsapi.h"
+ #include "mozilla/Attributes.h"
+ #include "nsAutoPtr.h"
+ #include "nsCycleCollectionParticipant.h"
+ #include "nsIDOMEventListener.h"
+ #include "nsIEventListenerService.h"
+ #include "nsString.h"
++#include "nsTObserverArray.h"
++#include "nsDataHashtable.h"
++
++class nsIMutableArray;
+ 
+ namespace mozilla {
++namespace dom {
++class EventTarget;
++};
+ 
+ template<typename T>
+ class Maybe;
+ 
+ class EventListenerInfo final : public nsIEventListenerInfo
+ {
+ public:
+   EventListenerInfo(const nsAString& aType,
+@@ -51,17 +58,34 @@ protected:
+   nsRefPtr<nsIDOMEventListener> mListener;
+   bool mCapturing;
+   bool mAllowsUntrusted;
+   bool mInSystemEventGroup;
+ };
+ 
+ class EventListenerService final : public nsIEventListenerService
+ {
+-  ~EventListenerService() {}
++  ~EventListenerService();
+ public:
++  EventListenerService();
+   NS_DECL_ISUPPORTS
+   NS_DECL_NSIEVENTLISTENERSERVICE
++
++  static void NotifyAboutMainThreadListenerChange(dom::EventTarget* aTarget)
++  {
++    if (sInstance) {
++      sInstance->NotifyAboutMainThreadListenerChangeInternal(aTarget);
++    }
++  }
++
++  void NotifyPendingChanges();
++private:
++  void NotifyAboutMainThreadListenerChangeInternal(dom::EventTarget* aTarget);
++  nsTObserverArray<nsCOMPtr<nsIListenerChangeListener>> mChangeListeners;
++  nsCOMPtr<nsIMutableArray> mPendingListenerChanges;
++  nsDataHashtable<nsISupportsHashKey, bool> mPendingListenerChangesSet;
++
++  static EventListenerService* sInstance;
+ };
+ 
+ } // namespace mozilla
+ 
+ #endif // mozilla_EventListenerService_h_
+diff --git a/dom/events/nsIEventListenerService.idl b/dom/events/nsIEventListenerService.idl
+--- a/dom/events/nsIEventListenerService.idl
++++ b/dom/events/nsIEventListenerService.idl
+@@ -2,16 +2,23 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "nsISupports.idl"
+ 
+ interface nsIDOMEventListener;
+ interface nsIDOMEventTarget;
++interface nsIArray;
++
++[scriptable, function, uuid(8d5b5a6b-dec0-473d-86c4-591801dfaac1)]
++interface nsIListenerChangeListener : nsISupports
++{
++  void listenersChanged(in nsIArray aEventTargets);
++};
+ 
+ /**
+  * An instance of this interface describes how an event listener
+  * was added to an event target.
+  */
+ [scriptable, uuid(11ba5fd7-8db2-4b1a-9f67-342cfa11afad)]
+ interface nsIEventListenerInfo : nsISupports
+ {
+@@ -34,17 +41,17 @@ interface nsIEventListenerInfo : nsISupp
+   /**
+    * Tries to serialize event listener to a string.
+    * Returns null if serialization isn't possible
+    * (for example with C++ listeners).
+    */
+   AString toSource();
+ };
+ 
+-[scriptable, uuid(f6964bfb-dabe-4cab-9733-be0ee2bf8171)]
++[scriptable, uuid(77aab5f7-213d-4db4-9f22-e46dfb774f15)]
+ interface nsIEventListenerService : nsISupports
+ {
+   /**
+    * Returns an array of nsIEventListenerInfo objects.
+    * If aEventTarget doesn't have any listeners, this returns null.
+    */
+   void getListenerInfoFor(in nsIDOMEventTarget aEventTarget,
+                           [optional] out unsigned long aCount,
+@@ -91,10 +98,13 @@ interface nsIEventListenerService : nsIS
+                                [optional] in boolean aUseCapture,
+                                [optional] in boolean aWantsUntrusted,
+                                [optional] in boolean aSystemEventGroup);
+ 
+   void removeListenerForAllEvents(in nsIDOMEventTarget target,
+                                   in nsIDOMEventListener listener,
+                                   [optional] in boolean aUseCapture,
+                                   [optional] in boolean aSystemEventGroup);
++
++  void addListenerChangeListener(in nsIListenerChangeListener aListener);
++  void removeListenerChangeListener(in nsIListenerChangeListener aListener);
+ };
+ 
+diff --git a/dom/events/test/chrome.ini b/dom/events/test/chrome.ini
+--- a/dom/events/test/chrome.ini
++++ b/dom/events/test/chrome.ini
+@@ -7,16 +7,17 @@ support-files =
+   bug602962.xul
+   file_bug679494.html
+   window_bug617528.xul
+ 
+ [test_bug336682.js]
+ [test_bug336682_2.xul]
+ [test_bug368835.html]
+ [test_bug415498.xul]
++[test_bug524674.xul]
+ [test_bug586961.xul]
+ [test_bug591249.xul]
+ [test_bug602962.xul]
+ [test_bug617528.xul]
+ [test_bug679494.xul]
+ [test_bug930374-chrome.html]
+ [test_bug1128787-1.html]
+ [test_bug1128787-2.html]
+diff --git a/dom/events/test/test_bug524674.xul b/dom/events/test/test_bug524674.xul
+new file mode 100644
+--- /dev/null
++++ b/dom/events/test/test_bug524674.xul
+@@ -0,0 +1,106 @@
++<?xml version="1.0"?>
++<?xml-stylesheet type="text/css" href="chrome://global/skin"?>
++<?xml-stylesheet type="text/css" href="chrome://mochikit/content/tests/SimpleTest/test.css"?>
++<!--
++https://bugzilla.mozilla.org/show_bug.cgi?id=524674
++-->
++<window title="Mozilla Bug 524674"
++        xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
++  <script type="application/javascript" src="chrome://mochikit/content/tests/SimpleTest/SimpleTest.js"/>
++
++  <!-- test results are displayed in the html:body -->
++  <body xmlns="http://www.w3.org/1999/xhtml">
++  <a href="https://bugzilla.mozilla.org/show_bug.cgi?id=524674"
++     target="_blank">Mozilla Bug 524674</a>
++  </body>
++
++  <!-- test code goes here -->
++  <script type="application/javascript">
++  <![CDATA[
++  /** Test for Bug 524674 **/
++
++  var els = Components.classes["@mozilla.org/eventlistenerservice;1"]
++                      .getService(Components.interfaces.nsIEventListenerService);
++
++  function dummyListener() {}
++
++  var runningTest = null;
++  var d = document.createElementNS("http://www.w3.org/1999/xhtml", "div");
++  var xhr = new XMLHttpRequest();
++
++  // Test also double removals and such.
++  var tests = [
++    function() {
++      els.addListenerChangeListener(changeListener);
++      d.addEventListener("foo", dummyListener);
++      d.addEventListener("foo", dummyListener);
++      xhr.addEventListener("foo", dummyListener);
++      tests[0] = [d, xhr];
++    },
++    function() {
++      d.onclick = dummyListener;
++      d.onclick = dummyListener;
++      xhr.onload = dummyListener;
++      tests[0] = [d, xhr];
++    },
++    function() {
++      d.onclick = function() {};
++      tests[0] = [d];
++    },
++    function() {
++      d.removeEventListener("foo", dummyListener);
++      d.removeEventListener("foo", dummyListener);
++      xhr.removeEventListener("foo", dummyListener);
++      tests[0] = [d, xhr];
++    },
++    function() {
++      d.onclick = null;
++      d.onclick = null;
++      xhr.onload = null;
++      tests[0] = [d, xhr];
++    },
++    function() {
++      els.removeListenerChangeListener(changeListener);
++      // Check that once we've removed the change listener, it isn't called anymore.
++      d.addEventListener("foo", dummyListener);
++      xhr.addEventListener("foo", dummyListener);
++      SimpleTest.executeSoon(function() {
++        SimpleTest.finish();
++      });
++    }
++  ];
++
++  SimpleTest.executeSoon(tests[0]);
++
++  function changeListener(array) {
++    if (typeof tests[0] == "function") {
++      return;
++    }
++    var expectedEventTargets = tests[0];
++    var e = array.enumerate();
++    var i = 0;
++    while (e.hasMoreElements()) {
++      var current = e.getNext();
++      var expected = expectedEventTargets[i];
++      if (current == expected) {
++        is(current, expected, current + " = " + expected);
++        // We may get random other event listener changes here too, not just the one from the
++        // test.
++        ++i
++      }
++    }
++    if (expectedEventTargets.length != i) {
++      return;
++    }
++
++    is(expectedEventTargets.length, i, "Should have got notification for all the changes.");
++    tests.shift();
++
++    ok(tests.length);
++    SimpleTest.executeSoon(tests[0]);
++  }
++
++  SimpleTest.waitForExplicitFinish();
++  ]]>
++  </script>
++</window>
