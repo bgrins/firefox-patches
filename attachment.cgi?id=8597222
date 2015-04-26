@@ -1,0 +1,652 @@
+# HG changeset patch
+# User Sami Jaktholm <sjakthol@outlook.com>
+# Date 1429854005 -10800
+#      Fri Apr 24 08:40:05 2015 +0300
+# Node ID 9a3d88cac950e95c2a67d6b6f11bc0d4669945e3
+# Parent  105eaef4e0f15ed018ae5ad0af994faefb67df9b
+Bug 1148086 - Style Editor: Don't jump to the first line unconditionally when an editor is shown. r=bgrins
+
+This overrides the jump-to-line other tools might have requested if the editor
+was not already active. The idea was to restore the scroll position after the
+editor was hidden and then shown again but the functionality regressed when bug
+816967 was fixed.
+
+Now that Style Editor uses CodeMirror the scroll position can be restored by
+calling refresh on the CodeMirror instance. If a specific line to focus was
+specified, refreshing the editor is a no-op as it was done when the line was
+selected. However, if the editor was not refreshed after the editor became
+visible again (i.e. a line to jump to was not specified), refreshing it will
+restore the previous scroll position.
+
+diff --git a/browser/devtools/sourceeditor/editor.js b/browser/devtools/sourceeditor/editor.js
+--- a/browser/devtools/sourceeditor/editor.js
++++ b/browser/devtools/sourceeditor/editor.js
+@@ -97,17 +97,18 @@ const CM_MAPPING = [
+   "getSelection",
+   "replaceSelection",
+   "extendSelection",
+   "undo",
+   "redo",
+   "clearHistory",
+   "openDialog",
+   "refresh",
+-  "getScrollInfo"
++  "getScrollInfo",
++  "getViewport"
+ ];
+ 
+ const { cssProperties, cssValues, cssColors } = getCSSKeywords();
+ 
+ const editors = new WeakMap();
+ 
+ Editor.modes = {
+   text: { name: "text" },
+diff --git a/browser/devtools/styleeditor/StyleSheetEditor.jsm b/browser/devtools/styleeditor/StyleSheetEditor.jsm
+--- a/browser/devtools/styleeditor/StyleSheetEditor.jsm
++++ b/browser/devtools/styleeditor/StyleSheetEditor.jsm
+@@ -86,18 +86,17 @@ function StyleSheetEditor(styleSheet, wi
+   this.walker = walker;
+   this.highlighter = highlighter;
+ 
+   this._state = {   // state to use when inputElement attaches
+     text: "",
+     selection: {
+       start: {line: 0, ch: 0},
+       end: {line: 0, ch: 0}
+-    },
+-    topIndex: 0              // the first visible line
++    }
+   };
+ 
+   this._styleSheetFilePath = null;
+   if (styleSheet.href &&
+       Services.io.extractScheme(this.styleSheet.href) == "file") {
+     this._styleSheetFilePath = this.styleSheet.href;
+   }
+ 
+@@ -395,17 +394,16 @@ StyleSheetEditor.prototype = {
+ 
+       this.sourceEditor = sourceEditor;
+ 
+       if (this._focusOnSourceEditorReady) {
+         this._focusOnSourceEditorReady = false;
+         sourceEditor.focus();
+       }
+ 
+-      sourceEditor.setFirstVisibleLine(this._state.topIndex);
+       sourceEditor.setSelection(this._state.selection.start,
+                                 this._state.selection.end);
+ 
+       if (this.highlighter && this.walker) {
+         sourceEditor.container.addEventListener("mousemove", this._onMouseMove);
+       }
+ 
+       this.emit("source-editor-load");
+@@ -441,17 +439,19 @@ StyleSheetEditor.prototype = {
+     }
+   },
+ 
+   /**
+    * Event handler for when the editor is shown.
+    */
+   onShow: function() {
+     if (this.sourceEditor) {
+-      this.sourceEditor.setFirstVisibleLine(this._state.topIndex);
++      // CodeMirror needs refresh to restore scroll position after hiding and
++      // showing the editor.
++      this.sourceEditor.refresh();
+     }
+     this.focus();
+   },
+ 
+   /**
+    * Toggled the disabled state of the underlying stylesheet.
+    */
+   toggleDisabled: function() {
+diff --git a/browser/devtools/styleeditor/test/browser.ini b/browser/devtools/styleeditor/test/browser.ini
+--- a/browser/devtools/styleeditor/test/browser.ini
++++ b/browser/devtools/styleeditor/test/browser.ini
+@@ -39,16 +39,18 @@ support-files =
+   sourcemap-sass/sourcemaps.scss
+   sourcemap-sass/media-rules.scss
+   sourcemap-styl/test-stylus.styl
+   sourcemaps.html
+   sourcemaps-large.html
+   sourcemaps-watching.html
+   test_private.css
+   test_private.html
++  doc_long-stylesheets.html
++  doc_long.css
+   doc_uncached.css
+   doc_uncached.html
+   doc_xulpage.xul
+ 
+ [browser_styleeditor_autocomplete.js]
+ [browser_styleeditor_autocomplete-disabled.js]
+ [browser_styleeditor_bug_740541_iframes.js]
+ skip-if = os == "linux" || "mac" # bug 949355
+@@ -70,16 +72,17 @@ skip-if = e10s # Bug 1055333 - style edi
+ [browser_styleeditor_missing_stylesheet.js]
+ [browser_styleeditor_navigate.js]
+ [browser_styleeditor_new.js]
+ [browser_styleeditor_nostyle.js]
+ [browser_styleeditor_opentab.js]
+ [browser_styleeditor_pretty.js]
+ [browser_styleeditor_private_perwindowpb.js]
+ [browser_styleeditor_reload.js]
++[browser_styleeditor_scroll.js]
+ [browser_styleeditor_sv_keynav.js]
+ [browser_styleeditor_sv_resize.js]
+ [browser_styleeditor_selectstylesheet.js]
+ [browser_styleeditor_sourcemaps.js]
+ [browser_styleeditor_sourcemap_large.js]
+ [browser_styleeditor_sourcemap_watching.js]
+ skip-if = e10s # Bug 1055333 - style editor tests disabled with e10s
+ [browser_styleeditor_transition_rule.js]
+diff --git a/browser/devtools/styleeditor/test/browser_styleeditor_scroll.js b/browser/devtools/styleeditor/test/browser_styleeditor_scroll.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleeditor/test/browser_styleeditor_scroll.js
+@@ -0,0 +1,78 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++"use strict";
++
++// Test that editor scrolls to correct line if it's selected with
++//  * selectStyleSheet (specified line)
++//  * click on the sidebar item (line before the editor was unselected)
++// See bug 1148086.
++
++const TESTCASE_URI = TEST_BASE_HTTP + "doc_long-stylesheets.html";
++const LINE_TO_SELECT = 201;
++
++add_task(function* () {
++  let { ui } = yield openStyleEditorForURL(TESTCASE_URI);
++
++  is(ui.editors.length, 2, "Two editors present.");
++
++  let simpleEditor = ui.editors[0];
++  let longEditor = ui.editors[1];
++
++  info(`Selecting doc_long.css and scrolling to line ${LINE_TO_SELECT}`);
++
++  // We need to wait for editor-selected if we want to check the scroll
++  // position as scrolling occurs after selectStyleSheet resolves but before the
++  // event is emitted.
++  let selectEventPromise = waitForEditorToBeSelected(longEditor, ui);
++  ui.selectStyleSheet(longEditor.styleSheet, LINE_TO_SELECT);
++  yield selectEventPromise;
++
++  info("Checking that the correct line is visible after initial load");
++
++  let { from, to } = longEditor.sourceEditor.getViewport();
++  info(`Lines ${from}-${to} are visible (expected ${LINE_TO_SELECT}).`);
++
++  ok(from <= LINE_TO_SELECT, "The editor scrolled too much.");
++  ok(to >= LINE_TO_SELECT, "The editor scrolled too little.");
++
++  let initialScrollTop = longEditor.sourceEditor.getScrollInfo().top;
++  info(`Storing scrollTop = ${initialScrollTop} for later comparison.`);
++
++  info("Selecting the first editor (simple.css)");
++  yield ui.selectStyleSheet(simpleEditor.styleSheet);
++
++  info("Selecting doc_long.css again.");
++  selectEventPromise = waitForEditorToBeSelected(longEditor, ui);
++
++  // Can't use ui.selectStyleSheet here as it will scroll the editor back to top
++  // and we want to check that the previous scroll position is restored.
++  let summary = yield ui.getEditorSummary(longEditor);
++  ui._view.activeSummary = summary;
++
++  info("Waiting for doc_long.css to be selected.");
++  yield selectEventPromise;
++
++  let scrollTop = longEditor.sourceEditor.getScrollInfo().top;
++  is(scrollTop, initialScrollTop,
++    "Scroll top was restored after the sheet was selected again.");
++});
++
++/**
++ * A helper that waits "editor-selected" event for given editor.
++ *
++ * @param {StyleSheetEditor} editor
++ *        The editor to wait for.
++ * @param {StyleEditorUI} ui
++ *        The StyleEditorUI the editor belongs to.
++ */
++let waitForEditorToBeSelected = Task.async(function* (editor, ui) {
++  info(`Waiting for ${editor.friendlyName} to be selected.`);
++  let selected = yield ui.once("editor-selected");
++  while (selected != editor) {
++    info(`Ignored editor-selected for editor ${editor.friendlyName}.`);
++    selected = yield ui.once("editor-selected");
++  }
++
++  info(`Got editor-selected for ${editor.friendlyName}.`);
++});
+diff --git a/browser/devtools/styleeditor/test/doc_long-stylesheets.html b/browser/devtools/styleeditor/test/doc_long-stylesheets.html
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleeditor/test/doc_long-stylesheets.html
+@@ -0,0 +1,11 @@
++<!doctype html>
++<html>
++<head>
++  <title>Long style sheet</title>
++  <link rel="stylesheet" charset="UTF-8" type="text/css" media="screen" href="simple.css"/>
++  <link rel="stylesheet" charset="UTF-8" type="text/css" media="screen" href="doc_long.css"/>
++</head>
++<body>
++	<div>Page with a style sheet with a lot of rules (for scrolling bug 1148086)</div>
++</body>
++</html>
+diff --git a/browser/devtools/styleeditor/test/doc_long.css b/browser/devtools/styleeditor/test/doc_long.css
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleeditor/test/doc_long.css
+@@ -0,0 +1,403 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++div {
++  z-index: 1;
++}
++
++div {
++  z-index: 2;
++}
++
++div {
++  z-index: 3;
++}
++
++div {
++  z-index: 4;
++}
++
++div {
++  z-index: 5;
++}
++
++div {
++  z-index: 6;
++}
++
++div {
++  z-index: 7;
++}
++
++div {
++  z-index: 8;
++}
++
++div {
++  z-index: 9;
++}
++
++div {
++  z-index: 10;
++}
++
++div {
++  z-index: 11;
++}
++
++div {
++  z-index: 12;
++}
++
++div {
++  z-index: 13;
++}
++
++div {
++  z-index: 14;
++}
++
++div {
++  z-index: 15;
++}
++
++div {
++  z-index: 16;
++}
++
++div {
++  z-index: 17;
++}
++
++div {
++  z-index: 18;
++}
++
++div {
++  z-index: 19;
++}
++
++div {
++  z-index: 20;
++}
++
++div {
++  z-index: 21;
++}
++
++div {
++  z-index: 22;
++}
++
++div {
++  z-index: 23;
++}
++
++div {
++  z-index: 24;
++}
++
++div {
++  z-index: 25;
++}
++
++div {
++  z-index: 26;
++}
++
++div {
++  z-index: 27;
++}
++
++div {
++  z-index: 28;
++}
++
++div {
++  z-index: 29;
++}
++
++div {
++  z-index: 30;
++}
++
++div {
++  z-index: 31;
++}
++
++div {
++  z-index: 32;
++}
++
++div {
++  z-index: 33;
++}
++
++div {
++  z-index: 34;
++}
++
++div {
++  z-index: 35;
++}
++
++div {
++  z-index: 36;
++}
++
++div {
++  z-index: 37;
++}
++
++div {
++  z-index: 38;
++}
++
++div {
++  z-index: 39;
++}
++
++div {
++  z-index: 40;
++}
++
++div {
++  z-index: 41;
++}
++
++div {
++  z-index: 42;
++}
++
++div {
++  z-index: 43;
++}
++
++div {
++  z-index: 44;
++}
++
++div {
++  z-index: 45;
++}
++
++div {
++  z-index: 46;
++}
++
++div {
++  z-index: 47;
++}
++
++div {
++  z-index: 48;
++}
++
++div {
++  z-index: 49;
++}
++
++div {
++  z-index: 50;
++}
++
++div {
++  z-index: 51;
++}
++
++div {
++  z-index: 52;
++}
++
++div {
++  z-index: 53;
++}
++
++div {
++  z-index: 54;
++}
++
++div {
++  z-index: 55;
++}
++
++div {
++  z-index: 56;
++}
++
++div {
++  z-index: 57;
++}
++
++div {
++  z-index: 58;
++}
++
++div {
++  z-index: 59;
++}
++
++div {
++  z-index: 60;
++}
++
++div {
++  z-index: 61;
++}
++
++div {
++  z-index: 62;
++}
++
++div {
++  z-index: 63;
++}
++
++div {
++  z-index: 64;
++}
++
++div {
++  z-index: 65;
++}
++
++div {
++  z-index: 66;
++}
++
++div {
++  z-index: 67;
++}
++
++div {
++  z-index: 68;
++}
++
++div {
++  z-index: 69;
++}
++
++div {
++  z-index: 70;
++}
++
++div {
++  z-index: 71;
++}
++
++div {
++  z-index: 72;
++}
++
++div {
++  z-index: 73;
++}
++
++div {
++  z-index: 74;
++}
++
++div {
++  z-index: 75;
++}
++
++div {
++  z-index: 76;
++}
++
++div {
++  z-index: 77;
++}
++
++div {
++  z-index: 78;
++}
++
++div {
++  z-index: 79;
++}
++
++div {
++  z-index: 80;
++}
++
++div {
++  z-index: 81;
++}
++
++div {
++  z-index: 82;
++}
++
++div {
++  z-index: 83;
++}
++
++div {
++  z-index: 84;
++}
++
++div {
++  z-index: 85;
++}
++
++div {
++  z-index: 86;
++}
++
++div {
++  z-index: 87;
++}
++
++div {
++  z-index: 88;
++}
++
++div {
++  z-index: 89;
++}
++
++div {
++  z-index: 90;
++}
++
++div {
++  z-index: 91;
++}
++
++div {
++  z-index: 92;
++}
++
++div {
++  z-index: 93;
++}
++
++div {
++  z-index: 94;
++}
++
++div {
++  z-index: 95;
++}
++
++div {
++  z-index: 96;
++}
++
++div {
++  z-index: 97;
++}
++
++div {
++  z-index: 98;
++}
++
++div {
++  z-index: 99;
++}
++
++div {
++  z-index: 100;
++}
