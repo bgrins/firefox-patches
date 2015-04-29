@@ -1,0 +1,375 @@
+# HG changeset patch
+# Parent 2c92a7df87c9af92b9ddb6763cd386db5d11c411
+# User Florent Fayolle <fayolle-florent@orange.fr>
+# Parent  37d60e3b8be6779b623439e15edad6e5b88ba039
+Bug 1151610 - Manage the case where two extensions fight over the same command, r=bgrins
+
+diff --git a/toolkit/devtools/webconsole/test/test_commands_registration.html b/toolkit/devtools/webconsole/test/test_commands_registration.html
+--- a/toolkit/devtools/webconsole/test/test_commands_registration.html
++++ b/toolkit/devtools/webconsole/test/test_commands_registration.html
+@@ -20,16 +20,21 @@ let tests;
+ 
+ let {devtools} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
+ let {WebConsoleCommands} = devtools.require("devtools/toolkit/webconsole/utils");
+ 
+ function evaluateJS(input) {
+   return new Promise((resolve) => gState.client.evaluateJS(input, resolve));
+ }
+ 
++function* evaluateJSAndCheckResult(input, result) {
++  let response = yield evaluateJS(input);
++  checkObject(response, {result});
++}
++
+ function startTest()
+ {
+   removeEventListener("load", startTest);
+ 
+   attachConsole(["PageError"], onAttach, true);
+ }
+ 
+ function onAttach(aState, aResponse)
+@@ -133,16 +138,44 @@ tests = [
+       input: command,
+       result: ">o_/"
+     });
+     is(document.getElementById("quack").textContent, ">o_/",
+         "#foo textContent should equal to \">o_/\"");
+     WebConsoleCommands.unregister("$foo");
+     ok(!WebConsoleCommands.hasCommand("$foo"), "$foo should be unregistered");
+     nextTest();
++  }),
++
++  Task.async(function* unregisterAfterOverridingTwice() {
++    WebConsoleCommands.register("keys", (owner, obj) => "command 1");
++    info("checking the value of the first override");
++    yield evaluateJSAndCheckResult("keys('foo');", "command 1");
++
++    let orig = WebConsoleCommands.getCommand("keys");
++    WebConsoleCommands.register("keys", (owner, obj) => {
++      if (obj === "quack")
++        return "bang!";
++      return orig(owner, obj);
++    });
++
++    info("checking the values after the second override");
++    yield evaluateJSAndCheckResult("keys({});", "command 1");
++    yield evaluateJSAndCheckResult("keys('quack');", "bang!");
++
++    WebConsoleCommands.unregister("keys");
++
++    info("checking the value after unregistration (should restore " +
++      "the original command)");
++    yield evaluateJSAndCheckResult("keys({});", {
++      class: "Array",
++      preview: {items: []}
++    });
++    nextTest();
++
+   })
+ ];
+ 
+ function testEnd()
+ {
+   // If this is the first run, reload the page and do it again.
+   // Otherwise, end the test.
+   delete top.foo;
+diff --git a/toolkit/devtools/webconsole/utils.js b/toolkit/devtools/webconsole/utils.js
+--- a/toolkit/devtools/webconsole/utils.js
++++ b/toolkit/devtools/webconsole/utils.js
+@@ -1511,16 +1511,29 @@ ConsoleAPIListener.prototype =
+  * WebConsole commands manager.
+  *
+  * Defines a set of functions /variables ("commands") that are available from
+  * the Web Console but not from the web page.
+  *
+  */
+ let WebConsoleCommands = {
+   _registeredCommands: new Map(),
++  _originalCommands: new Map(),
++
++  /**
++   * @private
++   * Reserved for built-in commands. To register a command from the code of an
++   * add-on, see WebConsoleCommands.register instead.
++   *
++   * @see WebConsoleCommands.register
++   */
++  _registerOriginal: function (name, command) {
++    this.register(name, command);
++    this._originalCommands.set(name, this.getCommand(name));
++  },
+ 
+   /**
+    * Register a new command.
+    * @param {string} name The command name (exemple: "$")
+    * @param {(function|object)} command The command to register.
+    *  It can be a function so the command is a function (like "$()"),
+    *  or it can also be a property descriptor to describe a getter / value (like
+    *  "$0").
+@@ -1546,20 +1559,26 @@ let WebConsoleCommands = {
+    */
+   register: function(name, command) {
+     this._registeredCommands.set(name, command);
+   },
+ 
+   /**
+    * Unregister a command.
+    *
++   * If the command being unregister overrode a built-in command,
++   * the latter is restored.
++   *
+    * @param {string} name The name of the command
+    */
+   unregister: function(name) {
+     this._registeredCommands.delete(name);
++    if (this._originalCommands.has(name)) {
++      this.register(name, this._originalCommands.get(name));
++    }
+   },
+ 
+   /**
+    * Returns a command by its name.
+    *
+    * @param {string} name The name of the command.
+    *
+    * @return {(function|object)} The command.
+@@ -1593,57 +1612,57 @@ exports.WebConsoleCommands = WebConsoleC
+ /**
+  * Find a node by ID.
+  *
+  * @param string aId
+  *        The ID of the element you want.
+  * @return nsIDOMNode or null
+  *         The result of calling document.querySelector(aSelector).
+  */
+-WebConsoleCommands.register("$", function JSTH_$(aOwner, aSelector)
++WebConsoleCommands._registerOriginal("$", function JSTH_$(aOwner, aSelector)
+ {
+   return aOwner.window.document.querySelector(aSelector);
+ });
+ 
+ /**
+  * Find the nodes matching a CSS selector.
+  *
+  * @param string aSelector
+  *        A string that is passed to window.document.querySelectorAll.
+  * @return nsIDOMNodeList
+  *         Returns the result of document.querySelectorAll(aSelector).
+  */
+-WebConsoleCommands.register("$$", function JSTH_$$(aOwner, aSelector)
++WebConsoleCommands._registerOriginal("$$", function JSTH_$$(aOwner, aSelector)
+ {
+   return aOwner.window.document.querySelectorAll(aSelector);
+ });
+ 
+ /**
+  * Returns the result of the last console input evaluation
+  *
+  * @return object|undefined
+  * Returns last console evaluation or undefined
+  */
+-WebConsoleCommands.register("$_", {
++WebConsoleCommands._registerOriginal("$_", {
+   get: function(aOwner) {
+     return aOwner.consoleActor.getLastConsoleInputEvaluation();
+   }
+ });
+ 
+ 
+ /**
+  * Runs an xPath query and returns all matched nodes.
+  *
+  * @param string aXPath
+  *        xPath search query to execute.
+  * @param [optional] nsIDOMNode aContext
+  *        Context to run the xPath query on. Uses window.document if not set.
+  * @return array of nsIDOMNode
+  */
+-WebConsoleCommands.register("$x", function JSTH_$x(aOwner, aXPath, aContext)
++WebConsoleCommands._registerOriginal("$x", function JSTH_$x(aOwner, aXPath, aContext)
+ {
+   let nodes = new aOwner.window.wrappedJSObject.Array();
+   let doc = aOwner.window.document;
+   aContext = aContext || doc;
+ 
+   let results = doc.evaluate(aXPath, aContext, null,
+                              Ci.nsIDOMXPathResult.ANY_TYPE, null);
+   let node;
+@@ -1655,93 +1674,93 @@ WebConsoleCommands.register("$x", functi
+ });
+ 
+ /**
+  * Returns the currently selected object in the highlighter.
+  *
+  * @return Object representing the current selection in the
+  *         Inspector, or null if no selection exists.
+  */
+-WebConsoleCommands.register("$0", {
++WebConsoleCommands._registerOriginal("$0", {
+   get: function(aOwner) {
+     return aOwner.makeDebuggeeValue(aOwner.selectedNode);
+   }
+ });
+ 
+ /**
+  * Clears the output of the WebConsole.
+  */
+-WebConsoleCommands.register("clear", function JSTH_clear(aOwner)
++WebConsoleCommands._registerOriginal("clear", function JSTH_clear(aOwner)
+ {
+   aOwner.helperResult = {
+     type: "clearOutput",
+   };
+ });
+ 
+ /**
+  * Clears the input history of the WebConsole.
+  */
+-WebConsoleCommands.register("clearHistory", function JSTH_clearHistory(aOwner)
++WebConsoleCommands._registerOriginal("clearHistory", function JSTH_clearHistory(aOwner)
+ {
+   aOwner.helperResult = {
+     type: "clearHistory",
+   };
+ });
+ 
+ /**
+  * Returns the result of Object.keys(aObject).
+  *
+  * @param object aObject
+  *        Object to return the property names from.
+  * @return array of strings
+  */
+-WebConsoleCommands.register("keys", function JSTH_keys(aOwner, aObject)
++WebConsoleCommands._registerOriginal("keys", function JSTH_keys(aOwner, aObject)
+ {
+   return aOwner.window.wrappedJSObject.Object.keys(WebConsoleUtils.unwrap(aObject));
+ });
+ 
+ /**
+  * Returns the values of all properties on aObject.
+  *
+  * @param object aObject
+  *        Object to display the values from.
+  * @return array of string
+  */
+-WebConsoleCommands.register("values", function JSTH_values(aOwner, aObject)
++WebConsoleCommands._registerOriginal("values", function JSTH_values(aOwner, aObject)
+ {
+   let arrValues = new aOwner.window.wrappedJSObject.Array();
+   let obj = WebConsoleUtils.unwrap(aObject);
+ 
+   for (let prop in obj) {
+     arrValues.push(obj[prop]);
+   }
+ 
+   return arrValues;
+ });
+ 
+ /**
+  * Opens a help window in MDN.
+  */
+-WebConsoleCommands.register("help", function JSTH_help(aOwner)
++WebConsoleCommands._registerOriginal("help", function JSTH_help(aOwner)
+ {
+   aOwner.helperResult = { type: "help" };
+ });
+ 
+ /**
+  * Change the JS evaluation scope.
+  *
+  * @param DOMElement|string|window aWindow
+  *        The window object to use for eval scope. This can be a string that
+  *        is used to perform document.querySelector(), to find the iframe that
+  *        you want to cd() to. A DOMElement can be given as well, the
+  *        .contentWindow property is used. Lastly, you can directly pass
+  *        a window object. If you call cd() with no arguments, the current
+  *        eval scope is cleared back to its default (the top window).
+  */
+-WebConsoleCommands.register("cd", function JSTH_cd(aOwner, aWindow)
++WebConsoleCommands._registerOriginal("cd", function JSTH_cd(aOwner, aWindow)
+ {
+   if (!aWindow) {
+     aOwner.consoleActor.evalWindow = null;
+     aOwner.helperResult = { type: "cd" };
+     return;
+   }
+ 
+   if (typeof aWindow == "string") {
+@@ -1760,17 +1779,17 @@ WebConsoleCommands.register("cd", functi
+ });
+ 
+ /**
+  * Inspects the passed aObject. This is done by opening the PropertyPanel.
+  *
+  * @param object aObject
+  *        Object to inspect.
+  */
+-WebConsoleCommands.register("inspect", function JSTH_inspect(aOwner, aObject)
++WebConsoleCommands._registerOriginal("inspect", function JSTH_inspect(aOwner, aObject)
+ {
+   let dbgObj = aOwner.makeDebuggeeValue(aObject);
+   let grip = aOwner.createValueGrip(dbgObj);
+   aOwner.helperResult = {
+     type: "inspectObject",
+     input: aOwner.evalInput,
+     object: grip,
+   };
+@@ -1778,17 +1797,17 @@ WebConsoleCommands.register("inspect", f
+ 
+ /**
+  * Prints aObject to the output.
+  *
+  * @param object aObject
+  *        Object to print to the output.
+  * @return string
+  */
+-WebConsoleCommands.register("pprint", function JSTH_pprint(aOwner, aObject)
++WebConsoleCommands._registerOriginal("pprint", function JSTH_pprint(aOwner, aObject)
+ {
+   if (aObject === null || aObject === undefined || aObject === true ||
+       aObject === false) {
+     aOwner.helperResult = {
+       type: "error",
+       message: "helperFuncUnsupportedTypeError",
+     };
+     return null;
+@@ -1825,17 +1844,17 @@ WebConsoleCommands.register("pprint", fu
+ 
+ /**
+  * Print the String representation of a value to the output, as-is.
+  *
+  * @param any aValue
+  *        A value you want to output as a string.
+  * @return void
+  */
+-WebConsoleCommands.register("print", function JSTH_print(aOwner, aValue)
++WebConsoleCommands._registerOriginal("print", function JSTH_print(aOwner, aValue)
+ {
+   aOwner.helperResult = { rawOutput: true };
+   if (typeof aValue === "symbol") {
+     return Symbol.prototype.toString.call(aValue);
+   }
+   // Waiving Xrays here allows us to see a closer representation of the
+   // underlying object. This may execute arbitrary content code, but that
+   // code will run with content privileges, and the result will be rendered
+@@ -1845,17 +1864,17 @@ WebConsoleCommands.register("print", fun
+ 
+ /**
+  * Copy the String representation of a value to the clipboard.
+  *
+  * @param any aValue
+  *        A value you want to copy as a string.
+  * @return void
+  */
+-WebConsoleCommands.register("copy", function JSTH_copy(aOwner, aValue)
++WebConsoleCommands._registerOriginal("copy", function JSTH_copy(aOwner, aValue)
+ {
+   let payload;
+   try {
+     if (aValue instanceof Ci.nsIDOMElement) {
+       payload = aValue.outerHTML;
+     } else if (typeof aValue == "string") {
+       payload = aValue;
+     } else {
