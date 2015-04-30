@@ -1,0 +1,212 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  84a280a8e16af2624a8cf9dd438dad9179f51dbc
+Bug 123
+
+diff --git a/browser/devtools/netmonitor/netmonitor-view.js b/browser/devtools/netmonitor/netmonitor-view.js
+--- a/browser/devtools/netmonitor/netmonitor-view.js
++++ b/browser/devtools/netmonitor/netmonitor-view.js
+@@ -56,16 +56,20 @@ const GENERIC_VARIABLES_VIEW_SETTINGS = 
+   editableValueTooltip: "",
+   editableNameTooltip: "",
+   preventDisableOnChange: true,
+   preventDescriptorModifiers: true,
+   eval: () => {}
+ };
+ const NETWORK_ANALYSIS_PIE_CHART_DIAMETER = 200; // px
+ const FREETEXT_FILTER_SEARCH_DELAY = 200; // ms
++const REFRESH_ZEBRA_DELAY = 100; // ms
++
++XPCOMUtils.defineLazyModuleGetter(this, "DeferredTask",
++  "resource://gre/modules/DeferredTask.jsm");
+ 
+ /**
+  * Object defining the network monitor view components.
+  */
+ let NetMonitorView = {
+   /**
+    * Initializes the network monitor view.
+    */
+@@ -378,16 +382,18 @@ RequestsMenuView.prototype = Heritage.ex
+     this._onContextPerfCommand = () => NetMonitorView.toggleFrontendMode();
+     this._onReloadCommand = () => NetMonitorView.reloadPage();
+ 
+     this.sendCustomRequestEvent = this.sendCustomRequest.bind(this);
+     this.closeCustomRequestEvent = this.closeCustomRequest.bind(this);
+     this.cloneSelectedRequestEvent = this.cloneSelectedRequest.bind(this);
+     this.toggleRawHeadersEvent = this.toggleRawHeaders.bind(this);
+ 
++    this.refreshZebraDeferred = new DeferredTask(this.refreshZebra.bind(this), REFRESH_ZEBRA_DELAY);
++
+     this.requestsFreetextFilterEvent = this.requestsFreetextFilterEvent.bind(this);
+     this.reFilterRequests = this.reFilterRequests.bind(this);
+ 
+     this.freetextFilterBox = $("#requests-menu-filter-freetext-text");
+     this.freetextFilterBox.addEventListener("input", this.requestsFreetextFilterEvent, false);
+     this.freetextFilterBox.addEventListener("command", this.requestsFreetextFilterEvent, false);
+ 
+     $("#toolbar-labels").addEventListener("click", this.requestsMenuSortEvent, false);
+@@ -449,16 +455,17 @@ RequestsMenuView.prototype = Heritage.ex
+     window.removeEventListener("resize", this._onResize, false);
+ 
+     $("#toolbar-labels").removeEventListener("click", this.requestsMenuSortEvent, false);
+     $("#requests-menu-footer").removeEventListener("click", this.requestsMenuFilterEvent, false);
+     $("#requests-menu-clear-button").removeEventListener("click", this.reqeustsMenuClearEvent, false);
+     this.freetextFilterBox.removeEventListener("input", this.requestsFreetextFilterEvent, false);
+     this.freetextFilterBox.removeEventListener("command", this.requestsFreetextFilterEvent, false);
+     this.userInputTimer.cancel();
++    this.refreshZebraDeferred.disarm();
+     $("#network-request-popup").removeEventListener("popupshowing", this._onContextShowing, false);
+     $("#request-menu-context-newtab").removeEventListener("command", this._onContextNewTabCommand, false);
+     $("#request-menu-context-copy-url").removeEventListener("command", this._onContextCopyUrlCommand, false);
+     $("#request-menu-context-copy-response").removeEventListener("command", this._onContextCopyResponseCommand, false);
+     $("#request-menu-context-copy-image-as-data-uri").removeEventListener("command", this._onContextCopyImageAsDataUriCommand, false);
+     $("#request-menu-context-resend").removeEventListener("command", this._onContextResendCommand, false);
+     $("#request-menu-context-perf").removeEventListener("command", this._onContextPerfCommand, false);
+ 
+@@ -536,17 +543,17 @@ RequestsMenuView.prototype = Heritage.ex
+         useCapture: true
+       }]
+     });
+ 
+     $("#details-pane-toggle").disabled = false;
+     $("#requests-menu-empty-notice").hidden = true;
+ 
+     this.refreshSummary();
+-    this.refreshZebra();
++    this.refreshZebraDeferred.arm();
+     this.refreshTooltip(requestItem);
+ 
+     if (aId == this._preferredItemId) {
+       this.selectedItem = requestItem;
+     }
+   },
+ 
+   /**
+diff --git a/browser/devtools/shared/widgets/SideMenuWidget.jsm b/browser/devtools/shared/widgets/SideMenuWidget.jsm
+--- a/browser/devtools/shared/widgets/SideMenuWidget.jsm
++++ b/browser/devtools/shared/widgets/SideMenuWidget.jsm
+@@ -5,17 +5,19 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ "use strict";
+ 
+ const Ci = Components.interfaces;
+ const Cu = Components.utils;
+ 
+ Cu.import("resource:///modules/devtools/ViewHelpers.jsm");
+ Cu.import("resource://gre/modules/devtools/event-emitter.js");
++const {DeferredTask} = Cu.import("resource://gre/modules/DeferredTask.jsm", {});
+ 
++const {console} = Components.utils.import("resource://gre/modules/devtools/Console.jsm", {});
+ this.EXPORTED_SYMBOLS = ["SideMenuWidget"];
+ 
+ /**
+  * A simple side menu, with the ability of grouping menu items.
+  *
+  * Note: this widget should be used in tandem with the WidgetMethods in
+  * ViewHelpers.jsm.
+  *
+@@ -53,16 +55,27 @@ this.SideMenuWidget = function SideMenuW
+   this._parent.appendChild(this._list);
+ 
+   // Menu items can optionally be grouped.
+   this._groupsByName = new Map(); // Can't use a WeakMap because keys are strings.
+   this._orderedGroupElementsArray = [];
+   this._orderedMenuElementsArray = [];
+   this._itemsByElement = new Map();
+ 
++  // this._list.addEventListener("scroll", () => {
++  //   if (this._list.lastElementChild) {
++  //   let cwu = this.window.QueryInterface(Ci.nsIInterfaceRequestor)
++  //                   .getInterface(Ci.nsIDOMWindowUtils);
++  //   let rect = cwu.getBoundsWithoutFlushing(this._list.lastElementChild);
++  //   let rect2 = cwu.getBoundsWithoutFlushing(this._list);
++
++  //   console.log("AT bottom?", (rect.height + rect.top) < rect2.bottom, rect.height + rect.top, rect2.bottom);
++  //   // console.log(rect, rect2, this._list.scrollTop, this._list.scrollHeight);
++  //   }
++  // });
+   // This widget emits events that can be handled in a MenuContainer.
+   EventEmitter.decorate(this);
+ 
+   // Delegate some of the associated node's methods to satisfy the interface
+   // required by MenuContainer instances.
+   ViewHelpers.delegateWidgetAttributeMethods(this, aNode);
+   ViewHelpers.delegateWidgetEventMethods(this, aNode);
+ };
+@@ -98,35 +111,72 @@ SideMenuWidget.prototype = {
+    *        Some attached primitive/object. Custom options supported:
+    *          - group: a string specifying the group to place this item into
+    *          - checkboxState: the checked state of the checkbox, if shown
+    *          - checkboxTooltip: the tooltip text for the checkbox, if shown
+    * @return nsIDOMNode
+    *         The element associated with the displayed item.
+    */
+   insertItemAt: function(aIndex, aContents, aAttachment={}) {
++
++    // if (this._list.lastElementChild) {
++    // let rect = cwu.getBoundsWithoutFlushing(this._list.lastElementChild);
++    // let rect2 = cwu.getBoundsWithoutFlushing(this._list);
++    // // console.log(rect, rect2, this._list.scrollTop, this._list.scrollHeight);
++
++    // // console.log("AT bottom?", (rect.height + rect.top) < rect2.bottom, rect.height + rect.top, rect2.bottom);
++    // }
++
++
+     // Maintaining scroll position at the bottom when a new item is inserted
+     // depends on several factors (the order of testing is important to avoid
+     // needlessly expensive operations that may cause reflows):
+     let maintainScrollAtBottom =
+       // 1. The behavior should be enabled,
+       this.autoscrollWithAppendedItems &&
+       // 2. There shouldn't currently be any selected item in the list.
+       !this._selectedItem &&
+       // 3. The new item should be appended at the end of the list.
+-      (aIndex < 0 || aIndex >= this._orderedMenuElementsArray.length) &&
++      (aIndex < 0 || aIndex >= this._orderedMenuElementsArray.length);
++
++    if (maintainScrollAtBottom && this._list.lastElementChild) {
++    let cwu = this.window.QueryInterface(Ci.nsIInterfaceRequestor)
++                    .getInterface(Ci.nsIDOMWindowUtils);
+       // 4. The list should already be scrolled at the bottom.
+-      (this._list.scrollTop + this._list.clientHeight >= this._list.scrollHeight);
++      let rect = cwu.getBoundsWithoutFlushing(this._list.lastElementChild);
++      let rect2 = cwu.getBoundsWithoutFlushing(this._list);
++      // console.log(rect, rect2, this._list.scrollTop, this._list.scrollHeight);
++
++      // console.log("AT bottom?", (rect.height + rect.top) < rect2.bottom, rect.height + rect.top, rect2.bottom);
++      maintainScrollAtBottom = (rect.height + rect.top) < rect2.bottom;
++
++      // (this._list.scrollTop + this._list.clientHeight >= this._list.scrollHeight);
++    }
+ 
+     let group = this._getMenuGroupForName(aAttachment.group);
+     let item = this._getMenuItemForGroup(group, aContents, aAttachment);
+     let element = item.insertSelfAt(aIndex);
+ 
++    let window = this.window;
++    function onscroll() {
++      this._queuedRequestHandler.disarm();
++      window.removeEventListener("scroll", onscroll);
++    }
+     if (maintainScrollAtBottom) {
+-      this._list.scrollTop = this._list.scrollHeight;
++
++
++      if (!this._queuedRequestHandler) {
++        this._queuedRequestHandler = new DeferredTask(() => {
++          this._list.scrollTop = this._list.scrollHeight;
++          window.removeEventListener("scroll", onscroll);
++        }, 100);
++      }
++
++      window.addEventListener("scroll", onscroll);
++      this._queuedRequestHandler.arm();
+     }
+ 
+     return element;
+   },
+ 
+   /**
+    * Returns the child node in this container situated at the specified index.
+    *
