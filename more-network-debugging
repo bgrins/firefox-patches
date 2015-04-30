@@ -1,97 +1,53 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  8319693198eb345275ca933f0997b283a90369ef
-Bug 1143224 -
+# Parent  a1547d926bac41b756756ef1a735a53f3a8a98cc
+Bug 1143224 - Use getBoundsWithoutFlushing and scroll less often in the SideMenuWidget to speed up the netmonitor UI;r=vporof
 
-diff --git a/browser/devtools/netmonitor/netmonitor-view.js b/browser/devtools/netmonitor/netmonitor-view.js
---- a/browser/devtools/netmonitor/netmonitor-view.js
-+++ b/browser/devtools/netmonitor/netmonitor-view.js
-@@ -536,17 +536,17 @@ RequestsMenuView.prototype = Heritage.ex
-         useCapture: true
-       }]
-     });
+diff --git a/browser/devtools/netmonitor/test/browser_net_autoscroll.js b/browser/devtools/netmonitor/test/browser_net_autoscroll.js
+--- a/browser/devtools/netmonitor/test/browser_net_autoscroll.js
++++ b/browser/devtools/netmonitor/test/browser_net_autoscroll.js
+@@ -8,16 +8,17 @@
+ //
+ thisTestLeaksUncaughtRejectionsAndShouldBeFixed("TypeError: aValue.content is undefined");
  
-     $("#details-pane-toggle").disabled = false;
-     $("#requests-menu-empty-notice").hidden = true;
+ /**
+  * Bug 863102 - Automatically scroll down upon new network requests.
+  */
  
-     this.refreshSummary();
--    this.refreshZebra();
-+    this.refreshZebra(true);
-     this.refreshTooltip(requestItem);
- 
-     if (aId == this._preferredItemId) {
-       this.selectedItem = requestItem;
-     }
-   },
- 
-   /**
-@@ -659,16 +659,18 @@ RequestsMenuView.prototype = Heritage.ex
- 
-     // Append a network request item to this container.
-     let newItem = this.push([menuView], {
-       attachment: Object.create(selected, {
-         isCustom: { value: true }
-       })
-     });
- 
-+    this.refreshZebra();
+ function test() {
 +
-     // Immediately switch to new request pane.
-     this.selectedItem = newItem;
-   },
+   requestLongerTimeout(2);
+   let monitor, debuggee, requestsContainer, scrollTop;
  
-   /**
-    * Send a new HTTP request using the data in the custom request form.
-    */
-   sendCustomRequest: function() {
-@@ -1114,31 +1116,45 @@ RequestsMenuView.prototype = Heritage.ex
-       .replace("#1", visibleRequestsCount)
-       .replace("#2", L10N.numberWithDecimals((totalBytes || 0) / 1024, CONTENT_SIZE_DECIMALS))
-       .replace("#3", L10N.numberWithDecimals((totalMillis || 0) / 1000, REQUEST_TIME_DECIMALS))
-     );
-   },
+   initNetMonitor(INFINITE_GET_URL).then(([aTab, aDebuggee, aMonitor]) => {
+     monitor = aMonitor;
+     debuggee = aDebuggee;
+     let win = monitor.panelWin;
+     let topNode = win.document.getElementById("requests-menu-contents");
+@@ -76,17 +77,22 @@ function test() {
  
-   /**
-    * Adds odd/even attributes to all the visible items in this container.
-+   *
-+   * @param boolean lastElementOnly
-+   *        Passing true will cause only the last visible element to be striped.
-+   *        Use only if you know the element was pushed onto the end.
-    */
--  refreshZebra: function() {
-+  refreshZebra: function(lastElementOnly) {
-     let visibleItems = this.visibleItems;
+   // Handle exceptions in the chain of promises.
+   .then(null, (err) => {
+     ok(false, err);
+     finish();
+   });
  
--    for (let i = 0, len = visibleItems.length; i < len; i++) {
-+    // lastElementOnly is an optimization used when only pushing an element
-+    // onto the end of the list.  In this case we only want to stripe the
-+    // most recent item.  Don't try it if there is a sort applied.
-+    lastElementOnly = lastElementOnly &&
-+                      document.querySelectorAll(".requests-menu-header-button[sorted]").length == 0;
+   function waitForRequestsToOverflowContainer (aMonitor, aContainer) {
+-    return waitForNetworkEvents(aMonitor, 1).then(() => {
++    aMonitor.panelWin.addEventListener("scroll", function onscroll() {
++      ok(false, "scrolled");
++    }, win);
++    return waitForNetworkEvents(aMonitor, 100).then(() => {
 +
-+    for (let i = visibleItems.length - 1; i >= 0; i--) {
-       let requestItem = visibleItems[i];
-       let requestTarget = requestItem.target;
- 
-       if (i % 2 == 0) {
-         requestTarget.setAttribute("even", "");
-         requestTarget.removeAttribute("odd");
++      return promise.defer().promise;
+       if (aContainer.scrollHeight > aContainer.clientHeight) {
+         // Wait for some more just for good measure.
+         return waitForNetworkEvents(aMonitor, 8);
        } else {
-         requestTarget.setAttribute("odd", "");
-         requestTarget.removeAttribute("even");
+         return waitForRequestsToOverflowContainer(aMonitor, aContainer);
        }
-+
-+      if (lastElementOnly) {
-+        break;
-+      }
-     }
-   },
- 
-   /**
-    * Refreshes the toggling anchor for the specified item's tooltip.
-    *
-    * @param object aItem
-    *        The network request item in this container.
+     });
+   }
 diff --git a/browser/devtools/shared/widgets/SideMenuWidget.jsm b/browser/devtools/shared/widgets/SideMenuWidget.jsm
 --- a/browser/devtools/shared/widgets/SideMenuWidget.jsm
 +++ b/browser/devtools/shared/widgets/SideMenuWidget.jsm
@@ -118,7 +74,7 @@ diff --git a/browser/devtools/shared/widgets/SideMenuWidget.jsm b/browser/devtoo
   *
   * @param nsIDOMNode aNode
   *        The element associated with the widget.
-@@ -100,39 +103,105 @@ SideMenuWidget.prototype = {
+@@ -100,39 +103,93 @@ SideMenuWidget.prototype = {
     *          - checkboxState: the checked state of the checkbox, if shown
     *          - checkboxTooltip: the tooltip text for the checkbox, if shown
     * @return nsIDOMNode
@@ -171,6 +127,7 @@ diff --git a/browser/devtools/shared/widgets/SideMenuWidget.jsm b/browser/devtoo
 +      // console.log(groupRect.height, groupRect.top, groupRect.bottom, listRect.bottom);
 +      return (groupRect.height + groupRect.top) < listRect.bottom;
 +    }
++
 +    return false;
 +  },
 +
@@ -179,43 +136,30 @@ diff --git a/browser/devtools/shared/widgets/SideMenuWidget.jsm b/browser/devtoo
 +   * If the user scrolls in the meantime, cancel this operation.
 +   */
 +  scrollToBottom: function() {
-+      const {console} = Components.utils.import("resource://gre/modules/devtools/Console.jsm", {});
-+    if (!this._queuedRequestHandler) {
++    // Lazily attach this functionality to the object, so it won't get
++    // created unless if this scrollToBottom behavior is needed.
++    if (!this._scrollToBottomTask) {
++      // The scroll event fires asynchronously, so we need to keep a bit to
++      // distinguish between user-initiated events and scrollTop assignment.
++      let ignoreNextScroll = false;
 +
-+      let setScrollManually = false;
-+
-+      this._disarm = () => {
-+        if (setScrollManually) {
-+          setScrollManually = false;
-+          return;
-+        }
-+        // Cancel the task and null out the handler so it will get recreated
-+        // on the next scrollToBottom call.
-+        this._queuedRequestHandler.disarm();
-+        this._list.removeEventListener("scroll", this._disarm);
-+        console.log("SCROLLL HAPPENED - REMOVED LISTENER");
-+      };
-+
-+      // let scroll = disarm.bind(this);
-+
-+      this._queuedRequestHandler = new DeferredTask(() => {
-+        console.log("ARM HAPPENED - SCROLLING");
-+        this._disarm();
-+
-+        // setScrollManually = true;
++      // This will fire at most once every SCROLL_FREQUENCY milliseconds.
++      this._scrollToBottomTask = new DeferredTask(() => {
++        ignoreNextScroll = true;
 +        this._list.scrollTop = this._list.scrollHeight;
-+        console.log("ARM HAPPENED - LISTENER REMOVED");
 +      }, SCROLL_FREQUENCY);
 +
++      // On a scroll, cancel any pending calls to _queuedRequestHandler.
++      this._list.addEventListener("scroll", () => {
++        if (ignoreNextScroll) {
++          ignoreNextScroll = false;
++        } else {
++          this._scrollToBottomTask.disarm();
++        }
++      }, true);
 +    }
 +
-+    if (!this._queuedRequestHandler.isArmed) {
-+      // If a user scroll happens while waiting for the task to execute,
-+      // then cancel it.
-+    console.log("ARMING");
-+      this._list.addEventListener("scroll", this._disarm);
-+      this._queuedRequestHandler.arm();
-+    }
++    this._scrollToBottomTask.arm();
 +  },
 +
 +  /**
