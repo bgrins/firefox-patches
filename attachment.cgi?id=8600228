@@ -1,0 +1,286 @@
+# HG changeset patch
+# User Timothy Nikkel <tnikkel@gmail.com>
+# Parent  f15a9eb18ceb4cd46693f997d10d8090585d3fa8
+Bug 1159772. Do window properties async because they can trigger sync painting.
+
+diff --git a/layout/base/nsCSSFrameConstructor.cpp b/layout/base/nsCSSFrameConstructor.cpp
+--- a/layout/base/nsCSSFrameConstructor.cpp
++++ b/layout/base/nsCSSFrameConstructor.cpp
+@@ -2693,17 +2693,17 @@ nsCSSFrameConstructor::ConstructRootFram
+ 
+   // Bind the viewport frame to the root view
+   nsView* rootView = mPresShell->GetViewManager()->GetRootView();
+   viewportFrame->SetView(rootView);
+ 
+   nsContainerFrame::SyncFrameViewProperties(mPresShell->GetPresContext(), viewportFrame,
+                                             viewportPseudoStyle, rootView);
+   nsContainerFrame::SyncWindowProperties(mPresShell->GetPresContext(), viewportFrame,
+-                                         rootView);
++                                         rootView, nullptr, false);
+ 
+   // Make it an absolute container for fixed-pos elements
+   viewportFrame->AddStateBits(NS_FRAME_CAN_HAVE_ABSPOS_CHILDREN);
+   viewportFrame->MarkAsAbsoluteContainingBlock();
+ 
+   return viewportFrame;
+ }
+ 
+diff --git a/layout/base/nsIPresShell.h b/layout/base/nsIPresShell.h
+--- a/layout/base/nsIPresShell.h
++++ b/layout/base/nsIPresShell.h
+@@ -1656,16 +1656,18 @@ public:
+ 
+   void SetNeverPainting(bool aNeverPainting) {
+     mIsNeverPainting = aNeverPainting;
+   }
+ 
+   bool HasPendingReflow() const
+     { return mReflowScheduled || mReflowContinueTimer; }
+ 
++  void SyncWindowProperties(nsView* aView);
++
+ protected:
+   friend class nsRefreshDriver;
+ 
+   // IMPORTANT: The ownership implicit in the following member variables
+   // has been explicitly checked.  If you add any members to this class,
+   // please make the ownership explicit (pinkerton, scc).
+ 
+   // These are the same Document and PresContext owned by the DocViewer.
+diff --git a/layout/base/nsPresShell.cpp b/layout/base/nsPresShell.cpp
+--- a/layout/base/nsPresShell.cpp
++++ b/layout/base/nsPresShell.cpp
+@@ -9240,17 +9240,17 @@ PresShell::DoReflow(nsIFrame* target, bo
+   // Always use boundsRelativeToTarget here, not desiredSize.GetVisualOverflowArea(),
+   // because for root frames (where they could be different, since root frames
+   // are allowed to have overflow) the root view bounds need to match the
+   // viewport bounds; the view manager "window dimensions" code depends on it.
+   nsContainerFrame::SyncFrameViewAfterReflow(mPresContext, target,
+                                              target->GetView(),
+                                              boundsRelativeToTarget);
+   nsContainerFrame::SyncWindowProperties(mPresContext, target,
+-                                         target->GetView(), &rcx);
++                                         target->GetView(), &rcx, false);
+ 
+   target->DidReflow(mPresContext, nullptr, nsDidReflowStatus::FINISHED);
+   if (target == rootFrame && size.BSize(wm) == NS_UNCONSTRAINEDSIZE) {
+     mPresContext->SetVisibleArea(boundsRelativeToTarget);
+   }
+ 
+ #ifdef DEBUG
+   mCurrentReflowRoot = nullptr;
+@@ -11076,8 +11076,18 @@ void
+ PresShell::ResumePainting()
+ {
+   if (GetPresContext()->RefreshDriver()->PresContext() != GetPresContext())
+     return;
+ 
+   mPaintingIsFrozen = false;
+   GetPresContext()->RefreshDriver()->Thaw();
+ }
++
++void
++nsIPresShell::SyncWindowProperties(nsView* aView)
++{
++  nsRenderingContext rcx(CreateReferenceRenderingContext());
++  nsIFrame* frame = aView->GetFrame();
++  if (frame && mPresContext) {
++    nsContainerFrame::SyncWindowProperties(mPresContext, frame, aView, &rcx, true);
++  }
++}
+diff --git a/layout/generic/nsContainerFrame.cpp b/layout/generic/nsContainerFrame.cpp
+--- a/layout/generic/nsContainerFrame.cpp
++++ b/layout/generic/nsContainerFrame.cpp
+@@ -604,24 +604,25 @@ IsTopLevelWidget(nsIWidget* aWidget)
+          windowType == eWindowType_dialog ||
+          windowType == eWindowType_sheet;
+   // popups aren't toplevel so they're not handled here
+ }
+ 
+ void
+ nsContainerFrame::SyncWindowProperties(nsPresContext*       aPresContext,
+                                        nsIFrame*            aFrame,
+-                                       nsView*             aView,
+-                                       nsRenderingContext*  aRC)
++                                       nsView*              aView,
++                                       nsRenderingContext*  aRC,
++                                       bool                 aSync)
+ {
+ #ifdef MOZ_XUL
+   if (!aView || !nsCSSRendering::IsCanvasFrame(aFrame) || !aView->HasWidget())
+     return;
+ 
+-  nsIWidget* windowWidget = GetPresContextContainerWidget(aPresContext);
++  nsCOMPtr<nsIWidget> windowWidget = GetPresContextContainerWidget(aPresContext);
+   if (!windowWidget || !IsTopLevelWidget(windowWidget))
+     return;
+ 
+   nsViewManager* vm = aView->GetViewManager();
+   nsView* rootView = vm->GetRootView();
+ 
+   if (aView != rootView)
+     return;
+@@ -645,25 +646,38 @@ nsContainerFrame::SyncWindowProperties(n
+     // even if the HTML doesn't have a background-color set.
+     return;
+   }
+ 
+   nsIFrame *rootFrame = aPresContext->PresShell()->FrameConstructor()->GetRootElementStyleFrame();
+   if (!rootFrame)
+     return;
+ 
++  if (!aSync) {
++    aView->SetNeedsWindowPropertiesSync();
++    return;
++  }
++
++  nsRefPtr<nsPresContext> pc(aPresContext);
++  nsWeakFrame weak(rootFrame);
++
+   nsTransparencyMode mode = nsLayoutUtils::GetFrameTransparency(aFrame, rootFrame);
+-  nsIWidget* viewWidget = aView->GetWidget();
++  int32_t shadow = rootFrame->StyleUIReset()->mWindowShadow;
++  nsCOMPtr<nsIWidget> viewWidget = aView->GetWidget();
+   viewWidget->SetTransparencyMode(mode);
+-  windowWidget->SetWindowShadowStyle(rootFrame->StyleUIReset()->mWindowShadow);
++  windowWidget->SetWindowShadowStyle(shadow);
+ 
+   if (!aRC)
+     return;
+-  
+-  nsBoxLayoutState aState(aPresContext, aRC);
++
++  if (!weak.IsAlive()) {
++    return;
++  }
++
++  nsBoxLayoutState aState(pc, aRC);
+   nsSize minSize = rootFrame->GetMinSize(aState);
+   nsSize maxSize = rootFrame->GetMaxSize(aState);
+ 
+   SetSizeConstraints(aPresContext, windowWidget, minSize, maxSize);
+ #endif
+ }
+ 
+ void nsContainerFrame::SetSizeConstraints(nsPresContext* aPresContext,
+diff --git a/layout/generic/nsContainerFrame.h b/layout/generic/nsContainerFrame.h
+--- a/layout/generic/nsContainerFrame.h
++++ b/layout/generic/nsContainerFrame.h
+@@ -177,18 +177,19 @@ public:
+                                        nsView*        aView,
+                                        const nsRect&   aVisualOverflowArea,
+                                        uint32_t        aFlags = 0);
+ 
+   // Syncs properties to the top level view and window, like transparency and
+   // shadow.
+   static void SyncWindowProperties(nsPresContext*       aPresContext,
+                                    nsIFrame*            aFrame,
+-                                   nsView*             aView,
+-                                   nsRenderingContext*  aRC = nullptr);
++                                   nsView*              aView,
++                                   nsRenderingContext*  aRC,
++                                   bool                 aSync);
+ 
+   // Sets the view's attributes from the frame style.
+   // - visibility
+   // - clip
+   // Call this when one of these styles changes or when the view has just
+   // been created.
+   // @param aStyleContext can be null, in which case the frame's style context is used
+   static void SyncFrameViewProperties(nsPresContext*  aPresContext,
+diff --git a/view/nsView.cpp b/view/nsView.cpp
+--- a/view/nsView.cpp
++++ b/view/nsView.cpp
+@@ -668,16 +668,24 @@ nsView::InitializeWindow(bool aEnableDra
+ 
+   //make sure visibility state is accurate
+ 
+   if (aResetVisibility) {
+     SetVisibility(GetVisibility());
+   }
+ }
+ 
++void
++nsView::SetNeedsWindowPropertiesSync()
++{
++  mNeedsWindowPropertiesSync = true;
++  if (mViewManager) mViewManager->PostPendingUpdate();
++}
++
++
+ // Attach to a top level widget and start receiving mirrored events.
+ nsresult nsView::AttachToTopLevelWidget(nsIWidget* aWidget)
+ {
+   NS_PRECONDITION(nullptr != aWidget, "null widget ptr");
+   /// XXXjimm This is a temporary workaround to an issue w/document
+   // viewer (bug 513162).
+   nsIWidgetListener* listener = aWidget->GetAttachedWidgetListener();
+   if (listener) {
+diff --git a/view/nsView.h b/view/nsView.h
+--- a/view/nsView.h
++++ b/view/nsView.h
+@@ -285,16 +285,18 @@ public:
+    * Returns true if the view has a widget associated with it.
+    */
+   bool HasWidget() const { return mWindow != nullptr; }
+   
+   void SetForcedRepaint(bool aForceRepaint) { 
+     mForcedRepaint = aForceRepaint; 
+   }
+ 
++  void SetNeedsWindowPropertiesSync();
++
+   /**
+    * Make aWidget direct its events to this view.
+    * The caller must call DetachWidgetEventHandler before this view
+    * is destroyed.
+    */
+   void AttachWidgetEventHandler(nsIWidget* aWidget);
+   /**
+    * Stop aWidget directing its events to this view.
+@@ -458,11 +460,12 @@ private:
+   nscoord           mPosX, mPosY;
+   // relative to parent, but in our appunits
+   nsRect            mDimBounds;
+   // in our appunits
+   nsPoint           mViewToWidgetOffset;
+   uint32_t          mVFlags;
+   bool              mWidgetIsTopLevel;
+   bool              mForcedRepaint;
++  bool              mNeedsWindowPropertiesSync;
+ };
+ 
+ #endif
+diff --git a/view/nsViewManager.cpp b/view/nsViewManager.cpp
+--- a/view/nsViewManager.cpp
++++ b/view/nsViewManager.cpp
+@@ -363,16 +363,29 @@ nsViewManager::ProcessPendingUpdatesForV
+   }
+ 
+   nsCOMPtr<nsIPresShell> rootShell(mPresShell);
+   nsTArray<nsCOMPtr<nsIWidget> > widgets;
+   aView->GetViewManager()->ProcessPendingUpdatesRecurse(aView, widgets);
+   for (uint32_t i = 0; i < widgets.Length(); ++i) {
+     nsView* view = nsView::GetViewFor(widgets[i]);
+     if (view) {
++      if (view->mNeedsWindowPropertiesSync) {
++        view->mNeedsWindowPropertiesSync = false;
++        if (view->GetFrame()) {
++          if (nsViewManager* vm = view->GetViewManager()) {
++            if (nsIPresShell* ps = vm->GetPresShell()) {
++              ps->SyncWindowProperties(view);
++            }
++          }
++        }
++      }
++    }
++    view = nsView::GetViewFor(widgets[i]);
++    if (view) {
+       view->ResetWidgetBounds(false, true);
+     }
+   }
+   if (rootShell->GetViewManager() != this) {
+     return; // 'this' might have been destroyed
+   }
+   if (aFlushDirtyRegion) {
+     profiler_tracing("Paint", "DisplayList", TRACING_INTERVAL_START);
