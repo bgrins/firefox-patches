@@ -1,0 +1,254 @@
+# HG changeset patch
+# User Cameron McCormack <cam@mcc.id.au>
+# Parent  64871af1bc058cc507b84c120535a99cd7918f9c
+
+Bug 729310 - Add nsIDOMUtils.getVisitedDependentCSSStyleRules.
+
+diff --git a/layout/base/tests/mochitest.ini b/layout/base/tests/mochitest.ini
+--- a/layout/base/tests/mochitest.ini
++++ b/layout/base/tests/mochitest.ini
+@@ -191,16 +191,17 @@ support-files = bug583889_inner1.html bu
+ support-files = bug968148_inner.html
+ [test_bug603550.html]
+ skip-if = buildapp == 'b2g' || toolkit == 'android' || e10s #TIMED_OUT # b2g(Components.classes[@mozilla.org/widget/dragservice;1] is undefined) b2g-debug(Components.classes[@mozilla.org/widget/dragservice;1] is undefined) b2g-desktop(Components.classes[@mozilla.org/widget/dragservice;1] is undefined)
+ [test_bug629838.html]
+ skip-if = buildapp == 'mulet' || buildapp == 'b2g' || toolkit == 'android' || e10s # b2g(depends on plugins support) b2g-debug(depends on plugins support) b2g-desktop(depends on plugins support)
+ [test_bug646757.html]
+ [test_bug718809.html]
+ [test_bug725426.html]
++[test_bug729310.html]
+ [test_bug731777.html]
+ [test_bug761572.html]
+ [test_bug770106.html]
+ [test_maxLineBoxWidth.html]
+ [test_remote_frame.html]
+ skip-if = (buildapp == 'b2g' && toolkit != 'gonk') #Bug 931116, b2g desktop specific, initial triage
+ [test_remote_passpointerevents.html]
+ [test_bug842853.html]
+diff --git a/layout/base/tests/test_bug729310.html b/layout/base/tests/test_bug729310.html
+new file mode 100644
+--- /dev/null
++++ b/layout/base/tests/test_bug729310.html
+@@ -0,0 +1,39 @@
++<!DOCTYPE html>
++<title>Test that inIDOMUtils.getCSSStyleRules does not include :visited rules while getVisitedDependentCSSStyleRules does</title>
++<script src="/tests/SimpleTest/SimpleTest.js"></script>
++<link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css">
++<style>
++a { color: blue; }
++a:visited { color: purple; }
++</style>
++<a href="">link</a>
++<script>
++function unwrap(aSupportsArray) {
++  var a = [];
++  for (var i = 0; i < aSupportsArray.Count(); i++) {
++    a.push(SpecialPowers.unwrap(aSupportsArray.GetElementAt(i).QueryInterface(nsIDOMCSSStyleRule)));
++  }
++  return a;
++}
++
++var domUtils = SpecialPowers.Cc["@mozilla.org/inspector/dom-utils;1"]
++                            .getService(SpecialPowers.Ci.inIDOMUtils);
++var nsIDOMCSSStyleRule = SpecialPowers.Ci["nsIDOMCSSStyleRule"];
++var a = document.querySelector("a");
++var sheetRules = document.querySelector("style").sheet.cssRules;
++var inspectedRules;
++
++inspectedRules = unwrap(domUtils.getCSSStyleRules(a));
++
++ok(inspectedRules.indexOf(sheetRules[0]) != -1,
++   "non-:visited rule should be returned by getCSSStyleRules");
++ok(inspectedRules.indexOf(sheetRules[1]) == -1,
++   ":visited rule should not be returned by getCSSStyleRules");
++
++inspectedRules = unwrap(domUtils.getVisitedDependentCSSStyleRules(a));
++
++ok(inspectedRules.indexOf(sheetRules[0]) != -1,
++   "non-:visited rule should be returned by getVisitedDependentCSSStyleRules");
++ok(inspectedRules.indexOf(sheetRules[1]) != -1,
++   ":visited rule should be returned by getVisitedDependentCSSStyleRules");
++</script>
+diff --git a/layout/inspector/inDOMUtils.cpp b/layout/inspector/inDOMUtils.cpp
+--- a/layout/inspector/inDOMUtils.cpp
++++ b/layout/inspector/inDOMUtils.cpp
+@@ -191,35 +191,37 @@ inDOMUtils::GetChildrenForNode(nsIDOMNod
+   if (!kids) {
+     aNode->GetChildNodes(getter_AddRefs(kids));
+   }
+ 
+   kids.forget(aChildren);
+   return NS_OK;
+ }
+ 
+-NS_IMETHODIMP
+-inDOMUtils::GetCSSStyleRules(nsIDOMElement *aElement,
++/* static */ nsresult
++inDOMUtils::GetCSSStyleRules(nsIDOMElement* aElement,
+                              const nsAString& aPseudo,
+-                             nsISupportsArray **_retval)
++                             VisitedRules aVisitedRules,
++                             nsISupportsArray** _retval)
+ {
+   NS_ENSURE_ARG_POINTER(aElement);
+ 
+   *_retval = nullptr;
+ 
+   nsCOMPtr<nsIAtom> pseudoElt;
+   if (!aPseudo.IsEmpty()) {
+     pseudoElt = do_GetAtom(aPseudo);
+   }
+ 
+   nsRuleNode* ruleNode = nullptr;
+   nsCOMPtr<Element> element = do_QueryInterface(aElement);
+   NS_ENSURE_STATE(element);
+   nsRefPtr<nsStyleContext> styleContext;
+-  GetRuleNodeForElement(element, pseudoElt, getter_AddRefs(styleContext), &ruleNode);
++  GetRuleNodeForElement(element, pseudoElt, aVisitedRules,
++                        getter_AddRefs(styleContext), &ruleNode);
+   if (!ruleNode) {
+     // This can fail for elements that are not in the document or
+     // if the document they're in doesn't have a presshell.  Bail out.
+     return NS_OK;
+   }
+ 
+   nsCOMPtr<nsISupportsArray> rules;
+   NS_NewISupportsArray(getter_AddRefs(rules));
+@@ -235,16 +237,32 @@ inDOMUtils::GetCSSStyleRules(nsIDOMEleme
+     }
+   }
+ 
+   rules.forget(_retval);
+ 
+   return NS_OK;
+ }
+ 
++NS_IMETHODIMP
++inDOMUtils::GetCSSStyleRules(nsIDOMElement *aElement,
++                             const nsAString& aPseudo,
++                             nsISupportsArray **_retval)
++{
++  return GetCSSStyleRules(aElement, aPseudo, eExcludeVisitedRules, _retval);
++}
++
++NS_IMETHODIMP
++inDOMUtils::GetVisitedDependentCSSStyleRules(nsIDOMElement* aElement,
++                                             const nsAString& aPseudo,
++                                             nsISupportsArray** _retval)
++{
++  return GetCSSStyleRules(aElement, aPseudo, eIncludeVisitedRules, _retval);
++}
++
+ static already_AddRefed<StyleRule>
+ GetRuleFromDOMRule(nsIDOMCSSStyleRule *aRule, ErrorResult& rv)
+ {
+   nsCOMPtr<nsICSSStyleRuleDOMWrapper> rule = do_QueryInterface(aRule);
+   if (!rule) {
+     rv.Throw(NS_ERROR_INVALID_POINTER);
+     return nullptr;
+   }
+@@ -937,16 +955,17 @@ inDOMUtils::GetContentState(nsIDOMElemen
+   // please remove GetInternalValue from EventStates
+   *aState = content->AsElement()->State().GetInternalValue();
+   return NS_OK;
+ }
+ 
+ /* static */ nsresult
+ inDOMUtils::GetRuleNodeForElement(dom::Element* aElement,
+                                   nsIAtom* aPseudo,
++                                  VisitedRules aVisitedRules,
+                                   nsStyleContext** aStyleContext,
+                                   nsRuleNode** aRuleNode)
+ {
+   MOZ_ASSERT(aElement);
+ 
+   *aRuleNode = nullptr;
+   *aStyleContext = nullptr;
+ 
+@@ -959,16 +978,22 @@ inDOMUtils::GetRuleNodeForElement(dom::E
+   nsPresContext *presContext = presShell->GetPresContext();
+   NS_ENSURE_TRUE(presContext, NS_ERROR_UNEXPECTED);
+ 
+   presContext->EnsureSafeToHandOutCSSRules();
+ 
+   nsRefPtr<nsStyleContext> sContext =
+     nsComputedDOMStyle::GetStyleContextForElement(aElement, aPseudo, presShell);
+   if (sContext) {
++    if (aVisitedRules == eIncludeVisitedRules) {
++      nsStyleContext* styleIfVisited = sContext->GetStyleIfVisited();
++      if (styleIfVisited) {
++        sContext = styleIfVisited;
++      }
++    }
+     *aRuleNode = sContext->RuleNode();
+     sContext.forget(aStyleContext);
+   }
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ inDOMUtils::GetUsedFontFaces(nsIDOMRange* aRange,
+diff --git a/layout/inspector/inDOMUtils.h b/layout/inspector/inDOMUtils.h
+--- a/layout/inspector/inDOMUtils.h
++++ b/layout/inspector/inDOMUtils.h
+@@ -23,20 +23,28 @@ public:
+   NS_DECL_ISUPPORTS
+   NS_DECL_INIDOMUTILS
+ 
+   inDOMUtils();
+ 
+ private:
+   virtual ~inDOMUtils();
+ 
++  enum VisitedRules { eExcludeVisitedRules, eIncludeVisitedRules };
++
+   // aStyleContext must be released by the caller once he's done with aRuleNode.
+   static nsresult GetRuleNodeForElement(mozilla::dom::Element* aElement,
+                                         nsIAtom* aPseudo,
++                                        VisitedRules aVisitedRules,
+                                         nsStyleContext** aStyleContext,
+                                         nsRuleNode** aRuleNode);
++
++  static nsresult GetCSSStyleRules(nsIDOMElement* aElement,
++                                   const nsAString& aPseudo,
++                                   VisitedRules aVisitedRules,
++                                   nsISupportsArray** _retval);
+ };
+ 
+ // {0a499822-a287-4089-ad3f-9ffcd4f40263}
+ #define IN_DOMUTILS_CID \
+   {0x0a499822, 0xa287, 0x4089, {0xad, 0x3f, 0x9f, 0xfc, 0xd4, 0xf4, 0x02, 0x63}}
+ 
+ #endif // __inDOMUtils_h__
+diff --git a/layout/inspector/inIDOMUtils.idl b/layout/inspector/inIDOMUtils.idl
+--- a/layout/inspector/inIDOMUtils.idl
++++ b/layout/inspector/inIDOMUtils.idl
+@@ -12,24 +12,27 @@ interface nsIDOMDocument;
+ interface nsIDOMCSSRule;
+ interface nsIDOMCSSStyleRule;
+ interface nsIDOMNode;
+ interface nsIDOMNodeList;
+ interface nsIDOMFontFaceList;
+ interface nsIDOMRange;
+ interface nsIDOMCSSStyleSheet;
+ 
+-[scriptable, uuid(1f5b7f08-fa80-49e9-b881-888f081240da)]
++[scriptable, uuid(a85df095-8474-495e-a6eb-277888ea8b95)]
+ interface inIDOMUtils : nsISupports
+ {
+   // CSS utilities
+   void getAllStyleSheets (in nsIDOMDocument aDoc,
+                           [optional] out unsigned long aLength,
+                           [array, size_is (aLength), retval] out nsISupports aSheets);
+   nsISupportsArray getCSSStyleRules(in nsIDOMElement aElement, [optional] in DOMString aPseudo);
++  nsISupportsArray getVisitedDependentCSSStyleRules(
++                                               in nsIDOMElement aElement,
++                                               [optional] in DOMString aPseudo);
+   unsigned long getRuleLine(in nsIDOMCSSRule aRule);
+   unsigned long getRuleColumn(in nsIDOMCSSRule aRule);
+ 
+   // Utilities for working with selectors.  We don't have a JS OM representation
+   // of a single selector or a selector list yet, but given a rule we can index
+   // into the selector list.
+   //
+   // This is a somewhat backwards API; once we move StyleRule to WebIDL we
