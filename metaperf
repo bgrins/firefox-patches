@@ -1,0 +1,1217 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  c1da803b295e4a2af3efdc52a5fe90baca2eb86e
+Bug 1154874 - Add metaperf test alongside damp
+
+diff --git a/talos/page_load_test/devtools/addon/chrome.manifest b/talos/page_load_test/devtools/addon/chrome.manifest
+--- a/talos/page_load_test/devtools/addon/chrome.manifest
++++ b/talos/page_load_test/devtools/addon/chrome.manifest
+@@ -1,2 +1,2 @@
+ content damp content/
+-overlay chrome://browser/content/browser.xul chrome://damp/content/damp.overlay.xul
++overlay chrome://browser/content/browser.xul chrome://damp/content/damp.overlay.xul
+\ No newline at end of file
+diff --git a/talos/page_load_test/devtools/addon/content/adding-new-tests.md b/talos/page_load_test/devtools/addon/content/adding-new-tests.md
+new file mode 100755
+--- /dev/null
++++ b/talos/page_load_test/devtools/addon/content/adding-new-tests.md
+@@ -0,0 +1,11 @@
++# Addin new tests to metaperf
++
++* Add test info in `metaperf.html`:
++  * `defaultConfig.subtests[TEST_NAME] = true`
++  * `testsInfo[TEST_NAME] = TEST_DESCRIPTION`
++
++* Create a new file with test as `test-${TEST_NAME}.js`, wrapped in a function named `test_${TEST_NAME}`.
++  * The test wrapper must return a promise that gets resolved upon completion. This function gets
++  passed in a `timer` object with `start` and `stop` methods. Call those before and after the function
++  you want to measure. Make sure to cleanup properly when you're done.
++* Include the file `test-${TEST_NAME}` via script tag in `metaperf.overlay.xul`.
+diff --git a/talos/page_load_test/devtools/addon/content/addon-test-frontend.js b/talos/page_load_test/devtools/addon/content/addon-test-frontend.js
+--- a/talos/page_load_test/devtools/addon/content/addon-test-frontend.js
++++ b/talos/page_load_test/devtools/addon/content/addon-test-frontend.js
+@@ -27,16 +27,17 @@ function chromeExec(commandName, data, d
+   );
+ }
+ 
+ function toClipboard(text) {
+   chromeExec("toClipboard", text);
+ }
+ 
+ function runTest(config, doneCallback) {
++  config.documentURI = document.documentURI;
+   chromeExec("runTest", config, doneCallback);
+ }
+ 
+ function sum(values) {
+   return values.reduce(function(a, b){return a + b;});
+ }
+ 
+ function average(values) {
+diff --git a/talos/page_load_test/devtools/addon/content/damp.js b/talos/page_load_test/devtools/addon/content/damp.js
+--- a/talos/page_load_test/devtools/addon/content/damp.js
++++ b/talos/page_load_test/devtools/addon/content/damp.js
+@@ -1,12 +1,9 @@
+ 
+-Components.utils.import("resource:///modules/devtools/gDevTools.jsm");
+-const {devtools} =
+-  Components.utils.import("resource://gre/modules/devtools/Loader.jsm", {});
+ const { getActiveTab } = devtools.require("sdk/tabs/utils");
+ const { getMostRecentBrowserWindow } = devtools.require("sdk/window/utils");
+ 
+ const SIMPLE_URL = "chrome://damp/content/pages/simple.html";
+ const COMPLICATED_URL = "http://localhost/page_load_test/tp5n/bild.de/www.bild.de/index.html";
+ 
+ function Damp() {
+ }
+diff --git a/talos/page_load_test/devtools/addon/content/damp.overlay.xul b/talos/page_load_test/devtools/addon/content/damp.overlay.xul
+--- a/talos/page_load_test/devtools/addon/content/damp.overlay.xul
++++ b/talos/page_load_test/devtools/addon/content/damp.overlay.xul
+@@ -1,26 +1,33 @@
+ <?xml version="1.0"?>
+ <overlay id="Scrapper-Overlay" xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
+ 
+ <script type="application/x-javascript" src="Profiler.js" />
++<script type="application/x-javascript" src="head.js" />
+ <script type="application/x-javascript" src="damp.js" />
++<script type="application/x-javascript" src="metaperf.js" />
++<script type="application/x-javascript" src="test-profilerFetchData.js" />
+ <script type="application/x-javascript">
+ 
+ (function(){
+   const Cc = Components.classes;
+   const Ci = Components.interfaces;
+   var prefs = Cc["@mozilla.org/preferences-service;1"].getService(Ci.nsIPrefBranch);
+ 
+   const PREFIX = "damp@mozilla.org:";
+ 
+   // "services" which the framescript can execute at the chrome process
+   var proxiedServices = {
+     runTest: function(config, callback) {
+-      (new Damp()).startTest(callback, config);
++      if (!config.documentURI.indexOf("chrome://damp/content/damp.html")) {
++        (new Damp()).startTest(callback, config);
++      } else {
++        (new MetaPerf()).startTest(callback, config);
++      }
+     },
+ 
+     toClipboard: function(text) {
+       const gClipboardHelper = Cc["@mozilla.org/widget/clipboardhelper;1"]
+                                .getService(Ci.nsIClipboardHelper);
+       gClipboardHelper.copyString(text);
+     }
+   };
+diff --git a/talos/page_load_test/devtools/addon/content/frame-script-utils.js b/talos/page_load_test/devtools/addon/content/frame-script-utils.js
+new file mode 100755
+--- /dev/null
++++ b/talos/page_load_test/devtools/addon/content/frame-script-utils.js
+@@ -0,0 +1,268 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++const {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
++const { devtools } = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
++devtools.lazyImporter(this, "promise", "resource://gre/modules/Promise.jsm", "Promise");
++devtools.lazyImporter(this, "Task", "resource://gre/modules/Task.jsm", "Task");
++const loader = Cc["@mozilla.org/moz/jssubscript-loader;1"]
++            .getService(Ci.mozIJSSubScriptLoader);
++let EventUtils = {};
++loader.loadSubScript("chrome://marionette/content/EventUtils.js", EventUtils);
++
++addMessageListener("devtools:test:history", function ({ data }) {
++  content.history[data.direction]();
++});
++
++addMessageListener("devtools:test:navigate", function ({ data }) {
++  content.location = data.location;
++});
++
++addMessageListener("devtools:test:reload", function ({ data }) {
++  data = data || {};
++  content.location.reload(data.forceget);
++});
++
++addMessageListener("devtools:test:console", function ({ data }) {
++  let method = data.shift();
++  content.console[method].apply(content.console, data);
++});
++
++/**
++ * Performs a single XMLHttpRequest and returns a promise that resolves once
++ * the request has loaded.
++ *
++ * @param Object data
++ *        { method: the request method (default: "GET"),
++ *          url: the url to request (default: content.location.href),
++ *          body: the request body to send (default: ""),
++ *          nocache: append an unique token to the query string (default: true)
++ *        }
++ *
++ * @return Promise A promise that's resolved with object
++ *         { status: XMLHttpRequest.status,
++ *           response: XMLHttpRequest.response }
++ *
++ */
++function promiseXHR(data) {
++  let xhr = new content.XMLHttpRequest();
++
++  let method = data.method || "GET";
++  let url = data.url || content.location.href;
++  let body = data.body || "";
++
++  if (data.nocache) {
++    url += "?devtools-cachebust=" + Math.random();
++  }
++
++  let deferred = promise.defer();
++  xhr.addEventListener("loadend", function loadend(event) {
++    xhr.removeEventListener("loadend", loadend);
++    deferred.resolve({ status: xhr.status, response: xhr.response });
++  });
++
++  xhr.open(method, url);
++  xhr.send(body);
++  return deferred.promise;
++
++}
++
++/**
++ * Performs XMLHttpRequest request(s) in the context of the page. The data
++ * parameter can be either a single object or an array of objects described below.
++ * The requests will be performed one at a time in the order they appear in the data.
++ *
++ * The objects should have following form (any of them can be omitted; defaults
++ * shown below):
++ * {
++ *   method: "GET",
++ *   url: content.location.href,
++ *   body: "",
++ *   nocache: true, // Adds a cache busting random token to the URL
++ * }
++ *
++ * The handler will respond with devtools:test:xhr message after all requests
++ * have finished. Following data will be available for each requests
++ * (in the same order as requests):
++ * {
++ *   status: XMLHttpRequest.status
++ *   response: XMLHttpRequest.response
++ * }
++ */
++addMessageListener("devtools:test:xhr", Task.async(function* ({ data }) {
++  let requests = Array.isArray(data) ? data : [data];
++  let responses = [];
++
++  for (let request of requests) {
++    let response = yield promiseXHR(request);
++    responses.push(response);
++  }
++
++  sendAsyncMessage("devtools:test:xhr", responses);
++}));
++
++// To eval in content, look at `evalInDebuggee` in the head.js of canvasdebugger
++// for an example.
++addMessageListener("devtools:test:eval", function ({ data }) {
++  sendAsyncMessage("devtools:test:eval:response", {
++    value: content.eval(data.script),
++    id: data.id
++  });
++});
++
++addEventListener("load", function() {
++  sendAsyncMessage("devtools:test:load");
++}, true);
++
++/**
++ * Set a given style property value on a node.
++ * @param {Object} data
++ * - {String} selector The CSS selector to get the node (can be a "super"
++ *   selector).
++ * - {String} propertyName The name of the property to set.
++ * - {String} propertyValue The value for the property.
++ */
++addMessageListener("devtools:test:setStyle", function(msg) {
++  let {selector, propertyName, propertyValue} = msg.data;
++  let node = superQuerySelector(selector);
++  if (!node) {
++    return;
++  }
++
++  node.style[propertyName] = propertyValue;
++
++  sendAsyncMessage("devtools:test:setStyle");
++});
++
++/**
++ * Get information about a DOM element, identified by a selector.
++ * @param {Object} data
++ * - {String} selector The CSS selector to get the node (can be a "super"
++ *   selector).
++ * @return {Object} data Null if selector didn't match any node, otherwise:
++ * - {String} tagName.
++ * - {String} namespaceURI.
++ * - {Number} numChildren The number of children in the element.
++ * - {Array} attributes An array of {name, value, namespaceURI} objects.
++ * - {String} outerHTML.
++ * - {String} innerHTML.
++ * - {String} textContent.
++ */
++addMessageListener("devtools:test:getDomElementInfo", function(msg) {
++  let {selector} = msg.data;
++  let node = superQuerySelector(selector);
++
++  let info = null;
++  if (node) {
++    info = {
++      tagName: node.tagName,
++      namespaceURI: node.namespaceURI,
++      numChildren: node.children.length,
++      attributes: [...node.attributes].map(({name, value, namespaceURI}) => {
++        return {name, value, namespaceURI};
++      }),
++      outerHTML: node.outerHTML,
++      innerHTML: node.innerHTML,
++      textContent: node.textContent
++    };
++  }
++
++  sendAsyncMessage("devtools:test:getDomElementInfo", info);
++});
++
++/**
++ * Set a given attribute value on a node.
++ * @param {Object} data
++ * - {String} selector The CSS selector to get the node (can be a "super"
++ *   selector).
++ * - {String} attributeName The name of the attribute to set.
++ * - {String} attributeValue The value for the attribute.
++ */
++addMessageListener("devtools:test:setAttribute", function(msg) {
++  let {selector, attributeName, attributeValue} = msg.data;
++  let node = superQuerySelector(selector);
++  if (!node) {
++    return;
++  }
++
++  node.setAttribute(attributeName, attributeValue);
++
++  sendAsyncMessage("devtools:test:setAttribute");
++});
++
++/**
++ * Synthesize a mouse event on an element. This handler doesn't send a message
++ * back. Consumers should listen to specific events on the inspector/highlighter
++ * to know when the event got synthesized.
++ * @param {Object} msg The msg.data part expects the following properties:
++ * - {Number} x
++ * - {Number} y
++ * - {Boolean} center If set to true, x/y will be ignored and
++ *             synthesizeMouseAtCenter will be used instead
++ * - {Object} options Other event options
++ * - {String} selector An optional selector that will be used to find the node to
++ *            synthesize the event on, if msg.objects doesn't contain the CPOW.
++ * The msg.objects part should be the element.
++ * @param {Object} data Event detail properties:
++ */
++addMessageListener("Test:SynthesizeMouse", function(msg) {
++  let {x, y, center, options, selector} = msg.data;
++  let {node} = msg.objects;
++
++  if (!node && selector) {
++    node = superQuerySelector(selector);
++  }
++
++  if (center) {
++    EventUtils.synthesizeMouseAtCenter(node, options, node.ownerDocument.defaultView);
++  } else {
++    EventUtils.synthesizeMouse(node, x, y, options, node.ownerDocument.defaultView);
++  }
++
++  // Most consumers won't need to listen to this message, unless they want to
++  // wait for the mouse event to be synthesized and don't have another event
++  // to listen to instead.
++  sendAsyncMessage("Test:SynthesizeMouse");
++});
++
++/**
++ * Synthesize a key event for an element. This handler doesn't send a message
++ * back. Consumers should listen to specific events on the inspector/highlighter
++ * to know when the event got synthesized.
++ * @param  {Object} msg The msg.data part expects the following properties:
++ * - {String} key
++ * - {Object} options
++ */
++addMessageListener("Test:SynthesizeKey", function(msg) {
++  let {key, options} = msg.data;
++
++  EventUtils.synthesizeKey(key, options, content);
++});
++
++/**
++ * Like document.querySelector but can go into iframes too.
++ * ".container iframe || .sub-container div" will first try to find the node
++ * matched by ".container iframe" in the root document, then try to get the
++ * content document inside it, and then try to match ".sub-container div" inside
++ * this document.
++ * Any selector coming before the || separator *MUST* match a frame node.
++ * @param {String} superSelector.
++ * @return {DOMNode} The node, or null if not found.
++ */
++function superQuerySelector(superSelector, root=content.document) {
++  let frameIndex = superSelector.indexOf("||");
++  if (frameIndex === -1) {
++    return root.querySelector(superSelector);
++  } else {
++    let rootSelector = superSelector.substring(0, frameIndex).trim();
++    let childSelector = superSelector.substring(frameIndex+2).trim();
++    root = root.querySelector(rootSelector);
++    if (!root || !root.contentWindow) {
++      return null;
++    }
++
++    return superQuerySelector(childSelector, root.contentWindow.document);
++  }
++}
+diff --git a/talos/page_load_test/devtools/addon/content/framescript.js b/talos/page_load_test/devtools/addon/content/framescript.js
+--- a/talos/page_load_test/devtools/addon/content/framescript.js
++++ b/talos/page_load_test/devtools/addon/content/framescript.js
+@@ -1,15 +1,16 @@
+ (function() {
+   const PREFIX = "damp@mozilla.org:";
+ 
+   addEventListener(PREFIX + "chrome-exec-event", function (e) {
+-    if (content.document.documentURI.indexOf("chrome://damp/content/damp.html")) {
++    if (content.document.documentURI.indexOf("chrome://damp/content/damp.html") &&
++        content.document.documentURI.indexOf("chrome://damp/content/metaperf.html")) {
+       // Can have url fragment. Backward compatible version of !str.startsWidth("prefix")
+-      throw new Error("Cannot be used outside of DAMP's launch page");
++      throw new Error("Cannot be used outside of DAMP or METAPERF's launch page");
+     }
+ 
+     var uniqueMessageId = PREFIX + content.document.documentURI + Date.now() + Math.random();
+ 
+     addMessageListener(PREFIX + "chrome-exec-reply", function done(reply) {
+       if (reply.data.id == uniqueMessageId) {
+         removeMessageListener(PREFIX + "chrome-exec-reply", done);
+         e.detail.doneCallback(reply.data.result);
+diff --git a/talos/page_load_test/devtools/addon/content/head.js b/talos/page_load_test/devtools/addon/content/head.js
+new file mode 100755
+--- /dev/null
++++ b/talos/page_load_test/devtools/addon/content/head.js
+@@ -0,0 +1,495 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++"use strict";
++
++const { classes: Cc, interfaces: Ci, utils: Cu, results: Cr } = Components;
++let { Services } = Cu.import("resource://gre/modules/Services.jsm", {});
++let { Preferences } = Cu.import("resource://gre/modules/Preferences.jsm", {});
++let { Task } = Cu.import("resource://gre/modules/Task.jsm", {});
++let { Promise } = Cu.import("resource://gre/modules/Promise.jsm", {});
++let { devtools } = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
++let { gDevTools } = Cu.import("resource:///modules/devtools/gDevTools.jsm", {});
++let { DevToolsUtils } = Cu.import("resource://gre/modules/devtools/DevToolsUtils.jsm", {});
++let { DebuggerServer } = Cu.import("resource://gre/modules/devtools/dbg-server.jsm", {});
++let { merge } = devtools.require("sdk/util/object");
++let { getPerformanceActorsConnection, PerformanceFront } = devtools.require("devtools/performance/front");
++let { generateUUID } = Cc['@mozilla.org/uuid-generator;1'].getService(Ci.nsIUUIDGenerator);
++let nsIProfilerModule = Cc["@mozilla.org/tools/profiler;1"].getService(Ci.nsIProfiler);
++let TargetFactory = devtools.TargetFactory;
++let mm = null;
++
++const FRAME_SCRIPT_UTILS_URL = "chrome://damp/content/frame-script-utils.js";
++
++const MEMORY_SAMPLE_PROB_PREF = "devtools.performance.memory.sample-probability";
++const MEMORY_MAX_LOG_LEN_PREF = "devtools.performance.memory.max-log-length";
++const PROFILER_BUFFER_SIZE_PREF = "devtools.performance.profiler.buffer-size";
++const PROFILER_SAMPLE_RATE_PREF = "devtools.performance.profiler.sample-frequency-khz";
++
++const FRAMERATE_PREF = "devtools.performance.ui.enable-framerate";
++const MEMORY_PREF = "devtools.performance.ui.enable-memory";
++
++const PLATFORM_DATA_PREF = "devtools.performance.ui.show-platform-data";
++const IDLE_PREF = "devtools.performance.ui.show-idle-blocks";
++const INVERT_PREF = "devtools.performance.ui.invert-call-tree";
++const INVERT_FLAME_PREF = "devtools.performance.ui.invert-flame-graph";
++const FLATTEN_PREF = "devtools.performance.ui.flatten-tree-recursion";
++const JIT_PREF = "devtools.performance.ui.show-jit-optimizations";
++
++let DEFAULT_PREFS = [
++  "devtools.debugger.log",
++  "devtools.performance.ui.invert-call-tree",
++  "devtools.performance.ui.flatten-tree-recursion",
++  "devtools.performance.ui.show-platform-data",
++  "devtools.performance.ui.show-idle-blocks",
++  "devtools.performance.ui.enable-memory",
++  "devtools.performance.ui.enable-framerate",
++  "devtools.performance.ui.show-jit-optimizations",
++  "devtools.performance.memory.sample-probability",
++  "devtools.performance.memory.max-log-length",
++  "devtools.performance.profiler.buffer-size",
++  "devtools.performance.profiler.sample-frequency-khz",
++].reduce((prefs, pref) => {
++  prefs[pref] = Preferences.get(pref);
++  return prefs;
++}, {});
++
++// Enable the new performance panel for all tests.
++Services.prefs.setBoolPref("devtools.performance.enabled", true);
++// Enable logging for all the tests. Both the debugger server and frontend will
++// be affected by this pref.
++Services.prefs.setBoolPref("devtools.debugger.log", false);
++
++// Disable retro mode.
++// TODO bug 1160313
++// wrap in a try/catch so when this gets removed, we don't crash here
++try {
++  Services.prefs.setBoolPref("devtools.performance.ui.retro-mode", false);
++} catch (e) {}
++
++/**
++ * Call manually in tests that use frame script utils after initializing
++ * the tool. Must be called after initializing so we can detect
++ * whether or not `content` is a CPOW or not. Call after init but before navigating
++ * to different pages.
++ */
++function loadFrameScripts () {
++  mm = gBrowser.selectedBrowser.messageManager;
++  mm.loadFrameScript(FRAME_SCRIPT_UTILS_URL, false);
++}
++
++function addTab(aUrl, aWindow) {
++
++  let deferred = Promise.defer();
++  let targetWindow = aWindow || window;
++  let targetBrowser = targetWindow.gBrowser;
++
++  targetWindow.focus();
++  let tab = targetBrowser.selectedTab = targetBrowser.addTab(aUrl);
++  let linkedBrowser = tab.linkedBrowser;
++
++  linkedBrowser.addEventListener("load", function onLoad() {
++    linkedBrowser.removeEventListener("load", onLoad, true);
++    deferred.resolve(tab);
++  }, true);
++
++  return deferred.promise;
++}
++
++function removeTab(aTab, aWindow) {
++
++  let deferred = Promise.defer();
++  let targetWindow = aWindow || window;
++  let targetBrowser = targetWindow.gBrowser;
++  let tabContainer = targetBrowser.tabContainer;
++
++  tabContainer.addEventListener("TabClose", function onClose(aEvent) {
++    tabContainer.removeEventListener("TabClose", onClose, false);
++    deferred.resolve();
++  }, false);
++
++  targetBrowser.removeTab(aTab);
++  return deferred.promise;
++}
++
++function handleError(aError) {
++  finish();
++}
++
++function once(aTarget, aEventName, aUseCapture = false, spread = false) {
++
++  let deferred = Promise.defer();
++
++  for (let [add, remove] of [
++    ["on", "off"], // Use event emitter before DOM events for consistency
++    ["addEventListener", "removeEventListener"],
++    ["addListener", "removeListener"]
++  ]) {
++    if ((add in aTarget) && (remove in aTarget)) {
++      aTarget[add](aEventName, function onEvent(...aArgs) {
++        aTarget[remove](aEventName, onEvent, aUseCapture);
++        deferred.resolve(spread ? aArgs : aArgs[0]);
++      }, aUseCapture);
++      break;
++    }
++  }
++
++  return deferred.promise;
++}
++
++/**
++ * Like `once`, except returns an array so we can
++ * access all arguments fired by the event.
++ */
++function onceSpread(aTarget, aEventName, aUseCapture) {
++  return once(aTarget, aEventName, aUseCapture, true);
++}
++
++function test () {
++  Task.spawn(spawnTest).then(finish, handleError);
++}
++
++function initBackend(aUrl, targetOps={}) {
++  if (!DebuggerServer.initialized) {
++    DebuggerServer.init();
++    DebuggerServer.addBrowserActors();
++  }
++
++  return Task.spawn(function*() {
++    let tab = yield addTab(aUrl);
++    let target = TargetFactory.forTab(tab);
++
++    yield target.makeRemote();
++
++    // Attach addition options to `target`. This is used to force mock fronts
++    // to smokescreen test different servers where memory or timeline actors
++    // may not exist. Possible options that will actually work:
++    // TEST_MOCK_MEMORY_ACTOR = true
++    // TEST_MOCK_TIMELINE_ACTOR = true
++    // TEST_MOCK_BUFFER_CHECK_TIMER = number
++    merge(target, targetOps);
++
++    let connection = getPerformanceActorsConnection(target);
++    yield connection.open();
++
++    let front = new PerformanceFront(connection);
++    return { target, front, connection };
++  });
++}
++
++function initPerformance(aUrl, selectedTool="performance", targetOps={}) {
++
++  return Task.spawn(function*() {
++    let tab = yield addTab(aUrl);
++    let target = TargetFactory.forTab(tab);
++
++    yield target.makeRemote();
++
++    // Attach addition options to `target`. This is used to force mock fronts
++    // to smokescreen test different servers where memory or timeline actors
++    // may not exist. Possible options that will actually work:
++    // TEST_MOCK_MEMORY_ACTOR = true
++    // TEST_MOCK_TIMELINE_ACTOR = true
++    merge(target, targetOps);
++
++    let toolbox = yield gDevTools.showToolbox(target, selectedTool);
++    let panel = toolbox.getCurrentPanel();
++    return { target, panel, toolbox };
++  });
++}
++
++/**
++ * Initializes a webconsole panel. Returns a target, panel and toolbox reference.
++ * Also returns a console property that allows calls to `profile` and `profileEnd`.
++ */
++function initConsole(aUrl) {
++  return Task.spawn(function*() {
++    let { target, toolbox, panel } = yield initPerformance(aUrl, "webconsole");
++    let { hud } = panel;
++    return {
++      target, toolbox, panel, console: {
++        profile: (s) => consoleExecute(hud, "profile", s),
++        profileEnd: (s) => consoleExecute(hud, "profileEnd", s)
++      }
++    };
++  });
++}
++
++function consoleExecute (console, method, val) {
++  let { ui, jsterm } = console;
++  let { promise, resolve } = Promise.defer();
++  let message = `console.${method}("${val}")`;
++
++  ui.on("new-messages", handler);
++  jsterm.execute(message);
++
++  let { console: c } = Cu.import("resource://gre/modules/devtools/Console.jsm", {});
++  function handler (event, messages) {
++    for (let msg of messages) {
++      if (msg.response._message === message) {
++        ui.off("new-messages", handler);
++        resolve();
++        return;
++      }
++    }
++  }
++  return promise;
++}
++
++function waitForProfilerConnection() {
++  let { promise, resolve } = Promise.defer();
++  Services.obs.addObserver(resolve, "performance-actors-connection-opened", false);
++  return promise.then(() =>
++    Services.obs.removeObserver(resolve, "performance-actors-connection-opened"));
++}
++
++function* teardown(panel) {
++  let tab = panel.target.tab;
++  yield panel._toolbox.destroy();
++  yield removeTab(tab);
++}
++
++function idleWait(time) {
++  return DevToolsUtils.waitForTime(time);
++}
++
++function busyWait(time) {
++  let start = Date.now();
++  let stack;
++  while (Date.now() - start < time) { stack = Components.stack; }
++}
++
++function consoleMethod (...args) {
++  if (!mm) {
++    throw new Error("`loadFrameScripts()` must be called before using frame scripts.");
++  }
++  // Terrible ugly hack -- this gets stringified when it uses the
++  // message manager, so an undefined arg in `console.profileEnd()`
++  // turns into a stringified "null", which is terrible. This method is only used
++  // for test helpers, so swap out the argument if its undefined with an empty string.
++  // Differences between empty string and undefined are tested on the front itself.
++  if (args[1] == null) {
++    args[1] = "";
++  }
++  mm.sendAsyncMessage("devtools:test:console", args);
++}
++
++function* consoleProfile(win, label) {
++  let profileStart = once(win.PerformanceController, win.EVENTS.CONSOLE_RECORDING_STARTED);
++  consoleMethod("profile", label);
++  yield profileStart;
++}
++
++function* consoleProfileEnd(win, label) {
++  let ended = once(win.PerformanceController, win.EVENTS.CONSOLE_RECORDING_STOPPED);
++  consoleMethod("profileEnd", label);
++  yield ended;
++}
++
++function command (button) {
++  let ev = button.ownerDocument.createEvent("XULCommandEvent");
++  ev.initCommandEvent("command", true, true, button.ownerDocument.defaultView, 0, false, false, false, false, null);
++  button.dispatchEvent(ev);
++}
++
++function click (win, button) {
++  EventUtils.sendMouseEvent({ type: "click" }, button, win);
++}
++
++function mousedown (win, button) {
++  EventUtils.sendMouseEvent({ type: "mousedown" }, button, win);
++}
++
++function* startRecording(panel, options = {
++  waitForOverview: true,
++  waitForStateChanged: true
++}) {
++  let win = panel.panelWin;
++  let clicked = panel.panelWin.PerformanceView.once(win.EVENTS.UI_START_RECORDING);
++  let willStart = panel.panelWin.PerformanceController.once(win.EVENTS.RECORDING_WILL_START);
++  let hasStarted = panel.panelWin.PerformanceController.once(win.EVENTS.RECORDING_STARTED);
++  let button = win.$("#main-record-button");
++
++  click(win, button);
++  yield clicked;
++
++  yield willStart;
++  let stateChanged = options.waitForStateChanged
++    ? once(win.PerformanceView, win.EVENTS.UI_STATE_CHANGED)
++    : Promise.resolve();
++
++  yield hasStarted;
++
++  let overviewRendered = options.waitForOverview
++    ? once(win.OverviewView, win.EVENTS.OVERVIEW_RENDERED)
++    : Promise.resolve();
++
++  yield stateChanged;
++  yield overviewRendered;
++}
++
++function* stopRecording(panel, options = {
++  waitForOverview: true,
++  waitForStateChanged: true
++}) {
++  let win = panel.panelWin;
++  let clicked = panel.panelWin.PerformanceView.once(win.EVENTS.UI_STOP_RECORDING);
++  let willStop = panel.panelWin.PerformanceController.once(win.EVENTS.RECORDING_WILL_STOP);
++  let hasStopped = panel.panelWin.PerformanceController.once(win.EVENTS.RECORDING_STOPPED);
++  let button = win.$("#main-record-button");
++  let overviewRendered = null;
++
++  click(win, button);
++  yield clicked;
++
++  yield willStop;
++  let stateChanged = options.waitForStateChanged
++    ? once(win.PerformanceView, win.EVENTS.UI_STATE_CHANGED)
++    : Promise.resolve();
++
++  yield hasStopped;
++
++  // Wait for the final rendering of the overview, not a low res
++  // incremental rendering and less likely to be from another rendering that was selected
++  while (!overviewRendered && options.waitForOverview) {
++    let [_, res] = yield onceSpread(win.OverviewView, win.EVENTS.OVERVIEW_RENDERED);
++    if (res === win.FRAMERATE_GRAPH_HIGH_RES_INTERVAL) {
++      overviewRendered = true;
++    }
++  }
++
++  yield stateChanged;
++}
++
++function waitForWidgetsRendered(panel) {
++  let {
++    EVENTS,
++    OverviewView,
++    WaterfallView,
++    JsCallTreeView,
++    JsFlameGraphView,
++    MemoryCallTreeView,
++    MemoryFlameGraphView,
++  } = panel.panelWin;
++
++  return Promise.all([
++    once(OverviewView, EVENTS.MARKERS_GRAPH_RENDERED),
++    once(OverviewView, EVENTS.MEMORY_GRAPH_RENDERED),
++    once(OverviewView, EVENTS.FRAMERATE_GRAPH_RENDERED),
++    once(OverviewView, EVENTS.OVERVIEW_RENDERED),
++    once(WaterfallView, EVENTS.WATERFALL_RENDERED),
++    once(JsCallTreeView, EVENTS.JS_CALL_TREE_RENDERED),
++    once(JsFlameGraphView, EVENTS.JS_FLAMEGRAPH_RENDERED),
++    once(MemoryCallTreeView, EVENTS.MEMORY_CALL_TREE_RENDERED),
++    once(MemoryFlameGraphView, EVENTS.MEMORY_FLAMEGRAPH_RENDERED),
++  ]);
++}
++
++/**
++ * Waits until a predicate returns true.
++ *
++ * @param function predicate
++ *        Invoked once in a while until it returns true.
++ * @param number interval [optional]
++ *        How often the predicate is invoked, in milliseconds.
++ */
++function waitUntil(predicate, interval = 10) {
++  if (predicate()) {
++    return Promise.resolve(true);
++  }
++  let deferred = Promise.defer();
++  setTimeout(function() {
++    waitUntil(predicate).then(() => deferred.resolve(true));
++  }, interval);
++  return deferred.promise;
++}
++
++// EventUtils just doesn't work!
++
++function dragStart(graph, x, y = 1) {
++  x /= window.devicePixelRatio;
++  y /= window.devicePixelRatio;
++  graph._onMouseMove({ clientX: x, clientY: y });
++  graph._onMouseDown({ clientX: x, clientY: y });
++}
++
++function dragStop(graph, x, y = 1) {
++  x /= window.devicePixelRatio;
++  y /= window.devicePixelRatio;
++  graph._onMouseMove({ clientX: x, clientY: y });
++  graph._onMouseUp({ clientX: x, clientY: y });
++}
++
++function dropSelection(graph) {
++  graph.dropSelection();
++  graph.emit("selecting");
++}
++
++/**
++ * Fires a key event, like "VK_UP", "VK_DOWN", etc.
++ */
++function fireKey (e) {
++  EventUtils.synthesizeKey(e, {});
++}
++
++function reload (aTarget, aEvent = "navigate") {
++  aTarget.activeTab.reload();
++  return once(aTarget, aEvent);
++}
++
++/**
++* Forces cycle collection and GC, used in AudioNode destruction tests.
++*/
++function forceCC () {
++  SpecialPowers.DOMWindowUtils.cycleCollect();
++  SpecialPowers.DOMWindowUtils.garbageCollect();
++  SpecialPowers.DOMWindowUtils.garbageCollect();
++}
++
++/**
++ * Cleans up test, destroys connection, closes tab, resets prefs
++ * and stops the profiler.
++ */
++function cleanup (target) {
++  return Task.spawn(function*() {
++    // Make sure the profiler module is stopped when the test finishes.
++    nsIProfilerModule.StopProfiler();
++
++    let connection = getPerformanceActorsConnection(target);
++    yield connection.destroy();
++    removeTab(target.tab);
++
++    // Rollback any pref changes
++    Object.keys(DEFAULT_PREFS).forEach(pref => {
++      Preferences.set(pref, DEFAULT_PREFS[pref]);
++    });
++
++    Cu.forceGC();
++  });
++}
++
++/**
++ * Takes a string `script` and evaluates it directly in the content
++ * in potentially a different process.
++ */
++function evalInDebuggee (script) {
++  let deferred = Promise.defer();
++
++  if (!mm) {
++    throw new Error("`loadFrameScripts()` must be called when using MessageManager.");
++  }
++
++  let id = generateUUID().toString();
++  mm.sendAsyncMessage("devtools:test:eval", { script: script, id: id });
++  mm.addMessageListener("devtools:test:eval:response", handler);
++
++  function handler ({ data }) {
++    if (id !== data.id) {
++      return;
++    }
++
++    mm.removeMessageListener("devtools:test:eval:response", handler);
++    deferred.resolve(data.value);
++  }
++
++  return deferred.promise;
++}
+diff --git a/talos/page_load_test/devtools/addon/content/metaperf.html b/talos/page_load_test/devtools/addon/content/metaperf.html
+new file mode 100755
+--- /dev/null
++++ b/talos/page_load_test/devtools/addon/content/metaperf.html
+@@ -0,0 +1,69 @@
++<html>
++<head>
++<meta charset="UTF-8"/>
++<title>metaperf</title>
++
++<script type="application/x-javascript">
++// Empty subtests interpreted as all subtests, since otherwise meaningless.
++var config = {subtests: [], repeat: 1};
++var defaultConfig = {
++  repeat: 1,
++  rest: 100,
++  subtests: {
++    profilerFetchData: true,
++  }
++};
++
++var testsInfo = {
++  profilerFetchData: "Measure retrieval of profiler data from devtools server",
++};
++
++function updateConfig() {
++  config = {subtests: []};
++  for (var test in defaultConfig.subtests) {
++    if ($("subtest-" + test).checked) {
++      config.subtests.push(test);
++    }
++  }
++
++  var repeat = $("repeat").value;
++  config.repeat = isNaN(repeat) ? 1 : repeat;
++
++  // use 1ms rest as a minimum.
++  var rest = $("rest").value;
++  config.rest = Math.max(1, isNaN(rest) ? defaultConfig.rest : rest);
++}
++</script>
++<script src="addon-test-frontend.js"></script>
++</head>
++<body style="font-family:sans-serif;">
++<h4>M E T A P E R F</h4>
++<div id="hide-during-run">
++   Visit <a href="https://wiki.mozilla.org/Buildbot/Talos/Tests#metaperf">talos/metaperf</a> for detailed info.<br/>
++  <ul>
++    <li><b>If you just opened the browser</b> - give Firefox few seconds to settle down before testing.</li>
++  </ul>
++
++Utilities:
++  <a href="pages/simple.html">simple page</a>&nbsp;&nbsp;&nbsp;
++  <a href="http://localhost/page_load_test/tp5n/bild.de/www.bild.de/index.html">complicated page</a>&nbsp;&nbsp;&nbsp;
++<br/><br/>
++<b>Configure metaperf</b> (CTRL-F5 to reset to talos defaults) <button type="button" onclick="deselectAll()">Deselect all tests</button><br/>
++<script>
++  for (var test in defaultConfig.subtests) {
++    document.write('<input type="checkbox" id="subtest-' + test + '" ' + (defaultConfig.subtests[test] ? "" : "un") + 'checked>'
++                  + test + '</input>'
++                  + '<span style="color:grey">&nbsp;&nbsp;&nbsp;' + testsInfo[test] + '</span>'
++                  + '<br/>');
++  }
++</script>
++  <br/>
++  Repeat: <input id="repeat" type="text" size=2 value="1" onchange="updateConfig()"/> times<br/>
++  Delay before starting a measured animation: <input id="rest" type="text" size=4 value="10"/> ms<br/>
++
++  <button type="button" id="start-test-button" onclick="triggerStart()">Start metaperf tests</button>&nbsp;&nbsp;&nbsp;
++  <div id="run-results"></div>
++</div>
++<div id="show-during-run" style="display:none">Testing in progress ...</div>
++</body>
++</html>
+diff --git a/talos/page_load_test/devtools/addon/content/metaperf.js b/talos/page_load_test/devtools/addon/content/metaperf.js
+new file mode 100755
+--- /dev/null
++++ b/talos/page_load_test/devtools/addon/content/metaperf.js
+@@ -0,0 +1,135 @@
++const global = this;
++
++const OCTANE_URL = "chrome://damp/content/pages/octane/index.html";
++
++function MetaPerf() {
++}
++
++MetaPerf.prototype = {
++  _startTest: function() {
++    var self = this;
++    var next = this._nextCommand.bind(this);
++    var config = this._config;
++    var rest = config.rest; // How long to wait in between opening the tab and starting the test.
++
++    let assembledTests = config.subtests.reduce((assembled, testName) => {
++      let test = () => {
++        console.log(global, testName);
++        global[`test_${testName}`](this._createTimer(testName)).then(next);
++      };
++      for (var r = 0; r < config.repeat; r++) {
++        assembled.push(test);
++      }
++      return assembled;
++    }, []);
++
++    this._doSequence(assembledTests, this._doneInternal);
++  },
++
++  // Everything below here are common pieces needed for the test runner to function,
++  // just copy and pasted from Tart with /s/DAMP/metaperf
++
++  _win: undefined,
++  _metaperfTab: undefined,
++  _results: [],
++  _config: {subtests: [], repeat: 1, rest: 100},
++  _nextCommandIx: 0,
++  _commands: [],
++  _onSequenceComplete: 0,
++  _nextCommand: function() {
++    if (this._nextCommandIx >= this._commands.length) {
++      this._onSequenceComplete();
++      return;
++    }
++    this._commands[this._nextCommandIx++]();
++  },
++  // Each command at the array a function which must call nextCommand once it's done
++  _doSequence: function(commands, onComplete) {
++    this._commands = commands;
++    this._onSequenceComplete = onComplete;
++    this._results = [];
++    this._nextCommandIx = 0;
++
++    this._nextCommand();
++  },
++
++  _log: function(str) {
++    if (window.MozillaFileLogger && window.MozillaFileLogger.log)
++      window.MozillaFileLogger.log(str);
++
++    window.dump(str);
++  },
++
++  _logLine: function(str) {
++    return this._log(str + "\n");
++  },
++
++  _reportAllResults: function() {
++    var testNames = [];
++    var testResults = [];
++
++    var out = "";
++    for (var i in this._results) {
++      res = this._results[i];
++      var disp = [].concat(res.value).map(function(a){return (isNaN(a) ? -1 : a.toFixed(1));}).join(" ");
++      out += res.name + ": " + disp + "\n";
++
++      if (!Array.isArray(res.value)) { // Waw intervals array is not reported to talos
++        testNames.push(res.name);
++        testResults.push(res.value);
++      }
++    }
++    this._log("\n" + out);
++
++    if (content && content.tpRecordTime) {
++      content.tpRecordTime(testResults.join(','), 0, testNames.join(','));
++    } else {
++      //alert(out);
++    }
++  },
++
++  _onTestComplete: null,
++
++  _createTimer: function (label) {
++    return new Timer(this, label);
++  },
++
++  _doneInternal: function() {
++    this._logLine("METAPERF_RESULTS_JSON=" + JSON.stringify(this._results));
++    this._reportAllResults();
++    this._win.gBrowser.selectedTab = this._metaperfTab;
++
++    if (this._onTestComplete) {
++      this._onTestComplete(JSON.parse(JSON.stringify(this._results))); // Clone results
++    }
++  },
++
++  startTest: function(doneCallback, config) {
++    this._onTestComplete = function (results) {
++      Profiler.mark("METAPERF - end", true);
++      doneCallback(results);
++    };
++    this._config = config;
++
++    const Ci = Components.interfaces;
++    var wm = Components.classes["@mozilla.org/appshell/window-mediator;1"].getService(Ci.nsIWindowMediator);
++    this._win = wm.getMostRecentWindow("navigator:browser");
++    this._metaperfTab = this._win.gBrowser.selectedTab;
++    this._win.gBrowser.selectedBrowser.focus(); // Unfocus the URL bar to avoid caret blink
++
++    Profiler.mark("METAPERF - start", true);
++
++    return this._startTest();
++  }
++}
++
++/**
++ * Utility timer function; an instance passed into each metaperf's test's `test_${TEST_NAME}` function.
++ */
++function Timer (metaperf, label) {
++  let startTime;
++  this.start = () => startTime = performance.now(),
++  this.stop = () => {
++    metaperf._results.push({ name: `metaperf-${label}`, value: performance.now() - startTime });
++  }
++}
+diff --git a/talos/page_load_test/devtools/addon/content/test-profilerFetchData.js b/talos/page_load_test/devtools/addon/content/test-profilerFetchData.js
+new file mode 100755
+--- /dev/null
++++ b/talos/page_load_test/devtools/addon/content/test-profilerFetchData.js
+@@ -0,0 +1,18 @@
++let test_profilerFetchData = Task.async(function*(timer) {
++  let { target, front } = yield initBackend(OCTANE_URL);
++  let NUMBER_OF_TESTS = 1;
++  loadFrameScripts();
++
++  let recording = yield front.startRecording();
++  yield evalInDebuggee("Run()");
++  // Check every second to see if the test is done
++  while (!(yield evalInDebuggee(`completed === ${NUMBER_OF_TESTS}`))) {
++    yield idleWait(1000);
++  }
++
++  timer.start();
++  yield front.stopRecording(recording);
++  timer.stop();
++
++  yield cleanup(target);
++});
+diff --git a/talos/page_load_test/devtools/damp.manifest.orig b/talos/page_load_test/devtools/damp.manifest.orig
+new file mode 100644
+--- /dev/null
++++ b/talos/page_load_test/devtools/damp.manifest.orig
+@@ -0,0 +1,1 @@
++% chrome://damp/content/damp.html
+diff --git a/talos/page_load_test/devtools/metaperf.manifest b/talos/page_load_test/devtools/metaperf.manifest
+new file mode 100644
+--- /dev/null
++++ b/talos/page_load_test/devtools/metaperf.manifest
+@@ -0,0 +1,1 @@
++% chrome://damp/content/metaperf.html#auto
+\ No newline at end of file
+diff --git a/talos/test.py b/talos/test.py
+--- a/talos/test.py
++++ b/talos/test.py
+@@ -329,17 +329,16 @@ class cart(PageloaderTest):
+     sps_profile_entries = 10000000
+     win_counters = w7_counters = linux_counters = mac_counters = remote_counters = None
+     """ ASAP mode """
+     preferences = {'layout.frame_rate': 0,
+                    'docshell.event_starvation_delay_hint': 1,
+                    'dom.send_after_paint_to_content': False}
+     filters = [["ignore_first", [1]], ['median', []]]
+ 
+-
+ class damp(PageloaderTest):
+     """
+     Devtools At Maximum Performance
+     Tests the speed of DevTools toolbox open, close, and page reload
+     for each tool, across a very simple and very complicated page.
+     """
+     tpmanifest = '${talos}/page_load_test/devtools/damp.manifest'
+     extensions = '${talos}/page_load_test/devtools/addon'
+@@ -347,16 +346,33 @@ class damp(PageloaderTest):
+     tppagecycles = 25
+     tploadnocache = True
+     tpmozafterpaint = False
+     sps_profile_interval = 10
+     sps_profile_entries = 1000000
+     win_counters = w7_counters = linux_counters = mac_counters = remote_counters = None
+     filters = [["ignore_first", [1]], ['median', []]]
+ 
++class metaperf(PageloaderTest):
++    """
++    Devtools At Maximum Performance
++    Tests the speed of DevTools toolbox open, close, and page reload
++    for each tool, across a very simple and very complicated page.
++    """
++    tpmanifest = '${talos}/page_load_test/devtools/metaperf.manifest'
++    extensions = '${talos}/page_load_test/devtools/addon'
++    tpcycles = 1
++    tppagecycles = 25
++    tploadnocache = True
++    tpmozafterpaint = False
++    sps_profile_interval = 10
++    sps_profile_entries = 1000000
++    win_counters = w7_counters = linux_counters = mac_counters = remote_counters = None
++    filters = [["ignore_first", [1]], ['median', []]]
++
+ class glterrain(PageloaderTest):
+     """
+     Simple rotating WebGL scene with moving light source over a textured terrain.
+     Measures average frame intervals.
+     The same sequence is measured 4 times for combinations of alpha and antialias as canvas properties.
+     Each of these 4 runs is reported as a different test name.
+     """
+     tpmanifest = '${talos}/page_load_test/webgl/glterrain.manifest'
+@@ -696,11 +712,11 @@ class a11yr(PageloaderTest):
+ # global test data
+ tests = [ts_paint, ts, tsvg, tdhtml, ts_paint_cold,
+          tp4m, tp5n, tp5o, tpaint, tresize, tp5o_scroll,
+          trobopan, tcheckerboard, tprovider, tcheck2, tcanvasmark,
+          dromaeo_css, dromaeo_dom, v8_7, kraken, media_tests,
+          tdhtmlr, tsvgr, tsvgr_opacity, tscrollr, a11yr,
+          tsvgx, tscrollx, tart, cart, glterrain,
+          sessionrestore, sessionrestore_no_auto_restore,
+-         damp
++         damp, metaperf
+          ]
+ test_dict = dict([(i.name(), i) for i in tests])
