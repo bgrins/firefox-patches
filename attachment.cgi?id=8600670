@@ -1,0 +1,1958 @@
+# HG changeset patch
+# User Gabriel Luong <gabriel.luong@gmail.com>
+# Parent  a2bcc5840bd0d7cab902989bbc2ceb54d7d7be93
+Bug 1157293 - Part 1: Filter styles highlight computed styles r=bgrins
+
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -1111,17 +1111,17 @@
+  * @constructor
+  */
+ function CssRuleView(aInspector, aDoc, aStore, aPageStyle) {
+   this.inspector = aInspector;
+   this.doc = aDoc;
+   this.store = aStore || {};
+   this.pageStyle = aPageStyle;
+
+-  this._highlightedElements = [];
++  this._editorsExpandedForFilter = [];
+   this._outputParser = new OutputParser();
+
+   this._buildContextMenu = this._buildContextMenu.bind(this);
+   this._onContextMenu = this._onContextMenu.bind(this);
+   this._contextMenuUpdate = this._contextMenuUpdate.bind(this);
+   this._onAddRule = this._onAddRule.bind(this);
+   this._onSelectAll = this._onSelectAll.bind(this);
+   this._onCopy = this._onCopy.bind(this);
+@@ -1633,16 +1633,17 @@
+
+     this._filterChangedTimeout = setTimeout(() => {
+       if (this.searchField.value.length > 0) {
+         this.searchField.setAttribute("filled", true);
+       } else {
+         this.searchField.removeAttribute("filled");
+       }
+
++      this._clearHighlights();
+       this._clearRules();
+       this._createEditors();
+
+       this.inspector.emit("ruleview-filtered");
+
+       this._filterChangeTimeout = null;
+     }, filterTimeout);
+   },
+@@ -1677,17 +1678,17 @@
+     gDummyPromise = null;
+
+     this._prefObserver.off(PREF_ORIG_SOURCES, this._onSourcePrefChanged);
+     this._prefObserver.off(PREF_UA_STYLES, this._handlePrefChange);
+     this._prefObserver.off(PREF_DEFAULT_COLOR_UNIT, this._handlePrefChange);
+     this._prefObserver.destroy();
+
+     this._outputParser = null;
+-    this._highlightedElements = null;
++    this._editorsExpandedForFilter = null;
+
+     // Remove context menu
+     if (this._contextmenu) {
+       // Destroy the Add Rule menuitem.
+       this.menuitemAddRule.removeEventListener("command", this._onAddRule);
+       this.menuitemAddRule = null;
+
+       // Destroy the Select All menuitem.
+@@ -1970,20 +1971,16 @@
+     let container = null;
+     let searchTerm = this.searchField.value.toLowerCase();
+     let isValidSearchTerm = searchTerm.trim().length > 0;
+
+     if (!this._elementStyle.rules) {
+       return;
+     }
+
+-    if (this._highlightedElements.length > 0) {
+-      this.clearHighlight();
+-    }
+-
+     for (let rule of this._elementStyle.rules) {
+       if (rule.domRule.system) {
+         continue;
+       }
+
+       // Initialize rule editor
+       if (!rule.editor) {
+         rule.editor = new RuleEditor(this, rule);
+@@ -2062,17 +2059,16 @@
+     }
+
+     aValue = aValue.trim();
+
+     // Highlight search matches in the rule selectors
+     for (let selectorNode of selectorNodes) {
+       if (selectorNode.textContent.toLowerCase().includes(aValue)) {
+         selectorNode.classList.add("ruleview-highlight");
+-        this._highlightedElements.push(selectorNode);
+         isHighlighted = true;
+       }
+     }
+
+     // Parse search value as a single property line and extract the property
+     // name and value. Otherwise, use the search value as both the name and
+     // value.
+     let propertyMatch = CSS_PROP_RE.exec(aValue);
+@@ -2080,47 +2076,116 @@
+     let value = propertyMatch ? propertyMatch[2] : aValue;
+
+     // Highlight search matches in the rule properties
+     for (let textProp of aRule.textProps) {
+       // Get the actual property value displayed in the rule view
+       let propertyValue = textProp.editor.valueSpan.textContent.toLowerCase();
+       let propertyName = textProp.name.toLowerCase();
+
+-      // If the input value matches a property line like `font-family: arial`,
+-      // then check to make sure the name and value match.  Otherwise, just
+-      // compare the input string directly against the name and value elements.
+-      let matches = false;
+-      if (propertyMatch && name && value) {
+-        matches = propertyName.includes(name) && propertyValue.includes(value);
+-      } else {
+-        matches = (name && propertyName.includes(name)) ||
+-                  (value && propertyValue.includes(value));
++      let editor = textProp.editor;
++
++      let isPropertyHighlighted = this._highlightMatches(editor.container, {
++        searchName: name,
++        searchValue: value,
++        propertyName: propertyName,
++        propertyValue: propertyValue,
++        propertyMatch: propertyMatch
++      });
++
++      let isComputedHighlighted = false;
++
++      // Highlight search matches in the computed list of properties
++      for (let computed of textProp.computed) {
++        if (computed.element) {
++          let computedName = computed.name;
++          let computedValue = computed.value;
++
++          isComputedHighlighted = this._highlightMatches(computed.element, {
++            searchName: name,
++            searchValue: value,
++            propertyName: computedName,
++            propertyValue: computedValue,
++            propertyMatch: propertyMatch
++          }) ? true : isComputedHighlighted;
++        }
+       }
+
+-      if (matches) {
+-      // if (matchTextProperty || matchNameOrValue) {
+-        textProp.editor.element.classList.add("ruleview-highlight");
+-        this._highlightedElements.push(textProp.editor.element);
++      if (isPropertyHighlighted || isComputedHighlighted) {
+         isHighlighted = true;
+       }
++
++      // Expand the computed list if a computed rule is highlighted and the
++      // property rule is not highlighted
++      if (!isPropertyHighlighted && isComputedHighlighted &&
++          !editor.computed.classList.contains("styleinspector-open")) {
++        editor.expandForFilter();
++        this._editorsExpandedForFilter.push(editor);
++      }
+     }
+
+     return isHighlighted;
+   },
+
+   /**
+-   * Clear all search filter highlights in the panel.
++   * Helper function for highlightRules that carries out highlighting the given
++   * element if the provided search terms match the property, and returns
++   * a boolean indicating whether or not the search terms match.
++   *
++   * @param {DOMNode} aElement
++   *        The node to highlight if search terms match
++   * @param {String} searchName
++   *        The parsed search name
++   * @param {String} searchValue
++   *        The parsed search value
++   * @param {String} propertyName
++   *        The property name of a rule
++   * @param {String} propertyValue
++   *        The property value of a rule
++   * @param {Boolean} propertyMatch
++   *        Whether or not the search term matches a property line like
++   *        `font-family: arial`
+    */
+-  clearHighlight: function() {
+-    for (let element of this._highlightedElements) {
++  _highlightMatches: function(aElement, { searchName, searchValue, propertyName,
++      propertyValue, propertyMatch }) {
++    let matches = false;
++
++    // If the inputted search value matches a property line like
++    // `font-family: arial`, then check to make sure the name and value match.
++    // Otherwise, just compare the inputted search string directly against the
++    // name and value of the rule property.
++    if (propertyMatch && searchName && searchValue) {
++      matches = propertyName.includes(searchName) &&
++                propertyValue.includes(searchValue);
++    } else {
++      matches = (searchName && propertyName.includes(searchName)) ||
++                (searchValue && propertyValue.includes(searchValue));
++    }
++
++    if (matches) {
++      aElement.classList.add("ruleview-highlight");
++    }
++
++    return matches;
++  },
++
++  /**
++   * Clear all search filter highlights in the panel, and close the computed
++   * list if toggled opened
++   */
++  _clearHighlights: function() {
++    for (let element of this.element.querySelectorAll(".ruleview-highlight")) {
+       element.classList.remove("ruleview-highlight");
+     }
+
+-    this._highlightedElements = [];
++    for (let editor of this._editorsExpandedForFilter) {
++      editor.collapseForFilter();
++    }
++
++    this._editorsExpandedForFilter = [];
+   }
+ };
+
+ /**
+  * Create a RuleEditor.
+  *
+  * @param {CssRuleView} aRuleView
+  *        The CssRuleView containg the document holding this rule editor.
+@@ -2568,46 +2633,50 @@
+
+   /**
+    * Create the property editor's DOM.
+    */
+   _create: function() {
+     this.element = this.doc.createElementNS(HTML_NS, "li");
+     this.element.classList.add("ruleview-property");
+
++    this.container = createChild(this.element, "div", {
++      class: "ruleview-propertycontainer"
++    });
++
+     // The enable checkbox will disable or enable the rule.
+-    this.enable = createChild(this.element, "div", {
++    this.enable = createChild(this.container, "div", {
+       class: "ruleview-enableproperty theme-checkbox",
+       tabindex: "-1"
+     });
+
+     // Click to expand the computed properties of the text property.
+-    this.expander = createChild(this.element, "span", {
++    this.expander = createChild(this.container, "span", {
+       class: "ruleview-expander theme-twisty"
+     });
+     this.expander.addEventListener("click", this._onExpandClicked, true);
+
+-    this.nameContainer = createChild(this.element, "span", {
++    this.nameContainer = createChild(this.container, "span", {
+       class: "ruleview-namecontainer"
+     });
+
+     // Property name, editable when focused.  Property name
+     // is committed when the editor is unfocused.
+     this.nameSpan = createChild(this.nameContainer, "span", {
+       class: "ruleview-propertyname theme-fg-color5",
+       tabindex: this.ruleEditor.isEditable ? "0" : "-1",
+     });
+
+     appendText(this.nameContainer, ": ");
+
+     // Create a span that will hold the property and semicolon.
+     // Use this span to create a slightly larger click target
+     // for the value.
+-    let propertyContainer = createChild(this.element, "span", {
+-      class: "ruleview-propertycontainer"
++    let propertyContainer = createChild(this.container, "span", {
++      class: "ruleview-propertyvaluecontainer"
+     });
+
+
+     // Property value, editable when focused.  Changes to the
+     // property value are applied as they are typed, and reverted
+     // if the user presses escape.
+     this.valueSpan = createChild(propertyContainer, "span", {
+       class: "ruleview-propertyvalue theme-fg-color1",
+@@ -2630,17 +2699,17 @@
+     // Save the initial value as the last committed value,
+     // for restoring after pressing escape.
+     this.committed = { name: this.prop.name,
+                        value: parsedValue,
+                        priority: this.prop.priority };
+
+     appendText(propertyContainer, ";");
+
+-    this.warning = createChild(this.element, "div", {
++    this.warning = createChild(this.container, "div", {
+       class: "ruleview-warning",
+       hidden: "",
+       title: CssLogic.l10n("rule.warning.title"),
+     });
+
+     // Holds the viewers for the computed properties.
+     // will be populated in |_updateComputed|.
+     this.computed = createChild(this.element, "ul", {
+@@ -2923,16 +2992,20 @@
+       );
+
+       createChild(li, "span", {
+         class: "ruleview-propertyvalue theme-fg-color1",
+         child: frag
+       });
+
+       appendText(li, ";");
++
++      // Store the computed style element for easy access when highlighting
++      // styles
++      computed.element = li;
+     }
+
+     // Show or hide the expander as needed.
+     if (showExpander) {
+       this.expander.style.visibility = "visible";
+     } else {
+       this.expander.style.visibility = "hidden";
+     }
+@@ -2948,26 +3021,56 @@
+     } else {
+       this.enable.setAttribute("checked", "");
+     }
+     this.prop.setEnabled(!checked);
+     aEvent.stopPropagation();
+   },
+
+   /**
+-   * Handles clicks on the computed property expander.
++   * Handles clicks on the computed property expander. If the computed list is
++   * open due to user expanding or style filtering, collapse the computed list
++   * and close the expander. Otherwise, add .styleinspector-open class which
++   * is used to expand the computed list and tracks whether or not the computed
++   * list is expanded by manually by the user.
+    */
+   _onExpandClicked: function(aEvent) {
+-    this.computed.classList.toggle("styleinspector-open");
+-    if (this.computed.classList.contains("styleinspector-open")) {
++    if (this.computed.classList.contains("filter-open") ||
++        this.computed.classList.contains("styleinspector-open")) {
++      this.expander.removeAttribute("open");
++      this.computed.classList.remove("filter-open");
++      this.computed.classList.remove("styleinspector-open");
++    } else {
+       this.expander.setAttribute("open", "true");
+-    } else {
++      this.computed.classList.add("styleinspector-open");
++    }
++
++    aEvent.stopPropagation();
++  },
++
++  /**
++   * Expands the computed list when a computed property is matched by the style
++   * filtering. The .filter-open class is used to track whether or not the
++   * computed list was toggled opened by the filter.
++   */
++  expandForFilter: function() {
++    if (!this.computed.classList.contains("styleinspector-open")) {
++      this.computed.classList.add("filter-open");
++      this.expander.setAttribute("open", "true");
++    }
++  },
++
++  /**
++   * Collapses the computed list that was expanded by style filtering.
++   */
++  collapseForFilter: function() {
++    this.computed.classList.remove("filter-open");
++    if (!this.computed.classList.contains("styleinspector-open")) {
+       this.expander.removeAttribute("open");
+     }
+-    aEvent.stopPropagation();
+   },
+
+   /**
+    * Called when the property name's inplace editor is closed.
+    * Ignores the change if the user pressed escape, otherwise
+    * commits it.
+    *
+    * @param {string} aValue
+diff --git a/browser/devtools/styleinspector/ruleview.css b/browser/devtools/styleinspector/ruleview.css
+--- a/browser/devtools/styleinspector/ruleview.css
++++ b/browser/devtools/styleinspector/ruleview.css
+@@ -42,30 +42,34 @@
+   pointer-events: none;
+ }
+
+ .ruleview-namecontainer,
+ .ruleview-selectorcontainer {
+   cursor: text;
+ }
+
+-.ruleview-propertycontainer {
++.ruleview-propertyvaluecontainer {
+   cursor: text;
+   padding-right: 15px;
+ }
+
+-.ruleview-propertycontainer a {
++.ruleview-propertyvaluecontainer a {
+   cursor: pointer;
+ }
+
+ .ruleview-computedlist:not(.styleinspector-open),
+ .ruleview-warning[hidden] {
+   display: none;
+ }
+
++.ruleview-computedlist.filter-open {
++  display: block;
++}
++
+ .ruleview-expandable-container {
+   display: none;
+ }
+
+ .show-expandable-container + .ruleview-expandable-container {
+   display: block;
+ }
+
+diff --git a/browser/devtools/styleinspector/test/browser.ini b/browser/devtools/styleinspector/test/browser.ini
+--- a/browser/devtools/styleinspector/test/browser.ini
++++ b/browser/devtools/styleinspector/test/browser.ini
+@@ -106,16 +106,24 @@
+ [browser_ruleview_cycle-color.js]
+ [browser_ruleview_override.js]
+ [browser_ruleview_pseudo-element_01.js]
+ [browser_ruleview_pseudo-element_02.js]
+ skip-if = e10s # Bug 1090340
+ [browser_ruleview_refresh-on-attribute-change_01.js]
+ [browser_ruleview_refresh-on-attribute-change_02.js]
+ [browser_ruleview_refresh-on-style-change.js]
++[browser_ruleview_search-filter-computed-list_01.js]
++[browser_ruleview_search-filter-computed-list_02.js]
++[browser_ruleview_search-filter-computed-list_03.js]
++[browser_ruleview_search-filter-computed-list_04.js]
++[browser_ruleview_search-filter-computed-list_05.js]
++[browser_ruleview_search-filter-computed-list_06.js]
++[browser_ruleview_search-filter-computed-list_clear.js]
++[browser_ruleview_search-filter-computed-list_expander.js]
+ [browser_ruleview_search-filter_01.js]
+ [browser_ruleview_search-filter_02.js]
+ [browser_ruleview_search-filter_03.js]
+ [browser_ruleview_search-filter_04.js]
+ [browser_ruleview_search-filter_05.js]
+ [browser_ruleview_search-filter_06.js]
+ [browser_ruleview_search-filter_07.js]
+ [browser_ruleview_search-filter_08.js]
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_01.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_01.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_01.js
+@@ -0,0 +1,66 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly in the computed list
++// for property values.
++
++const SEARCH = "0px"
++
++let TEST_URI = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    margin: 4px 0px;',
++  '  }',
++  '  .testclass {',
++  '    background-color: red;',
++  '  }',
++  '</style>',
++  '<h1 id="testid" class="testclass">Styled Node</h1>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {toolbox, inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("Setting filter text to \"" + SEARCH + "\"");
++
++  let win = ruleView.doc.defaultView;
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("ruleview-filtered");
++
++  searchField.focus();
++  synthesizeKeys(SEARCH, win);
++  yield onRuleViewFiltered;
++
++  info("Check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++  let ruleEditor = rule.textProps[0].editor;
++  let computed = ruleEditor.computed;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(!ruleEditor.expander.getAttribute("open"), "Expander is closed.");
++  ok(ruleEditor.container.classList.contains("ruleview-highlight"),
++    "margin text property is correctly highlighted.");
++  ok(!computed.classList.contains("filter-open"),
++    "margin computed list is closed.");
++
++  ok(!computed.children[0].classList.contains("ruleview-highlight"),
++    "margin-top computed property is not highlighted.");
++  ok(computed.children[1].classList.contains("ruleview-highlight"),
++    "margin-right computed property is correctly highlighted.");
++  ok(!computed.children[2].classList.contains("ruleview-highlight"),
++    "margin-bottom computed property is not highlighted.");
++  ok(computed.children[3].classList.contains("ruleview-highlight"),
++    "margin-left computed property is correctly highlighted.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_02.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_02.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_02.js
+@@ -0,0 +1,66 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly in the computed list
++// for property names.
++
++const SEARCH = "margin"
++
++let TEST_URI = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    margin: 4px 0px;',
++  '  }',
++  '  .testclass {',
++  '    background-color: red;',
++  '  }',
++  '</style>',
++  '<h1 id="testid" class="testclass">Styled Node</h1>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {toolbox, inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("Setting filter text to \"" + SEARCH + "\"");
++
++  let win = ruleView.doc.defaultView;
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("ruleview-filtered");
++
++  searchField.focus();
++  synthesizeKeys(SEARCH, win);
++  yield onRuleViewFiltered;
++
++  info("Check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++  let ruleEditor = rule.textProps[0].editor;
++  let computed = ruleEditor.computed;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(!ruleEditor.expander.getAttribute("open"), "Expander is closed.");
++  ok(ruleEditor.container.classList.contains("ruleview-highlight"),
++    "margin text property is correctly highlighted.");
++  ok(!computed.classList.contains("filter-open"),
++    "margin computed list is closed.");
++
++  ok(computed.children[0].classList.contains("ruleview-highlight"),
++    "margin-top computed property is correctly highlighted.");
++  ok(computed.children[1].classList.contains("ruleview-highlight"),
++    "margin-right computed property is correctly highlighted.");
++  ok(computed.children[2].classList.contains("ruleview-highlight"),
++    "margin-bottom computed property is correctly highlighted.");
++  ok(computed.children[3].classList.contains("ruleview-highlight"),
++    "margin-left computed property is correctly highlighted.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_03.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_03.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_03.js
+@@ -0,0 +1,66 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly in the computed list
++// for property line input.
++
++const SEARCH = "margin-top:4px"
++
++let TEST_URI = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    margin: 4px 0px;',
++  '  }',
++  '  .testclass {',
++  '    background-color: red;',
++  '  }',
++  '</style>',
++  '<h1 id="testid" class="testclass">Styled Node</h1>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {toolbox, inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("Setting filter text to \"" + SEARCH + "\"");
++
++  let win = ruleView.doc.defaultView;
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("ruleview-filtered");
++
++  searchField.focus();
++  synthesizeKeys(SEARCH, win);
++  yield onRuleViewFiltered;
++
++  info("Check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++  let ruleEditor = rule.textProps[0].editor;
++  let computed = ruleEditor.computed;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(ruleEditor.expander.getAttribute("open"), "Expander is open.");
++  ok(!ruleEditor.container.classList.contains("ruleview-highlight"),
++    "margin text property is not highlighted.");
++  ok(computed.classList.contains("filter-open"),
++    "margin computed list is open.");
++
++  ok(computed.children[0].classList.contains("ruleview-highlight"),
++    "margin-top computed property is not highlighted.");
++  ok(!computed.children[1].classList.contains("ruleview-highlight"),
++    "margin-right computed property is not highlighted.");
++  ok(!computed.children[2].classList.contains("ruleview-highlight"),
++    "margin-bottom computed property is not highlighted.");
++  ok(!computed.children[3].classList.contains("ruleview-highlight"),
++    "margin-left computed property is not highlighted.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_04.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_04.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_04.js
+@@ -0,0 +1,66 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly in the computed list
++// for parsed property value.
++
++const SEARCH = ":4px"
++
++let TEST_URI = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    margin: 4px 0px;',
++  '  }',
++  '  .testclass {',
++  '    background-color: red;',
++  '  }',
++  '</style>',
++  '<h1 id="testid" class="testclass">Styled Node</h1>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {toolbox, inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("Setting filter text to \"" + SEARCH + "\"");
++
++  let win = ruleView.doc.defaultView;
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("ruleview-filtered");
++
++  searchField.focus();
++  synthesizeKeys(SEARCH, win);
++  yield onRuleViewFiltered;
++
++  info("Check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++  let ruleEditor = rule.textProps[0].editor;
++  let computed = ruleEditor.computed;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(!ruleEditor.expander.getAttribute("open"), "Expander is closed.");
++  ok(ruleEditor.container.classList.contains("ruleview-highlight"),
++    "margin text property is correctly highlighted.");
++  ok(!computed.classList.contains("filter-open"),
++    "margin computed list is closed.");
++
++  ok(computed.children[0].classList.contains("ruleview-highlight"),
++    "margin-top computed property is correctly highlighted.");
++  ok(!computed.children[1].classList.contains("ruleview-highlight"),
++    "margin-right computed property is not highlighted.");
++  ok(computed.children[2].classList.contains("ruleview-highlight"),
++    "margin-bottom computed property is correctly highlighted.");
++  ok(!computed.children[3].classList.contains("ruleview-highlight"),
++    "margin-left computed property is not highlighted.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_05.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_05.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_05.js
+@@ -0,0 +1,66 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly in the computed list
++// for parsed property name.
++
++const SEARCH = "margin-top:"
++
++let TEST_URI = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    margin: 4px 0px;',
++  '  }',
++  '  .testclass {',
++  '    background-color: red;',
++  '  }',
++  '</style>',
++  '<h1 id="testid" class="testclass">Styled Node</h1>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {toolbox, inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testAddTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("Setting filter text to \"" + SEARCH + "\"");
++
++  let win = ruleView.doc.defaultView;
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("ruleview-filtered");
++
++  searchField.focus();
++  synthesizeKeys(SEARCH, win);
++  yield onRuleViewFiltered;
++
++  info("Check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++  let ruleEditor = rule.textProps[0].editor;
++  let computed = ruleEditor.computed;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(ruleEditor.expander.getAttribute("open"), "Expander is open.");
++  ok(!ruleEditor.container.classList.contains("ruleview-highlight"),
++    "margin text property is not highlighted.");
++  ok(computed.classList.contains("filter-open"),
++    "margin computed list is open.");
++
++  ok(computed.children[0].classList.contains("ruleview-highlight"),
++    "margin-top computed property is correctly highlighted.");
++  ok(!computed.children[1].classList.contains("ruleview-highlight"),
++    "margin-right computed property is not highlighted.");
++  ok(!computed.children[2].classList.contains("ruleview-highlight"),
++    "margin-bottom computed property is not highlighted.");
++  ok(!computed.children[3].classList.contains("ruleview-highlight"),
++    "margin-left computed property is not highlighted.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_06.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_06.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_06.js
+@@ -0,0 +1,104 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter works properly in the computed list
++// when modifying the existing search filter value
++
++const SEARCH = "margin-"
++
++let TEST_URI = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    margin: 4px 0px;',
++  '  }',
++  '  .testclass {',
++  '    background-color: red;',
++  '  }',
++  '</style>',
++  '<h1 id="testid" class="testclass">Styled Node</h1>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {toolbox, inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testAddTextInFilter(inspector, view);
++  yield testRemoveTextInFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("Setting filter text to \"" + SEARCH + "\"");
++
++  let win = ruleView.doc.defaultView;
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("ruleview-filtered");
++
++  searchField.focus();
++  synthesizeKeys(SEARCH, win);
++  yield onRuleViewFiltered;
++
++  info("Check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++  let ruleEditor = rule.textProps[0].editor;
++  let computed = ruleEditor.computed;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(ruleEditor.expander.getAttribute("open"), "Expander is open.");
++  ok(!ruleEditor.container.classList.contains("ruleview-highlight"),
++    "margin text property is not highlighted.");
++  ok(computed.classList.contains("filter-open"),
++    "margin computed list is open.");
++
++  ok(computed.children[0].classList.contains("ruleview-highlight"),
++    "margin-top computed property is correctly highlighted.");
++  ok(computed.children[1].classList.contains("ruleview-highlight"),
++    "margin-right computed property is correctly highlighted.");
++  ok(computed.children[2].classList.contains("ruleview-highlight"),
++    "margin-bottom computed property is correctly highlighted.");
++  ok(computed.children[3].classList.contains("ruleview-highlight"),
++    "margin-left computed property is correctly highlighted.");
++}
++
++function* testRemoveTextInFilter(inspector, ruleView) {
++  info("Press backspace and set filter text to \"margin\"");
++
++  let win = ruleView.doc.defaultView;
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("ruleview-filtered");
++
++  searchField.focus();
++  EventUtils.synthesizeKey("VK_BACK_SPACE", {}, win);
++  yield inspector.once("ruleview-filtered");
++
++  info("Check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++  let ruleEditor = rule.textProps[0].editor;
++  let computed = ruleEditor.computed;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(!ruleEditor.expander.getAttribute("open"), "Expander is closed.");
++  ok(ruleEditor.container.classList.contains("ruleview-highlight"),
++    "margin text property is correctly highlighted.");
++  ok(!computed.classList.contains("filter-open"),
++    "margin computed list is closed.");
++
++  ok(computed.children[0].classList.contains("ruleview-highlight"),
++    "margin-top computed property is correctly highlighted.");
++  ok(computed.children[1].classList.contains("ruleview-highlight"),
++    "margin-right computed property is correctly highlighted.");
++  ok(computed.children[2].classList.contains("ruleview-highlight"),
++    "margin-bottom computed property is correctly highlighted.");
++  ok(computed.children[3].classList.contains("ruleview-highlight"),
++    "margin-left computed property is correctly highlighted.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_clear.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_clear.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_clear.js
+@@ -0,0 +1,94 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view search filter clear button works properly and clears
++// the highlighted rules in the computed list.
++
++const SEARCH = "0px"
++
++let TEST_URI = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    margin: 4px 0px;',
++  '  }',
++  '  .testclass {',
++  '    background-color: red;',
++  '  }',
++  '</style>',
++  '<h1 id="testid" class="testclass">Styled Node</h1>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {toolbox, inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testAddTextInFilter(inspector, view);
++  yield testClearSearchFilter(inspector, view);
++});
++
++function* testAddTextInFilter(inspector, ruleView) {
++  info("Setting filter text to \"" + SEARCH + "\"");
++
++  let win = ruleView.doc.defaultView;
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("ruleview-filtered");
++
++  searchField.focus();
++  synthesizeKeys(SEARCH, win);
++  yield onRuleViewFiltered;
++
++  info("Check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++  let ruleEditor = rule.textProps[0].editor;
++  let computed = ruleEditor.computed;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(!ruleEditor.expander.getAttribute("open"), "Expander is closed.");
++  ok(ruleEditor.container.classList.contains("ruleview-highlight"),
++    "margin text property is correctly highlighted.");
++  ok(!computed.classList.contains("filter-open"),
++    "margin computed list is closed.");
++
++  ok(!computed.children[0].classList.contains("ruleview-highlight"),
++    "margin-top computed property is not highlighted.");
++  ok(computed.children[1].classList.contains("ruleview-highlight"),
++    "margin-right computed property is correctly highlighted.");
++  ok(!computed.children[2].classList.contains("ruleview-highlight"),
++    "margin-bottom computed property is not highlighted.");
++  ok(computed.children[3].classList.contains("ruleview-highlight"),
++    "margin-left computed property is correctly highlighted.");
++}
++
++function* testClearSearchFilter(inspector, ruleView) {
++  info("Clearing the search filter");
++
++  let doc = ruleView.doc;
++  let win = ruleView.doc.defaultView;
++  let searchField = ruleView.searchField;
++  let searchClearButton = ruleView.searchClearButton;
++  let onRuleViewFiltered = inspector.once("ruleview-filtered");
++
++  EventUtils.synthesizeMouseAtCenter(searchClearButton, {}, win);
++
++  yield onRuleViewFiltered;
++
++  info("Check the search filter is cleared and no rules are highlighted");
++  is(ruleView.element.children.length, 3, "Should have 3 rules.");
++  ok(!searchField.value, "Search filter is cleared");
++  ok(!doc.querySelectorAll(".ruleview-highlight").length,
++    "No rules are higlighted");
++
++  let ruleEditor = getRuleViewRuleEditor(ruleView, 1).rule.textProps[0].editor;
++  let computed = ruleEditor.computed;
++
++  ok(!ruleEditor.expander.getAttribute("open"), "Expander is closed.");
++  ok(!computed.classList.contains("filter-open"),
++    "margin computed list is closed.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_expander.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_expander.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter-computed-list_expander.js
+@@ -0,0 +1,99 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the expanded computed list for a property remains open after
++// clearing the rule view search filter.
++
++const SEARCH = "0px"
++
++let TEST_URI = [
++  '<style type="text/css">',
++  '  #testid {',
++  '    margin: 4px 0px;',
++  '  }',
++  '  .testclass {',
++  '    background-color: red;',
++  '  }',
++  '</style>',
++  '<h1 id="testid" class="testclass">Styled Node</h1>'
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {toolbox, inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testOpenExpanderAndAddTextInFilter(inspector, view);
++  yield testClearSearchFilter(inspector, view);
++});
++
++function* testOpenExpanderAndAddTextInFilter(inspector, ruleView) {
++  let win = ruleView.doc.defaultView;
++  let searchField = ruleView.searchField;
++  let onRuleViewFiltered = inspector.once("ruleview-filtered");
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++  let ruleEditor = rule.textProps[0].editor;
++  let computed = ruleEditor.computed;
++
++  info("Opening the computed list of margin property")
++  ruleEditor.expander.click();
++
++  info("Setting filter text to \"" + SEARCH + "\"");
++  searchField.focus();
++  synthesizeKeys(SEARCH, win);
++  yield onRuleViewFiltered;
++
++  info("Check that the correct rules are visible");
++  is(ruleView.element.children.length, 2, "Should have 2 rules.");
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(ruleEditor.expander.getAttribute("open"), "Expander is open.");
++  ok(ruleEditor.container.classList.contains("ruleview-highlight"),
++    "margin text property is correctly highlighted.");
++  ok(!computed.classList.contains("filter-open"),
++    "margin computed list does not contain filter-open class.");
++  ok(computed.classList.contains("styleinspector-open"),
++    "margin computed list contains styleinspector-open class.");
++
++  ok(!computed.children[0].classList.contains("ruleview-highlight"),
++    "margin-top computed property is not highlighted.");
++  ok(computed.children[1].classList.contains("ruleview-highlight"),
++    "margin-right computed property is correctly highlighted.");
++  ok(!computed.children[2].classList.contains("ruleview-highlight"),
++    "margin-bottom computed property is not highlighted.");
++  ok(computed.children[3].classList.contains("ruleview-highlight"),
++    "margin-left computed property is correctly highlighted.");
++}
++
++function* testClearSearchFilter(inspector, ruleView) {
++  info("Clearing the search filter");
++
++  let doc = ruleView.doc;
++  let win = ruleView.doc.defaultView;
++  let searchField = ruleView.searchField;
++  let searchClearButton = ruleView.searchClearButton;
++  let onRuleViewFiltered = inspector.once("ruleview-filtered");
++
++  EventUtils.synthesizeMouseAtCenter(searchClearButton, {}, win);
++
++  yield onRuleViewFiltered;
++
++  info("Check the search filter is cleared and no rules are highlighted");
++  is(ruleView.element.children.length, 3, "Should have 3 rules.");
++  ok(!searchField.value, "Search filter is cleared");
++  ok(!doc.querySelectorAll(".ruleview-highlight").length,
++    "No rules are higlighted");
++
++  let ruleEditor = getRuleViewRuleEditor(ruleView, 1).rule.textProps[0].editor;
++  let computed = ruleEditor.computed;
++
++  ok(ruleEditor.expander.getAttribute("open"), "Expander is open.");
++  ok(!computed.classList.contains("filter-open"),
++    "margin computed list does not contain filter-open class.");
++  ok(computed.classList.contains("styleinspector-open"),
++    "margin computed list contains styleinspector-open class.");
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_01.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_01.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_01.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_01.js
+@@ -1,16 +1,18 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+
+ "use strict";
+
+ // Tests that the rule view search filter works properly for property values.
+
++const SEARCH = "00F";
++
+ let TEST_URI = [
+   '<style type="text/css">',
+   '  #testid {',
+   '    background-color: #00F;',
+   '  }',
+   '  .testclass {',
+   '    width: 100%;',
+   '  }',
+@@ -21,25 +23,29 @@
+ add_task(function*() {
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+   yield testAddTextInFilter(inspector, view);
+ });
+
+ function* testAddTextInFilter(inspector, ruleView) {
+-  info("Setting filter text to \"00F\"");
++  info("Setting filter text to \"" + SEARCH + "\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFiltered = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+-  synthesizeKeys("00F", win);
++  synthesizeKeys(SEARCH, win);
+   yield onRuleViewFiltered;
+
+   info("Check that the correct rules are visible");
+   is(ruleView.element.children.length, 2, "Should have 2 rules.");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  is(getRuleViewRuleEditor(ruleView, 1).rule.selectorText, "#testid", "Second rule is #testid.");
+-  ok(getRuleViewRuleEditor(ruleView, 1).rule.textProps[0].editor.element.classList.contains("ruleview-highlight"),
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(rule.textProps[0].editor.container.classList.contains("ruleview-highlight"),
+     "background-color text property is correctly highlighted.");
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_02.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_02.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_02.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_02.js
+@@ -1,16 +1,18 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+
+ "use strict";
+
+ // Tests that the rule view search filter works properly for property names.
+
++const SEARCH = "color";
++
+ let TEST_URI = [
+   '<style type="text/css">',
+   '  #testid {',
+   '    font-family: arial;',
+   '    background-color: #00F;',
+   '  }',
+   '  .testclass {',
+   '    width: 100%;',
+@@ -22,25 +24,29 @@
+ add_task(function*() {
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+   yield testAddTextInFilter(inspector, view);
+ });
+
+ function* testAddTextInFilter(inspector, ruleView) {
+-  info("Setting filter text to \"color\"");
++  info("Setting filter text to \"" + SEARCH + "\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFiltered = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+-  synthesizeKeys("color", win);
++  synthesizeKeys(SEARCH, win);
+   yield onRuleViewFiltered;
+
+   info("Check that the correct rules are visible");
+   is(ruleView.element.children.length, 2, "Should have 2 rules.");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  is(getRuleViewRuleEditor(ruleView, 1).rule.selectorText, "#testid", "Second rule is #testid.");
+-  ok(getRuleViewRuleEditor(ruleView, 1).rule.textProps[1].editor.element.classList.contains("ruleview-highlight"),
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(rule.textProps[1].editor.container.classList.contains("ruleview-highlight"),
+     "background-color text property is correctly highlighted.");
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_03.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_03.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_03.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_03.js
+@@ -1,16 +1,18 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+
+ "use strict";
+
+ // Tests that the rule view search filter works properly for rule selectors.
+
++const SEARCH = "#test";
++
+ let TEST_URI = [
+   '<style type="text/css">',
+   '  #testid {',
+   '    background-color: #00F;',
+   '  }',
+   '  .testclass {',
+   '    width: 100%;',
+   '  }',
+@@ -21,25 +23,29 @@
+ add_task(function*() {
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+   yield testAddTextInFilter(inspector, view);
+ });
+
+ function* testAddTextInFilter(inspector, ruleView) {
+-  info("Setting filter text to \"#test\"");
++  info("Setting filter text to \"" + SEARCH + "\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFilter = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+-  synthesizeKeys("#test", win);
++  synthesizeKeys(SEARCH, win);
+   yield onRuleViewFilter;
+
+   info("Check that the correct rules are visible");
+   is(ruleView.element.children.length, 2, "Should have 2 rules.");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  is(getRuleViewRuleEditor(ruleView, 1).rule.selectorText, "#testid", "Second rule is #testid.");
+-  ok(getRuleViewRuleEditor(ruleView, 1).selectorText.children[0].classList.contains("ruleview-highlight"),
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let ruleEditor = getRuleViewRuleEditor(ruleView, 1);
++
++  is(ruleEditor.rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(ruleEditor.selectorText.children[0].classList.contains("ruleview-highlight"),
+     "#testid selector is highlighted.")
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_04.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_04.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_04.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_04.js
+@@ -1,34 +1,39 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+
+ "use strict";
+
+ // Tests that the rule view search filter works properly for keyframe rule selectors.
+
++const SEARCH = "20%"
+ const TEST_URI = TEST_URL_ROOT + "doc_keyframeanimation.html";
+
+ add_task(function*() {
+   yield addTab(TEST_URI);
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("#boxy", inspector);
+   yield testAddTextInFilter(inspector, view);
+ });
+
+ function* testAddTextInFilter(inspector, ruleView) {
+-  info("Setting filter text to \"20%\"");
++  info("Setting filter text to \"" + SEARCH + "\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFilter = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+-  synthesizeKeys("20%", win);
++  synthesizeKeys(SEARCH, win);
+   yield onRuleViewFilter;
+
+   info("Check that the correct rules are visible");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  is(getRuleViewRuleEditor(ruleView, 2, 0).rule.domRule.keyText, "20%", "Second rule is 20%.");
+-  ok(getRuleViewRuleEditor(ruleView, 2, 0).selectorText.classList.contains("ruleview-highlight"),
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let ruleEditor = getRuleViewRuleEditor(ruleView, 2, 0);
++
++  is(ruleEditor.rule.domRule.keyText, "20%", "Second rule is 20%.");
++  ok(ruleEditor.selectorText.classList.contains("ruleview-highlight"),
+     "20% selector is highlighted.")
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_05.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_05.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_05.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_05.js
+@@ -1,16 +1,18 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+
+ "use strict";
+
+ // Tests that the rule view search filter works properly for multiple rule selectors.
+
++const SEARCH = "body";
++
+ let TEST_URI = [
+   '<style type="text/css">',
+   '  html, body, div {',
+   '    background-color: #00F;',
+   '  }',
+   '  .testclass {',
+   '    width: 100%;',
+   '  }',
+@@ -21,25 +23,30 @@
+ add_task(function*() {
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+   yield testAddTextInFilter(inspector, view);
+ });
+
+ function* testAddTextInFilter(inspector, ruleView) {
+-  info("Setting filter text to \"body\"");
++  info("Setting filter text to \"" + SEARCH + "\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFilter = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+-  synthesizeKeys("body", win);
++  synthesizeKeys(SEARCH, win);
+   yield onRuleViewFilter;
+
+   info("Check that the correct rules are visible");
+   is(ruleView.element.children.length, 2, "Should have 2 rules.");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  is(getRuleViewRuleEditor(ruleView, 1).rule.selectorText, "html, body, div", "Second rule is html, body, div.");
+-  ok(getRuleViewRuleEditor(ruleView, 1).selectorText.children[2].classList.contains("ruleview-highlight"),
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let ruleEditor = getRuleViewRuleEditor(ruleView, 1);
++
++  is(ruleEditor.rule.selectorText, "html, body, div",
++    "Second rule is html, body, div.");
++  ok(ruleEditor.selectorText.children[2].classList.contains("ruleview-highlight"),
+     "body selector is highlighted.")
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_06.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_06.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_06.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_06.js
+@@ -1,16 +1,18 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+
+ "use strict";
+
+ // Tests that the rule view search filter works properly for property line input.
+
++const SEARCH = "background-color:#00F";
++
+ let TEST_URI = [
+   '<style type="text/css">',
+   '  #testid {',
+   '    background-color: #FFF;',
+   '  }',
+   '  .testclass {',
+   '    background-color: #00F;',
+   '  }',
+@@ -21,25 +23,29 @@
+ add_task(function*() {
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+   yield testAddTextInFilter(inspector, view);
+ });
+
+ function* testAddTextInFilter(inspector, ruleView) {
+-  info("Setting filter text to \"background-color:#00F\"");
++  info("Setting filter text to \"" + SEARCH + "\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFiltered = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+-  synthesizeKeys("background-color:#00F", win);
++  synthesizeKeys(SEARCH, win);
+   yield onRuleViewFiltered;
+
+   info("Check that the correct rules are visible");
+   is(ruleView.element.children.length, 2, "Should have 2 rules.");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  is(getRuleViewRuleEditor(ruleView, 1).rule.selectorText, ".testclass", "Second rule is .testclass.");
+-  ok(getRuleViewRuleEditor(ruleView, 1).rule.textProps[0].editor.element.classList.contains("ruleview-highlight"),
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++
++  is(rule.selectorText, ".testclass", "Second rule is .testclass.");
++  ok(rule.textProps[0].editor.container.classList.contains("ruleview-highlight"),
+     "background-color text property is correctly highlighted.");
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_07.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_07.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_07.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_07.js
+@@ -1,16 +1,18 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+
+ "use strict";
+
+ // Tests that the rule view search filter works properly for parsed property value.
+
++const SEARCH = ":00F";
++
+ let TEST_URI = [
+   '<style type="text/css">',
+   '  #testid {',
+   '    background-color: #00F;',
+   '  }',
+   '  .testclass {',
+   '    width: 100%;',
+   '  }',
+@@ -21,25 +23,29 @@
+ add_task(function*() {
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+   yield testAddTextInFilter(inspector, view);
+ });
+
+ function* testAddTextInFilter(inspector, ruleView) {
+-  info("Setting filter text to \":00F\"");
++  info("Setting filter text to \"" + SEARCH + "\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFiltered = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+-  synthesizeKeys(":00F", win);
++  synthesizeKeys(SEARCH, win);
+   yield onRuleViewFiltered;
+
+   info("Check that the correct rules are visible");
+   is(ruleView.element.children.length, 2, "Should have 2 rules.");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  is(getRuleViewRuleEditor(ruleView, 1).rule.selectorText, "#testid", "Second rule is #testid.");
+-  ok(getRuleViewRuleEditor(ruleView, 1).rule.textProps[0].editor.element.classList.contains("ruleview-highlight"),
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(rule.textProps[0].editor.container.classList.contains("ruleview-highlight"),
+     "background-color text property is correctly highlighted.");
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_08.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_08.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_08.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_08.js
+@@ -1,16 +1,18 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+
+ "use strict";
+
+ // Tests that the rule view search filter works properly for parsed property name.
+
++const SEARCH = "background:";
++
+ let TEST_URI = [
+   '<style type="text/css">',
+   '  #testid {',
+   '    background-color: #00F;',
+   '  }',
+   '  .testclass {',
+   '    width: 100%;',
+   '  }',
+@@ -21,25 +23,29 @@
+ add_task(function*() {
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+   yield testAddTextInFilter(inspector, view);
+ });
+
+ function* testAddTextInFilter(inspector, ruleView) {
+-  info("Setting filter text to \"background:\"");
++  info("Setting filter text to \"" + SEARCH + "\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFiltered = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+-  synthesizeKeys("background:", win);
++  synthesizeKeys(SEARCH, win);
+   yield onRuleViewFiltered;
+
+   info("Check that the correct rules are visible");
+   is(ruleView.element.children.length, 2, "Should have 2 rules.");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  is(getRuleViewRuleEditor(ruleView, 1).rule.selectorText, "#testid", "Second rule is #testid.");
+-  ok(getRuleViewRuleEditor(ruleView, 1).rule.textProps[0].editor.element.classList.contains("ruleview-highlight"),
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(rule.textProps[0].editor.container.classList.contains("ruleview-highlight"),
+     "background-color text property is correctly highlighted.");
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_09.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_09.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_09.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_09.js
+@@ -1,16 +1,18 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+
+ "use strict";
+
+ // Tests that the rule view search filter works properly for inline styles.
+
++const SEARCH = "color";
++
+ let TEST_URI = [
+   '<style type="text/css">',
+   '  #testid {',
+   '    width: 100%;',
+   '  }',
+   '</style>',
+   '<div id="testid" style="background-color:aliceblue">Styled Node</div>'
+ ].join("\n");
+@@ -18,24 +20,27 @@
+ add_task(function*() {
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+   yield testAddTextInFilter(inspector, view);
+ });
+
+ function* testAddTextInFilter(inspector, ruleView) {
+-  info("Setting filter text to \"color\"");
++  info("Setting filter text to \"" + SEARCH + "\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFiltered = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+-  synthesizeKeys("color", win);
++  synthesizeKeys(SEARCH, win);
+   yield onRuleViewFiltered;
+
+   info("Check that the correct rules are visible");
+   is(ruleView.element.children.length, 1, "Should have 1 rule.");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  ok(getRuleViewRuleEditor(ruleView, 0).rule.textProps[0].editor.element.classList.contains("ruleview-highlight"),
++
++  let rule = getRuleViewRuleEditor(ruleView, 0).rule;
++
++  is(rule.selectorText, "element", "First rule is inline element.");
++  ok(rule.textProps[0].editor.container.classList.contains("ruleview-highlight"),
+     "background-color text property is correctly highlighted.");
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_10.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_10.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_10.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_10.js
+@@ -2,16 +2,18 @@
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+
+ "use strict";
+
+ // Tests that the rule view search filter works properly when modifying the
+ // existing search filter value
+
++const SEARCH = "00F"
++
+ let TEST_URI = [
+   '<style type="text/css">',
+   '  #testid {',
+   '    background-color: #00F;',
+   '  }',
+   '  .testclass {',
+   '    width: 100%;',
+   '  }',
+@@ -23,47 +25,58 @@
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+   yield testAddTextInFilter(inspector, view);
+   yield testRemoveTextInFilter(inspector, view);
+ });
+
+ function* testAddTextInFilter(inspector, ruleView) {
+-  info("Setting filter text to \"00F\"");
++  info("Setting filter text to \"" + SEARCH + "\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFiltered = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+-  synthesizeKeys("00F", win);
++  synthesizeKeys(SEARCH, win);
+   yield onRuleViewFiltered;
+
+   info("Check that the correct rules are visible");
+   is(ruleView.element.children.length, 2, "Should have 2 rules.");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  is(getRuleViewRuleEditor(ruleView, 1).rule.selectorText, "#testid", "Second rule is #testid.");
+-  ok(getRuleViewRuleEditor(ruleView, 1).rule.textProps[0].editor.element.classList.contains("ruleview-highlight"),
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(rule.textProps[0].editor.container.classList.contains("ruleview-highlight"),
+     "background-color text property is correctly highlighted.");
+ }
+
+ function* testRemoveTextInFilter(inspector, ruleView) {
+   info("Press backspace and set filter text to \"00\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFiltered = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+   EventUtils.synthesizeKey("VK_BACK_SPACE", {}, win);
+   yield inspector.once("ruleview-filtered");
+
+-  info("heck that the correct rules are visible");
++  info("Check that the correct rules are visible");
+   is(ruleView.element.children.length, 3, "Should have 3 rules.");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  is(getRuleViewRuleEditor(ruleView, 1).rule.selectorText, "#testid", "Second rule is #testid.");
+-  is(getRuleViewRuleEditor(ruleView, 2).rule.selectorText, ".testclass", "Second rule is .testclass.");
+-  ok(getRuleViewRuleEditor(ruleView, 1).rule.textProps[0].editor.element.classList.contains("ruleview-highlight"),
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(rule.textProps[0].editor.container.classList.contains("ruleview-highlight"),
+     "background-color text property is correctly highlighted.");
+-  ok(getRuleViewRuleEditor(ruleView, 2).rule.textProps[0].editor.element.classList.contains("ruleview-highlight"),
++
++  rule = getRuleViewRuleEditor(ruleView, 2).rule;
++
++  is(rule.selectorText, ".testclass", "Second rule is .testclass.");
++  ok(rule.textProps[0].editor.container.classList.contains("ruleview-highlight"),
+     "width text property is correctly highlighted.");
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_clear.js b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_clear.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_search-filter_clear.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_search-filter_clear.js
+@@ -1,16 +1,18 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+
+ "use strict";
+
+ // Tests that the rule view search filter clear button works properly.
+
++const SEARCH = "00F";
++
+ let TEST_URI = [
+   '<style type="text/css">',
+   '  #testid {',
+   '    background-color: #00F;',
+   '  }',
+   '  .testclass {',
+   '    width: 100%;',
+   '  }',
+@@ -22,31 +24,35 @@
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+   yield testAddTextInFilter(inspector, view);
+   yield testClearSearchFilter(inspector, view);
+ });
+
+ function* testAddTextInFilter(inspector, ruleView) {
+-  info("Setting filter text to \"00F\"");
++  info("Setting filter text to \"" + SEARCH + "\"");
+
+   let win = ruleView.doc.defaultView;
+   let searchField = ruleView.searchField;
+   let onRuleViewFiltered = inspector.once("ruleview-filtered");
+
+   searchField.focus();
+-  synthesizeKeys("00F", win);
++  synthesizeKeys(SEARCH, win);
+   yield onRuleViewFiltered;
+
+   info("Check that the correct rules are visible");
+   is(ruleView.element.children.length, 2, "Should have 2 rules.");
+-  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element", "First rule is inline element.");
+-  is(getRuleViewRuleEditor(ruleView, 1).rule.selectorText, "#testid", "Second rule is #testid.");
+-  ok(getRuleViewRuleEditor(ruleView, 1).rule.textProps[0].editor.element.classList.contains("ruleview-highlight"),
++  is(getRuleViewRuleEditor(ruleView, 0).rule.selectorText, "element",
++    "First rule is inline element.");
++
++  let rule = getRuleViewRuleEditor(ruleView, 1).rule;
++
++  is(rule.selectorText, "#testid", "Second rule is #testid.");
++  ok(rule.textProps[0].editor.container.classList.contains("ruleview-highlight"),
+     "background-color text property is correctly highlighted.");
+ }
+
+ function* testClearSearchFilter(inspector, ruleView) {
+   info("Clearing the search filter");
+
+   let doc = ruleView.doc;
+   let win = ruleView.doc.defaultView;
+@@ -56,11 +62,11 @@
+
+   EventUtils.synthesizeMouseAtCenter(searchClearButton, {}, win);
+
+   yield onRuleViewFiltered;
+
+   info("Check the search filter is cleared and no rules are highlighted");
+   is(ruleView.element.children.length, 3, "Should have 3 rules.");
+   ok(!searchField.value, "Search filter is cleared");
+-  ok(!doc.querySelectorAll(".ruleview-highlight").length &&
+-     !ruleView._highlightedElements.length, "No rules are higlighted");
++  ok(!doc.querySelectorAll(".ruleview-highlight").length,
++    "No rules are higlighted");
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_select-and-copy-styles.js b/browser/devtools/styleinspector/test/browser_ruleview_select-and-copy-styles.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_select-and-copy-styles.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_select-and-copy-styles.js
+@@ -43,17 +43,17 @@
+   yield checkSelectAll(view);
+ });
+
+ function checkCopySelection(view) {
+   info("Testing selection copy");
+
+   let contentDoc = view.doc;
+   let prop = contentDoc.querySelector(".ruleview-property");
+-  let values = contentDoc.querySelectorAll(".ruleview-propertycontainer");
++  let values = contentDoc.querySelectorAll(".ruleview-propertyvaluecontainer");
+
+   let range = contentDoc.createRange();
+   range.setStart(prop, 0);
+   range.setEnd(values[4], 2);
+   let selection = view.doc.defaultView.getSelection().addRange(range);
+
+   info("Checking that _Copy() returns the correct clipboard value");
+
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_urls-clickable.js b/browser/devtools/styleinspector/test/browser_ruleview_urls-clickable.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_urls-clickable.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_urls-clickable.js
+@@ -21,41 +21,41 @@
+   let relative2 = ".relative2";
+   let absolute = ".absolute";
+   let inline = ".inline";
+   let base64 = ".base64";
+   let noimage = ".noimage";
+   let inlineresolved = ".inline-resolved";
+
+   yield selectNode(relative1, inspector);
+-  let relativeLink = ruleView.doc.querySelector(".ruleview-propertycontainer a");
++  let relativeLink = ruleView.doc.querySelector(".ruleview-propertyvaluecontainer a");
+   ok(relativeLink, "Link exists for relative1 node");
+   is(relativeLink.getAttribute("href"), TEST_IMAGE, "href matches");
+
+   yield selectNode(relative2, inspector);
+-  relativeLink = ruleView.doc.querySelector(".ruleview-propertycontainer a");
++  relativeLink = ruleView.doc.querySelector(".ruleview-propertyvaluecontainer a");
+   ok(relativeLink, "Link exists for relative2 node");
+   is(relativeLink.getAttribute("href"), TEST_IMAGE, "href matches");
+
+   yield selectNode(absolute, inspector);
+-  let absoluteLink = ruleView.doc.querySelector(".ruleview-propertycontainer a");
++  let absoluteLink = ruleView.doc.querySelector(".ruleview-propertyvaluecontainer a");
+   ok(absoluteLink, "Link exists for absolute node");
+   is(absoluteLink.getAttribute("href"), TEST_IMAGE, "href matches");
+
+   yield selectNode(inline, inspector);
+-  let inlineLink = ruleView.doc.querySelector(".ruleview-propertycontainer a");
++  let inlineLink = ruleView.doc.querySelector(".ruleview-propertyvaluecontainer a");
+   ok(inlineLink, "Link exists for inline node");
+   is(inlineLink.getAttribute("href"), TEST_IMAGE, "href matches");
+
+   yield selectNode(base64, inspector);
+-  let base64Link = ruleView.doc.querySelector(".ruleview-propertycontainer a");
++  let base64Link = ruleView.doc.querySelector(".ruleview-propertyvaluecontainer a");
+   ok(base64Link, "Link exists for base64 node");
+   is(base64Link.getAttribute("href"), BASE_64_URL, "href matches");
+
+   yield selectNode(inlineresolved, inspector);
+-  let inlineResolvedLink = ruleView.doc.querySelector(".ruleview-propertycontainer a");
++  let inlineResolvedLink = ruleView.doc.querySelector(".ruleview-propertyvaluecontainer a");
+   ok(inlineResolvedLink, "Link exists for style tag node");
+   is(inlineResolvedLink.getAttribute("href"), TEST_IMAGE, "href matches");
+
+   yield selectNode(noimage, inspector);
+-  let noimageLink = ruleView.doc.querySelector(".ruleview-propertycontainer a");
++  let noimageLink = ruleView.doc.querySelector(".ruleview-propertyvaluecontainer a");
+   ok(!noimageLink, "There is no link for the node with no background image");
+ }
+diff --git a/browser/themes/shared/devtools/ruleview.css b/browser/themes/shared/devtools/ruleview.css
+--- a/browser/themes/shared/devtools/ruleview.css
++++ b/browser/themes/shared/devtools/ruleview.css
+@@ -75,19 +75,19 @@
+ .ruleview-rule[uneditable=true] .ruleview-enableproperty {
+   visibility: hidden;
+ }
+
+ .ruleview-rule[uneditable=true] .ruleview-swatch {
+   cursor: default;
+ }
+
+-
+ .ruleview-rule[uneditable=true] .ruleview-namecontainer > .ruleview-propertyname,
+-.ruleview-rule[uneditable=true] .ruleview-propertycontainer > .ruleview-propertyvalue {
++.ruleview-rule[uneditable=true] .ruleview-propertyvaluecontainer >
++.ruleview-propertyvalue {
+   border-bottom-color: transparent;
+ }
+
+ #noResults {
+   font: message-box;
+   color: GrayText;
+ }
+
+@@ -137,17 +137,17 @@
+ }
+
+ .ruleview-newproperty {
+   /* (enable checkbox width: 12px) + (expander width: 15px) */
+   -moz-margin-start: 27px;
+ }
+
+ .ruleview-namecontainer,
+-.ruleview-propertycontainer,
++.ruleview-propertyvaluecontainer,
+ .ruleview-propertyname,
+ .ruleview-propertyvalue {
+   text-decoration: inherit;
+ }
+
+ .ruleview-computedlist {
+   list-style: none;
+   padding: 0;
+@@ -214,35 +214,35 @@
+   padding: 0;
+ }
+
+ .ruleview-property {
+   border-left: 3px solid transparent;
+   clear: right;
+ }
+
+-.ruleview-property  > * {
++.ruleview-propertycontainer  > * {
+   vertical-align: middle;
+ }
+
+ .ruleview-property[dirty] {
+   border-left-color: var(--theme-highlight-green);
+ }
+
+ .ruleview-highlight {
+   background-color: var(--rule-highlight-background-color);
+ }
+
+ .ruleview-namecontainer > .ruleview-propertyname,
+-.ruleview-propertycontainer > .ruleview-propertyvalue {
++.ruleview-propertyvaluecontainer > .ruleview-propertyvalue {
+   border-bottom: 1px dashed transparent;
+ }
+
+ .ruleview-namecontainer:hover > .ruleview-propertyname,
+-.ruleview-propertycontainer:hover > .ruleview-propertyvalue {
++.ruleview-propertyvaluecontainer:hover > .ruleview-propertyvalue {
+   border-bottom-color: hsl(0,0%,50%);
+ }
+
+ .ruleview-selector {
+   word-wrap: break-word;
+ }
+
+ .ruleview-selector-separator, .ruleview-selector-unmatched {
