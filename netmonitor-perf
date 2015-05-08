@@ -1,0 +1,170 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  ea7ad0a6b0e6a5e75875dd50961303f4abe5f7bc
+Bug 1143224 - Queue up requests in netmonitor-controller
+
+diff --git a/browser/devtools/netmonitor/netmonitor-controller.js b/browser/devtools/netmonitor/netmonitor-controller.js
+--- a/browser/devtools/netmonitor/netmonitor-controller.js
++++ b/browser/devtools/netmonitor/netmonitor-controller.js
+@@ -111,16 +111,17 @@ Cu.import("resource://gre/modules/Servic
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ Cu.import("resource:///modules/devtools/SideMenuWidget.jsm");
+ Cu.import("resource:///modules/devtools/VariablesView.jsm");
+ Cu.import("resource:///modules/devtools/VariablesViewController.jsm");
+ Cu.import("resource:///modules/devtools/ViewHelpers.jsm");
+ 
+ const require = Cu.import("resource://gre/modules/devtools/Loader.jsm", {}).devtools.require;
+ const promise = Cu.import("resource://gre/modules/Promise.jsm", {}).Promise;
++const {DeferredTask} = Cu.import("resource://gre/modules/DeferredTask.jsm", {});
+ const EventEmitter = require("devtools/toolkit/event-emitter");
+ const Editor = require("devtools/sourceeditor/editor");
+ const {Tooltip} = require("devtools/shared/widgets/Tooltip");
+ const {ToolSidebar} = require("devtools/framework/sidebar");
+ 
+ XPCOMUtils.defineLazyModuleGetter(this, "Chart",
+   "resource:///modules/devtools/Chart.jsm");
+ 
+@@ -450,16 +451,29 @@ function NetworkEventsHandler() {
+ NetworkEventsHandler.prototype = {
+   get client() NetMonitorController._target.client,
+   get webConsoleClient() NetMonitorController.webConsoleClient,
+ 
+   /**
+    * Connect to the current target client.
+    */
+   connect: function() {
++    this._queuedActors = new Map();
++    this._queuedUpdates = new Map();
++    this._flushRequestsTask = new DeferredTask(() => {
++      for (let [actor, info] of this._queuedActors.entries()) {
++        this._addEvent(actor, info);
++      }
++      this._queuedActors.clear();
++      for (let [actor, value] of this._queuedUpdates.entries()) {
++        this._addUpdate(actor, value);
++      }
++      this._queuedUpdates.clear();
++    }, 10);
++
+     dumpn("NetworkEventsHandler is connecting...");
+     this.webConsoleClient.on("networkEvent", this._onNetworkEvent);
+     this.webConsoleClient.on("networkEventUpdate", this._onNetworkEventUpdate);
+     this._displayCachedEvents();
+   },
+ 
+   /**
+    * Display any network events already in the cache.
+@@ -479,54 +493,65 @@ NetworkEventsHandler.prototype = {
+       }
+     }
+   },
+ 
+   /**
+    * Disconnect from the client.
+    */
+   disconnect: function() {
++    this._queuedActors.clear();
++    this._queuedUpdates.clear();
++    this._flushRequestsTask.disarm();
+     if (!this.client) {
+       return;
+     }
+     dumpn("NetworkEventsHandler is disconnecting...");
+     this.webConsoleClient.off("networkEvent", this._onNetworkEvent);
+     this.webConsoleClient.off("networkEventUpdate", this._onNetworkEventUpdate);
+   },
+ 
++  _addEvent: function(actor, {startedDateTime, method, url, isXHR, fromCache}) {
++    NetMonitorView.RequestsMenu.addRequest(
++      actor, startedDateTime, method, url, isXHR, fromCache
++    );
++    window.emit(EVENTS.NETWORK_EVENT, actor);
++  },
++
+   /**
+    * The "networkEvent" message type handler.
+    *
+    * @param string type
+    *        Message type.
+    * @param object networkInfo
+    *        The network request information.
+    */
+   _onNetworkEvent: function(type, networkInfo) {
+     let { actor, startedDateTime, request: { method, url }, isXHR, fromCache } = networkInfo;
+ 
+-    NetMonitorView.RequestsMenu.addRequest(
+-      actor, startedDateTime, method, url, isXHR, fromCache
+-    );
+-    window.emit(EVENTS.NETWORK_EVENT, actor);
++    this._queuedActors.set(actor, {actor, startedDateTime, method, url, isXHR, fromCache});
++    this._flushRequestsTask.arm();
+   },
+ 
+   /**
+    * The "networkEventUpdate" message type handler.
+    *
+    * @param string type
+    *        Message type.
+    * @param object packet
+    *        The message received from the server.
+    * @param object networkInfo
+    *        The network request information.
+    */
+   _onNetworkEventUpdate: function(type, { packet, networkInfo }) {
+-    let actor = networkInfo.actor;
++    this._queuedUpdates.set(networkInfo.actor, { packet, networkInfo });
++    this._flushRequestsTask.arm();
++  },
+ 
++  _addUpdate: function(actor, { packet, networkInfo }) {
+     switch (packet.updateType) {
+       case "requestHeaders":
+         this.webConsoleClient.getRequestHeaders(actor, this._onRequestHeaders);
+         window.emit(EVENTS.UPDATING_REQUEST_HEADERS, actor);
+         break;
+       case "requestCookies":
+         this.webConsoleClient.getRequestCookies(actor, this._onRequestCookies);
+         window.emit(EVENTS.UPDATING_REQUEST_COOKIES, actor);
+diff --git a/browser/devtools/netmonitor/test/browser_net_accessibility-01.js b/browser/devtools/netmonitor/test/browser_net_accessibility-01.js
+--- a/browser/devtools/netmonitor/test/browser_net_accessibility-01.js
++++ b/browser/devtools/netmonitor/test/browser_net_accessibility-01.js
+@@ -12,19 +12,21 @@ function test() {
+     // It seems that this test may be slow on Ubuntu builds running on ec2.
+     requestLongerTimeout(2);
+ 
+     let { NetMonitorView } = aMonitor.panelWin;
+     let { RequestsMenu } = NetMonitorView;
+ 
+     RequestsMenu.lazyUpdate = false;
+ 
++ok(false, "Brian 1");
+     waitForNetworkEvents(aMonitor, 2).then(() => {
+       check(-1, false);
+ 
++ok(false, "Brian 2");
+       RequestsMenu.focusLastVisibleItem();
+       check(1, true);
+       RequestsMenu.focusFirstVisibleItem();
+       check(0, true);
+ 
+       RequestsMenu.focusNextItem();
+       check(1, true);
+       RequestsMenu.focusPrevItem();
+@@ -39,16 +41,17 @@ function test() {
+       check(1, true);
+       RequestsMenu.focusItemAtDelta(-10);
+       check(0, true);
+ 
+       aDebuggee.performRequests(18);
+       return waitForNetworkEvents(aMonitor, 18);
+     })
+     .then(() => {
++ok(false, "Brian 3");
+       RequestsMenu.focusLastVisibleItem();
+       check(19, true);
+       RequestsMenu.focusFirstVisibleItem();
+       check(0, true);
+ 
+       RequestsMenu.focusNextItem();
+       check(1, true);
+       RequestsMenu.focusPrevItem();

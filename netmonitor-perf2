@@ -1,0 +1,268 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  4dc08dfc1fbfe0deff1f13bba3ce5983c29d94ce
+Bug 1143224 - Process added requests asynchronously
+
+diff --git a/browser/devtools/netmonitor/netmonitor-view.js b/browser/devtools/netmonitor/netmonitor-view.js
+--- a/browser/devtools/netmonitor/netmonitor-view.js
++++ b/browser/devtools/netmonitor/netmonitor-view.js
+@@ -57,16 +57,18 @@ const GENERIC_VARIABLES_VIEW_SETTINGS = 
+   editableNameTooltip: "",
+   preventDisableOnChange: true,
+   preventDescriptorModifiers: true,
+   eval: () => {}
+ };
+ const NETWORK_ANALYSIS_PIE_CHART_DIAMETER = 200; // px
+ const FREETEXT_FILTER_SEARCH_DELAY = 200; // ms
+ 
++const {DeferredTask} = Cu.import("resource://gre/modules/DeferredTask.jsm", {});
++
+ /**
+  * Object defining the network monitor view components.
+  */
+ let NetMonitorView = {
+   /**
+    * Initializes the network monitor view.
+    */
+   initialize: function() {
+@@ -372,16 +374,17 @@ RequestsMenuView.prototype = Heritage.ex
+     this._onContextNewTabCommand = this.openRequestInTab.bind(this);
+     this._onContextCopyUrlCommand = this.copyUrl.bind(this);
+     this._onContextCopyImageAsDataUriCommand = this.copyImageAsDataUri.bind(this);
+     this._onContextCopyResponseCommand = this.copyResponse.bind(this);
+     this._onContextResendCommand = this.cloneSelectedRequest.bind(this);
+     this._onContextToggleRawHeadersCommand = this.toggleRawHeaders.bind(this);
+     this._onContextPerfCommand = () => NetMonitorView.toggleFrontendMode();
+     this._onReloadCommand = () => NetMonitorView.reloadPage();
++    this._flushRequestsTask = new DeferredTask(this._flushRequests, REQUESTS_REFRESH_RATE);
+ 
+     this.sendCustomRequestEvent = this.sendCustomRequest.bind(this);
+     this.closeCustomRequestEvent = this.closeCustomRequest.bind(this);
+     this.cloneSelectedRequestEvent = this.cloneSelectedRequest.bind(this);
+     this.toggleRawHeadersEvent = this.toggleRawHeaders.bind(this);
+ 
+     this.requestsFreetextFilterEvent = this.requestsFreetextFilterEvent.bind(this);
+     this.reFilterRequests = this.reFilterRequests.bind(this);
+@@ -501,57 +504,24 @@ RequestsMenuView.prototype = Heritage.ex
+    * @param string aUrl
+    *        Specifies the request's url.
+    * @param boolean aIsXHR
+    *        True if this request was initiated via XHR.
+    * @param boolean aFromCache
+    *        Indicates if the result came from the browser cache
+    */
+   addRequest: function(aId, aStartedDateTime, aMethod, aUrl, aIsXHR, aFromCache) {
+-    // Convert the received date/time string to a unix timestamp.
+-    let unixTime = Date.parse(aStartedDateTime);
+-
+-    // Create the element node for the network request item.
+-    let menuView = this._createMenuView(aMethod, aUrl);
+-
+-    // Remember the first and last event boundaries.
+-    this._registerFirstRequestStart(unixTime);
+-    this._registerLastRequestEnd(unixTime);
+-
+-    // Append a network request item to this container.
+-    let requestItem = this.push([menuView, aId], {
+-      attachment: {
+-        startedDeltaMillis: unixTime - this._firstRequestStartedMillis,
+-        startedMillis: unixTime,
+-        method: aMethod,
+-        url: aUrl,
+-        isXHR: aIsXHR,
+-        fromCache: aFromCache
+-      }
+-    });
+-
+-    // Create a tooltip for the newly appended network request item.
+-    let requestTooltip = requestItem.attachment.tooltip = new Tooltip(document, {
+-      closeOnEvents: [{
+-        emitter: $("#requests-menu-contents"),
+-        event: "scroll",
+-        useCapture: true
+-      }]
+-    });
+-
+-    $("#details-pane-toggle").disabled = false;
+-    $("#requests-menu-empty-notice").hidden = true;
+-
+-    this.refreshSummary();
+-    this.refreshZebra();
+-    this.refreshTooltip(requestItem);
+-
+-    if (aId == this._preferredItemId) {
+-      this.selectedItem = requestItem;
++    this._addQueue.push([aId, aStartedDateTime, aMethod, aUrl, aIsXHR, aFromCache]);
++
++    // Lazy updating is disabled in some tests.
++    if (!this.lazyUpdate) {
++      return void this._flushRequests();
+     }
++
++    this._flushRequestsTask.arm();
+   },
+ 
+   /**
+    * Opens selected item in a new tab.
+    */
+   openRequestInTab: function() {
+     let win = Services.wm.getMostRecentWindow("navigator:browser");
+     let selected = this.selectedItem.attachment;
+@@ -1186,25 +1156,64 @@ RequestsMenuView.prototype = Heritage.ex
+       return;
+     }
+     this._updateQueue.push([aId, aData]);
+ 
+     // Lazy updating is disabled in some tests.
+     if (!this.lazyUpdate) {
+       return void this._flushRequests();
+     }
+-    // Allow requests to settle down first.
+-    setNamedTimeout(
+-      "update-requests", REQUESTS_REFRESH_RATE, () => this._flushRequests());
++
++    this._flushRequestsTask.arm();
+   },
+ 
+   /**
+    * Starts adding all queued additional information about network requests.
+    */
+   _flushRequests: function() {
++    for (let [aId, aStartedDateTime, aMethod, aUrl, aIsXHR, aFromCache] of this._addQueue) {
++      // Convert the received date/time string to a unix timestamp.
++      let unixTime = Date.parse(aStartedDateTime);
++
++      // Create the element node for the network request item.
++      let menuView = this._createMenuView(aMethod, aUrl);
++
++      // Remember the first and last event boundaries.
++      this._registerFirstRequestStart(unixTime);
++      this._registerLastRequestEnd(unixTime);
++
++      // Append a network request item to this container.
++      let requestItem = this.push([menuView, aId], {
++        attachment: {
++          startedDeltaMillis: unixTime - this._firstRequestStartedMillis,
++          startedMillis: unixTime,
++          method: aMethod,
++          url: aUrl,
++          isXHR: aIsXHR,
++          fromCache: aFromCache
++        }
++      });
++
++      // Create a tooltip for the newly appended network request item.
++      let requestTooltip = requestItem.attachment.tooltip = new Tooltip(document, {
++        closeOnEvents: [{
++          emitter: $("#requests-menu-contents"),
++          event: "scroll",
++          useCapture: true
++        }]
++      });
++
++      this.refreshTooltip(requestItem);
++
++      if (aId == this._preferredItemId) {
++        this.selectedItem = requestItem;
++      }
++    }
++
++
+     // For each queued additional information packet, get the corresponding
+     // request item in the view and update it based on the specified data.
+     for (let [id, data] of this._updateQueue) {
+       let requestItem = this.getItemByValue(id);
+       if (!requestItem) {
+         // Packet corresponds to a dead request item, target navigated.
+         continue;
+       }
+@@ -1350,16 +1359,20 @@ RequestsMenuView.prototype = Heritage.ex
+       let selectedItem = NetMonitorView.RequestsMenu.selectedItem;
+       if (selectedItem == aRequestItem) {
+         NetMonitorView.NetworkDetails.populate(selectedItem.attachment);
+       }
+     }
+ 
+     // We're done flushing all the requests, clear the update queue.
+     this._updateQueue = [];
++    this._addQueue = [];
++
++    $("#details-pane-toggle").disabled = false;
++    $("#requests-menu-empty-notice").hidden = true;
+ 
+     // Make sure all the requests are sorted and filtered.
+     // Freshly added requests may not yet contain all the information required
+     // for sorting and filtering predicates, so this is done each time the
+     // network requests table is flushed (don't worry, events are drained first
+     // so this doesn't happen once per network event update).
+     this.sortContents();
+     this.filterContents();
+@@ -1936,17 +1949,17 @@ RequestsMenuView.prototype = Heritage.ex
+    *
+    * @param array aItemsArray
+    * @return number
+    */
+   _getTotalBytesOfRequests: function(aItemsArray) {
+     if (!aItemsArray.length) {
+       return 0;
+     }
+-    return aItemsArray.reduce((prev, curr) => prev + curr.attachment.contentSize || 0, 0);
++    return aItemsArray.reduce((prev, curr) => prev + (curr.attachment.contentSize || 0), 0);
+   },
+ 
+   /**
+    * Gets the oldest (first performed) request in a set. Returns null for an
+    * empty set.
+    *
+    * @param array aItemsArray
+    * @return object
+@@ -1955,28 +1968,28 @@ RequestsMenuView.prototype = Heritage.ex
+     if (!aItemsArray.length) {
+       return null;
+     }
+     return aItemsArray.reduce((prev, curr) =>
+       prev.attachment.startedMillis < curr.attachment.startedMillis ? prev : curr);
+   },
+ 
+   /**
+-   * Gets the newest (latest performed) request in a set. Returns null for an
++   * Gets the newest (last finished) request in a set. Returns null for an
+    * empty set.
+    *
+    * @param array aItemsArray
+    * @return object
+    */
+   _getNewestRequest: function(aItemsArray) {
+     if (!aItemsArray.length) {
+       return null;
+     }
+-    return aItemsArray.reduce((prev, curr) =>
+-      prev.attachment.startedMillis > curr.attachment.startedMillis ? prev : curr);
++    return aItemsArray.filter(r=>r.attachment.endedMillis).reduce((prev, curr) =>
++      prev.attachment.endedMillis > curr.attachment.endedMillis ? prev : curr);
+   },
+ 
+   /**
+    * Gets the available waterfall width in this container.
+    * @return number
+    */
+   get _waterfallWidth() {
+     if (this._cachedWaterfallWidth == 0) {
+@@ -1996,16 +2009,17 @@ RequestsMenuView.prototype = Heritage.ex
+   _splitter: null,
+   _summary: null,
+   _canvas: null,
+   _ctx: null,
+   _cachedWaterfallWidth: 0,
+   _firstRequestStartedMillis: -1,
+   _lastRequestEndedMillis: -1,
+   _updateQueue: [],
++  _addQueue: [],
+   _updateTimeout: null,
+   _resizeTimeout: null,
+   _activeFilters: ["all"],
+   _currentFreetextFilter: ""
+ });
+ 
+ /**
+  * Functions handling the sidebar details view.
