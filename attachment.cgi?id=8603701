@@ -1,0 +1,372 @@
+# HG changeset patch
+# User Tooru Fujisawa <arai_a@mac.com>
+# Date 1431080906 -32400
+#      Fri May 08 19:28:26 2015 +0900
+# Node ID 310af0268946fb4df63dad871b3d49afd3cb2ac8
+# Parent  b2a742938d6417248a6ffe2685d5fe6026493224
+Bug 861219 - Part 0: Make ClassSpec be able to delegate to another ClassSpec.
+
+diff --git a/js/public/Class.h b/js/public/Class.h
+--- a/js/public/Class.h
++++ b/js/public/Class.h
+@@ -449,46 +449,95 @@ typedef JSObject* (*ClassObjectCreationO
+ // Callback for custom post-processing after class initialization via ClassSpec.
+ typedef bool (*FinishClassInitOp)(JSContext* cx, JS::HandleObject ctor,
+                                   JS::HandleObject proto);
+ 
+ const size_t JSCLASS_CACHED_PROTO_WIDTH = 6;
+ 
+ struct ClassSpec
+ {
++    // All properties except flags should be accessed through get* accessor.
+     ClassObjectCreationOp createConstructor;
+     ClassObjectCreationOp createPrototype;
+     const JSFunctionSpec* constructorFunctions;
+     const JSPropertySpec* constructorProperties;
+     const JSFunctionSpec* prototypeFunctions;
+     const JSPropertySpec* prototypeProperties;
+     FinishClassInitOp finishInit;
+     uintptr_t flags;
+ 
+     static const size_t ParentKeyWidth = JSCLASS_CACHED_PROTO_WIDTH;
+ 
+     static const uintptr_t ParentKeyMask = (1 << ParentKeyWidth) - 1;
+     static const uintptr_t DontDefineConstructor = 1 << ParentKeyWidth;
+ 
+-    bool defined() const { return !!createConstructor; }
++    static const uintptr_t DelegatedTag = 1;
++
++    bool defined() const { return !!getCreateConstructor(); }
++
++    bool delegated() const {
++        return !!(reinterpret_cast<uintptr_t>(createConstructor) & DelegatedTag);
++    }
+ 
+     bool dependent() const {
+         MOZ_ASSERT(defined());
+         return (flags & ParentKeyMask);
+     }
+ 
+     JSProtoKey parentKey() const {
+         static_assert(JSProto_Null == 0, "zeroed key must be null");
+         return JSProtoKey(flags & ParentKeyMask);
+     }
+ 
+     bool shouldDefineConstructor() const {
+         MOZ_ASSERT(defined());
+         return !(flags & DontDefineConstructor);
+     }
++
++    const ClassSpec* getDelegatedClassSpec() const {
++        MOZ_ASSERT(delegated());
++        return reinterpret_cast<ClassSpec*>(reinterpret_cast<uintptr_t>(createConstructor) &
++                                            ~DelegatedTag);
++    }
++
++    ClassObjectCreationOp getCreateConstructor() const {
++        if (delegated())
++            return getDelegatedClassSpec()->getCreateConstructor();
++        return createConstructor;
++    }
++    ClassObjectCreationOp getCreatePrototype() const {
++        if (delegated())
++            return getDelegatedClassSpec()->getCreatePrototype();
++        return createPrototype;
++    }
++    const JSFunctionSpec* getConstructorFunctions() const {
++        if (delegated())
++            return getDelegatedClassSpec()->getConstructorFunctions();
++        return constructorFunctions;
++    }
++    const JSPropertySpec* getConstructorProperties() const {
++        if (delegated())
++            return getDelegatedClassSpec()->getConstructorProperties();
++        return constructorProperties;
++    }
++    const JSFunctionSpec* getPrototypeFunctions() const {
++        if (delegated())
++            return getDelegatedClassSpec()->getPrototypeFunctions();
++        return prototypeFunctions;
++    }
++    const JSPropertySpec* getPrototypeProperties() const {
++        if (delegated())
++            return getDelegatedClassSpec()->getPrototypeProperties();
++        return prototypeProperties;
++    }
++    FinishClassInitOp getFinishInit() const {
++        if (delegated())
++            return getDelegatedClassSpec()->getFinishInit();
++        return finishInit;
++    }
+ };
+ 
+ struct ClassExtension
+ {
+     ObjectOp            outerObject;
+     InnerObjectOp       innerObject;
+ 
+     /*
+@@ -519,16 +568,21 @@ struct ClassExtension
+      *
+      * Note that this hook can be called before JS_NewObject() returns if a GC
+      * is triggered during construction of the object. This can happen for
+      * global objects for example.
+      */
+     JSObjectMovedOp objectMovedOp;
+ };
+ 
++inline ClassObjectCreationOp DELEGATED_CLASSSPEC(const ClassSpec* spec) {
++    return reinterpret_cast<ClassObjectCreationOp>(reinterpret_cast<uintptr_t>(spec) |
++                                                   ClassSpec::DelegatedTag);
++}
++
+ #define JS_NULL_CLASS_SPEC  {nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr}
+ #define JS_NULL_CLASS_EXT   {nullptr,nullptr,false,nullptr,nullptr}
+ 
+ struct ObjectOps
+ {
+     LookupPropertyOp    lookupProperty;
+     DefinePropertyOp    defineProperty;
+     HasPropertyOp       hasProperty;
+diff --git a/js/src/vm/GlobalObject.cpp b/js/src/vm/GlobalObject.cpp
+--- a/js/src/vm/GlobalObject.cpp
++++ b/js/src/vm/GlobalObject.cpp
+@@ -148,65 +148,65 @@ GlobalObject::resolveConstructor(JSConte
+     // Function will also be resolved before we return.
+     if (key == JSProto_Function && global->getPrototype(JSProto_Object).isUndefined())
+         return resolveConstructor(cx, global, JSProto_Object);
+ 
+     // We don't always have a prototype (i.e. Math and JSON). If we don't,
+     // |createPrototype|, |prototypeFunctions|, and |prototypeProperties|
+     // should all be null.
+     RootedObject proto(cx);
+-    if (clasp->spec.createPrototype) {
+-        proto = clasp->spec.createPrototype(cx, key);
++    if (clasp->spec.getCreatePrototype()) {
++        proto = clasp->spec.getCreatePrototype()(cx, key);
+         if (!proto)
+             return false;
+ 
+         global->setPrototype(key, ObjectValue(*proto));
+     }
+ 
+     // Create the constructor.
+-    RootedObject ctor(cx, clasp->spec.createConstructor(cx, key));
++    RootedObject ctor(cx, clasp->spec.getCreateConstructor()(cx, key));
+     if (!ctor)
+         return false;
+ 
+     RootedId id(cx, NameToId(ClassName(key, cx)));
+     if (clasp->spec.shouldDefineConstructor()) {
+         if (!global->addDataProperty(cx, id, constructorPropertySlot(key), 0))
+             return false;
+     }
+ 
+     global->setConstructor(key, ObjectValue(*ctor));
+     global->setConstructorPropertySlot(key, ObjectValue(*ctor));
+ 
+     // Define any specified functions and properties, unless we're a dependent
+     // standard class (in which case they live on the prototype).
+     if (!StandardClassIsDependent(key)) {
+-        if (const JSFunctionSpec* funs = clasp->spec.prototypeFunctions) {
++        if (const JSFunctionSpec* funs = clasp->spec.getPrototypeFunctions()) {
+             if (!JS_DefineFunctions(cx, proto, funs, DontDefineLateProperties))
+                 return false;
+         }
+-        if (const JSPropertySpec* props = clasp->spec.prototypeProperties) {
++        if (const JSPropertySpec* props = clasp->spec.getPrototypeProperties()) {
+             if (!JS_DefineProperties(cx, proto, props))
+                 return false;
+         }
+-        if (const JSFunctionSpec* funs = clasp->spec.constructorFunctions) {
++        if (const JSFunctionSpec* funs = clasp->spec.getConstructorFunctions()) {
+             if (!JS_DefineFunctions(cx, ctor, funs, DontDefineLateProperties))
+                 return false;
+         }
+-        if (const JSPropertySpec* props = clasp->spec.constructorProperties) {
++        if (const JSPropertySpec* props = clasp->spec.getConstructorProperties()) {
+             if (!JS_DefineProperties(cx, ctor, props))
+                 return false;
+         }
+     }
+ 
+     // If the prototype exists, link it with the constructor.
+     if (proto && !LinkConstructorAndPrototype(cx, ctor, proto))
+         return false;
+ 
+     // Call the post-initialization hook, if provided.
+-    if (clasp->spec.finishInit && !clasp->spec.finishInit(cx, ctor, proto))
++    if (clasp->spec.getFinishInit() && !clasp->spec.getFinishInit()(cx, ctor, proto))
+         return false;
+ 
+     if (clasp->spec.shouldDefineConstructor()) {
+         // Stash type information, so that what we do here is equivalent to
+         // initBuiltinConstructor.
+         AddTypePropertyId(cx, global, id, ObjectValue(*ctor));
+     }
+ 
+@@ -349,21 +349,21 @@ GlobalObject::initStandardClasses(JSCont
+  * self-hosted builtins.
+  */
+ static bool
+ InitBareBuiltinCtor(JSContext* cx, Handle<GlobalObject*> global, JSProtoKey protoKey)
+ {
+     MOZ_ASSERT(cx->runtime()->isSelfHostingGlobal(global));
+     const Class* clasp = ProtoKeyToClass(protoKey);
+     RootedObject proto(cx);
+-    proto = clasp->spec.createPrototype(cx, protoKey);
++    proto = clasp->spec.getCreatePrototype()(cx, protoKey);
+     if (!proto)
+         return false;
+ 
+-    RootedObject ctor(cx, clasp->spec.createConstructor(cx, protoKey));
++    RootedObject ctor(cx, clasp->spec.getCreateConstructor()(cx, protoKey));
+     if (!ctor)
+         return false;
+ 
+     return GlobalObject::initBuiltinConstructor(cx, global, protoKey, ctor, proto);
+ }
+ 
+ /**
+  * The self-hosting global only gets a small subset of all standard classes.
+diff --git a/js/src/vm/TypedArrayObject.cpp b/js/src/vm/TypedArrayObject.cpp
+--- a/js/src/vm/TypedArrayObject.cpp
++++ b/js/src/vm/TypedArrayObject.cpp
+@@ -1825,18 +1825,18 @@ const Class TypedArrayObject::classes[Sc
+ };
+ 
+ // The various typed array prototypes are supposed to 1) be normal objects,
+ // 2) stringify to "[object <name of constructor>]", and 3) (Gecko-specific)
+ // be xrayable.  The first and second requirements mandate (in the absence of
+ // @@toStringTag) a custom class.  The third requirement mandates that each
+ // prototype's class have the relevant typed array's cached JSProtoKey in them.
+ // Thus we need one class with cached prototype per kind of typed array, with a
+-// dummy createConstructor to placate js::ClassSpec::defined().
+-#define IMPL_TYPED_ARRAY_PROTO_CLASS(typedArray) \
++// delegated ClassSpec.
++#define IMPL_TYPED_ARRAY_PROTO_CLASS(typedArray,i) \
+ { \
+     /*
+      * Actually ({}).toString.call(Uint8Array.prototype) should throw, because
+      * Uint8Array.prototype lacks the the typed array internal slots.  (Same as
+      * with %TypedArray%.prototype.)  It's not clear this is desirable (see
+      * above), but it's what we've always done, so keep doing it til we
+      * implement @@toStringTag or ES6 changes.
+      */ \
+@@ -1851,37 +1851,37 @@ const Class TypedArrayObject::classes[Sc
+     nullptr, /* mayResolve */ \
+     nullptr, /* convert */ \
+     nullptr, /* finalize */ \
+     nullptr, /* call */ \
+     nullptr, /* hasInstance */ \
+     nullptr, /* construct */ \
+     nullptr, /* trace  */ \
+     { \
+-        typedArray::createConstructor, \
+-        typedArray::createPrototype, \
++        DELEGATED_CLASSSPEC(&TypedArrayObject::classes[i].spec), \
++        nullptr, \
+         nullptr, \
+         nullptr, \
+         nullptr, \
+         nullptr, \
+         nullptr, \
+         JSProto_TypedArray \
+     } \
+ }
+ 
+ const Class TypedArrayObject::protoClasses[Scalar::MaxTypedArrayViewType] = {
+-    IMPL_TYPED_ARRAY_PROTO_CLASS(Int8Array),
+-    IMPL_TYPED_ARRAY_PROTO_CLASS(Uint8Array),
+-    IMPL_TYPED_ARRAY_PROTO_CLASS(Int16Array),
+-    IMPL_TYPED_ARRAY_PROTO_CLASS(Uint16Array),
+-    IMPL_TYPED_ARRAY_PROTO_CLASS(Int32Array),
+-    IMPL_TYPED_ARRAY_PROTO_CLASS(Uint32Array),
+-    IMPL_TYPED_ARRAY_PROTO_CLASS(Float32Array),
+-    IMPL_TYPED_ARRAY_PROTO_CLASS(Float64Array),
+-    IMPL_TYPED_ARRAY_PROTO_CLASS(Uint8ClampedArray)
++    IMPL_TYPED_ARRAY_PROTO_CLASS(Int8Array, 0),
++    IMPL_TYPED_ARRAY_PROTO_CLASS(Uint8Array, 1),
++    IMPL_TYPED_ARRAY_PROTO_CLASS(Int16Array, 2),
++    IMPL_TYPED_ARRAY_PROTO_CLASS(Uint16Array, 3),
++    IMPL_TYPED_ARRAY_PROTO_CLASS(Int32Array, 4),
++    IMPL_TYPED_ARRAY_PROTO_CLASS(Uint32Array, 5),
++    IMPL_TYPED_ARRAY_PROTO_CLASS(Float32Array, 6),
++    IMPL_TYPED_ARRAY_PROTO_CLASS(Float64Array, 7),
++    IMPL_TYPED_ARRAY_PROTO_CLASS(Uint8ClampedArray, 8)
+ };
+ 
+ /* static */ bool
+ TypedArrayObject::isOriginalLengthGetter(Native native)
+ {
+     return native == TypedArray_lengthGetter;
+ }
+ 
+diff --git a/js/xpconnect/wrappers/XrayWrapper.cpp b/js/xpconnect/wrappers/XrayWrapper.cpp
+--- a/js/xpconnect/wrappers/XrayWrapper.cpp
++++ b/js/xpconnect/wrappers/XrayWrapper.cpp
+@@ -499,17 +499,17 @@ JSXrayTraits::resolveOwnProperty(JSConte
+     }
+ 
+     // Grab the JSClass. We require all Xrayable classes to have a ClassSpec.
+     const js::Class* clasp = js::GetObjectClass(target);
+     MOZ_ASSERT(clasp->spec.defined());
+ 
+     // Scan through the functions. Indexed array properties are handled above.
+     const JSFunctionSpec* fsMatch = nullptr;
+-    for (const JSFunctionSpec* fs = clasp->spec.prototypeFunctions; fs && fs->name; ++fs) {
++    for (const JSFunctionSpec* fs = clasp->spec.getPrototypeFunctions(); fs && fs->name; ++fs) {
+         if (PropertySpecNameEqualsId(fs->name, id)) {
+             fsMatch = fs;
+             break;
+         }
+     }
+     if (fsMatch) {
+         // Generate an Xrayed version of the method.
+         RootedFunction fun(cx);
+@@ -527,17 +527,17 @@ JSXrayTraits::resolveOwnProperty(JSConte
+         // JS_GetPropertyById at the top of this function.
+         RootedObject funObj(cx, JS_GetFunctionObject(fun));
+         return JS_DefinePropertyById(cx, holder, id, funObj, 0) &&
+                JS_GetPropertyDescriptorById(cx, holder, id, desc);
+     }
+ 
+     // Scan through the properties.
+     const JSPropertySpec* psMatch = nullptr;
+-    for (const JSPropertySpec* ps = clasp->spec.prototypeProperties; ps && ps->name; ++ps) {
++    for (const JSPropertySpec* ps = clasp->spec.getPrototypeProperties(); ps && ps->name; ++ps) {
+         if (PropertySpecNameEqualsId(ps->name, id)) {
+             psMatch = ps;
+             break;
+         }
+     }
+     if (psMatch) {
+         desc.value().setUndefined();
+         RootedFunction getterObj(cx);
+@@ -760,24 +760,24 @@ JSXrayTraits::enumerateNames(JSContext* 
+     if (key == JSProto_RegExp && !props.append(GetRTIdByIndex(cx, XPCJSRuntime::IDX_LASTINDEX)))
+         return false;
+ 
+     // Grab the JSClass. We require all Xrayable classes to have a ClassSpec.
+     const js::Class* clasp = js::GetObjectClass(target);
+     MOZ_ASSERT(clasp->spec.defined());
+ 
+     // Convert the method and property names to jsids and pass them to the caller.
+-    for (const JSFunctionSpec* fs = clasp->spec.prototypeFunctions; fs && fs->name; ++fs) {
++    for (const JSFunctionSpec* fs = clasp->spec.getPrototypeFunctions(); fs && fs->name; ++fs) {
+         jsid id;
+         if (!PropertySpecNameToPermanentId(cx, fs->name, &id))
+             return false;
+         if (!MaybeAppend(id, flags, props))
+             return false;
+     }
+-    for (const JSPropertySpec* ps = clasp->spec.prototypeProperties; ps && ps->name; ++ps) {
++    for (const JSPropertySpec* ps = clasp->spec.getPrototypeProperties(); ps && ps->name; ++ps) {
+         jsid id;
+         if (!PropertySpecNameToPermanentId(cx, ps->name, &id))
+             return false;
+         if (!MaybeAppend(id, flags, props))
+             return false;
+     }
+ 
+     return true;

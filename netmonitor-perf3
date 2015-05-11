@@ -1,0 +1,236 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  515edd77648b025f88ea972e717ec0108d0a4c89
+Bug 1143224 - Update async requests;r=jsantell
+
+diff --git a/browser/devtools/netmonitor/netmonitor-controller.js b/browser/devtools/netmonitor/netmonitor-controller.js
+--- a/browser/devtools/netmonitor/netmonitor-controller.js
++++ b/browser/devtools/netmonitor/netmonitor-controller.js
+@@ -18,16 +18,19 @@ const EVENTS = {
+   TARGET_WILL_NAVIGATE: "NetMonitor:TargetWillNavigate",
+   TARGET_DID_NAVIGATE: "NetMonitor:TargetNavigate",
+ 
+   // When a network event is received.
+   // See https://developer.mozilla.org/docs/Tools/Web_Console/remoting for
+   // more information about what each packet is supposed to deliver.
+   NETWORK_EVENT: "NetMonitor:NetworkEvent",
+ 
++  // When a network event is added to the view
++  REQUEST_ADDED: "NetMonitor:RequestAdded",
++
+   // When request headers begin and finish receiving.
+   UPDATING_REQUEST_HEADERS: "NetMonitor:NetworkEventUpdating:RequestHeaders",
+   RECEIVED_REQUEST_HEADERS: "NetMonitor:NetworkEventUpdated:RequestHeaders",
+ 
+   // When request cookies begin and finish receiving.
+   UPDATING_REQUEST_COOKIES: "NetMonitor:NetworkEventUpdating:RequestCookies",
+   RECEIVED_REQUEST_COOKIES: "NetMonitor:NetworkEventUpdated:RequestCookies",
+ 
+diff --git a/browser/devtools/netmonitor/netmonitor-view.js b/browser/devtools/netmonitor/netmonitor-view.js
+--- a/browser/devtools/netmonitor/netmonitor-view.js
++++ b/browser/devtools/netmonitor/netmonitor-view.js
+@@ -1196,26 +1196,23 @@ RequestsMenuView.prototype = Heritage.ex
+       let requestTooltip = requestItem.attachment.tooltip = new Tooltip(document, {
+         closeOnEvents: [{
+           emitter: $("#requests-menu-contents"),
+           event: "scroll",
+           useCapture: true
+         }]
+       });
+ 
+-      $("#details-pane-toggle").disabled = false;
+-      $("#requests-menu-empty-notice").hidden = true;
+-
+-      this.refreshSummary();
+-      this.refreshZebra();
+       this.refreshTooltip(requestItem);
+ 
+       if (aId == this._preferredItemId) {
+         this.selectedItem = requestItem;
+       }
++
++      window.emit(EVENTS.REQUEST_ADDED, aId);
+     }
+ 
+ 
+     // For each queued additional information packet, get the corresponding
+     // request item in the view and update it based on the specified data.
+     for (let [id, data] of this._updateQueue) {
+       let requestItem = this.getItemByValue(id);
+       if (!requestItem) {
+@@ -1366,16 +1363,19 @@ RequestsMenuView.prototype = Heritage.ex
+         NetMonitorView.NetworkDetails.populate(selectedItem.attachment);
+       }
+     }
+ 
+     // We're done flushing all the requests, clear the update queue.
+     this._updateQueue = [];
+     this._addQueue = [];
+ 
++    $("#details-pane-toggle").disabled = false;
++    $("#requests-menu-empty-notice").hidden = true;
++
+     // Make sure all the requests are sorted and filtered.
+     // Freshly added requests may not yet contain all the information required
+     // for sorting and filtering predicates, so this is done each time the
+     // network requests table is flushed (don't worry, events are drained first
+     // so this doesn't happen once per network event update).
+     this.sortContents();
+     this.filterContents();
+     this.refreshSummary();
+diff --git a/browser/devtools/netmonitor/test/browser_net_autoscroll.js b/browser/devtools/netmonitor/test/browser_net_autoscroll.js
+--- a/browser/devtools/netmonitor/test/browser_net_autoscroll.js
++++ b/browser/devtools/netmonitor/test/browser_net_autoscroll.js
+@@ -14,16 +14,18 @@ thisTestLeaksUncaughtRejectionsAndShould
+ add_task(function*() {
+   requestLongerTimeout(2);
+   let monitor, debuggee, requestsContainer, scrollTop;
+ 
+   let [aTab, aDebuggee, aMonitor] = yield initNetMonitor(INFINITE_GET_URL);
+   monitor = aMonitor;
+   debuggee = aDebuggee;
+   let win = monitor.panelWin;
++  let RequestsMenu = win.NetMonitorView.RequestsMenu;
++  RequestsMenu.lazyUpdate = true;
+   let topNode = win.document.getElementById("requests-menu-contents");
+   requestsContainer = topNode.getElementsByTagName("scrollbox")[0];
+   ok(!!requestsContainer, "Container element exists as expected.");
+ 
+   // (1) Check that the scroll position is maintained at the bottom
+   // when the requests overflow the vertical size of the container.
+   yield waitForRequestsToOverflowContainer(monitor, requestsContainer);
+   yield waitForScroll(monitor);
+diff --git a/browser/devtools/netmonitor/test/browser_net_details-no-duplicated-content.js b/browser/devtools/netmonitor/test/browser_net_details-no-duplicated-content.js
+--- a/browser/devtools/netmonitor/test/browser_net_details-no-duplicated-content.js
++++ b/browser/devtools/netmonitor/test/browser_net_details-no-duplicated-content.js
+@@ -90,16 +90,21 @@ let test = Task.async(function* () {
+       waitForNetworkEvents(monitor, 0, 1) : waitForNetworkEvents(monitor, 1);
+ 
+     info("Performing a request");
+     debuggee.performRequests(1, uri);
+ 
+     info("Waiting for NETWORK_EVENT");
+     yield onNetworkEvent;
+ 
++    if (!RequestsMenu.getItemAtIndex(0)) {
++      info ("Waiting for the request to be added to the view")
++      yield monitor.panelWin.once("NetMonitor:RequestAdded");
++    }
++
+     ok(true, "Received NETWORK_EVENT. Selecting the item.");
+     let item = RequestsMenu.getItemAtIndex(0);
+     RequestsMenu.selectedItem = item;
+ 
+     info("Item selected. Waiting for NETWORKDETAILSVIEW_POPULATED");
+     yield onDetailsPopulated;
+ 
+     info("Received populated event. Selecting tab at index " + tabIndex);
+diff --git a/browser/devtools/netmonitor/test/head.js b/browser/devtools/netmonitor/test/head.js
+--- a/browser/devtools/netmonitor/test/head.js
++++ b/browser/devtools/netmonitor/test/head.js
+@@ -192,16 +192,18 @@ function waitForNetworkEvents(aMonitor, 
+   let deferred = promise.defer();
+ 
+   let panel = aMonitor.panelWin;
+   let events = panel.EVENTS;
+ 
+   let progress = {};
+   let genericEvents = 0;
+   let postEvents = 0;
++  let addedToViewEvents = 0;
++  // XXX: Handle case where the request is already in view
+ 
+   let awaitedEventsToListeners = [
+     ["UPDATING_REQUEST_HEADERS", onGenericEvent],
+     ["RECEIVED_REQUEST_HEADERS", onGenericEvent],
+     ["UPDATING_REQUEST_COOKIES", onGenericEvent],
+     ["RECEIVED_REQUEST_COOKIES", onGenericEvent],
+     ["UPDATING_REQUEST_POST_DATA", onPostEvent],
+     ["RECEIVED_REQUEST_POST_DATA", onPostEvent],
+@@ -232,36 +234,44 @@ function waitForNetworkEvents(aMonitor, 
+     maybeResolve(event, actor);
+   }
+ 
+   function onPostEvent(event, actor) {
+     postEvents++;
+     maybeResolve(event, actor);
+   }
+ 
++  function onRequestAdded(event, data) {
++    addedToViewEvents++;
++    maybeResolve(event, data);
++  }
++
+   function maybeResolve(event, [actor, url]) {
+     info("> Network events progress: " +
+       genericEvents + "/" + ((aGetRequests + aPostRequests) * 13) + ", " +
+       postEvents + "/" + (aPostRequests * 2) + ", " +
+       "got " + event + " for " + actor);
+ 
+     updateProgressForURL(url, event);
+     info("> Current state: " + JSON.stringify(progress, null, 2));
+ 
+     // There are 15 updates which need to be fired for a request to be
+     // considered finished. The "requestPostData" packet isn't fired for
+     // non-POST requests.
+     if (genericEvents == (aGetRequests + aPostRequests) * 13 &&
+-        postEvents == aPostRequests * 2) {
++        postEvents == aPostRequests * 2 &&
++        addedToViewEvents == (aGetRequests + aPostRequests)) {
+ 
+       awaitedEventsToListeners.forEach(([e, l]) => panel.off(events[e], l));
++      panel.off("NetMonitor:RequestAdded", onRequestAdded);
+       executeSoon(deferred.resolve);
+     }
+   }
+ 
++  panel.on("NetMonitor:RequestAdded", onRequestAdded);
+   awaitedEventsToListeners.forEach(([e, l]) => panel.on(events[e], l));
+   return deferred.promise;
+ }
+ 
+ function verifyRequestItemTarget(aRequestItem, aMethod, aUrl, aData = {}) {
+   info("> Verifying: " + aMethod + " " + aUrl + " " + aData.toSource());
+   // This bloats log sizes significantly in automation (bug 992485)
+   //info("> Request: " + aRequestItem.attachment.toSource());
+diff --git a/browser/devtools/webconsole/test/browser_netmonitor_shows_reqs_in_webconsole.js b/browser/devtools/webconsole/test/browser_netmonitor_shows_reqs_in_webconsole.js
+--- a/browser/devtools/webconsole/test/browser_netmonitor_shows_reqs_in_webconsole.js
++++ b/browser/devtools/webconsole/test/browser_netmonitor_shows_reqs_in_webconsole.js
+@@ -39,33 +39,35 @@ add_task(function* () {
+     ]
+   });
+ 
+   // Test that the request appears in the network panel.
+   let target = TargetFactory.forTab(tab);
+   let toolbox = yield gDevTools.showToolbox(target, "netmonitor");
+   info("Network panel is open.");
+ 
+-  testNetmonitor(toolbox);
++  yield testNetmonitor(toolbox);
+ });
+ 
+ 
+ function loadDocument(browser) {
+   let deferred = promise.defer();
+ 
+   browser.addEventListener("load", function onLoad() {
+     browser.removeEventListener("load", onLoad, true);
+     deferred.resolve();
+   }, true);
+   content.location = TEST_PATH;
+ 
+   return deferred.promise;
+ }
+ 
+-function testNetmonitor(toolbox) {
++function* testNetmonitor(toolbox) {
+   let monitor = toolbox.getCurrentPanel();
+   let { RequestsMenu } = monitor.panelWin.NetMonitorView;
++
++  yield monitor.panelWin.once("NetMonitor:RequestAdded");
+   is(RequestsMenu.itemCount, 1, "Network request appears in the network panel");
+ 
+   let item = RequestsMenu.getItemAtIndex(0);
+   is(item.attachment.method, "GET", "The attached method is correct.");
+   is(item.attachment.url, TEST_PATH, "The attached url is correct.");
+ }
