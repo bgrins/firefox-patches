@@ -1,0 +1,344 @@
+# HG changeset patch
+# User Tom Tromey <tromey@mozilla.com>
+
+Bug 1154809 - rewrite prettifyCSS to use CSSLexer; r=pbrosset
+
+diff --git a/browser/devtools/styleeditor/test/browser_styleeditor_pretty.js b/browser/devtools/styleeditor/test/browser_styleeditor_pretty.js
+index 8bc7c2c..513ea56 100644
+--- a/browser/devtools/styleeditor/test/browser_styleeditor_pretty.js
++++ b/browser/devtools/styleeditor/test/browser_styleeditor_pretty.js
+@@ -4,26 +4,24 @@
+ "use strict";
+ 
+ // Test that minified sheets are automatically prettified but other are left
+ // untouched.
+ 
+ const TESTCASE_URI = TEST_BASE_HTTP + "minified.html";
+ 
+ const PRETTIFIED_SOURCE = "" +
+-"body\{\r?\n" +                   // body{
++"body \{\r?\n" +                   // body{
+   "\tbackground\:white;\r?\n" +   //   background:white;
+ "\}\r?\n" +                       // }
+-"\r?\n" +                         //
+-"div\{\r?\n" +                    // div{
++"div \{\r?\n" +                    // div{
+   "\tfont\-size\:4em;\r?\n" +     //   font-size:4em;
+   "\tcolor\:red\r?\n" +           //   color:red
+ "\}\r?\n" +                       // }
+-"\r?\n" +                         //
+-"span\{\r?\n" +                   // span{
++"span \{\r?\n" +                   // span{
+   "\tcolor\:green;\r?\n"          //   color:green;
+ "\}\r?\n";                        // }
+ 
+ const ORIGINAL_SOURCE = "" +
+ "body \{ background\: red; \}\r?\n" + // body { background: red; }
+ "div \{\r?\n" +                       // div {
+   "font\-size\: 5em;\r?\n" +          // font-size: 5em;
+   "color\: red\r?\n" +                // color: red
+diff --git a/toolkit/devtools/styleinspector/css-logic.js b/toolkit/devtools/styleinspector/css-logic.js
+index e56b74e..ee65eb5 100644
+--- a/toolkit/devtools/styleinspector/css-logic.js
++++ b/toolkit/devtools/styleinspector/css-logic.js
+@@ -990,60 +990,182 @@ CssLogic.prettifyCSS = function(text, ruleCount) {
+   text = text.replace(/(?:^\s*<!--[\r\n]*)|(?:\s*-->\s*$)/g, "");
+ 
+   // don't attempt to prettify if there's more than one line per rule.
+   let lineCount = text.split("\n").length - 1;
+   if (ruleCount !== null && lineCount >= ruleCount) {
+     return text;
+   }
+ 
+-  let parts = [];    // indented parts
+-  let partStart = 0; // start offset of currently parsed part
++  // We reformat the text using a simple state machine.  The
++  // reformatting preserves most of the input text, changing only
++  // whitespace.  The rules are:
++  //
++  // * After a "{" or ";" symbol, ensure there is a newline and
++  //   indentation before the next non-comment, non-whitespace token.
++  // * Additionally after a "{" symbol, increase the indentation.
++  // * A "}" symbol ensures there is a preceding newline, and
++  //   decreases the indentation level.
++  // * Ensure there is whitespace before a "{".
++  //
++  // This approach can be confused sometimes, but should do ok on a
++  // minified file.
+   let indent = "";
+   let indentLevel = 0;
++  let tokens = domUtils.getCSSLexer(text);
++  let result = "";
++  let pushbackToken = undefined;
+ 
+-  for (let i = 0; i < text.length; i++) {
+-    let c = text[i];
+-    let shouldIndent = false;
+-
+-    switch (c) {
+-      case "}":
+-        if (i - partStart > 1) {
+-          // there's more than just } on the line, add line
+-          parts.push(indent + text.substring(partStart, i));
+-          partStart = i;
+-        }
+-        indent = TAB_CHARS.repeat(--indentLevel);
+-        /* fallthrough */
+-      case ";":
+-      case "{":
+-        shouldIndent = true;
++  // A helper function that reads tokens, looking for the next
++  // non-comment, non-whitespace token.  Comment and whitespace tokens
++  // are appended to |result|.  If this encounters EOF, it returns
++  // null.  Otherwise it returns the last whitespace token that was
++  // seen.  This function also updates |pushbackToken|.
++  let readUntilSignificantToken = () => {
++    while (true) {
++      let token = tokens.nextToken();
++      if (!token || token.tokenType !== "whitespace") {
++        pushbackToken = token;
++        return token;
++      }
++      // Saw whitespace.  Before committing to it, check the next
++      // token.
++      let nextToken = tokens.nextToken();
++      if (!nextToken || nextToken.tokenType !== "comment") {
++        pushbackToken = nextToken;
++        return token;
++      }
++      // Saw whitespace + comment.  Update the result and continue.
++      result = result + text.substring(token.startOffset, nextToken.endOffset);
++    }
++  };
++
++  // State variables for readUntilNewlineNeeded.
++  //
++  // Starting index of the accumulated tokens.
++  let startIndex;
++  // Ending index of the accumulated tokens.
++  let endIndex;
++  // True if any non-whitespace token was seen.
++  let anyNonWS;
++  // True if the terminating token is "}".
++  let isCloseBrace;
++  // True if the token just before the terminating token was
++  // whitespace.
++  let lastWasWS;
++
++  // A helper function that reads tokens until there is a reason to
++  // insert a newline.  This updates the state variables as needed.
++  // If this encounters EOF, it returns null.  Otherwise it returns
++  // the final token read.  Note that if the returned token is "{",
++  // then it will not be included in the computed start/end token
++  // range.  This is used to handle whitespace insertion before a "{".
++  let readUntilNewlineNeeded = () => {
++    let token;
++    while (true) {
++      if (pushbackToken) {
++        token = pushbackToken;
++        pushbackToken = undefined;
++      } else {
++        token = tokens.nextToken();
++      }
++      if (!token) {
++        endIndex = text.length;
+         break;
++      }
++
++      // A "}" symbol must be inserted later, to deal with indentation
++      // and newline.
++      if (token.tokenType === "symbol" && token.text === "}") {
++        isCloseBrace = true;
++        break;
++      } else if (token.tokenType === "symbol" && token.text === "{") {
++        break;
++      }
++
++      if (token.tokenType !== "whitespace") {
++        anyNonWS = true;
++      }
++
++      if (startIndex === undefined) {
++        startIndex = token.startOffset;
++      }
++      endIndex = token.endOffset;
++
++      if (token.tokenType === "symbol" && token.text === ';') {
++        break;
++      }
++
++      lastWasWS = token.tokenType === "whitespace";
+     }
++    return token;
++  };
++
++  while (true) {
++    // Set the initial state.
++    startIndex = undefined;
++    endIndex = undefined;
++    anyNonWS = false;
++    isCloseBrace = false;
++    lastWasWS = false;
+ 
+-    if (shouldIndent) {
+-      let la = text[i+1]; // one-character lookahead
+-      if (!/\n/.test(la) || /^\s+$/.test(text.substring(i+1, text.length))) {
+-        // following character should be a new line, but isn't,
+-        // or it's whitespace at the end of the file
+-        parts.push(indent + text.substring(partStart, i + 1));
+-        if (c == "}") {
+-          parts.push(""); // for extra line separator
+-        }
+-        partStart = i + 1;
++    // Read tokens until we see a reason to insert a newline.
++    let token = readUntilNewlineNeeded();
++
++    // Append any saved up text to the result, applying indentation.
++    if (startIndex !== undefined) {
++      if (isCloseBrace && !anyNonWS) {
++        // If we saw only whitespace followed by a "}", then we don't
++        // need anything here.
+       } else {
+-        return text; // assume it is not minified, early exit
++        result = result + indent + text.substring(startIndex, endIndex);
++        if (isCloseBrace)
++          result += CssLogic.LINE_SEPARATOR;
+       }
+     }
+ 
+-    if (c == "{") {
++    if (isCloseBrace) {
++      indent = TAB_CHARS.repeat(--indentLevel);
++      result = result + indent + '}';
++    }
++
++    if (!token) {
++      break;
++    }
++
++    if (token.tokenType === "symbol" && token.text === '{') {
++      if (!lastWasWS) {
++        result += ' ';
++      }
++      result += '{';
+       indent = TAB_CHARS.repeat(++indentLevel);
+     }
++
++    // Now it is time to insert a newline.  However first we want to
++    // deal with any trailing comments.
++    token = readUntilSignificantToken();
++
++    // "Early" bail-out if the text does not appear to be minified.
++    // Here we ignore the case where whitespace appears at the end of
++    // the text.
++    if (pushbackToken && token && token.tokenType === "whitespace" &&
++        /\n/g.test(text.substring(token.startOffset, token.endOffset))) {
++      return text;
++    }
++
++    // Finally time for that newline.
++    result = result + CssLogic.LINE_SEPARATOR;
++
++    // Maybe we hit EOF.
++    if (!pushbackToken) {
++      break;
++    }
+   }
+-  return parts.join(CssLogic.LINE_SEPARATOR);
++
++  return result;
+ };
+ 
+ /**
+  * A safe way to access cached bits of information about a stylesheet.
+  *
+  * @constructor
+  * @param {CssLogic} aCssLogic pointer to the CssLogic instance working with
+  * this CssSheet object.
+diff --git a/toolkit/devtools/tests/unit/test_prettifyCSS.js b/toolkit/devtools/tests/unit/test_prettifyCSS.js
+new file mode 100644
+index 0000000..18fd766
+--- /dev/null
++++ b/toolkit/devtools/tests/unit/test_prettifyCSS.js
+@@ -0,0 +1,64 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++// Test prettifyCSS.
++
++"use strict";
++
++const loader = new DevToolsLoader();
++const require = loader.require;
++const {CssLogic} = require("devtools/styleinspector/css-logic");
++
++
++const TESTS = [
++  { name: "simple test",
++    input: "div { font-family:'Arial Black', Arial, sans-serif; }",
++    expected: [
++      "div {",
++      "\tfont-family:'Arial Black', Arial, sans-serif;",
++      "}"
++    ]
++  },
++
++  { name: "whitespace before open brace",
++    input: "div{}",
++    expected: [
++      "div {",
++      "}"
++    ]
++  },
++
++  { name: "minified with trailing newline",
++    input: "\nbody{background:white;}div{font-size:4em;color:red}span{color:green;}\n",
++    expected: [
++      "",
++      "body {",
++      "\tbackground:white;",
++      "}",
++      "div {",
++      "\tfont-size:4em;",
++      "\tcolor:red",
++      "}",
++      "span {",
++      "\tcolor:green;",
++      "}"
++    ]
++  },
++
++];
++
++function run_test() {
++  // Note that CssLogic.LINE_SEPARATOR is computed lazily, so we
++  // ensure it is set.
++  CssLogic.prettifyCSS("");
++
++  for (let test of TESTS) {
++    do_print(test.name);
++
++    let input = test.input.split("\n").join(CssLogic.LINE_SEPARATOR);
++    let output = CssLogic.prettifyCSS(input);
++    let expected = test.expected.join(CssLogic.LINE_SEPARATOR) +
++        CssLogic.LINE_SEPARATOR;
++    equal(output, expected, test.name);
++  }
++}
+diff --git a/toolkit/devtools/tests/unit/xpcshell.ini b/toolkit/devtools/tests/unit/xpcshell.ini
+index 7ba8de7..81684e1 100644
+--- a/toolkit/devtools/tests/unit/xpcshell.ini
++++ b/toolkit/devtools/tests/unit/xpcshell.ini
+@@ -7,11 +7,12 @@ support-files =
+   exposeLoader.js
+ 
+ [test_independent_loaders.js]
+ [test_invisible_loader.js]
+ [test_safeErrorString.js]
+ [test_defineLazyPrototypeGetter.js]
+ [test_async-utils.js]
+ [test_consoleID.js]
++[test_prettifyCSS.js]
+ [test_require_lazy.js]
+ [test_require.js]
+ [test_stack.js]
