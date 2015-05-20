@@ -1,0 +1,319 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  200691b3395383bf4d9b490ad6a3508bb89885c1
+1164327- Resizing performance tool doesn't not maintain selection accurately
+
+diff --git a/browser/devtools/performance/performance.xul b/browser/devtools/performance/performance.xul
+--- a/browser/devtools/performance/performance.xul
++++ b/browser/devtools/performance/performance.xul
+@@ -145,22 +145,23 @@
+               flex="1">
+           <hbox class="devtools-toolbarbutton-group"
+                 pack="center">
+             <toolbarbutton class="devtools-toolbarbutton record-button"
+                            label="&profilerUI.startRecording;" />
+           </hbox>
+         </hbox>
+         <vbox id="performance-view-content" flex="1">
++          <box id="box-wrapper">
+           <vbox id="overview-pane">
+             <hbox id="markers-overview"/>
+             <hbox id="memory-overview"/>
+             <hbox id="time-framerate"/>
+           </vbox>
+-          <deck id="details-pane-container" flex="1">
++          <deck id="details-pane-container">
+             <hbox id="loading-notice"
+                   class="notice-container devtools-throbber"
+                   align="center"
+                   pack="center"
+                   flex="1">
+               <label value="&profilerUI.loadingNotice;"/>
+             </hbox>
+             <hbox id="recording-notice"
+@@ -169,20 +170,22 @@
+                   pack="center"
+                   flex="1">
+               <vbox>
+                 <hbox class="devtools-toolbarbutton-group"
+                       pack="center">
+                   <toolbarbutton class="devtools-toolbarbutton record-button"
+                                  label="&profilerUI.stopRecording;" />
+                 </hbox>
+-                <label class="realtime-disabled-message"
+-                       value="Realtime recording data disabled on non-multiprocess Firefox."/>
+-                <label class="realtime-disabled-on-e10s-message"
+-                       value="Enable multiprocess Firefox in preferences for rendering recording data in realtime."/>
++                <label class="realtime-disabled-message">
++                  Realtime recording data disabled on non-multiprocess Firefox
++                </label>
++                <label class="realtime-disabled-on-e10s-message">
++                  Enable multiprocess Firefox in preferences for rendering recording data in realtime.
++                </label>
+                 <label class="buffer-status-message"
+                        tooltiptext="&profilerUI.bufferStatusTooltip;"/>
+                 <label class="buffer-status-message-full"
+                        value="&profilerUI.bufferStatusFull;"/>
+               </vbox>
+             </hbox>
+             <hbox id="console-recording-notice"
+                   class="notice-container"
+@@ -292,13 +295,14 @@
+                 </hbox>
+                 <vbox class="call-tree-cells-container" flex="1"/>
+               </vbox>
+ 
+               <hbox id="memory-flamegraph-view" flex="1">
+               </hbox>
+             </deck>
+           </deck>
++          </box>
+         </vbox>
+       </deck>
+     </vbox>
+   </hbox>
+ </window>
+diff --git a/browser/devtools/shared/widgets/Graphs.jsm b/browser/devtools/shared/widgets/Graphs.jsm
+--- a/browser/devtools/shared/widgets/Graphs.jsm
++++ b/browser/devtools/shared/widgets/Graphs.jsm
+@@ -5,16 +5,18 @@
+ 
+ const Cu = Components.utils;
+ 
+ Cu.import("resource:///modules/devtools/ViewHelpers.jsm");
+ const promise = Cu.import("resource://gre/modules/Promise.jsm", {}).Promise;
+ const {Task} = Cu.import("resource://gre/modules/Task.jsm", {});
+ const {EventEmitter} = Cu.import("resource://gre/modules/devtools/event-emitter.js", {});
+ const {DevToolsWorker} = Cu.import("resource://gre/modules/devtools/shared/worker.js", {});
++const {DeferredTask} = Cu.import("resource://gre/modules/DeferredTask.jsm", {});
++const {console} = Components.utils.import("resource://gre/modules/devtools/Console.jsm", {});
+ 
+ this.EXPORTED_SYMBOLS = [
+   "GraphCursor",
+   "GraphArea",
+   "GraphAreaDragger",
+   "GraphAreaResizer",
+   "AbstractCanvasGraph",
+   "LineGraphWidget",
+@@ -163,19 +165,17 @@ this.AbstractCanvasGraph = function(pare
+     this._pixelRatio = sharpness || this._window.devicePixelRatio;
+ 
+     let container = this._container = this._document.getElementById("graph-container");
+     container.className = name + "-widget-container graph-widget-container";
+ 
+     let canvas = this._canvas = this._document.getElementById("graph-canvas");
+     canvas.className = name + "-widget-canvas graph-widget-canvas";
+ 
+-    let bounds = parent.getBoundingClientRect();
+-    bounds.width = this.fixedWidth || bounds.width;
+-    bounds.height = this.fixedHeight || bounds.height;
++    let bounds = this.bounds;
+     iframe.setAttribute("width", bounds.width);
+     iframe.setAttribute("height", bounds.height);
+ 
+     this._width = canvas.width = bounds.width * this._pixelRatio;
+     this._height = canvas.height = bounds.height * this._pixelRatio;
+     this._ctx = canvas.getContext("2d");
+     this._ctx.mozImageSmoothingEnabled = false;
+ 
+@@ -187,18 +187,21 @@ this.AbstractCanvasGraph = function(pare
+ 
+     this._onAnimationFrame = this._onAnimationFrame.bind(this);
+     this._onMouseMove = this._onMouseMove.bind(this);
+     this._onMouseDown = this._onMouseDown.bind(this);
+     this._onMouseUp = this._onMouseUp.bind(this);
+     this._onMouseWheel = this._onMouseWheel.bind(this);
+     this._onMouseOut = this._onMouseOut.bind(this);
+     this._onResize = this._onResize.bind(this);
++
+     this.refresh = this.refresh.bind(this);
+ 
++    this.refreshResizeTask = new DeferredTask(this.refresh, GRAPH_RESIZE_EVENTS_DRAIN);
++
+     this._window.addEventListener("mousemove", this._onMouseMove);
+     this._window.addEventListener("mousedown", this._onMouseDown);
+     this._window.addEventListener("MozMousePixelScroll", this._onMouseWheel);
+     this._window.addEventListener("mouseout", this._onMouseOut);
+ 
+     let ownerWindow = this._parent.ownerDocument.defaultView;
+     ownerWindow.addEventListener("resize", this._onResize);
+ 
+@@ -216,16 +219,28 @@ AbstractCanvasGraph.prototype = {
+    */
+   get width() {
+     return this._width;
+   },
+   get height() {
+     return this._height;
+   },
+ 
++  get bounds() {
++    // let parentFrameRect = this._parent.ownerDocument.defaultView.frameElement.getBoundingClientRect();
++    // let quads = this._parent.getBoxQuads()[0];
++    // let width = parentFrameRect.width - quads.p1.x;
++    // let height = quads.p3.y - quads.p1.y;
++    let {width,height} = this._parent.getBoundingClientRect();
++    width = Math.max(200, this.fixedWidth || width);
++    height = Math.max(10, this.fixedHeight || height);
++
++    return {width,height};
++  },
++
+   /**
+    * Return true if the mouse is actively messing with the selection, false
+    * otherwise.
+    */
+   get isMouseActive() {
+     return this._isMouseActive;
+   },
+ 
+@@ -249,16 +264,18 @@ AbstractCanvasGraph.prototype = {
+     this._window.removeEventListener("MozMousePixelScroll", this._onMouseWheel);
+     this._window.removeEventListener("mouseout", this._onMouseOut);
+ 
+     let ownerWindow = this._parent.ownerDocument.defaultView;
+     if (ownerWindow) {
+       ownerWindow.removeEventListener("resize", this._onResize);
+     }
+ 
++    this.refreshResizeTask.disarm();
++
+     this._window.cancelAnimationFrame(this._animationId);
+     this._iframe.remove();
+ 
+     this._cursor = null;
+     this._selection = null;
+     this._selectionDragger = null;
+     this._selectionResizer = null;
+ 
+@@ -666,31 +683,40 @@ AbstractCanvasGraph.prototype = {
+ 
+   /**
+    * Updates this graph to reflect the new dimensions of the parent node.
+    *
+    * @param boolean options.force
+    *        Force redrawing everything
+    */
+   refresh: function(options={}) {
+-    let bounds = this._parent.getBoundingClientRect();
+-    let newWidth = this.fixedWidth || bounds.width;
+-    let newHeight = this.fixedHeight || bounds.height;
++    this._iframe.removeAttribute("width");
++    this._iframe.removeAttribute("height");
++    // let parentFrameRect = this._parent.ownerDocument.defaultView.frameElement.getBoundingClientRect();
++    // let quads = this._parent.getBoxQuads()[0];
++    // let bounds = { width: parentFrameRect.width - quads.p1.x, height: quads.p3.y - quads.p1.y };
++    // // let bounds = { width: quads.p2.x - quads.p1.x, height: quads.p3.y - quads.p1.y };
++    // // let bounds = this._parent.getBoundingClientRect();
++    // let newWidth = Math.max(200, this.fixedWidth || bounds.width);
++    // let newHeight = Math.max(10, this.fixedHeight || bounds.height);
++
++    let bounds = this.bounds;
++    this._iframe.setAttribute("width", bounds.width);
++    this._iframe.setAttribute("height", bounds.height);
+ 
+     // Prevent redrawing everything if the graph's width & height won't change,
+     // except if force=true.
+     if (!options.force &&
+-        this._width == newWidth * this._pixelRatio &&
+-        this._height == newHeight * this._pixelRatio) {
++        this._width == bounds.width * this._pixelRatio &&
++        this._height == bounds.height * this._pixelRatio) {
+       this.emit("refresh-cancelled");
+       return;
+     }
+ 
+-    bounds.width = newWidth;
+-    bounds.height = newHeight;
++    console.log("resize", bounds.width, bounds.height, this._width, this._height);
+     this._iframe.setAttribute("width", bounds.width);
+     this._iframe.setAttribute("height", bounds.height);
+     this._width = this._canvas.width = bounds.width * this._pixelRatio;
+     this._height = this._canvas.height = bounds.height * this._pixelRatio;
+ 
+     if (this.hasData()) {
+       this._cachedBackgroundImage = this.buildBackgroundImage();
+       this._cachedGraphImage = this.buildGraphImage();
+@@ -1220,17 +1246,17 @@ AbstractCanvasGraph.prototype = {
+     }
+   },
+ 
+   /**
+    * Listener for the "resize" event on the graph's parent node.
+    */
+   _onResize: function() {
+     if (this.hasData()) {
+-      setNamedTimeout(this._uid, GRAPH_RESIZE_EVENTS_DRAIN, this.refresh);
++      this.refreshResizeTask.arm();
+     }
+   }
+ };
+ 
+ /**
+  * A basic line graph, plotting values on a curve and adding helper lines
+  * and tooltips for maximum, average and minimum values.
+  *
+diff --git a/browser/themes/shared/devtools/performance.inc.css b/browser/themes/shared/devtools/performance.inc.css
+--- a/browser/themes/shared/devtools/performance.inc.css
++++ b/browser/themes/shared/devtools/performance.inc.css
+@@ -13,16 +13,42 @@
+ 
+ .theme-light {
+   --cell-border-color: rgba(0,0,0,0.15);
+   --focus-cell-border-color: rgba(0,0,0,0.3);
+   --row-alt-background-color: rgba(76,158,217,0.1);
+   --row-hover-background-color: rgba(76,158,217,0.2);
+ }
+ 
++iframe {
++  min-width: 200px;
++}
++#box-wrapper {
++  display: block;
++}
++/*
++#box-wrapper {
++  display: flex;
++  flex-direction: column;
++}*/
++
++#performance-view-content {
++  overflow: auto;
++}
++#overview-pane,
++#details-pane-container {
++  width: 100%;
++}
++#overview-pane > hbox {
++  width: 100%;
++}
++
++#details-pane-container {
++  /*flex: 1;*/
++}
+ /* Toolbar */
+ 
+ #performance-toolbar > tabs,
+ #performance-toolbar {
+   -moz-border-end-color: var(--theme-splitter-color);
+ }
+ 
+ #performance-toolbar-control-other {
+@@ -115,16 +141,17 @@
+ #performance-view .realtime-disabled-message,
+ #performance-view .realtime-disabled-on-e10s-message {
+   display: none;
+ }
+ 
+ #performance-view[e10s="disabled"] .realtime-disabled-on-e10s-message {
+   display: block;
+   opacity: 0.5;
++  max-width: 400px;
+ 
+ }
+ #performance-view[e10s="unsupported"] .realtime-disabled-message {
+   display: block;
+   opacity: 0.5;
+ }
+ 
+ #details-pane-container .buffer-status-message,
