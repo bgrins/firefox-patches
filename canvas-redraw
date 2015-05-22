@@ -1,0 +1,241 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  dd444a7dd2832d1b438e89d033f7aea4abe847e8
+Bug 1164327 - Improve perceived performance of canvas redrawing
+
+diff --git a/browser/devtools/shared/widgets/Graphs.jsm b/browser/devtools/shared/widgets/Graphs.jsm
+--- a/browser/devtools/shared/widgets/Graphs.jsm
++++ b/browser/devtools/shared/widgets/Graphs.jsm
+@@ -5,16 +5,17 @@
+ 
+ const Cu = Components.utils;
+ 
+ Cu.import("resource:///modules/devtools/ViewHelpers.jsm");
+ const promise = Cu.import("resource://gre/modules/Promise.jsm", {}).Promise;
+ const {Task} = Cu.import("resource://gre/modules/Task.jsm", {});
+ const {EventEmitter} = Cu.import("resource://gre/modules/devtools/event-emitter.js", {});
+ const {DevToolsWorker} = Cu.import("resource://gre/modules/devtools/shared/worker.js", {});
++const {DeferredTask} = Cu.import("resource://gre/modules/DeferredTask.jsm", {});
+ 
+ this.EXPORTED_SYMBOLS = [
+   "GraphCursor",
+   "GraphArea",
+   "GraphAreaDragger",
+   "GraphAreaResizer",
+   "AbstractCanvasGraph",
+   "LineGraphWidget",
+@@ -24,17 +25,17 @@ this.EXPORTED_SYMBOLS = [
+ 
+ const HTML_NS = "http://www.w3.org/1999/xhtml";
+ const GRAPH_SRC = "chrome://browser/content/devtools/graphs-frame.xhtml";
+ const WORKER_URL = "resource:///modules/devtools/GraphsWorker.js";
+ const L10N = new ViewHelpers.L10N();
+ 
+ // Generic constants.
+ 
+-const GRAPH_RESIZE_EVENTS_DRAIN = 100; // ms
++const GRAPH_RESIZE_EVENTS_DRAIN = 10; // ms
+ const GRAPH_WHEEL_ZOOM_SENSITIVITY = 0.00075;
+ const GRAPH_WHEEL_SCROLL_SENSITIVITY = 0.1;
+ const GRAPH_WHEEL_MIN_SELECTION_WIDTH = 10; // px
+ 
+ const GRAPH_SELECTION_BOUNDARY_HOVER_LINE_WIDTH = 4; // px
+ const GRAPH_SELECTION_BOUNDARY_HOVER_THRESHOLD = 10; // px
+ const GRAPH_MAX_SELECTION_LEFT_PADDING = 1;
+ const GRAPH_MAX_SELECTION_RIGHT_PADDING = 1;
+@@ -147,35 +148,32 @@ this.GraphAreaResizer = function() {
+  *        Defaults to the current device pixel ratio.
+  */
+ this.AbstractCanvasGraph = function(parent, name, sharpness) {
+   EventEmitter.decorate(this);
+ 
+   this._parent = parent;
+   this._ready = promise.defer();
+ 
+-  this._uid = "canvas-graph-" + Date.now();
+   this._renderTargets = new Map();
+ 
+   AbstractCanvasGraph.createIframe(GRAPH_SRC, parent, iframe => {
+     this._iframe = iframe;
+     this._window = iframe.contentWindow;
+     this._topWindow = this._window.top;
+     this._document = iframe.contentDocument;
+     this._pixelRatio = sharpness || this._window.devicePixelRatio;
+ 
+     let container = this._container = this._document.getElementById("graph-container");
+     container.className = name + "-widget-container graph-widget-container";
+ 
+     let canvas = this._canvas = this._document.getElementById("graph-canvas");
+     canvas.className = name + "-widget-canvas graph-widget-canvas";
+ 
+-    let bounds = parent.getBoundingClientRect();
+-    bounds.width = this.fixedWidth || bounds.width;
+-    bounds.height = this.fixedHeight || bounds.height;
++    let bounds = this.bounds;
+     iframe.setAttribute("width", bounds.width);
+     iframe.setAttribute("height", bounds.height);
+ 
+     this._width = canvas.width = bounds.width * this._pixelRatio;
+     this._height = canvas.height = bounds.height * this._pixelRatio;
+     this._ctx = canvas.getContext("2d");
+     this._ctx.mozImageSmoothingEnabled = false;
+ 
+@@ -188,16 +186,17 @@ this.AbstractCanvasGraph = function(pare
+     this._onAnimationFrame = this._onAnimationFrame.bind(this);
+     this._onMouseMove = this._onMouseMove.bind(this);
+     this._onMouseDown = this._onMouseDown.bind(this);
+     this._onMouseUp = this._onMouseUp.bind(this);
+     this._onMouseWheel = this._onMouseWheel.bind(this);
+     this._onMouseOut = this._onMouseOut.bind(this);
+     this._onResize = this._onResize.bind(this);
+     this.refresh = this.refresh.bind(this);
++    this._refreshTask = new DeferredTask(this.refresh, GRAPH_RESIZE_EVENTS_DRAIN);
+ 
+     this._window.addEventListener("mousemove", this._onMouseMove);
+     this._window.addEventListener("mousedown", this._onMouseDown);
+     this._window.addEventListener("MozMousePixelScroll", this._onMouseWheel);
+     this._window.addEventListener("mouseout", this._onMouseOut);
+ 
+     let ownerWindow = this._parent.ownerDocument.defaultView;
+     ownerWindow.addEventListener("resize", this._onResize);
+@@ -217,16 +216,27 @@ AbstractCanvasGraph.prototype = {
+   get width() {
+     return this._width;
+   },
+   get height() {
+     return this._height;
+   },
+ 
+   /**
++   * The actual size of the parent element.
++   * @return object {width,height}
++   */
++  get bounds() {
++    let bounds = this._parent.getBoundingClientRect();
++    let width = this.fixedWidth || bounds.width;
++    let height = this.fixedHeight || bounds.height;
++    return {width,height};
++  },
++
++  /**
+    * Return true if the mouse is actively messing with the selection, false
+    * otherwise.
+    */
+   get isMouseActive() {
+     return this._isMouseActive;
+   },
+ 
+   /**
+@@ -666,42 +676,36 @@ AbstractCanvasGraph.prototype = {
+ 
+   /**
+    * Updates this graph to reflect the new dimensions of the parent node.
+    *
+    * @param boolean options.force
+    *        Force redrawing everything
+    */
+   refresh: function(options={}) {
+-    let bounds = this._parent.getBoundingClientRect();
+-    let newWidth = this.fixedWidth || bounds.width;
+-    let newHeight = this.fixedHeight || bounds.height;
++    let bounds = this.bounds;
+ 
+     // Prevent redrawing everything if the graph's width & height won't change,
+     // except if force=true.
+     if (!options.force &&
+-        this._width == newWidth * this._pixelRatio &&
+-        this._height == newHeight * this._pixelRatio) {
++        this._width == bounds.width * this._pixelRatio &&
++        this._height == bounds.height * this._pixelRatio) {
+       this.emit("refresh-cancelled");
+       return;
+     }
+ 
+     // Handle a changed size by mapping the old selection to the new width
+-    if (this._width && newWidth && this.hasSelection()) {
+-      let ratio = this._width / (newWidth * this._pixelRatio);
++    if (this._width && bounds.width && this.hasSelection()) {
++      let ratio = this._width / (bounds.width * this._pixelRatio);
+       this._selection.start = this._selection.start / ratio;
+       this._selection.end = this._selection.end / ratio;
+     }
+ 
+-    bounds.width = newWidth;
+-    bounds.height = newHeight;
+-    this._iframe.setAttribute("width", bounds.width);
+-    this._iframe.setAttribute("height", bounds.height);
+-    this._width = this._canvas.width = bounds.width * this._pixelRatio;
+-    this._height = this._canvas.height = bounds.height * this._pixelRatio;
++    this._width = bounds.width * this._pixelRatio;
++    this._height = bounds.height * this._pixelRatio;
+ 
+     if (this.hasData()) {
+       this._cachedBackgroundImage = this.buildBackgroundImage();
+       this._cachedGraphImage = this.buildGraphImage();
+     }
+     if (this.hasMask()) {
+       this._cachedMaskImage = this.buildMaskImage.apply(this, this._maskArgs);
+     }
+@@ -726,16 +730,17 @@ AbstractCanvasGraph.prototype = {
+    *        container canvas width and height.
+    */
+   _getNamedCanvas: function(name, width = this._width, height = this._height) {
+     let cachedRenderTarget = this._renderTargets.get(name);
+     if (cachedRenderTarget) {
+       let { canvas, ctx } = cachedRenderTarget;
+       canvas.width = width;
+       canvas.height = height;
++
+       ctx.clearRect(0, 0, width, height);
+       return cachedRenderTarget;
+     }
+ 
+     let canvas = this._document.createElementNS(HTML_NS, "canvas");
+     let ctx = canvas.getContext("2d");
+     canvas.width = width;
+     canvas.height = height;
+@@ -764,17 +769,24 @@ AbstractCanvasGraph.prototype = {
+    * Redraws the widget when necessary. The actual graph is not refreshed
+    * every time this function is called, only the cliphead, selection etc.
+    */
+   _drawWidget: function() {
+     if (!this._shouldRedraw) {
+       return;
+     }
+     let ctx = this._ctx;
+-    ctx.clearRect(0, 0, this._width, this._height);
++    this._canvas.width = this._width;
++    this._canvas.height = this._height;
++
++    let bounds = this.bounds;
++    this._iframe.setAttribute("width", bounds.width);
++    this._iframe.setAttribute("height", bounds.height);
++    this._canvas.style.width = bounds.width + "px";
++    this._canvas.style.height =  bounds.height + "px";
+ 
+     if (this._cachedGraphImage) {
+       ctx.drawImage(this._cachedGraphImage, 0, 0, this._width, this._height);
+     }
+     if (this._cachedMaskImage) {
+       ctx.globalCompositeOperation = "destination-out";
+       ctx.drawImage(this._cachedMaskImage, 0, 0, this._width, this._height);
+     }
+@@ -1227,17 +1239,17 @@ AbstractCanvasGraph.prototype = {
+     }
+   },
+ 
+   /**
+    * Listener for the "resize" event on the graph's parent node.
+    */
+   _onResize: function() {
+     if (this.hasData()) {
+-      setNamedTimeout(this._uid, GRAPH_RESIZE_EVENTS_DRAIN, this.refresh);
++      this._refreshTask.arm();
+     }
+   }
+ };
+ 
+ /**
+  * A basic line graph, plotting values on a curve and adding helper lines
+  * and tooltips for maximum, average and minimum values.
+  *
