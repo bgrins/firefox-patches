@@ -1,0 +1,928 @@
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+index a94835b..6a0173e 100644
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -1432,19 +1432,20 @@ pref("devtools.debugger.remote-host", "localhost");
+ pref("devtools.debugger.remote-timeout", 20000);
+ pref("devtools.debugger.pause-on-exceptions", false);
+ pref("devtools.debugger.ignore-caught-exceptions", true);
+ pref("devtools.debugger.source-maps-enabled", true);
+ pref("devtools.debugger.pretty-print-enabled", true);
+ pref("devtools.debugger.auto-pretty-print", false);
+ pref("devtools.debugger.auto-black-box", true);
+ pref("devtools.debugger.tracer", false);
++pref("devtools.debugger.workers", false);
+ 
+ // The default Debugger UI settings
+-pref("devtools.debugger.ui.panes-sources-width", 200);
++pref("devtools.debugger.ui.panes-workers-and-sources-width", 200);
+ pref("devtools.debugger.ui.panes-instruments-width", 300);
+ pref("devtools.debugger.ui.panes-visible-on-startup", false);
+ pref("devtools.debugger.ui.variables-sorting-enabled", true);
+ pref("devtools.debugger.ui.variables-only-enum-visible", false);
+ pref("devtools.debugger.ui.variables-searchbox-visible", false);
+ 
+ // Enable the Performance tools
+ pref("devtools.performance.enabled", true);
+diff --git a/browser/devtools/debugger/debugger-controller.js b/browser/devtools/debugger/debugger-controller.js
+index 0b26a1c..e9a27ee 100644
+--- a/browser/devtools/debugger/debugger-controller.js
++++ b/browser/devtools/debugger/debugger-controller.js
+@@ -177,16 +177,19 @@ let DebuggerController = {
+     if (this._shutdown) {
+       return;
+     }
+ 
+     yield DebuggerView.destroy();
+     this.SourceScripts.disconnect();
+     this.StackFrames.disconnect();
+     this.ThreadState.disconnect();
++    if (this._target.isTabActor) {
++      this.Workers.disconnect();
++    }
+     this.Tracer.disconnect();
+     this.disconnect();
+ 
+     this._shutdown = true;
+   }),
+ 
+   /**
+    * Initiates remote debugging based on the current target, wiring event
+@@ -314,16 +317,17 @@ let DebuggerController = {
+     };
+ 
+     this._target.activeTab.attachThread(threadOptions, (aResponse, aThreadClient) => {
+       if (!aThreadClient) {
+         deferred.reject(new Error("Couldn't attach to thread: " + aResponse.error));
+         return;
+       }
+       this.activeThread = aThreadClient;
++      this.Workers.connect();
+       this.ThreadState.connect();
+       this.StackFrames.connect();
+       this.SourceScripts.connect();
+ 
+       if (aThreadClient.paused) {
+         aThreadClient.resume(this._ensureResumptionOrder);
+       }
+ 
+@@ -441,16 +445,85 @@ let DebuggerController = {
+ 
+   _startup: false,
+   _shutdown: false,
+   _connected: false,
+   client: null,
+   activeThread: null
+ };
+ 
++function Workers() {
++  this._workerClients = new Map();
++  this._onWorkerListChanged = this._onWorkerListChanged.bind(this);
++  this._onWorkerFreeze = this._onWorkerFreeze.bind(this);
++  this._onWorkerThaw = this._onWorkerThaw.bind(this);
++}
++
++Workers.prototype = {
++  get _tabClient() {
++    return DebuggerController._target.activeTab;
++  },
++
++  connect: function () {
++    if (!Prefs.workersEnabled) {
++      return;
++    }
++
++    this._updateWorkerList();
++    this._tabClient.addListener("workerListChanged", this._onWorkerListChanged);
++  },
++
++  disconnect: function () {
++    this._tabClient.removeListener("workerListChanged", this._onWorkerListChanged);
++  },
++
++  _updateWorkerList: function () {
++    this._tabClient.listWorkers((response) => {
++      let workerActors = new Set();
++      for (let worker of response.workers) {
++        workerActors.add(worker.actor);
++      }
++
++      for (let [workerActor, workerClient] of this._workerClients) {
++        if (!workerActors.has(workerActor)) {
++          workerClient.removeListener("freeze", this._onWorkerFreeze);
++          workerClient.removeListener("thaw", this._onWorkerThaw);
++          this._workerClients.delete(workerActor);
++          DebuggerView.Workers.removeWorker(workerActor);
++        }
++      }
++
++      for (let actor of workerActors) {
++        let workerActor = actor
++        if (!this._workerClients.has(workerActor)) {
++          this._tabClient.attachWorker(workerActor, (response, workerClient) => {
++            workerClient.addListener("freeze", this._onWorkerFreeze);
++            workerClient.addListener("thaw", this._onWorkerThaw);
++            this._workerClients.set(workerActor, workerClient);
++            DebuggerView.Workers.addWorker(workerActor, workerClient.url);
++          });
++        }
++      }
++    });
++  },
++
++  _onWorkerListChanged: function () {
++    this._updateWorkerList();
++  },
++
++  _onWorkerFreeze: function (type, packet) {
++    DebuggerView.Workers.removeWorker(packet.from);
++  },
++
++  _onWorkerThaw: function (type, packet) {
++    let workerClient = this._workerClients.get(packet.from);
++    DebuggerView.Workers.addWorker(packet.from, workerClient.url);
++  }
++};
++
+ /**
+  * ThreadState keeps the UI up to date with the state of the
+  * thread (paused/attached/etc.).
+  */
+ function ThreadState() {
+   this._update = this._update.bind(this);
+   this.interruptedByResumeButton = false;
+ }
+@@ -2410,42 +2483,44 @@ HitCounts.prototype = {
+  * Localization convenience methods.
+  */
+ let L10N = new ViewHelpers.L10N(DBG_STRINGS_URI);
+ 
+ /**
+  * Shortcuts for accessing various debugger preferences.
+  */
+ let Prefs = new ViewHelpers.Prefs("devtools", {
+-  sourcesWidth: ["Int", "debugger.ui.panes-sources-width"],
++  workersAndSourcesWidth: ["Int", "debugger.ui.panes-workers-and-sources-width"],
+   instrumentsWidth: ["Int", "debugger.ui.panes-instruments-width"],
+   panesVisibleOnStartup: ["Bool", "debugger.ui.panes-visible-on-startup"],
+   variablesSortingEnabled: ["Bool", "debugger.ui.variables-sorting-enabled"],
+   variablesOnlyEnumVisible: ["Bool", "debugger.ui.variables-only-enum-visible"],
+   variablesSearchboxVisible: ["Bool", "debugger.ui.variables-searchbox-visible"],
+   pauseOnExceptions: ["Bool", "debugger.pause-on-exceptions"],
+   ignoreCaughtExceptions: ["Bool", "debugger.ignore-caught-exceptions"],
+   sourceMapsEnabled: ["Bool", "debugger.source-maps-enabled"],
+   prettyPrintEnabled: ["Bool", "debugger.pretty-print-enabled"],
+   autoPrettyPrint: ["Bool", "debugger.auto-pretty-print"],
+   tracerEnabled: ["Bool", "debugger.tracer"],
++  workersEnabled: ["Bool", "debugger.workers"],
+   editorTabSize: ["Int", "editor.tabsize"],
+   autoBlackBox: ["Bool", "debugger.auto-black-box"]
+ });
+ 
+ /**
+  * Convenient way of emitting events from the panel window.
+  */
+ EventEmitter.decorate(this);
+ 
+ /**
+  * Preliminary setup for the DebuggerController object.
+  */
+ DebuggerController.initialize();
+ DebuggerController.Parser = new Parser();
++DebuggerController.Workers = new Workers();
+ DebuggerController.ThreadState = new ThreadState();
+ DebuggerController.StackFrames = new StackFrames();
+ DebuggerController.SourceScripts = new SourceScripts();
+ DebuggerController.Breakpoints = new Breakpoints();
+ DebuggerController.Breakpoints.DOM = new EventListeners();
+ DebuggerController.Tracer = new Tracer();
+ DebuggerController.HitCounts = new HitCounts();
+ 
+diff --git a/browser/devtools/debugger/debugger-view.js b/browser/devtools/debugger/debugger-view.js
+index 3e27dfb..c19ebd5 100644
+--- a/browser/devtools/debugger/debugger-view.js
++++ b/browser/devtools/debugger/debugger-view.js
+@@ -50,16 +50,17 @@ let DebuggerView = {
+     this._startup = deferred.promise;
+ 
+     this._initializePanes();
+     this.Toolbar.initialize();
+     this.Options.initialize();
+     this.Filtering.initialize();
+     this.StackFrames.initialize();
+     this.StackFramesClassicList.initialize();
++    this.Workers.initialize();
+     this.Sources.initialize();
+     this.VariableBubble.initialize();
+     this.Tracer.initialize();
+     this.WatchExpressions.initialize();
+     this.EventListeners.initialize();
+     this.GlobalSearch.initialize();
+     this._initializeVariablesView();
+     this._initializeEditor(deferred.resolve);
+@@ -103,53 +104,53 @@ let DebuggerView = {
+   /**
+    * Initializes the UI for all the displayed panes.
+    */
+   _initializePanes: function() {
+     dumpn("Initializing the DebuggerView panes");
+ 
+     this._body = document.getElementById("body");
+     this._editorDeck = document.getElementById("editor-deck");
+-    this._sourcesPane = document.getElementById("sources-pane");
++    this._workersAndSourcesPane = document.getElementById("workers-and-sources-pane");
+     this._instrumentsPane = document.getElementById("instruments-pane");
+     this._instrumentsPaneToggleButton = document.getElementById("instruments-pane-toggle");
+ 
+     this.showEditor = this.showEditor.bind(this);
+     this.showBlackBoxMessage = this.showBlackBoxMessage.bind(this);
+     this.showProgressBar = this.showProgressBar.bind(this);
+     this.maybeShowBlackBoxMessage = this.maybeShowBlackBoxMessage.bind(this);
+ 
+     this._onTabSelect = this._onInstrumentsPaneTabSelect.bind(this);
+     this._instrumentsPane.tabpanels.addEventListener("select", this._onTabSelect);
+ 
+     this._collapsePaneString = L10N.getStr("collapsePanes");
+     this._expandPaneString = L10N.getStr("expandPanes");
+ 
+-    this._sourcesPane.setAttribute("width", Prefs.sourcesWidth);
++    this._workersAndSourcesPane.setAttribute("width", Prefs.workersAndSourcesWidth);
+     this._instrumentsPane.setAttribute("width", Prefs.instrumentsWidth);
+     this.toggleInstrumentsPane({ visible: Prefs.panesVisibleOnStartup });
+ 
+     // Side hosts requires a different arrangement of the debugger widgets.
+     if (gHostType == "side") {
+       this.handleHostChanged(gHostType);
+     }
+   },
+ 
+   /**
+    * Destroys the UI for all the displayed panes.
+    */
+   _destroyPanes: function() {
+     dumpn("Destroying the DebuggerView panes");
+ 
+     if (gHostType != "side") {
+-      Prefs.sourcesWidth = this._sourcesPane.getAttribute("width");
++      Prefs.workersAndSourcesWidth = this._workersAndSourcesPane.getAttribute("width");
+       Prefs.instrumentsWidth = this._instrumentsPane.getAttribute("width");
+     }
+ 
+-    this._sourcesPane = null;
++    this._workersAndSourcesPane = null;
+     this._instrumentsPane = null;
+     this._instrumentsPaneToggleButton = null;
+   },
+ 
+   /**
+    * Initializes the VariablesView instance and attaches a controller.
+    */
+   _initializeVariablesView: function() {
+@@ -608,17 +609,17 @@ let DebuggerView = {
+    * Switches the debugger widgets to a horizontal layout.
+    */
+   _enterVerticalLayout: function() {
+     let normContainer = document.getElementById("debugger-widgets");
+     let vertContainer = document.getElementById("vertical-layout-panes-container");
+ 
+     // Move the soruces and instruments panes in a different container.
+     let splitter = document.getElementById("sources-and-instruments-splitter");
+-    vertContainer.insertBefore(this._sourcesPane, splitter);
++    vertContainer.insertBefore(this._workersAndSourcesPane, splitter);
+     vertContainer.appendChild(this._instrumentsPane);
+ 
+     // Make sure the vertical layout container's height doesn't repeatedly
+     // grow or shrink based on the displayed sources, variables etc.
+     vertContainer.setAttribute("height",
+       vertContainer.getBoundingClientRect().height);
+   },
+ 
+@@ -627,22 +628,22 @@ let DebuggerView = {
+    */
+   _enterHorizontalLayout: function() {
+     let normContainer = document.getElementById("debugger-widgets");
+     let vertContainer = document.getElementById("vertical-layout-panes-container");
+ 
+     // The sources and instruments pane need to be inserted at their
+     // previous locations in their normal container.
+     let splitter = document.getElementById("sources-and-editor-splitter");
+-    normContainer.insertBefore(this._sourcesPane, splitter);
++    normContainer.insertBefore(this._workersAndSourcesPane, splitter);
+     normContainer.appendChild(this._instrumentsPane);
+ 
+     // Revert to the preferred sources and instruments widths, because
+     // they flexed in the vertical layout.
+-    this._sourcesPane.setAttribute("width", Prefs.sourcesWidth);
++    this._workersAndSourcesPane.setAttribute("width", Prefs.workersAndSourcesWidth);
+     this._instrumentsPane.setAttribute("width", Prefs.instrumentsWidth);
+   },
+ 
+   /**
+    * Handles any initialization on a tab navigation event issued by the client.
+    */
+   handleTabNavigation: function() {
+     dumpn("Handling tab navigation in the DebuggerView");
+@@ -677,17 +678,17 @@ let DebuggerView = {
+   VariableBubble: null,
+   WatchExpressions: null,
+   EventListeners: null,
+   editor: null,
+   _editorSource: {},
+   _loadingText: "",
+   _body: null,
+   _editorDeck: null,
+-  _sourcesPane: null,
++  _workersAndSourcesPane: null,
+   _instrumentsPane: null,
+   _instrumentsPaneToggleButton: null,
+   _collapsePaneString: "",
+   _expandPaneString: ""
+ };
+ 
+ /**
+  * A custom items container, used for displaying views like the
+diff --git a/browser/devtools/debugger/debugger.css b/browser/devtools/debugger/debugger.css
+index f6da599..101ee1a 100644
+--- a/browser/devtools/debugger/debugger.css
++++ b/browser/devtools/debugger/debugger.css
+@@ -1,16 +1,17 @@
+ /* -*- Mode: javascript; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ /* Side pane views */
+ 
++#workers-pane > tabpanels > tabpanel,
+ #sources-pane > tabpanels > tabpanel,
+ #instruments-pane > tabpanels > tabpanel {
+   -moz-box-orient: vertical;
+ }
+ 
+ /* Toolbar controls */
+ 
+ .devtools-toolbarbutton:not([label]) > .toolbarbutton-text {
+@@ -18,17 +19,17 @@
+ }
+ 
+ /* Horizontal vs. vertical layout */
+ 
+ #body[layout=vertical] #debugger-widgets {
+   -moz-box-orient: vertical;
+ }
+ 
+-#body[layout=vertical] #sources-pane {
++#body[layout=vertical] #workers-and-sources-pane {
+   -moz-box-flex: 1;
+ }
+ 
+ #body[layout=vertical] #instruments-pane {
+   -moz-box-flex: 2;
+ }
+ 
+ #body[layout=vertical] #instruments-pane-toggle {
+diff --git a/browser/devtools/debugger/debugger.xul b/browser/devtools/debugger/debugger.xul
+index ba3ab5d..0f50a4c 100644
+--- a/browser/devtools/debugger/debugger.xul
++++ b/browser/devtools/debugger/debugger.xul
+@@ -23,16 +23,17 @@
+         persist="screenX screenY width height sizemode">
+ 
+   <script type="application/javascript;version=1.8"
+           src="chrome://browser/content/devtools/theme-switching.js"/>
+   <script type="text/javascript" src="chrome://global/content/globalOverlay.js"/>
+   <script type="text/javascript" src="debugger-controller.js"/>
+   <script type="text/javascript" src="debugger-view.js"/>
+   <script type="text/javascript" src="debugger/utils.js"/>
++  <script type="text/javascript" src="debugger/workers-view.js"/>
+   <script type="text/javascript" src="debugger/sources-view.js"/>
+   <script type="text/javascript" src="debugger/variable-bubble-view.js"/>
+   <script type="text/javascript" src="debugger/tracer-view.js"/>
+   <script type="text/javascript" src="debugger/watch-expressions-view.js"/>
+   <script type="text/javascript" src="debugger/event-listeners-view.js"/>
+   <script type="text/javascript" src="debugger/global-search-view.js"/>
+   <script type="text/javascript" src="debugger/toolbar-view.js"/>
+   <script type="text/javascript" src="debugger/options-view.js"/>
+@@ -307,71 +308,88 @@
+                      class="devtools-toolbarbutton devtools-option-toolbarbutton"
+                      tooltiptext="&debuggerUI.optsButton.tooltip;"
+                      popup="debuggerPrefsContextMenu"
+                      tabindex="0"/>
+     </toolbar>
+     <vbox id="globalsearch" orient="vertical" hidden="true"/>
+     <splitter class="devtools-horizontal-splitter" hidden="true"/>
+     <hbox id="debugger-widgets" flex="1">
+-      <tabbox id="sources-pane"
+-              class="devtools-sidebar-tabs">
+-        <tabs>
+-          <tab id="sources-tab" label="&debuggerUI.tabs.sources;"/>
+-          <tab id="callstack-tab" label="&debuggerUI.tabs.callstack;"/>
+-          <tab id="tracer-tab" label="&debuggerUI.tabs.traces;" hidden="true"/>
+-        </tabs>
+-        <tabpanels flex="1">
+-          <tabpanel id="sources-tabpanel">
+-            <vbox id="sources" flex="1"/>
+-            <toolbar id="sources-toolbar" class="devtools-toolbar">
+-              <hbox id="sources-controls"
+-                    class="devtools-toolbarbutton-group">
+-                <toolbarbutton id="black-box"
++      <vbox id="workers-and-sources-pane">
++        <tabbox id="workers-pane"
++                class="devtools-sidebar-tabs"
++                flex="0"
++                hidden="true">
++          <tabs>
++            <tab id="workers-tab" label="&debuggerUI.tabs.workers;"/>
++          </tabs>
++          <tabpanels flex="1">
++            <tabpanel>
++              <vbox id="workers" flex="1"/>
++            </tabpanel>
++          </tabpanels>
++        </tabbox>
++        <splitter class="devtools-horizontal-splitter"/>
++        <tabbox id="sources-pane"
++                class="devtools-sidebar-tabs"
++                flex="1">
++          <tabs>
++            <tab id="sources-tab" label="&debuggerUI.tabs.sources;"/>
++            <tab id="callstack-tab" label="&debuggerUI.tabs.callstack;"/>
++            <tab id="tracer-tab" label="&debuggerUI.tabs.traces;" hidden="true"/>
++          </tabs>
++          <tabpanels flex="1">
++            <tabpanel id="sources-tabpanel">
++              <vbox id="sources" flex="1"/>
++              <toolbar id="sources-toolbar" class="devtools-toolbar">
++                <hbox id="sources-controls"
++                      class="devtools-toolbarbutton-group">
++                  <toolbarbutton id="black-box"
++                                 class="devtools-toolbarbutton"
++                                 tooltiptext="&debuggerUI.sources.blackBoxTooltip;"
++                                 command="blackBoxCommand"/>
++                  <toolbarbutton id="pretty-print"
++                                 class="devtools-toolbarbutton"
++                                 tooltiptext="&debuggerUI.sources.prettyPrint;"
++                                 command="prettyPrintCommand"
++                                 hidden="true"/>
++                </hbox>
++                <vbox class="devtools-separator"/>
++                <toolbarbutton id="toggle-breakpoints"
+                                class="devtools-toolbarbutton"
+-                               tooltiptext="&debuggerUI.sources.blackBoxTooltip;"
+-                               command="blackBoxCommand"/>
+-                <toolbarbutton id="pretty-print"
+-                               class="devtools-toolbarbutton"
+-                               tooltiptext="&debuggerUI.sources.prettyPrint;"
+-                               command="prettyPrintCommand"
+-                               hidden="true"/>
+-              </hbox>
+-              <vbox class="devtools-separator"/>
+-              <toolbarbutton id="toggle-breakpoints"
+-                             class="devtools-toolbarbutton"
+-                             tooltiptext="&debuggerUI.sources.toggleBreakpoints;"
+-                             command="toggleBreakpointsCommand"/>
+-            </toolbar>
+-          </tabpanel>
+-          <tabpanel id="callstack-tabpanel">
+-            <vbox id="callstack-list" flex="1"/>
+-          </tabpanel>
+-          <tabpanel id="tracer-tabpanel">
+-            <vbox id="tracer-traces" flex="1"/>
+-            <hbox class="trace-item-template" hidden="true">
+-              <hbox class="trace-item" align="center" flex="1" crop="end">
+-                <label class="trace-type plain"/>
+-                <label class="trace-name plain" crop="end"/>
++                               tooltiptext="&debuggerUI.sources.toggleBreakpoints;"
++                               command="toggleBreakpointsCommand"/>
++              </toolbar>
++            </tabpanel>
++            <tabpanel id="callstack-tabpanel">
++              <vbox id="callstack-list" flex="1"/>
++            </tabpanel>
++            <tabpanel id="tracer-tabpanel">
++              <vbox id="tracer-traces" flex="1"/>
++              <hbox class="trace-item-template" hidden="true">
++                <hbox class="trace-item" align="center" flex="1" crop="end">
++                  <label class="trace-type plain"/>
++                  <label class="trace-name plain" crop="end"/>
++                </hbox>
+               </hbox>
+-            </hbox>
+-            <toolbar id="tracer-toolbar" class="devtools-toolbar">
+-              <toolbarbutton id="clear-tracer"
+-                             label="&debuggerUI.clearButton;"
+-                             tooltiptext="&debuggerUI.clearButton.tooltip;"
+-                             command="clearTraces"
+-                             class="devtools-toolbarbutton"/>
+-              <textbox id="tracer-search"
+-                       class="devtools-searchinput"
+-                       flex="1"
+-                       type="search"/>
+-            </toolbar>
+-          </tabpanel>
+-        </tabpanels>
+-      </tabbox>
++              <toolbar id="tracer-toolbar" class="devtools-toolbar">
++                <toolbarbutton id="clear-tracer"
++                               label="&debuggerUI.clearButton;"
++                               tooltiptext="&debuggerUI.clearButton.tooltip;"
++                               command="clearTraces"
++                               class="devtools-toolbarbutton"/>
++                <textbox id="tracer-search"
++                         class="devtools-searchinput"
++                         flex="1"
++                         type="search"/>
++              </toolbar>
++            </tabpanel>
++          </tabpanels>
++        </tabbox>
++      </vbox>
+       <splitter id="sources-and-editor-splitter"
+                 class="devtools-side-splitter"/>
+       <deck id="editor-deck" flex="1" class="devtools-main-content">
+         <vbox id="editor"/>
+         <vbox id="black-boxed-message"
+               align="center"
+               pack="center">
+           <description id="black-boxed-message-label">
+diff --git a/browser/devtools/debugger/test/browser_dbg_host-layout.js b/browser/devtools/debugger/test/browser_dbg_host-layout.js
+index e07998f..8a4d3ed 100644
+--- a/browser/devtools/debugger/test/browser_dbg_host-layout.js
++++ b/browser/devtools/debugger/test/browser_dbg_host-layout.js
+@@ -66,23 +66,23 @@ function testHost(aTab, aPanel, aHostType, aLayoutType) {
+     "The default host type should've been set on the panel window (1).");
+   is(gDebugger.gHostType, aHostType,
+     "The default host type should've been set on the panel window (2).");
+ 
+   is(gView._body.getAttribute("layout"), aLayoutType,
+     "The default host type is present as an attribute on the panel's body.");
+ 
+   if (aLayoutType == "horizontal") {
+-    is(gView._sourcesPane.parentNode.id, "debugger-widgets",
+-      "The sources pane's parent is correct for the horizontal layout.");
++    is(gView._workersAndSourcesPane.parentNode.id, "debugger-widgets",
++      "The workers and sources pane's parent is correct for the horizontal layout.");
+     is(gView._instrumentsPane.parentNode.id, "debugger-widgets",
+       "The instruments pane's parent is correct for the horizontal layout.");
+   } else {
+-    is(gView._sourcesPane.parentNode.id, "vertical-layout-panes-container",
+-      "The sources pane's parent is correct for the vertical layout.");
++    is(gView._workersAndSourcesPane.parentNode.id, "vertical-layout-panes-container",
++      "The workers and sources pane's parent is correct for the vertical layout.");
+     is(gView._instrumentsPane.parentNode.id, "vertical-layout-panes-container",
+       "The instruments pane's parent is correct for the vertical layout.");
+   }
+ 
+   let widgets = gDebugger.document.getElementById("debugger-widgets").childNodes;
+   let panes = gDebugger.document.getElementById("vertical-layout-panes-container").childNodes;
+ 
+   if (aLayoutType == "horizontal") {
+diff --git a/browser/devtools/debugger/test/browser_dbg_panel-size.js b/browser/devtools/debugger/test/browser_dbg_panel-size.js
+index 8ae8aad..81c5adf 100644
+--- a/browser/devtools/debugger/test/browser_dbg_panel-size.js
++++ b/browser/devtools/debugger/test/browser_dbg_panel-size.js
+@@ -5,78 +5,78 @@
+  * Test that the sources and instruments panels widths are properly
+  * remembered when the debugger closes.
+  */
+ 
+ const TAB_URL = EXAMPLE_URL + "doc_recursion-stack.html";
+ 
+ function test() {
+   let gTab, gPanel, gDebugger;
+-  let gPrefs, gSources, gInstruments;
++  let gPrefs, gWorkersAndSources, gInstruments;
+ 
+   initDebugger(TAB_URL).then(([aTab,, aPanel]) => {
+     gTab = aTab;
+     gPanel = aPanel;
+     gDebugger = gPanel.panelWin;
+     gPrefs = gDebugger.Prefs;
+-    gSources = gDebugger.document.getElementById("sources-pane");
++    gWorkersAndSources = gDebugger.document.getElementById("workers-and-sources-pane");
+     gInstruments = gDebugger.document.getElementById("instruments-pane");
+ 
+     waitForSourceShown(gPanel, ".html").then(performTest);
+   });
+ 
+   function performTest() {
+-    let preferredSw = Services.prefs.getIntPref("devtools.debugger.ui.panes-sources-width");
++    let preferredWsw = Services.prefs.getIntPref("devtools.debugger.ui.panes-workers-and-sources-width");
+     let preferredIw = Services.prefs.getIntPref("devtools.debugger.ui.panes-instruments-width");
+     let someWidth1, someWidth2;
+ 
+     do {
+       someWidth1 = parseInt(Math.random() * 200) + 100;
+       someWidth2 = parseInt(Math.random() * 300) + 100;
+-    } while ((someWidth1 == preferredSw) || (someWidth2 == preferredIw));
++    } while ((someWidth1 == preferredWsw) || (someWidth2 == preferredIw));
+ 
+-    info("Preferred sources width: " + preferredSw);
++    info("Preferred sources width: " + preferredWsw);
+     info("Preferred instruments width: " + preferredIw);
+     info("Generated sources width: " + someWidth1);
+     info("Generated instruments width: " + someWidth2);
+ 
+-    ok(gPrefs.sourcesWidth,
+-      "The debugger preferences should have a saved sourcesWidth value.");
++    ok(gPrefs.workersAndSourcesWidth,
++      "The debugger preferences should have a saved workersAndSourcesWidth value.");
+     ok(gPrefs.instrumentsWidth,
+       "The debugger preferences should have a saved instrumentsWidth value.");
+ 
+-    is(gPrefs.sourcesWidth, preferredSw,
+-      "The debugger preferences should have a correct sourcesWidth value.");
++    is(gPrefs.workersAndSourcesWidth, preferredWsw,
++      "The debugger preferences should have a correct workersAndSourcesWidth value.");
+     is(gPrefs.instrumentsWidth, preferredIw,
+       "The debugger preferences should have a correct instrumentsWidth value.");
+ 
+-    is(gSources.getAttribute("width"), gPrefs.sourcesWidth,
+-      "The sources pane width should be the same as the preferred value.");
++    is(gWorkersAndSources.getAttribute("width"), gPrefs.workersAndSourcesWidth,
++      "The workers and sources pane width should be the same as the preferred value.");
+     is(gInstruments.getAttribute("width"), gPrefs.instrumentsWidth,
+       "The instruments pane width should be the same as the preferred value.");
+ 
+-    gSources.setAttribute("width", someWidth1);
++    gWorkersAndSources.setAttribute("width", someWidth1);
+     gInstruments.setAttribute("width", someWidth2);
+ 
+-    is(gPrefs.sourcesWidth, preferredSw,
+-      "The sources pane width pref should still be the same as the preferred value.");
++    is(gPrefs.workersAndSourcesWidth, preferredWsw,
++      "The workers and sources pane width pref should still be the same as the preferred value.");
+     is(gPrefs.instrumentsWidth, preferredIw,
+       "The instruments pane width pref should still be the same as the preferred value.");
+ 
+-    isnot(gSources.getAttribute("width"), gPrefs.sourcesWidth,
+-      "The sources pane width should not be the preferred value anymore.");
++    isnot(gWorkersAndSources.getAttribute("width"), gPrefs.workersAndSourcesWidth,
++      "The workers and sources pane width should not be the preferred value anymore.");
+     isnot(gInstruments.getAttribute("width"), gPrefs.instrumentsWidth,
+       "The instruments pane width should not be the preferred value anymore.");
+ 
+     teardown(gPanel).then(() => {
+-      is(gPrefs.sourcesWidth, someWidth1,
+-        "The sources pane width should have been saved by now.");
++      is(gPrefs.workersAndSourcesWidth, someWidth1,
++        "The workers and sources pane width should have been saved by now.");
+       is(gPrefs.instrumentsWidth, someWidth2,
+         "The instruments pane width should have been saved by now.");
+ 
+       // Cleanup after ourselves!
+-      Services.prefs.setIntPref("devtools.debugger.ui.panes-sources-width", preferredSw);
++      Services.prefs.setIntPref("devtools.debugger.ui.panes-workers-and-sources-width", preferredWsw);
+       Services.prefs.setIntPref("devtools.debugger.ui.panes-instruments-width", preferredIw);
+ 
+       finish();
+     });
+   }
+ }
+diff --git a/browser/devtools/debugger/views/workers-view.js b/browser/devtools/debugger/views/workers-view.js
+new file mode 100644
+index 0000000..808cac6
+--- /dev/null
++++ b/browser/devtools/debugger/views/workers-view.js
+@@ -0,0 +1,36 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++"use strict";
++
++function WorkersView() {}
++
++WorkersView.prototype = Heritage.extend(WidgetMethods, {
++  initialize: function () {
++    if (!Prefs.workersEnabled) {
++      return;
++    }
++
++    document.getElementById("workers-pane").removeAttribute("hidden");
++
++    this.widget = new SideMenuWidget(document.getElementById("workers"), {
++      showArrows: true,
++    });
++    this.emptyText = L10N.getStr("noWorkersText");
++  },
++
++  addWorker: function (actor, name) {
++    let element = document.createElement("label");
++    element.className = "plain dbg-worker-item";
++    element.setAttribute("value", name);
++    element.setAttribute("flex", "1");
++
++    this.push([element, actor], {});
++  },
++
++  removeWorker: function (actor) {
++    this.remove(this.getItemByValue(actor));
++  }
++});
++
++DebuggerView.Workers = new WorkersView();
+diff --git a/browser/devtools/framework/toolbox-options.xul b/browser/devtools/framework/toolbox-options.xul
+index 9b512c5..531e16f1 100644
+--- a/browser/devtools/framework/toolbox-options.xul
++++ b/browser/devtools/framework/toolbox-options.xul
+@@ -154,15 +154,20 @@
+                       tooltiptext="&options.enableChrome.tooltip3;"
+                       data-pref="devtools.chrome.enabled"/>
+           </hbox>
+           <hbox class="hidden-labels-box">
+             <checkbox label="&options.enableRemote.label3;"
+                       tooltiptext="&options.enableRemote.tooltip;"
+                       data-pref="devtools.debugger.remote-enabled"/>
+           </hbox>
++          <hbox class="hidden-labels-box">
++            <checkbox label="&options.enableWorkers.label;"
++                      tooltiptext="&options.enableWorkers.tooltip;"
++                      data-pref="devtools.debugger.workers"/>
++          </hbox>
+           <label class="options-citation-label theme-comment"
+           >&options.context.triggersPageRefresh;</label>
+         </vbox>
+       </vbox>
+     </hbox>
+   </hbox>
+ </window>
+diff --git a/browser/devtools/jar.mn b/browser/devtools/jar.mn
+index 3e82f35..a532baa 100644
+--- a/browser/devtools/jar.mn
++++ b/browser/devtools/jar.mn
+@@ -64,16 +64,17 @@ browser.jar:
+     content/browser/devtools/codemirror/foldgutter.js                  (sourceeditor/codemirror/fold/foldgutter.js)
+     content/browser/devtools/codemirror/tern.js                        (sourceeditor/codemirror/tern/tern.js)
+     content/browser/devtools/codemirror/show-hint.js                   (sourceeditor/codemirror/hint/show-hint.js)
+     content/browser/devtools/codemirror/mozilla.css                    (sourceeditor/codemirror/mozilla.css)
+     content/browser/devtools/debugger.xul                              (debugger/debugger.xul)
+     content/browser/devtools/debugger.css                              (debugger/debugger.css)
+     content/browser/devtools/debugger-controller.js                    (debugger/debugger-controller.js)
+     content/browser/devtools/debugger-view.js                          (debugger/debugger-view.js)
++    content/browser/devtools/debugger/workers-view.js                  (debugger/views/workers-view.js)
+     content/browser/devtools/debugger/sources-view.js                  (debugger/views/sources-view.js)
+     content/browser/devtools/debugger/variable-bubble-view.js          (debugger/views/variable-bubble-view.js)
+     content/browser/devtools/debugger/tracer-view.js                   (debugger/views/tracer-view.js)
+     content/browser/devtools/debugger/watch-expressions-view.js        (debugger/views/watch-expressions-view.js)
+     content/browser/devtools/debugger/event-listeners-view.js          (debugger/views/event-listeners-view.js)
+     content/browser/devtools/debugger/global-search-view.js            (debugger/views/global-search-view.js)
+     content/browser/devtools/debugger/toolbar-view.js                  (debugger/views/toolbar-view.js)
+     content/browser/devtools/debugger/options-view.js                  (debugger/views/options-view.js)
+diff --git a/browser/locales/en-US/chrome/browser/devtools/debugger.dtd b/browser/locales/en-US/chrome/browser/devtools/debugger.dtd
+index 63879c7..87d9d3d 100644
+--- a/browser/locales/en-US/chrome/browser/devtools/debugger.dtd
++++ b/browser/locales/en-US/chrome/browser/devtools/debugger.dtd
+@@ -160,16 +160,17 @@
+ <!-- LOCALIZATION NOTE (debuggerUI.seMenuCondBreak): This is the text that
+   -  appears in the source editor context menu for adding a conditional
+   -  breakpoint. -->
+ <!ENTITY debuggerUI.seMenuCondBreak     "Add Conditional Breakpoint">
+ <!ENTITY debuggerUI.seMenuCondBreak.key "B">
+ 
+ <!-- LOCALIZATION NOTE (debuggerUI.tabs.*): This is the text that
+   -  appears in the debugger's side pane tabs. -->
++<!ENTITY debuggerUI.tabs.workers        "Workers">
+ <!ENTITY debuggerUI.tabs.sources        "Sources">
+ <!ENTITY debuggerUI.tabs.traces         "Traces">
+ <!ENTITY debuggerUI.tabs.callstack      "Call Stack">
+ <!ENTITY debuggerUI.tabs.variables      "Variables">
+ <!ENTITY debuggerUI.tabs.events         "Events">
+ 
+ <!-- LOCALIZATION NOTE (debuggerUI.seMenuAddWatch): This is the text that
+   -  appears in the source editor context menu for adding an expression. -->
+diff --git a/browser/locales/en-US/chrome/browser/devtools/debugger.properties b/browser/locales/en-US/chrome/browser/devtools/debugger.properties
+index 292188d..f066474 100644
+--- a/browser/locales/en-US/chrome/browser/devtools/debugger.properties
++++ b/browser/locales/en-US/chrome/browser/devtools/debugger.properties
+@@ -72,18 +72,22 @@ stepInTooltip=Step In (%S)
+ # LOCALIZATION NOTE (stepOutTooltip): The label that is displayed on the
+ # button that steps out of a function call.
+ stepOutTooltip=Step Out (%S)
+ 
+ # LOCALIZATION NOTE (emptyGlobalsText): The text to display in the menulist
+ # when there are no chrome globals available.
+ noGlobalsText=No globals
+ 
+-# LOCALIZATION NOTE (noSourcesText): The text to display in the sources menu
+-# when there are no scripts.
++# LOCALIZATION NOTE (noWorkersText): The text to display in the workers list
++# when there are no workers.
++noWorkersText=This page has no workers.
++
++# LOCALIZATION NOTE (noSourcesText): The text to display in the sources list
++# when there are no sources.
+ noSourcesText=This page has no sources.
+ 
+ # LOCALIZATION NOTE (loadingSourcesText): The text to display in the sources menu
+ # when waiting for scripts to load.
+ loadingSourcesText=Waiting for sources…
+ 
+ # LOCALIZATION NOTE (noEventListenersText): The text to display in the events tab
+ # when there are no events.
+@@ -315,9 +319,9 @@ functionSearchSeparatorLabel=←
+ # The substitution parameter is the URL of the last paused window that must be
+ # resumed first.
+ resumptionOrderPanelTitle=There are one or more paused debuggers. Please resume the most-recently paused debugger first at: %S
+ 
+ variablesViewOptimizedOut=(optimized away)
+ variablesViewUninitialized=(uninitialized)
+ variablesViewMissingArgs=(unavailable)
+ 
+-anonymousSourcesLabel=Anonymous Sources
+\ No newline at end of file
++anonymousSourcesLabel=Anonymous Sources
+diff --git a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
+index e122f0c..f4e406e 100644
+--- a/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
++++ b/browser/locales/en-US/chrome/browser/devtools/toolbox.dtd
+@@ -83,16 +83,22 @@
+ <!ENTITY options.enableChrome.tooltip3  "Turning this option on will allow you to use various developer tools in browser context (via Tools > Web Developer > Browser Toolbox) and debug add-ons from the Add-ons Manager">
+ 
+ <!-- LOCALIZATION NOTE (options.enableRemote.label3): This is the label for the
+   -  checkbox that toggles remote debugging, i.e. devtools.debugger.remote-enabled
+   -  boolean preference in about:config, in the options panel. -->
+ <!ENTITY options.enableRemote.label3    "Enable remote debugging">
+ <!ENTITY options.enableRemote.tooltip   "Turning this option on will allow the developer tools to debug remote Firefox instance like Firefox OS">
+ 
++<!-- LOCALIZATION NOTE (options.enableWorkers.label): This is the label for the
++  -  checkbox that toggles worker debugging, i.e. devtools.debugger.workers
++  -  boolean preference in about:config, in the options panel. -->
++<!ENTITY options.enableWorkers.label    "Enable worker debugging (in development)">
++<!ENTITY options.enableWorkers.tooltip  "Turning this option on will allow the developer tools to debug workers">
++
+ <!-- LOCALIZATION NOTE (options.disableJavaScript.label,
+   -  options.disableJavaScript.tooltip): This is the options panel label and
+   -  tooltip for the checkbox that toggles JavaScript on or off. -->
+ <!ENTITY options.disableJavaScript.label     "Disable JavaScript *">
+ <!ENTITY options.disableJavaScript.tooltip   "Turning this option on will disable JavaScript for the current tab. If the tab or the toolbox is closed then this setting will be forgotten.">
+ 
+ <!-- LOCALIZATION NOTE (options.disableCache.label2,
+   -  options.disableCache.tooltip2): This is the options panel label and
+diff --git a/toolkit/devtools/client/dbg-client.jsm b/toolkit/devtools/client/dbg-client.jsm
+index b8f08c8..24a29f5 100644
+--- a/toolkit/devtools/client/dbg-client.jsm
++++ b/toolkit/devtools/client/dbg-client.jsm
+@@ -1359,16 +1359,17 @@ TabClient.prototype = {
+ 
+ eventSource(TabClient.prototype);
+ 
+ function WorkerClient(aClient, aForm) {
+   this.client = aClient;
+   this._actor = aForm.from;
+   this._isClosed = false;
+   this._isFrozen = aForm.isFrozen;
++  this._url = aForm.url;
+ 
+   this._onClose = this._onClose.bind(this);
+   this._onFreeze = this._onFreeze.bind(this);
+   this._onThaw = this._onThaw.bind(this);
+ 
+   this.addListener("close", this._onClose);
+   this.addListener("freeze", this._onFreeze);
+   this.addListener("thaw", this._onThaw);
+@@ -1382,16 +1383,20 @@ WorkerClient.prototype = {
+   get request() {
+     return this.client.request;
+   },
+ 
+   get actor() {
+     return this._actor;
+   },
+ 
++  get url() {
++    return this._url;
++  },
++
+   get isClosed() {
+     return this._isClosed;
+   },
+ 
+   get isFrozen() {
+     return this._isFrozen;
+   },
+ 
+diff --git a/toolkit/devtools/server/actors/worker.js b/toolkit/devtools/server/actors/worker.js
+index 5d32e63..8676f64 100644
+--- a/toolkit/devtools/server/actors/worker.js
++++ b/toolkit/devtools/server/actors/worker.js
+@@ -50,17 +50,18 @@ WorkerActor.prototype = {
+ 
+     if (!this._isAttached) {
+       this._dbg.addListener(this);
+       this._isAttached = true;
+     }
+ 
+     return {
+       type: "attached",
+-      isFrozen: this._dbg.isFrozen
++      isFrozen: this._dbg.isFrozen,
++      url: this._dbg.url
+     };
+   },
+ 
+   onDetach: function () {
+     if (!this._isAttached) {
+       return { error: "wrongState" };
+     }
+ 
