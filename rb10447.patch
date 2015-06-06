@@ -1,0 +1,217 @@
+diff -r 945d7b08f296 -r 72a427293aa2 browser/devtools/webconsole/test/browser_console_consolejsm_output.js
+--- a/browser/devtools/webconsole/test/browser_console_consolejsm_output.js	Thu Jun 04 13:02:00 2015 -0700
++++ b/browser/devtools/webconsole/test/browser_console_consolejsm_output.js	Fri Jun 05 15:31:31 2015 -0700
+@@ -2,16 +2,25 @@
+  * Any copyright is dedicated to the Public Domain.
+  * http://creativecommons.org/publicdomain/zero/1.0/
+  */
+ 
+ // Test that Console.jsm outputs messages to the Browser Console, bug 851231.
+ 
+ "use strict";
+ 
++function onNewMessage(aEvent, aNewMessages) {
++  for (let msg of aNewMessages) {
++    // Messages that shouldn't be output contain the substring FAIL_TEST
++    if (msg.node.textContent.includes("FAIL_TEST")) {
++      ok(false, "Message shouldn't have been output: " + msg.node.textContent);
++    }
++  }
++};
++
+ add_task(function*() {
+   let storage = Cc["@mozilla.org/consoleAPI-storage;1"].getService(Ci.nsIConsoleAPIStorage);
+   storage.clearEvents();
+ 
+   let {console} = Cu.import("resource://gre/modules/devtools/Console.jsm", {});
+   console.log("bug861338-log-cached");
+ 
+   let hud = yield HUDService.toggleBrowserConsole();
+@@ -161,8 +170,110 @@ add_task(function* test_prefix() {
+       severity: SEVERITY_ERROR,
+       text: "Testing a prefix",
+     }],
+   });
+ 
+   hud.jsterm.clearOutput(true);
+   yield HUDService.toggleBrowserConsole();
+ });
++
++add_task(function* test_maxLogLevelPref_missing() {
++  let storage = Cc["@mozilla.org/consoleAPI-storage;1"].getService(Ci.nsIConsoleAPIStorage);
++  storage.clearEvents();
++
++  let {ConsoleAPI} = Cu.import("resource://gre/modules/devtools/Console.jsm", {});
++  let consoleOptions = {
++    maxLogLevel: "error",
++    maxLogLevelPref: "testing.maxLogLevel",
++  };
++  let console = new ConsoleAPI(consoleOptions);
++
++  is(Services.prefs.getPrefType(consoleOptions.maxLogLevelPref),
++     Services.prefs.PREF_INVALID,
++     "Check log level pref is missing");
++
++  // Since the maxLogLevelPref doesn't exist, we should fallback to the passed
++  // maxLogLevel of "error".
++  console.warn("FAIL_TEST: Below the maxLogLevel");
++  console.error("Error should be shown");
++
++  let hud = yield HUDService.toggleBrowserConsole();
++
++  hud.ui.on("new-messages", onNewMessage);
++
++  yield waitForMessages({
++    webconsole: hud,
++    messages: [{
++      name: "defaulting to error level",
++      severity: SEVERITY_ERROR,
++      text: "Error should be shown",
++    }],
++  });
++
++  hud.jsterm.clearOutput(true);
++  hud.ui.off("new-messages", onNewMessage);
++  yield HUDService.toggleBrowserConsole();
++});
++
++add_task(function* test_maxLogLevelPref() {
++  let storage = Cc["@mozilla.org/consoleAPI-storage;1"].getService(Ci.nsIConsoleAPIStorage);
++  storage.clearEvents();
++
++  let {ConsoleAPI} = Cu.import("resource://gre/modules/devtools/Console.jsm", {});
++  let consoleOptions = {
++    maxLogLevel: "error",
++    maxLogLevelPref: "testing.maxLogLevel",
++  };
++
++  info("Setting the pref to warn");
++  Services.prefs.setCharPref(consoleOptions.maxLogLevelPref, "warn");
++
++  let console = new ConsoleAPI(consoleOptions);
++
++  is(console.maxLogLevel, "warn", "Check pref was read at initialization");
++
++  console.info("FAIL_TEST: info is below the maxLogLevel");
++  console.error("Error should be shown");
++  console.warn("Warn should be shown due to the initial pref value");
++
++  info("Setting the pref to info");
++  Services.prefs.setCharPref(consoleOptions.maxLogLevelPref, "info");
++
++  console.info("info should be shown due to the pref change being observed");
++
++  info("Clearing the pref");
++  Services.prefs.clearUserPref(consoleOptions.maxLogLevelPref);
++
++  console.warn("FAIL_TEST: Shouldn't be shown due to defaulting to error");
++  console.error("Should be shown due to defaulting to error");
++
++  let hud = yield HUDService.toggleBrowserConsole();
++  hud.ui.on("new-messages", onNewMessage);
++
++  yield waitForMessages({
++    webconsole: hud,
++    messages: [{
++      name: "error > warn",
++      severity: SEVERITY_ERROR,
++      text: "Error should be shown",
++    },
++    {
++      name: "warn is the inital pref value",
++      severity: SEVERITY_WARNING,
++      text: "Warn should be shown due to the initial pref value",
++    },
++    {
++      name: "pref changed to info",
++      severity: SEVERITY_INFO,
++      text: "info should be shown due to the pref change being observed",
++    },
++    {
++      name: "default to intial maxLogLevel if pref is removed",
++      severity: SEVERITY_ERROR,
++      text: "Should be shown due to defaulting to error",
++    }],
++  });
++
++  hud.jsterm.clearOutput(true);
++  hud.ui.off("new-messages", onNewMessage);
++  yield HUDService.toggleBrowserConsole();
++});
+diff -r 945d7b08f296 -r 72a427293aa2 browser/devtools/webconsole/test/head.js
+--- a/browser/devtools/webconsole/test/head.js	Thu Jun 04 13:02:00 2015 -0700
++++ b/browser/devtools/webconsole/test/head.js	Fri Jun 05 15:31:31 2015 -0700
+@@ -902,16 +902,17 @@ function openDebugger(aOptions = {})
+  *            - type: match messages that are instances of the given object. For
+  *            example, you can point to Messages.NavigationMarker to match any
+  *            such message.
+  *            - objects: boolean, set to |true| if you expect inspectable
+  *            objects in the message.
+  *            - source: object of the shape { url, line }. This is used to
+  *            match the source URL and line number of the error message or
+  *            console API call.
++ *            - prefix: prefix text to check for in the prefix element.
+  *            - stacktrace: array of objects of the form { file, fn, line } that
+  *            can match frames in the stacktrace associated with the message.
+  *            - groupDepth: number used to check the depth of the message in
+  *            a group.
+  *            - url: URL to match for network requests.
+  * @return object
+  *         A promise object is returned once the messages you want are found.
+  *         The promise is resolved with the array of rule objects you give in
+diff -r 945d7b08f296 -r 72a427293aa2 toolkit/devtools/Console.jsm
+--- a/toolkit/devtools/Console.jsm	Thu Jun 04 13:02:00 2015 -0700
++++ b/toolkit/devtools/Console.jsm	Fri Jun 05 15:31:31 2015 -0700
+@@ -576,16 +576,21 @@ function sendConsoleAPIMessage(aConsole,
+  *        - prefix {string} : An optional prefix string to be printed before
+  *                            the actual logged message
+  *        - maxLogLevel {string} : String identifier (See LOG_LEVELS for
+  *                            possible values) that allows to filter which
+  *                            messages are logged based on their log level.
+  *                            If falsy value, all messages will be logged.
+  *                            If wrong value that doesn't match any key of
+  *                            LOG_LEVELS, no message will be logged
++ *        - maxLogLevelPref {string} : String pref name which contains the
++ *                            level to use for maxLogLevel. If the pref doesn't
++ *                            exist or gets removed, the maxLogLevel will default
++ *                            to the value passed to this constructor (or "all"
++ *                            if it wasn't specified).
+  *        - dump {function} : An optional function to intercept all strings
+  *                            written to stdout
+  *        - innerID {string}: An ID representing the source of the message.
+  *                            Normally the inner ID of a DOM window.
+  *        - consoleID {string} : String identified for the console, this will
+  *                            be passed through the console notifications
+  * @return {object}
+  *        A console API instance object
+@@ -594,16 +599,30 @@ function ConsoleAPI(aConsoleOptions = {}
+   // Normalize console options to set default values
+   // in order to avoid runtime checks on each console method call.
+   this.dump = aConsoleOptions.dump || dump;
+   this.prefix = aConsoleOptions.prefix || "";
+   this.maxLogLevel = aConsoleOptions.maxLogLevel || "all";
+   this.innerID = aConsoleOptions.innerID || null;
+   this.consoleID = aConsoleOptions.consoleID || "";
+ 
++  // Setup maxLogLevelPref watching
++  let updateMaxLogLevel = () => {
++    if (Services.prefs.getPrefType(aConsoleOptions.maxLogLevelPref) == Services.prefs.PREF_STRING) {
++      this.maxLogLevel = Services.prefs.getCharPref(aConsoleOptions.maxLogLevelPref).toLowerCase();
++    } else {
++      this.maxLogLevel = aConsoleOptions.maxLogLevel || "all";
++    }
++  };
++
++  if (aConsoleOptions.maxLogLevelPref) {
++    updateMaxLogLevel();
++    Services.prefs.addObserver(aConsoleOptions.maxLogLevelPref, updateMaxLogLevel, false);
++  }
++
+   // Bind all the functions to this object.
+   for (let prop in this) {
+     if (typeof(this[prop]) === "function") {
+       this[prop] = this[prop].bind(this);
+     }
+   }
+ }
+ 
