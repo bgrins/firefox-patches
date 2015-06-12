@@ -1,0 +1,3628 @@
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/animation-controller.js
+--- a/browser/devtools/animationinspector/animation-controller.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/animation-controller.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -109,16 +109,17 @@ let AnimationsController = {
+     this.hasSetCurrentTime = yield target.actorHasMethod("animationplayer",
+                                                          "setCurrentTime");
+     this.hasMutationEvents = yield target.actorHasMethod("animations",
+                                                          "stopAnimationPlayerUpdates");
+     this.hasSetPlaybackRate = yield target.actorHasMethod("animationplayer",
+                                                           "setPlaybackRate");
+     this.hasTargetNode = yield target.actorHasMethod("domwalker",
+                                                      "getNodeFromActor");
++    this.isNewUI = Services.prefs.getBoolPref("devtools.inspector.animationInspectorV3");
+ 
+     if (this.destroyed) {
+       console.warn("Could not fully initialize the AnimationsController");
+       return;
+     }
+ 
+     this.startListeners();
+     yield this.onNewNodeFront();
+@@ -235,38 +236,50 @@ let AnimationsController = {
+   }),
+ 
+   onAnimationMutations: Task.async(function*(changes) {
+     // Insert new players into this.animationPlayers when new animations are
+     // added.
+     for (let {type, player} of changes) {
+       if (type === "added") {
+         this.animationPlayers.push(player);
+-        player.startAutoRefresh();
++        if (!this.isNewUI) {
++          player.startAutoRefresh();
++        }
+       }
+ 
+       if (type === "removed") {
+-        player.stopAutoRefresh();
++        if (!this.isNewUI) {
++          player.stopAutoRefresh();
++        }
+         yield player.release();
+         let index = this.animationPlayers.indexOf(player);
+         this.animationPlayers.splice(index, 1);
+       }
+     }
+ 
+     // Let the UI know the list has been updated.
+     this.emit(this.PLAYERS_UPDATED_EVENT, this.animationPlayers);
+   }),
+ 
+   startAllAutoRefresh: function() {
++    if (this.isNewUI) {
++      return;
++    }
++
+     for (let front of this.animationPlayers) {
+       front.startAutoRefresh();
+     }
+   },
+ 
+   stopAllAutoRefresh: function() {
++    if (this.isNewUI) {
++      return;
++    }
++
+     for (let front of this.animationPlayers) {
+       front.stopAutoRefresh();
+     }
+   },
+ 
+   destroyAnimationPlayers: Task.async(function*() {
+     // Let the server know that we're not interested in receiving updates about
+     // players for the current node. We're either being destroyed or a new node
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/animation-panel.js
+--- a/browser/devtools/animationinspector/animation-panel.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/animation-panel.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -1,33 +1,37 @@
+ /* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++/* globals AnimationsController, document, performance, promise,
++   gToolbox, gInspector, requestAnimationFrame, cancelAnimationFrame, L10N */
+ 
+ "use strict";
+ 
++const {createNode} = require("devtools/animationinspector/utils");
+ const {
+   PlayerMetaDataHeader,
+   PlaybackRateSelector,
+   AnimationTargetNode,
+-  createNode
++  AnimationsTimeline
+ } = require("devtools/animationinspector/components");
+ 
+ /**
+  * The main animations panel UI.
+  */
+ let AnimationsPanel = {
+   UI_UPDATED_EVENT: "ui-updated",
+   PANEL_INITIALIZED: "panel-initialized",
+ 
+   initialize: Task.async(function*() {
+     if (AnimationsController.destroyed) {
+-      console.warn("Could not initialize the animation-panel, controller was destroyed");
++      console.warn("Could not initialize the animation-panel, controller " +
++                   "was destroyed");
+       return;
+     }
+     if (this.initialized) {
+       return this.initialized.promise;
+     }
+     this.initialized = promise.defer();
+ 
+     this.playersEl = document.querySelector("#players");
+@@ -40,23 +44,28 @@ let AnimationsPanel = {
+     if (!AnimationsController.hasToggleAll) {
+       document.querySelector("#toolbar").style.display = "none";
+     }
+ 
+     let hUtils = gToolbox.highlighterUtils;
+     this.togglePicker = hUtils.togglePicker.bind(hUtils);
+     this.onPickerStarted = this.onPickerStarted.bind(this);
+     this.onPickerStopped = this.onPickerStopped.bind(this);
+-    this.createPlayerWidgets = this.createPlayerWidgets.bind(this);
++    this.refreshAnimations = this.refreshAnimations.bind(this);
+     this.toggleAll = this.toggleAll.bind(this);
+     this.onTabNavigated = this.onTabNavigated.bind(this);
+ 
+     this.startListeners();
+ 
+-    yield this.createPlayerWidgets();
++    if (AnimationsController.isNewUI) {
++      this.animationsTimelineComponent = new AnimationsTimeline(gInspector);
++      this.animationsTimelineComponent.init(this.playersEl);
++    }
++
++    yield this.refreshAnimations();
+ 
+     this.initialized.resolve();
+ 
+     this.emit(this.PANEL_INITIALIZED);
+   }),
+ 
+   destroy: Task.async(function*() {
+     if (!this.initialized) {
+@@ -64,39 +73,44 @@ let AnimationsPanel = {
+     }
+ 
+     if (this.destroyed) {
+       return this.destroyed.promise;
+     }
+     this.destroyed = promise.defer();
+ 
+     this.stopListeners();
++
++    if (this.animationsTimelineComponent) {
++      this.animationsTimelineComponent.destroy();
++      this.animationsTimelineComponent = null;
++    }
+     yield this.destroyPlayerWidgets();
+ 
+     this.playersEl = this.errorMessageEl = null;
+     this.toggleAllButtonEl = this.pickerButtonEl = null;
+ 
+     this.destroyed.resolve();
+   }),
+ 
+   startListeners: function() {
+     AnimationsController.on(AnimationsController.PLAYERS_UPDATED_EVENT,
+-      this.createPlayerWidgets);
++      this.refreshAnimations);
+ 
+     this.pickerButtonEl.addEventListener("click", this.togglePicker, false);
+     gToolbox.on("picker-started", this.onPickerStarted);
+     gToolbox.on("picker-stopped", this.onPickerStopped);
+ 
+     this.toggleAllButtonEl.addEventListener("click", this.toggleAll, false);
+     gToolbox.target.on("navigate", this.onTabNavigated);
+   },
+ 
+   stopListeners: function() {
+     AnimationsController.off(AnimationsController.PLAYERS_UPDATED_EVENT,
+-      this.createPlayerWidgets);
++      this.refreshAnimations);
+ 
+     this.pickerButtonEl.removeEventListener("click", this.togglePicker, false);
+     gToolbox.off("picker-started", this.onPickerStarted);
+     gToolbox.off("picker-stopped", this.onPickerStopped);
+ 
+     this.toggleAllButtonEl.removeEventListener("click", this.toggleAll, false);
+     gToolbox.target.off("navigate", this.onTabNavigated);
+   },
+@@ -117,62 +131,75 @@ let AnimationsPanel = {
+ 
+   onPickerStopped: function() {
+     this.pickerButtonEl.removeAttribute("checked");
+   },
+ 
+   toggleAll: Task.async(function*() {
+     let btnClass = this.toggleAllButtonEl.classList;
+ 
+-    // Toggling all animations is async and it may be some time before each of
+-    // the current players get their states updated, so toggle locally too, to
+-    // avoid the timelines from jumping back and forth.
+-    if (this.playerWidgets) {
+-      let currentWidgetStateChange = [];
+-      for (let widget of this.playerWidgets) {
+-        currentWidgetStateChange.push(btnClass.contains("paused")
+-          ? widget.play() : widget.pause());
++    if (!AnimationsController.isNewUI) {
++      // Toggling all animations is async and it may be some time before each of
++      // the current players get their states updated, so toggle locally too, to
++      // avoid the timelines from jumping back and forth.
++      if (this.playerWidgets) {
++        let currentWidgetStateChange = [];
++        for (let widget of this.playerWidgets) {
++          currentWidgetStateChange.push(btnClass.contains("paused")
++            ? widget.play() : widget.pause());
++        }
++        yield promise.all(currentWidgetStateChange).catch(Cu.reportError);
+       }
+-      yield promise.all(currentWidgetStateChange).catch(Cu.reportError);
+     }
+ 
+     btnClass.toggle("paused");
+     yield AnimationsController.toggleAll();
+   }),
+ 
+   onTabNavigated: function() {
+     this.toggleAllButtonEl.classList.remove("paused");
+   },
+ 
+-  createPlayerWidgets: Task.async(function*() {
++  refreshAnimations: Task.async(function*() {
+     let done = gInspector.updating("animationspanel");
+ 
+     // Empty the whole panel first.
+     this.hideErrorMessage();
+     yield this.destroyPlayerWidgets();
+ 
+-    // If there are no players to show, show the error message instead and return.
++    // Re-render the timeline component.
++    if (this.animationsTimelineComponent) {
++      this.animationsTimelineComponent.render(
++        AnimationsController.animationPlayers);
++    }
++
++    // If there are no players to show, show the error message instead and
++    // return.
+     if (!AnimationsController.animationPlayers.length) {
+       this.displayErrorMessage();
+       this.emit(this.UI_UPDATED_EVENT);
+       done();
+       return;
+     }
+ 
+-    // Otherwise, create player widgets.
+-    this.playerWidgets = [];
+-    let initPromises = [];
++    // Otherwise, create player widgets (only when isNewUI is false, the
++    // timeline has already been re-rendered).
++    if (!AnimationsController.isNewUI) {
++      this.playerWidgets = [];
++      let initPromises = [];
+ 
+-    for (let player of AnimationsController.animationPlayers) {
+-      let widget = new PlayerWidget(player, this.playersEl);
+-      initPromises.push(widget.initialize());
+-      this.playerWidgets.push(widget);
++      for (let player of AnimationsController.animationPlayers) {
++        let widget = new PlayerWidget(player, this.playersEl);
++        initPromises.push(widget.initialize());
++        this.playerWidgets.push(widget);
++      }
++
++      yield initPromises;
+     }
+ 
+-    yield initPromises;
+     this.emit(this.UI_UPDATED_EVENT);
+     done();
+   }),
+ 
+   destroyPlayerWidgets: Task.async(function*() {
+     if (!this.playerWidgets) {
+       return;
+     }
+@@ -387,31 +414,30 @@ PlayerWidget.prototype = {
+    * Note that tests may want to call this callback directly rather than
+    * simulating a click on the button since it returns the promise returned by
+    * play and paused.
+    * @return {Promise}
+    */
+   onPlayPauseBtnClick: function() {
+     if (this.player.state.playState === "running") {
+       return this.pause();
+-    } else {
+-      return this.play();
+     }
++    return this.play();
+   },
+ 
+   onRewindBtnClick: function() {
+     this.setCurrentTime(0, true);
+   },
+ 
+   onFastForwardBtnClick: function() {
+     let state = this.player.state;
+ 
+     let time = state.duration;
+     if (state.iterationCount) {
+-     time = state.iterationCount * state.duration;
++      time = state.iterationCount * state.duration;
+     }
+     this.setCurrentTime(time, true);
+   },
+ 
+   /**
+    * Executed when the current-time range input is changed.
+    */
+   onCurrentTimeChanged: function(e) {
+@@ -461,17 +487,18 @@ PlayerWidget.prototype = {
+   /**
+    * Set the current time of the animation.
+    * @param {Number} time.
+    * @param {Boolean} shouldPause Should the player be paused too.
+    * @return {Promise} Resolves when the current time has been set.
+    */
+   setCurrentTime: Task.async(function*(time, shouldPause) {
+     if (!AnimationsController.hasSetCurrentTime) {
+-      throw new Error("This server version doesn't support setting animations' currentTime");
++      throw new Error("This server version doesn't support setting " +
++                      "animations' currentTime");
+     }
+ 
+     if (shouldPause) {
+       this.stopTimelineAnimation();
+       yield this.pause();
+     }
+ 
+     if (this.player.state.delay) {
+@@ -487,17 +514,18 @@ PlayerWidget.prototype = {
+ 
+   /**
+    * Set the playback rate of the animation.
+    * @param {Number} rate.
+    * @return {Promise} Resolves when the rate has been set.
+    */
+   setPlaybackRate: function(rate) {
+     if (!AnimationsController.hasSetPlaybackRate) {
+-      throw new Error("This server version doesn't support setting animations' playbackRate");
++      throw new Error("This server version doesn't support setting " +
++                      "animations' playbackRate");
+     }
+ 
+     return this.player.setPlaybackRate(rate);
+   },
+ 
+   /**
+    * Pause the animation player via this widget.
+    * @return {Promise} Resolves when the player is paused, the button is
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/components.js
+--- a/browser/devtools/animationinspector/components.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/components.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -1,34 +1,44 @@
+ /* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++/* globals ViewHelpers */
+ 
+ "use strict";
+ 
+ // Set of reusable UI components for the animation-inspector UI.
+ // All components in this module share a common API:
+ // 1. construct the component:
+ //    let c = new ComponentName();
+ // 2. initialize the markup of the component in a given parent node:
+ //    c.init(containerElement);
+ // 3. render the component, passing in some sort of state:
+ //    This may be called over and over again when the state changes, to update
+ //    the component output.
+ //    c.render(state);
+ // 4. destroy the component:
+ //    c.destroy();
+ 
+-const {Cu} = require('chrome');
++const {Cu} = require("chrome");
+ Cu.import("resource:///modules/devtools/ViewHelpers.jsm");
++const {Task} = Cu.import("resource://gre/modules/Task.jsm", {});
++const {
++  createNode,
++  drawGraphElementBackground,
++  findOptimalTimeInterval
++} = require("devtools/animationinspector/utils");
+ 
+ const STRINGS_URI = "chrome://browser/locale/devtools/animationinspector.properties";
+ const L10N = new ViewHelpers.L10N(STRINGS_URI);
++const MILLIS_TIME_FORMAT_MAX_DURATION = 4000;
++// The minimum spacing between 2 time graduation headers in the timeline (ms).
++const TIME_GRADUATION_MIN_SPACING = 40;
+ 
+ /**
+  * UI component responsible for displaying and updating the player meta-data:
+  * name, duration, iterations, delay.
+  * The parent UI component for this should drive its updates by calling
+  * render(state) whenever it wants the component to update.
+  */
+ function PlayerMetaDataHeader() {
+@@ -70,50 +80,50 @@ PlayerMetaDataHeader.prototype = {
+       attributes: {
+         "class": "meta-data"
+       }
+     });
+ 
+     // Animation duration.
+     this.durationLabel = createNode({
+       parent: metaData,
+-      nodeType: "span"
++      nodeType: "span",
++      textContent: L10N.getStr("player.animationDurationLabel")
+     });
+-    this.durationLabel.textContent = L10N.getStr("player.animationDurationLabel");
+ 
+     this.durationValue = createNode({
+       parent: metaData,
+       nodeType: "strong"
+     });
+ 
+     // Animation delay (hidden by default since there may not be a delay).
+     this.delayLabel = createNode({
+       parent: metaData,
+       nodeType: "span",
+       attributes: {
+         "style": "display:none;"
+-      }
++      },
++      textContent: L10N.getStr("player.animationDelayLabel")
+     });
+-    this.delayLabel.textContent = L10N.getStr("player.animationDelayLabel");
+ 
+     this.delayValue = createNode({
+       parent: metaData,
+       nodeType: "strong"
+     });
+ 
+     // Animation iteration count (also hidden by default since we don't display
+     // single iterations).
+     this.iterationLabel = createNode({
+       parent: metaData,
+       nodeType: "span",
+       attributes: {
+         "style": "display:none;"
+-      }
++      },
++      textContent: L10N.getStr("player.animationIterationCountLabel")
+     });
+-    this.iterationLabel.textContent = L10N.getStr("player.animationIterationCountLabel");
+ 
+     this.iterationValue = createNode({
+       parent: metaData,
+       nodeType: "strong",
+       attributes: {
+         "style": "display:none;"
+       }
+     });
+@@ -219,17 +229,17 @@ PlaybackRateSelector.prototype = {
+     }
+   },
+ 
+   /**
+    * Get the ordered list of presets, including the current playbackRate if
+    * different from the existing presets.
+    */
+   getCurrentPresets: function({playbackRate}) {
+-    return [...new Set([...this.PRESETS, playbackRate])].sort((a,b) => a > b);
++    return [...new Set([...this.PRESETS, playbackRate])].sort((a, b) => a > b);
+   },
+ 
+   render: function(state) {
+     if (state.playbackRate === this.currentRate) {
+       return;
+     }
+ 
+     this.removeSelect();
+@@ -243,43 +253,47 @@ PlaybackRateSelector.prototype = {
+     });
+ 
+     for (let preset of this.getCurrentPresets(state)) {
+       let option = createNode({
+         parent: this.el,
+         nodeType: "option",
+         attributes: {
+           value: preset,
+-        }
++        },
++        textContent: L10N.getFormatStr("player.playbackRateLabel", preset)
+       });
+-      option.textContent = L10N.getFormatStr("player.playbackRateLabel", preset);
+       if (preset === state.playbackRate) {
+         option.setAttribute("selected", "");
+       }
+     }
+ 
+     this.el.addEventListener("change", this.onSelectionChanged);
+ 
+     this.currentRate = state.playbackRate;
+   },
+ 
+-  onSelectionChanged: function(e) {
++  onSelectionChanged: function() {
+     this.emit("rate-changed", parseFloat(this.el.value));
+   }
+ };
+ 
+ /**
+  * UI component responsible for displaying a preview of the target dom node of
+  * a given animation.
+  * @param {InspectorPanel} inspector Requires a reference to the inspector-panel
+  * to highlight and select the node, as well as refresh it when there are
+  * mutations.
++ * @param {Object} options Supported properties are:
++ * - compact {Boolean} Defaults to false. If true, nodes will be previewed like
++ *   tag#id.class instead of <tag id="id" class="class">
+  */
+-function AnimationTargetNode(inspector) {
++function AnimationTargetNode(inspector, options={}) {
+   this.inspector = inspector;
++  this.options = options;
+ 
+   this.onPreviewMouseOver = this.onPreviewMouseOver.bind(this);
+   this.onPreviewMouseOut = this.onPreviewMouseOut.bind(this);
+   this.onSelectNodeClick = this.onSelectNodeClick.bind(this);
+   this.onMarkupMutations = this.onMarkupMutations.bind(this);
+ 
+   EventEmitter.decorate(this);
+ }
+@@ -308,80 +322,107 @@ AnimationTargetNode.prototype = {
+     });
+ 
+     // Wrapper used for mouseover/out event handling.
+     this.previewEl = createNode({
+       parent: this.el,
+       nodeType: "span"
+     });
+ 
+-    this.previewEl.appendChild(document.createTextNode("<"));
++    if (!this.options.compact) {
++      this.previewEl.appendChild(document.createTextNode("<"));
++    }
+ 
+     // Tag name.
+     this.tagNameEl = createNode({
+       parent: this.previewEl,
+       nodeType: "span",
+       attributes: {
+         "class": "tag-name theme-fg-color3"
+       }
+     });
+ 
+     // Id attribute container.
+     this.idEl = createNode({
+       parent: this.previewEl,
+       nodeType: "span"
+     });
+ 
+-    createNode({
+-      parent: this.idEl,
+-      nodeType: "span",
+-      attributes: {
+-        "class": "attribute-name theme-fg-color2"
+-      }
+-    }).textContent = "id";
+-
+-    this.idEl.appendChild(document.createTextNode("=\""));
++    if (!this.options.compact) {
++      createNode({
++        parent: this.idEl,
++        nodeType: "span",
++        attributes: {
++          "class": "attribute-name theme-fg-color2"
++        },
++        textContent: "id"
++      });
++      this.idEl.appendChild(document.createTextNode("=\""));
++    } else {
++      createNode({
++        parent: this.idEl,
++        nodeType: "span",
++        attributes: {
++          "class": "theme-fg-color2"
++        },
++        textContent: "#"
++      });
++    }
+ 
+     createNode({
+       parent: this.idEl,
+       nodeType: "span",
+       attributes: {
+         "class": "attribute-value theme-fg-color6"
+       }
+     });
+ 
+-    this.idEl.appendChild(document.createTextNode("\""));
++    if (!this.options.compact) {
++      this.idEl.appendChild(document.createTextNode("\""));
++    }
+ 
+     // Class attribute container.
+     this.classEl = createNode({
+       parent: this.previewEl,
+       nodeType: "span"
+     });
+ 
+-    createNode({
+-      parent: this.classEl,
+-      nodeType: "span",
+-      attributes: {
+-        "class": "attribute-name theme-fg-color2"
+-      }
+-    }).textContent = "class";
+-
+-    this.classEl.appendChild(document.createTextNode("=\""));
++    if (!this.options.compact) {
++      createNode({
++        parent: this.classEl,
++        nodeType: "span",
++        attributes: {
++          "class": "attribute-name theme-fg-color2"
++        },
++        textContent: "class"
++      });
++      this.classEl.appendChild(document.createTextNode("=\""));
++    } else {
++      createNode({
++        parent: this.classEl,
++        nodeType: "span",
++        attributes: {
++          "class": "theme-fg-color6"
++        },
++        textContent: "."
++      });
++    }
+ 
+     createNode({
+       parent: this.classEl,
+       nodeType: "span",
+       attributes: {
+         "class": "attribute-value theme-fg-color6"
+       }
+     });
+ 
+-    this.classEl.appendChild(document.createTextNode("\""));
+-
+-    this.previewEl.appendChild(document.createTextNode(">"));
++    if (!this.options.compact) {
++      this.classEl.appendChild(document.createTextNode("\""));
++      this.previewEl.appendChild(document.createTextNode(">"));
++    }
+ 
+     // Init events for highlighting and selecting the node.
+     this.previewEl.addEventListener("mouseover", this.onPreviewMouseOver);
+     this.previewEl.addEventListener("mouseout", this.onPreviewMouseOut);
+     this.selectNodeEl.addEventListener("click", this.onSelectNodeClick);
+ 
+     // Start to listen for markupmutation events.
+     this.inspector.on("markupmutation", this.onMarkupMutations);
+@@ -425,78 +466,364 @@ AnimationTargetNode.prototype = {
+       if (target === this.nodeFront) {
+         // Re-render with the same nodeFront to update the output.
+         this.render(this.playerFront);
+         break;
+       }
+     }
+   },
+ 
+-  render: function(playerFront) {
++  render: Task.async(function*(playerFront) {
+     this.playerFront = playerFront;
+-    this.inspector.walker.getNodeFromActor(playerFront.actorID, ["node"]).then(nodeFront => {
+-      // We might have been destroyed in the meantime, or the node might not be found.
+-      if (!this.el || !nodeFront) {
+-        return;
++    this.nodeFront = undefined;
++
++    try {
++      this.nodeFront = yield this.inspector.walker.getNodeFromActor(
++                             playerFront.actorID, ["node"]);
++    } catch (e) {
++      // We might have been destroyed in the meantime, or the node might not be
++      // found.
++      if (!this.el) {
++        console.warn("Cound't retrieve the animation target node, widget " +
++                     "destroyed");
++      }
++      console.error(e);
++      return;
++    }
++
++    if (!this.nodeFront || !this.el) {
++      return;
++    }
++
++    let {tagName, attributes} = this.nodeFront;
++
++    this.tagNameEl.textContent = tagName.toLowerCase();
++
++    let idIndex = attributes.findIndex(({name}) => name === "id");
++    if (idIndex > -1 && attributes[idIndex].value) {
++      this.idEl.querySelector(".attribute-value").textContent =
++        attributes[idIndex].value;
++      this.idEl.style.display = "inline";
++    } else {
++      this.idEl.style.display = "none";
++    }
++
++    let classIndex = attributes.findIndex(({name}) => name === "class");
++    if (classIndex > -1 && attributes[classIndex].value) {
++      let value = attributes[classIndex].value;
++      if (this.options.compact) {
++        value = value.split(" ").join(".");
+       }
+ 
+-      this.nodeFront = nodeFront;
+-      let {tagName, attributes} = nodeFront;
++      this.classEl.querySelector(".attribute-value").textContent = value;
++      this.classEl.style.display = "inline";
++    } else {
++      this.classEl.style.display = "none";
++    }
+ 
+-      this.tagNameEl.textContent = tagName.toLowerCase();
++    this.emit("target-retrieved");
++  })
++};
+ 
+-      let idIndex = attributes.findIndex(({name}) => name === "id");
+-      if (idIndex > -1 && attributes[idIndex].value) {
+-        this.idEl.querySelector(".attribute-value").textContent =
+-          attributes[idIndex].value;
+-        this.idEl.style.display = "inline";
+-      } else {
+-        this.idEl.style.display = "none";
+-      }
++/**
++ * The TimeScale helper object is used to know which size should something be
++ * displayed with in the animation panel, depending on the animations that are
++ * currently displayed.
++ * If there are 5 animations displayed, and the first one starts at 10000ms and
++ * the last one ends at 20000ms, then this helper can be used to convert any
++ * time in this range to a distance in pixels.
++ *
++ * For the helper to know how to convert, it needs to know all the animations.
++ * Whenever a new animation is added to the panel, addAnimation(state) should be
++ * called. reset() can be called to start over.
++ */
++let TimeScale = {
++  minStartTime: Infinity,
++  maxEndTime: 0,
+ 
+-      let classIndex = attributes.findIndex(({name}) => name === "class");
+-      if (classIndex > -1 && attributes[classIndex].value) {
+-        this.classEl.querySelector(".attribute-value").textContent =
+-          attributes[classIndex].value;
+-        this.classEl.style.display = "inline";
+-      } else {
+-        this.classEl.style.display = "none";
+-      }
++  /**
++   * Add a new animation to time scale.
++   * @param {Object} state A PlayerFront.state object.
++   */
++  addAnimation: function({startTime, delay, duration, iterationCount}) {
++    this.minStartTime = Math.min(this.minStartTime, startTime);
++    let length = delay + (duration * (!iterationCount ? 1 : iterationCount));
++    this.maxEndTime = Math.max(this.maxEndTime, startTime + length);
++  },
+ 
+-      this.emit("target-retrieved");
+-    }, e => {
+-      this.nodeFront = null;
+-      if (!this.el) {
+-        console.warn("Cound't retrieve the animation target node, widget destroyed");
+-      } else {
+-        console.error(e);
+-      }
+-    });
++  /**
++   * Reset the current time scale.
++   */
++  reset: function() {
++    this.minStartTime = Infinity;
++    this.maxEndTime = 0;
++  },
++
++  /**
++   * Convert a startTime to a distance in pixels, in the current time scale.
++   * @param {Number} time
++   * @param {Number} containerWidth The width of the container element.
++   * @return {Number}
++   */
++  startTimeToDistance: function(time, containerWidth) {
++    time -= this.minStartTime;
++    return this.durationToDistance(time, containerWidth);
++  },
++
++  /**
++   * Convert a duration to a distance in pixels, in the current time scale.
++   * @param {Number} time
++   * @param {Number} containerWidth The width of the container element.
++   * @return {Number}
++   */
++  durationToDistance: function(duration, containerWidth) {
++    return containerWidth * duration / (this.maxEndTime - this.minStartTime);
++  },
++
++  /**
++   * Convert a distance in pixels to a time, in the current time scale.
++   * @param {Number} distance
++   * @param {Number} containerWidth The width of the container element.
++   * @return {Number}
++   */
++  distanceToTime: function(distance, containerWidth) {
++    return this.minStartTime +
++      ((this.maxEndTime - this.minStartTime) * distance / containerWidth);
++  },
++
++  /**
++   * Convert a distance in pixels to a time, in the current time scale.
++   * The time will be relative to the current minimum start time.
++   * @param {Number} distance
++   * @param {Number} containerWidth The width of the container element.
++   * @return {Number}
++   */
++  distanceToRelativeTime: function(distance, containerWidth) {
++    let time = this.distanceToTime(distance, containerWidth);
++    return time - this.minStartTime;
++  },
++
++  /**
++   * Depending on the time scale, format the given time as milliseconds or
++   * seconds.
++   * @param {Number} time
++   * @return {String} The formatted time string.
++   */
++  formatTime: function(time) {
++    let duration = this.maxEndTime - this.minStartTime;
++
++    // Format in milliseconds if the total duration is short enough.
++    if (duration <= MILLIS_TIME_FORMAT_MAX_DURATION) {
++      return L10N.getFormatStr("timeline.timeGraduationLabel", time.toFixed(0));
++    }
++
++    // Otherwise format in seconds.
++    return L10N.getFormatStr("player.timeLabel", (time / 1000).toFixed(1));
+   }
+ };
+ 
++exports.TimeScale = TimeScale;
++
+ /**
+- * DOM node creation helper function.
+- * @param {Object} Options to customize the node to be created.
+- * - nodeType {String} Optional, defaults to "div",
+- * - attributes {Object} Optional attributes object like
+- *   {attrName1:value1, attrName2: value2, ...}
+- * - parent {DOMNode} Mandatory node to append the newly created node to.
+- * @return {DOMNode} The newly created node.
++ * UI component responsible for displaying a timeline for animations.
++ * The timeline is essentially a graph with time along the x axis and animations
++ * along the y axis.
++ * The time is represented with a graduation header at the top and a current
++ * time play head.
++ * Animations are organized by lines, with a left margin containing the preview
++ * of the target DOM element the animation applies to.
+  */
+-function createNode(options) {
+-  if (!options.parent) {
+-    throw new Error("Missing parent DOMNode to create new node");
+-  }
++function AnimationsTimeline(inspector) {
++  this.animations = [];
++  this.targetNodes = [];
++  this.inspector = inspector;
+ 
+-  let type = options.nodeType || "div";
+-  let node = options.parent.ownerDocument.createElement(type);
+-
+-  for (let name in options.attributes || {}) {
+-    let value = options.attributes[name];
+-    node.setAttribute(name, value);
+-  }
+-
+-  options.parent.appendChild(node);
+-  return node;
++  this.onAnimationStateChanged = this.onAnimationStateChanged.bind(this);
+ }
+ 
+-exports.createNode = createNode;
++exports.AnimationsTimeline = AnimationsTimeline;
++
++AnimationsTimeline.prototype = {
++  init: function(containerEl) {
++    this.win = containerEl.ownerDocument.defaultView;
++
++    this.rootWrapperEl = createNode({
++      parent: containerEl,
++      attributes: {
++        "class": "animation-timeline"
++      }
++    });
++
++    this.timeHeaderEl = createNode({
++      parent: this.rootWrapperEl,
++      attributes: {
++        "class": "time-header"
++      }
++    });
++
++    this.animationsEl = createNode({
++      parent: this.rootWrapperEl,
++      nodeType: "ul",
++      attributes: {
++        "class": "animations"
++      }
++    });
++  },
++
++  destroy: function() {
++    this.unrender();
++
++    this.rootWrapperEl.remove();
++    this.animations = [];
++
++    this.rootWrapperEl = null;
++    this.timeHeaderEl = null;
++    this.animationsEl = null;
++    this.win = null;
++    this.inspector = null;
++  },
++
++  destroyTargetNodes: function() {
++    for (let targetNode of this.targetNodes) {
++      targetNode.destroy();
++    }
++    this.targetNodes = [];
++  },
++
++  unrender: function() {
++    for (let animation of this.animations) {
++      animation.off("changed", this.onAnimationStateChanged);
++    }
++
++    TimeScale.reset();
++    this.destroyTargetNodes();
++    this.animationsEl.innerHTML = "";
++  },
++
++  render: function(animations) {
++    this.unrender();
++
++    this.animations = animations;
++    if (!this.animations.length) {
++      return;
++    }
++
++    // Loop first to set the time scale for all current animations.
++    for (let {state} of animations) {
++      TimeScale.addAnimation(state);
++    }
++
++    this.drawHeaderAndBackground();
++
++    for (let animation of this.animations) {
++      animation.on("changed", this.onAnimationStateChanged);
++
++      // Each line contains the target animated node and the animation time
++      // block.
++      let animationEl = createNode({
++        parent: this.animationsEl,
++        nodeType: "li",
++        attributes: {
++          "class": "animation"
++        }
++      });
++
++      // Left sidebar for the animated node.
++      let animatedNodeEl = createNode({
++        parent: animationEl,
++        attributes: {
++          "class": "target"
++        }
++      });
++
++      let timeBlockEl = createNode({
++        parent: animationEl,
++        attributes: {
++          "class": "time-block"
++        }
++      });
++
++      this.drawTimeBlock(animation, timeBlockEl);
++
++      // Draw the animated node target.
++      let targetNode = new AnimationTargetNode(this.inspector, {compact: true});
++      targetNode.init(animatedNodeEl);
++      targetNode.render(animation);
++
++      // Save the targetNode so it can be destroyed later.
++      this.targetNodes.push(targetNode);
++    }
++  },
++
++  onAnimationStateChanged: function() {
++    // For now, simply re-render the component. The animation front's state has
++    // already been updated.
++    this.render(this.animations);
++  },
++
++  drawHeaderAndBackground: function() {
++    let width = this.timeHeaderEl.offsetWidth;
++    let scale = width / (TimeScale.maxEndTime - TimeScale.minStartTime);
++    drawGraphElementBackground(this.win.document, "time-graduations", width, scale);
++
++    // And the time graduation header.
++    this.timeHeaderEl.innerHTML = "";
++    let interval = findOptimalTimeInterval(scale, TIME_GRADUATION_MIN_SPACING);
++    for (let i = 0; i < width; i += interval) {
++      createNode({
++        parent: this.timeHeaderEl,
++        nodeType: "span",
++        attributes: {
++          "class": "time-tick",
++          "style": `left:${i}px`
++        },
++        textContent: TimeScale.formatTime(
++          TimeScale.distanceToRelativeTime(i, width))
++      });
++    }
++  },
++
++  drawTimeBlock: function({state}, el) {
++    let width = el.offsetWidth;
++
++    // Container for all iterations and delay. Positioned at the right start
++    // time.
++    let x = TimeScale.startTimeToDistance(state.startTime + (state.delay || 0),
++                                          width);
++    // With the right width (duration*duration).
++    let count = state.iterationCount || 1;
++    let w = TimeScale.durationToDistance(state.duration, width);
++
++    let iterations = createNode({
++      parent: el,
++      attributes: {
++        "class": "iterations" + (state.iterationCount ? "" : " infinite"),
++        // Individual iterations are represented by setting the size of the
++        // repeating linear-gradient.
++        "style": `left:${x}px;
++                  width:${w * count}px;
++                  background-size:${Math.max(w, 2)}px 100%;`
++      }
++    });
++
++    // The animation name is displayed over the iterations.
++    createNode({
++      parent: iterations,
++      attributes: {
++        "class": "name"
++      },
++      textContent: state.name
++    });
++
++    // Delay.
++    if (state.delay) {
++      let delay = TimeScale.durationToDistance(state.delay, width);
++      createNode({
++        parent: iterations,
++        attributes: {
++          "class": "delay",
++          "style": `left:-${delay}px;
++                    width:${delay}px;`
++        }
++      });
++    }
++  }
++};
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/moz.build
+--- a/browser/devtools/animationinspector/moz.build	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/moz.build	Thu Jun 11 21:57:17 2015 +0200
+@@ -1,11 +1,13 @@
+ # -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ BROWSER_CHROME_MANIFESTS += ['test/browser.ini']
++XPCSHELL_TESTS_MANIFESTS += ['test/unit/xpcshell.ini']
+ 
+ EXTRA_JS_MODULES.devtools.animationinspector += [
+     'components.js',
++    'utils.js',
+ ]
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser.ini
+--- a/browser/devtools/animationinspector/test/browser.ini	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser.ini	Thu Jun 11 21:57:17 2015 +0200
+@@ -14,30 +14,35 @@ support-files =
+ [browser_animation_play_pause_button.js]
+ [browser_animation_playerFronts_are_refreshed.js]
+ [browser_animation_playerWidgets_appear_on_panel_init.js]
+ [browser_animation_playerWidgets_destroy.js]
+ [browser_animation_playerWidgets_disables_on_finished.js]
+ [browser_animation_playerWidgets_dont_show_time_after_duration.js]
+ [browser_animation_playerWidgets_have_control_buttons.js]
+ [browser_animation_playerWidgets_meta_data.js]
++[browser_animation_playerWidgets_scrubber_delayed.js]
++[browser_animation_playerWidgets_scrubber_enabled.js]
++[browser_animation_playerWidgets_scrubber_moves.js]
+ [browser_animation_playerWidgets_state_after_pause.js]
+ [browser_animation_playerWidgets_target_nodes.js]
+ [browser_animation_rate_select_shows_presets.js]
+ [browser_animation_refresh_on_added_animation.js]
+ [browser_animation_refresh_on_removed_animation.js]
+ [browser_animation_refresh_when_active.js]
+ [browser_animation_same_nb_of_playerWidgets_and_playerFronts.js]
+ [browser_animation_setting_currentTime_works_and_pauses.js]
+ [browser_animation_setting_playbackRate_works.js]
+ [browser_animation_shows_player_on_valid_node.js]
+ [browser_animation_target_highlight_select.js]
+-[browser_animation_timeline_animates.js]
+-[browser_animation_timeline_is_enabled.js]
+-[browser_animation_timeline_waits_for_delay.js]
++[browser_animation_timeline_displays_with_pref.js]
++[browser_animation_timeline_header.js]
++[browser_animation_timeline_shows_delay.js]
++[browser_animation_timeline_shows_iterations.js]
++[browser_animation_timeline_ui.js]
+ [browser_animation_toggle_button_resets_on_navigate.js]
+ [browser_animation_toggle_button_toggles_animations.js]
+ [browser_animation_toggle_button_updates_playerWidgets.js]
+ [browser_animation_toolbar_exists.js]
+ [browser_animation_ui_updates_when_animation_changes.js]
+ [browser_animation_ui_updates_when_animation_data_changes.js]
+ [browser_animation_ui_updates_when_animation_rate_changes.js]
+ [browser_animation_ui_updates_when_animation_time_changes.js]
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_empty_on_invalid_nodes.js
+--- a/browser/devtools/animationinspector/test/browser_animation_empty_on_invalid_nodes.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_empty_on_invalid_nodes.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -3,22 +3,49 @@
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+ // Test that the panel shows no animation data for invalid or not animated nodes
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
++
+   let {inspector, panel} = yield openAnimationInspector();
++  yield testEmptyPanel(inspector, panel);
+ 
++  ({inspector, panel}) = yield closeAnimationInspectorAndRestartWithNewUI();
++  yield testEmptyPanel(inspector, panel, true);
++});
++
++function* testEmptyPanel(inspector, panel, isNewUI=false) {
+   info("Select node .still and check that the panel is empty");
+   let stillNode = yield getNodeFront(".still", inspector);
++  let onUpdated = panel.once(panel.UI_UPDATED_EVENT);
+   yield selectNode(stillNode, inspector);
+-  ok(!panel.playerWidgets || !panel.playerWidgets.length,
+-    "No player widgets displayed for a still node");
++  yield onUpdated;
++
++  if (isNewUI) {
++    is(panel.animationsTimelineComponent.animations.length, 0,
++       "No animation players stored in the timeline component for a still node");
++    is(panel.animationsTimelineComponent.animationsEl.childNodes.length, 0,
++       "No animation displayed in the timeline component for a still node");
++  } else {
++    ok(!panel.playerWidgets || !panel.playerWidgets.length,
++       "No player widgets displayed for a still node");
++  }
+ 
+   info("Select the comment text node and check that the panel is empty");
+   let commentNode = yield inspector.walker.previousSibling(stillNode);
++  onUpdated = panel.once(panel.UI_UPDATED_EVENT);
+   yield selectNode(commentNode, inspector);
+-  ok(!panel.playerWidgets || !panel.playerWidgets.length,
+-    "No player widgets displayed for a text node");
+-});
++  yield onUpdated;
++
++  if (isNewUI) {
++    is(panel.animationsTimelineComponent.animations.length, 0,
++       "No animation players stored in the timeline component for a text node");
++    is(panel.animationsTimelineComponent.animationsEl.childNodes.length, 0,
++       "No animation displayed in the timeline component for a text node");
++  } else {
++    ok(!panel.playerWidgets || !panel.playerWidgets.length,
++       "No player widgets displayed for a text node");
++  }
++}
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_panel_exists.js
+--- a/browser/devtools/animationinspector/test/browser_animation_panel_exists.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_panel_exists.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -10,9 +10,18 @@ add_task(function*() {
+   yield addTab("data:text/html;charset=utf-8,welcome to the animation panel");
+   let {panel, controller} = yield openAnimationInspector();
+ 
+   ok(controller, "The animation controller exists");
+   ok(controller.animationsFront, "The animation controller has been initialized");
+ 
+   ok(panel, "The animation panel exists");
+   ok(panel.playersEl, "The animation panel has been initialized");
++
++  ({panel, controller}) = yield closeAnimationInspectorAndRestartWithNewUI();
++
++  ok(controller, "The animation controller exists");
++  ok(controller.animationsFront, "The animation controller has been initialized");
++
++  ok(panel, "The animation panel exists");
++  ok(panel.playersEl, "The animation panel has been initialized");
++  ok(panel.animationsTimelineComponent, "The animation panel has been initialized");
+ });
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_participate_in_inspector_update.js
+--- a/browser/devtools/animationinspector/test/browser_animation_participate_in_inspector_update.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_participate_in_inspector_update.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -5,35 +5,42 @@
+ "use strict";
+ 
+ // Test that the update of the animation panel participate in the
+ // inspector-updated event. This means that the test verifies that the
+ // inspector-updated event is emitted *after* the animation panel is ready.
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+-  let {inspector, panel, controller} = yield openAnimationInspector();
+ 
++  let ui = yield openAnimationInspector();
++  yield testEventsOrder(ui);
++
++  ui = yield closeAnimationInspectorAndRestartWithNewUI();
++  yield testEventsOrder(ui);
++});
++
++function* testEventsOrder({inspector, panel, controller}) {
+   info("Listen for the players-updated, ui-updated and inspector-updated events");
+   let receivedEvents = [];
+   controller.once(controller.PLAYERS_UPDATED_EVENT, () => {
+     receivedEvents.push(controller.PLAYERS_UPDATED_EVENT);
+   });
+   panel.once(panel.UI_UPDATED_EVENT, () => {
+     receivedEvents.push(panel.UI_UPDATED_EVENT);
+-  })
++  });
+   inspector.once("inspector-updated", () => {
+     receivedEvents.push("inspector-updated");
+   });
+ 
+   info("Selecting an animated node");
+   let node = yield getNodeFront(".animated", inspector);
+   yield selectNode(node, inspector);
+ 
+   info("Check that all events were received, and in the right order");
+   is(receivedEvents.length, 3, "3 events were received");
+   is(receivedEvents[0], controller.PLAYERS_UPDATED_EVENT,
+     "The first event received was the players-updated event");
+   is(receivedEvents[1], panel.UI_UPDATED_EVENT,
+     "The second event received was the ui-updated event");
+   is(receivedEvents[2], "inspector-updated",
+     "The third event received was the inspector-updated event");
+-});
++}
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_playerWidgets_appear_on_panel_init.js
+--- a/browser/devtools/animationinspector/test/browser_animation_playerWidgets_appear_on_panel_init.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_playerWidgets_appear_on_panel_init.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -4,12 +4,19 @@
+ 
+ "use strict";
+ 
+ // Test that player widgets are displayed right when the animation panel is
+ // initialized, if the selected node (<body> by default) is animated.
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_body_animation.html");
++
+   let {panel} = yield openAnimationInspector();
++  is(panel.playerWidgets.length, 1,
++    "One animation player is displayed after init");
+ 
+-  is(panel.playerWidgets.length, 1, "One animation player is displayed after init");
++  ({panel}) = yield closeAnimationInspectorAndRestartWithNewUI();
++  is(panel.animationsTimelineComponent.animations.length, 1,
++    "One animation is handled by the timeline after init");
++  is(panel.animationsTimelineComponent.animationsEl.childNodes.length, 1,
++    "One animation is displayed after init");
+ });
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_playerWidgets_scrubber_delayed.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/browser_animation_playerWidgets_scrubber_delayed.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,24 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Test that the currentTime timeline doesn't move if the animation is currently
++// waiting for an animation-delay.
++
++add_task(function*() {
++  yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
++  let {inspector, panel} = yield openAnimationInspector();
++
++  info("Select the delayed animation node");
++  yield selectNode(".delayed", inspector);
++
++  let widget = panel.playerWidgets[0];
++
++  let timeline = widget.currentTimeEl;
++  is(timeline.value, 0, "The timeline is at 0 since the animation hasn't started");
++
++  let timeLabel = widget.timeDisplayEl;
++  is(timeLabel.textContent, "0s", "The current time is 0");
++});
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_playerWidgets_scrubber_enabled.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/browser_animation_playerWidgets_scrubber_enabled.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,41 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Test that the currentTime timeline widget is enabled and that the associated
++// player front supports setting the current time.
++
++add_task(function*() {
++  yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
++  let {controller, inspector, panel} = yield openAnimationInspector();
++
++  info("Select the animated node");
++  yield selectNode(".animated", inspector);
++
++  info("Get the player widget's timeline element");
++  let widget = panel.playerWidgets[0];
++  let timeline = widget.currentTimeEl;
++
++  ok(!timeline.hasAttribute("disabled"), "The timeline input[range] is enabled");
++  ok(widget.setCurrentTime, "The widget has the setCurrentTime method");
++  ok(widget.player.setCurrentTime, "The associated player front has the setCurrentTime method");
++
++  info("Faking an older server version by setting " +
++    "AnimationsController.hasSetCurrentTime to false");
++
++  yield selectNode("body", inspector);
++  controller.hasSetCurrentTime = false;
++
++  yield selectNode(".animated", inspector);
++
++  info("Get the player widget's timeline element");
++  widget = panel.playerWidgets[0];
++  timeline = widget.currentTimeEl;
++
++  ok(timeline.hasAttribute("disabled"), "The timeline input[range] is disabled");
++
++  yield selectNode("body", inspector);
++  controller.hasSetCurrentTime = true;
++});
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_playerWidgets_scrubber_moves.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/browser_animation_playerWidgets_scrubber_moves.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,28 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Test that the currentTime timeline widget actually progresses with the
++// animation itself.
++
++add_task(function*() {
++  yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
++  let {inspector, panel} = yield openAnimationInspector();
++
++  info("Select the animated node");
++  yield selectNode(".animated", inspector);
++
++  info("Get the player widget's timeline element and its current position");
++  let widget = panel.playerWidgets[0];
++  let timeline = widget.currentTimeEl;
++
++  yield onceNextPlayerRefresh(widget.player);
++  ok(widget.rafID, "The widget is updating the timeline with a rAF loop");
++
++  info("Pause the animation");
++  yield togglePlayPauseButton(widget);
++
++  ok(!widget.rafID, "The rAF loop has been stopped after the animation was paused");
++});
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_playerWidgets_target_nodes.js
+--- a/browser/devtools/animationinspector/test/browser_animation_playerWidgets_target_nodes.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_playerWidgets_target_nodes.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -22,10 +22,31 @@ add_task(function*() {
+   }
+ 
+   let targetEl = widget.el.querySelector(".animation-target");
+   ok(targetEl, "The player widget has a target element");
+   is(targetEl.textContent, "<divid=\"\"class=\"ball animated\">",
+     "The target element's content is correct");
+ 
+   let selectorEl = targetEl.querySelector(".node-selector");
+-  ok(selectorEl, "The icon to select the target element in the inspector exists");
++  ok(selectorEl,
++    "The icon to select the target element in the inspector exists");
++
++  info("Test again with the new timeline UI");
++  ({inspector, panel}) = yield closeAnimationInspectorAndRestartWithNewUI();
++
++  info("Select the simple animated node");
++  yield selectNode(".animated", inspector);
++
++  let targetNodeComponent = panel.animationsTimelineComponent.targetNodes[0];
++  // Make sure to wait for the target-retrieved event if the nodeFront hasn't
++  // yet been retrieved by the TargetNodeComponent.
++  if (!targetNodeComponent.nodeFront) {
++    yield targetNodeComponent.once("target-retrieved");
++  }
++
++  is(targetNodeComponent.el.textContent, "div#.ball.animated",
++    "The target element's content is correct");
++
++  selectorEl = targetNodeComponent.el.querySelector(".node-selector");
++  ok(selectorEl,
++    "The icon to select the target element in the inspector exists");
+ });
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_refresh_on_added_animation.js
+--- a/browser/devtools/animationinspector/test/browser_animation_refresh_on_added_animation.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_refresh_on_added_animation.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -3,32 +3,46 @@
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+ // Test that the panel content refreshes when new animations are added.
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+-  let {toolbox, inspector, panel} = yield openAnimationInspector();
+ 
++  let {inspector, panel} = yield openAnimationInspector();
++  yield testRefreshOnNewAnimation(inspector, panel);
++
++  ({inspector, panel}) = yield closeAnimationInspectorAndRestartWithNewUI();
++  yield testRefreshOnNewAnimation(inspector, panel);
++});
++
++function* testRefreshOnNewAnimation(inspector, panel) {
+   info("Select a non animated node");
+   yield selectNode(".still", inspector);
+ 
+-  is(panel.playersEl.querySelectorAll(".player-widget").length, 0,
+-    "There are no player widgets in the panel");
++  assertAnimationsDisplayed(panel, 0);
+ 
+   info("Listen to the next UI update event");
+   let onPanelUpdated = panel.once(panel.UI_UPDATED_EVENT);
+ 
+   info("Start an animation on the node");
+   yield executeInContent("devtools:test:setAttribute", {
+     selector: ".still",
+     attributeName: "class",
+     attributeValue: "ball animated"
+   });
+ 
+   yield onPanelUpdated;
+   ok(true, "The panel update event was fired");
+ 
+-  is(panel.playersEl.querySelectorAll(".player-widget").length, 1,
+-    "There is one player widget in the panel");
+-});
++  assertAnimationsDisplayed(panel, 1);
++
++  info("Remove the animation class on the node");
++  onPanelUpdated = panel.once(panel.UI_UPDATED_EVENT);
++  yield executeInContent("devtools:test:setAttribute", {
++    selector: ".ball.animated",
++    attributeName: "class",
++    attributeValue: "ball still"
++  });
++  yield onPanelUpdated;
++}
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_refresh_on_removed_animation.js
+--- a/browser/devtools/animationinspector/test/browser_animation_refresh_on_removed_animation.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_refresh_on_removed_animation.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -3,60 +3,69 @@
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+ // Test that the panel content refreshes when animations are removed.
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+-  let {toolbox, inspector, panel} = yield openAnimationInspector();
+ 
++  let {inspector, panel} = yield openAnimationInspector();
++  yield testRefreshOnRemove(inspector, panel);
++  yield testAddedAnimationWorks(inspector, panel);
++
++  info("Reload and test again with the new UI");
++  ({inspector, panel}) = yield closeAnimationInspectorAndRestartWithNewUI(true);
++  yield testRefreshOnRemove(inspector, panel, true);
++});
++
++function* testRefreshOnRemove(inspector, panel) {
+   info("Select a animated node");
+   yield selectNode(".animated", inspector);
+ 
+-  is(panel.playersEl.querySelectorAll(".player-widget").length, 1,
+-    "There is one player widget in the panel");
++  assertAnimationsDisplayed(panel, 1);
+ 
+   info("Listen to the next UI update event");
+   let onPanelUpdated = panel.once(panel.UI_UPDATED_EVENT);
+ 
+   info("Remove the animation on the node by removing the class");
+   yield executeInContent("devtools:test:setAttribute", {
+     selector: ".animated",
+     attributeName: "class",
+     attributeValue: "ball still test-node"
+   });
+ 
+   yield onPanelUpdated;
+   ok(true, "The panel update event was fired");
+ 
+-  is(panel.playersEl.querySelectorAll(".player-widget").length, 0,
+-    "There are no player widgets in the panel anymore");
++  assertAnimationsDisplayed(panel, 0);
+ 
+   info("Add an finite animation on the node again, and wait for it to appear");
+   onPanelUpdated = panel.once(panel.UI_UPDATED_EVENT);
+   yield executeInContent("devtools:test:setAttribute", {
+     selector: ".test-node",
+     attributeName: "class",
+-    attributeValue: "ball short"
++    attributeValue: "ball short test-node"
+   });
+   yield onPanelUpdated;
+-  is(panel.playersEl.querySelectorAll(".player-widget").length, 1,
+-    "There is one player widget in the panel again");
+ 
++  assertAnimationsDisplayed(panel, 1);
++}
++
++function* testAddedAnimationWorks(inspector, panel) {
+   info("Now wait until the animation finishes");
+   let widget = panel.playerWidgets[0];
+-  yield waitForPlayState(widget.player, "finished")
++  yield waitForPlayState(widget.player, "finished");
+ 
+   is(panel.playersEl.querySelectorAll(".player-widget").length, 1,
+     "There is still a player widget in the panel after the animation finished");
+ 
+   info("Checking that the animation's currentTime can still be set");
+   info("Click at the center of the slider input");
+ 
+   let onPaused = waitForPlayState(widget.player, "paused");
+   let input = widget.currentTimeEl;
+   let win = input.ownerDocument.defaultView;
+   EventUtils.synthesizeMouseAtCenter(input, {type: "mousedown"}, win);
+   yield onPaused;
+   ok(widget.el.classList.contains("paused"), "The widget is in paused mode");
+-});
++}
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_refresh_when_active.js
+--- a/browser/devtools/animationinspector/test/browser_animation_refresh_when_active.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_refresh_when_active.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -3,45 +3,52 @@
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+ // Test that the panel only refreshes when it is visible in the sidebar.
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+-  let {toolbox, inspector, panel} = yield openAnimationInspector();
+ 
++  let {inspector, panel} = yield openAnimationInspector();
++  yield testRefresh(inspector, panel);
++
++  ({inspector, panel}) = yield closeAnimationInspectorAndRestartWithNewUI();
++  yield testRefresh(inspector, panel);
++});
++
++function* testRefresh(inspector, panel) {
+   info("Select a non animated node");
+   yield selectNode(".still", inspector);
+ 
+   info("Switch to the rule-view panel");
+   inspector.sidebar.select("ruleview");
+ 
+   info("Select the animated node now");
+   yield selectNode(".animated", inspector);
+ 
+-  ok(!panel.playerWidgets || !panel.playerWidgets.length,
++  assertAnimationsDisplayed(panel, 0,
+     "The panel doesn't show the animation data while inactive");
+ 
+   info("Switch to the animation panel");
+   inspector.sidebar.select("animationinspector");
+   yield panel.once(panel.UI_UPDATED_EVENT);
+ 
+-  is(panel.playerWidgets.length, 1,
++  assertAnimationsDisplayed(panel, 1,
+     "The panel shows the animation data after selecting it");
+ 
+   info("Switch again to the rule-view");
+   inspector.sidebar.select("ruleview");
+ 
+   info("Select the non animated node again");
+   yield selectNode(".still", inspector);
+ 
+-  is(panel.playerWidgets.length, 1,
++  assertAnimationsDisplayed(panel, 1,
+     "The panel still shows the previous animation data since it is inactive");
+ 
+   info("Switch to the animation panel again");
+   inspector.sidebar.select("animationinspector");
+   yield panel.once(panel.UI_UPDATED_EVENT);
+ 
+-  ok(!panel.playerWidgets || !panel.playerWidgets.length,
++  assertAnimationsDisplayed(panel, 0,
+     "The panel is now empty after refreshing");
+-});
++}
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_same_nb_of_playerWidgets_and_playerFronts.js
+--- a/browser/devtools/animationinspector/test/browser_animation_same_nb_of_playerWidgets_and_playerFronts.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_same_nb_of_playerWidgets_and_playerFronts.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -17,9 +17,21 @@ add_task(function*() {
+   is(controller.animationPlayers.length, panel.playerWidgets.length,
+     "As many playerWidgets were created as there are playerFronts");
+ 
+   for (let widget of panel.playerWidgets) {
+     ok(widget.initialized, "The player widget is initialized");
+     is(widget.el.parentNode, panel.playersEl,
+       "The player widget has been appended to the panel");
+   }
++
++  info("Test again with the new UI, making sure the same number of " +
++       "animation timelines is created");
++  ({inspector, panel, controller}) = yield closeAnimationInspectorAndRestartWithNewUI();
++  let timeline = panel.animationsTimelineComponent;
++
++  info("Selecting the test animated node again");
++  yield selectNode(".multi", inspector);
++
++  is(controller.animationPlayers.length,
++    timeline.animationsEl.querySelectorAll(".animation").length,
++    "As many timeline elements were created as there are playerFronts");
+ });
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_shows_player_on_valid_node.js
+--- a/browser/devtools/animationinspector/test/browser_animation_shows_player_on_valid_node.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_shows_player_on_valid_node.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -4,17 +4,23 @@
+ 
+ "use strict";
+ 
+ // Test that the panel shows an animation player when an animated node is
+ // selected.
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
++
+   let {inspector, panel} = yield openAnimationInspector();
++  yield testShowsAnimations(inspector, panel);
+ 
++  ({inspector, panel}) = yield closeAnimationInspectorAndRestartWithNewUI();
++  yield testShowsAnimations(inspector, panel);
++});
++
++function* testShowsAnimations(inspector, panel) {
+   info("Select node .animated and check that the panel is not empty");
+   let node = yield getNodeFront(".animated", inspector);
+   yield selectNode(node, inspector);
+ 
+-  is(panel.playerWidgets.length, 1,
+-    "Exactly 1 player widget is shown for animated node");
+-});
++  assertAnimationsDisplayed(panel, 1);
++}
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_target_highlight_select.js
+--- a/browser/devtools/animationinspector/test/browser_animation_target_highlight_select.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_target_highlight_select.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -4,59 +4,79 @@
+ 
+ "use strict";
+ 
+ // Test that the DOM element targets displayed in animation player widgets can
+ // be used to highlight elements in the DOM and select them in the inspector.
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+-  let {toolbox, inspector, panel} = yield openAnimationInspector();
+ 
++  let ui = yield openAnimationInspector();
++  yield testTargetNode(ui);
++
++  ui = yield closeAnimationInspectorAndRestartWithNewUI();
++  yield testTargetNode(ui, true);
++});
++
++function* testTargetNode({toolbox, inspector, panel}, isNewUI) {
+   info("Select the simple animated node");
+   yield selectNode(".animated", inspector);
+ 
+   // Make sure to wait for the target-retrieved event if the nodeFront hasn't
+   // yet been retrieved by the TargetNodeComponent.
+-  let targetNodeComponent = panel.playerWidgets[0].targetNodeComponent;
++  let targetNodeComponent;
++  if (isNewUI) {
++    targetNodeComponent = panel.animationsTimelineComponent.targetNodes[0];
++  } else {
++    targetNodeComponent = panel.playerWidgets[0].targetNodeComponent;
++  }
+   if (!targetNodeComponent.nodeFront) {
+     yield targetNodeComponent.once("target-retrieved");
+   }
+ 
+   info("Retrieve the part of the widget that highlights the node on hover");
+   let highlightingEl = targetNodeComponent.previewEl;
+ 
+   info("Listen to node-highlight event and mouse over the widget");
+   let onHighlight = toolbox.once("node-highlight");
+   EventUtils.synthesizeMouse(highlightingEl, 10, 5, {type: "mouseover"},
+                              highlightingEl.ownerDocument.defaultView);
+   let nodeFront = yield onHighlight;
+ 
+   ok(true, "The node-highlight event was fired");
+   is(targetNodeComponent.nodeFront, nodeFront,
+     "The highlighted node is the one stored on the animation widget");
+-  is(nodeFront.tagName, "DIV", "The highlighted node has the correct tagName");
+-  is(nodeFront.attributes[0].name, "class", "The highlighted node has the correct attributes");
+-  is(nodeFront.attributes[0].value, "ball animated", "The highlighted node has the correct class");
++  is(nodeFront.tagName, "DIV",
++    "The highlighted node has the correct tagName");
++  is(nodeFront.attributes[0].name, "class",
++    "The highlighted node has the correct attributes");
++  is(nodeFront.attributes[0].value, "ball animated",
++    "The highlighted node has the correct class");
+ 
+   info("Select the body node in order to have the list of all animations");
+   yield selectNode("body", inspector);
+ 
+   // Make sure to wait for the target-retrieved event if the nodeFront hasn't
+   // yet been retrieved by the TargetNodeComponent.
+-  targetNodeComponent = panel.playerWidgets[0].targetNodeComponent;
++  if (isNewUI) {
++    targetNodeComponent = panel.animationsTimelineComponent.targetNodes[0];
++  } else {
++    targetNodeComponent = panel.playerWidgets[0].targetNodeComponent;
++  }
+   if (!targetNodeComponent.nodeFront) {
+     yield targetNodeComponent.once("target-retrieved");
+   }
+ 
+-  info("Click on the first animation widget's selector icon and wait for the selection to change");
++  info("Click on the first animation widget's selector icon and wait for the " +
++    "selection to change");
+   let onSelection = inspector.selection.once("new-node-front");
+   let onPanelUpdated = panel.once(panel.UI_UPDATED_EVENT);
+   let selectIconEl = targetNodeComponent.selectNodeEl;
+   EventUtils.sendMouseEvent({type: "click"}, selectIconEl,
+                             selectIconEl.ownerDocument.defaultView);
+   yield onSelection;
+ 
+   is(inspector.selection.nodeFront, targetNodeComponent.nodeFront,
+     "The selected node is the one stored on the animation widget");
+ 
+   yield onPanelUpdated;
+-});
++}
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_timeline_animates.js
+--- a/browser/devtools/animationinspector/test/browser_animation_timeline_animates.js	Tue Jun 09 12:54:11 2015 +0200
++++ /dev/null	Thu Jan 01 00:00:00 1970 +0000
+@@ -1,28 +0,0 @@
+-/* vim: set ts=2 et sw=2 tw=80: */
+-/* Any copyright is dedicated to the Public Domain.
+- http://creativecommons.org/publicdomain/zero/1.0/ */
+-
+-"use strict";
+-
+-// Test that the currentTime timeline widget actually progresses with the
+-// animation itself.
+-
+-add_task(function*() {
+-  yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+-  let {inspector, panel} = yield openAnimationInspector();
+-
+-  info("Select the animated node");
+-  yield selectNode(".animated", inspector);
+-
+-  info("Get the player widget's timeline element and its current position");
+-  let widget = panel.playerWidgets[0];
+-  let timeline = widget.currentTimeEl;
+-
+-  yield onceNextPlayerRefresh(widget.player);
+-  ok(widget.rafID, "The widget is updating the timeline with a rAF loop");
+-
+-  info("Pause the animation");
+-  yield togglePlayPauseButton(widget);
+-
+-  ok(!widget.rafID, "The rAF loop has been stopped after the animation was paused");
+-});
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_timeline_displays_with_pref.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/browser_animation_timeline_displays_with_pref.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,24 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Check that the timeline-based UI is displayed instead of the playerwidget-
++// based UI when the "devtools.inspector.animationInspectorV3" is set.
++
++add_task(function*() {
++  yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
++  let {inspector, panel} = yield openAnimationInspectorNewUI();
++
++  info("Selecting the test node");
++  yield selectNode(".animated", inspector);
++
++  let timeline = panel.animationsTimelineComponent;
++
++  ok(timeline, "The timeline components was created");
++  is(timeline.rootWrapperEl.parentNode, panel.playersEl,
++    "The timeline component was appended in the DOM");
++  is(panel.playersEl.querySelectorAll(".player-widget").length, 0,
++    "There are no playerWidgets in the DOM");
++});
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_timeline_header.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/browser_animation_timeline_header.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,47 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Check that the timeline-based UI shows correct time graduations in the
++// header.
++
++const {findOptimalTimeInterval} = require("devtools/animationinspector/utils");
++const {TimeScale} = require("devtools/animationinspector/components");
++// Should be kept in sync with TIME_GRADUATION_MIN_SPACING in components.js
++const TIME_GRADUATION_MIN_SPACING = 40;
++
++add_task(function*() {
++  yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
++  let {panel} = yield openAnimationInspectorNewUI();
++
++  let timeline = panel.animationsTimelineComponent;
++  let headerEl = timeline.timeHeaderEl;
++
++  info("Find out how many time graduations should there be");
++  let width = headerEl.offsetWidth;
++  let scale = width / (TimeScale.maxEndTime - TimeScale.minStartTime);
++  // Note that findOptimalTimeInterval is tested separately in xpcshell test
++  // test_findOptimalTimeInterval.js, so we assume that it works here.
++  let interval = findOptimalTimeInterval(scale, TIME_GRADUATION_MIN_SPACING);
++  let nb = Math.ceil(width / interval);
++
++  is(headerEl.querySelectorAll(".time-tick").length, nb,
++     "The expected number of time ticks were found");
++
++  info("Make sure graduations are evenly distributed and show the right times");
++  [...headerEl.querySelectorAll(".time-tick")].forEach((tick, i) => {
++    let left = parseFloat(tick.style.left);
++    is(Math.round(left), Math.round(i * interval),
++      "Graduation " + i + " is positioned correctly");
++
++    // Note that the distancetoRelativeTime and formatTime functions are tested
++    // separately in xpcshell test test_timeScale.js, so we assume that they
++    // work here.
++    let formattedTime = TimeScale.formatTime(
++      TimeScale.distanceToRelativeTime(i * interval, width));
++    is(tick.textContent, formattedTime,
++      "Graduation " + i + " has the right text content");
++  });
++});
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_timeline_is_enabled.js
+--- a/browser/devtools/animationinspector/test/browser_animation_timeline_is_enabled.js	Tue Jun 09 12:54:11 2015 +0200
++++ /dev/null	Thu Jan 01 00:00:00 1970 +0000
+@@ -1,41 +0,0 @@
+-/* vim: set ts=2 et sw=2 tw=80: */
+-/* Any copyright is dedicated to the Public Domain.
+- http://creativecommons.org/publicdomain/zero/1.0/ */
+-
+-"use strict";
+-
+-// Test that the currentTime timeline widget is enabled and that the associated
+-// player front supports setting the current time.
+-
+-add_task(function*() {
+-  yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+-  let {controller, inspector, panel} = yield openAnimationInspector();
+-
+-  info("Select the animated node");
+-  yield selectNode(".animated", inspector);
+-
+-  info("Get the player widget's timeline element");
+-  let widget = panel.playerWidgets[0];
+-  let timeline = widget.currentTimeEl;
+-
+-  ok(!timeline.hasAttribute("disabled"), "The timeline input[range] is enabled");
+-  ok(widget.setCurrentTime, "The widget has the setCurrentTime method");
+-  ok(widget.player.setCurrentTime, "The associated player front has the setCurrentTime method");
+-
+-  info("Faking an older server version by setting " +
+-    "AnimationsController.hasSetCurrentTime to false");
+-
+-  yield selectNode("body", inspector);
+-  controller.hasSetCurrentTime = false;
+-
+-  yield selectNode(".animated", inspector);
+-
+-  info("Get the player widget's timeline element");
+-  widget = panel.playerWidgets[0];
+-  timeline = widget.currentTimeEl;
+-
+-  ok(timeline.hasAttribute("disabled"), "The timeline input[range] is disabled");
+-
+-  yield selectNode("body", inspector);
+-  controller.hasSetCurrentTime = true;
+-});
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_timeline_shows_delay.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/browser_animation_timeline_shows_delay.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,30 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Check that animation delay is visualized in the timeline-based UI when the
++// animation is delayed.
++
++add_task(function*() {
++  yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
++  let {inspector, panel} = yield openAnimationInspectorNewUI();
++
++  info("Selecting a delayed animated node");
++  yield selectNode(".delayed", inspector);
++
++  info("Getting the animation and delay elements from the panel");
++  let timelineEl = panel.animationsTimelineComponent.rootWrapperEl;
++  let delay = timelineEl.querySelector(".delay");
++
++  ok(delay, "The animation timeline contains the delay element");
++
++  info("Selecting a no-delay animated node");
++  yield selectNode(".animated", inspector);
++
++  info("Getting the animation and delay elements from the panel again");
++  delay = timelineEl.querySelector(".delay");
++
++  ok(!delay, "The animation timeline contains no delay element");
++});
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_timeline_shows_iterations.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/browser_animation_timeline_shows_iterations.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,51 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Check that the timeline-based UI is displays as many iteration elements as
++// there are iterations in an animation.
++
++add_task(function*() {
++  yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
++  let {inspector, panel} = yield openAnimationInspectorNewUI();
++
++  info("Selecting the test node");
++  yield selectNode(".delayed", inspector);
++
++  info("Getting the animation element from the panel");
++  let timelineEl = panel.animationsTimelineComponent.rootWrapperEl;
++  let animation = timelineEl.querySelector(".time-block");
++  let iterations = animation.querySelector(".iterations");
++
++  // Iterations are rendered with a repeating linear-gradient, so we need to
++  // calculate how many iterations are represented by looking at the background
++  // size.
++  let iterationCount = getIterationCountFromBackground(iterations);
++
++  is(iterationCount, 10,
++     "The animation timeline contains the right number of iterations");
++  ok(!iterations.classList.contains("infinite"),
++     "The iteration element doesn't have the infinite class");
++
++  info("Selecting another test node with an infinite animation");
++  yield selectNode(".animated", inspector);
++
++  info("Getting the animation element from the panel again");
++  animation = timelineEl.querySelector(".time-block");
++  iterations = animation.querySelector(".iterations");
++
++  iterationCount = getIterationCountFromBackground(iterations);
++
++  is(iterationCount, 1,
++     "The animation timeline contains just one iteration");
++  ok(iterations.classList.contains("infinite"),
++     "The iteration element has the infinite class");
++});
++
++function getIterationCountFromBackground(el) {
++  let backgroundSize = parseFloat(el.style.backgroundSize.split(" ")[0]);
++  let width = el.offsetWidth;
++  return Math.ceil(width / backgroundSize);
++}
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_timeline_ui.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/browser_animation_timeline_ui.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,41 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Check that the timeline-based UI contains the right elements.
++
++add_task(function*() {
++  yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
++  let {panel} = yield openAnimationInspectorNewUI();
++
++  let timeline = panel.animationsTimelineComponent;
++  let el = timeline.rootWrapperEl;
++
++  ok(el.querySelector(".time-header"),
++     "The header element is in the DOM of the timeline");
++  ok(el.querySelectorAll(".time-header .time-tick").length,
++     "The header has some time graduations");
++
++  ok(el.querySelector(".animations"),
++     "The animations container is in the DOM of the timeline");
++  is(el.querySelectorAll(".animations .animation").length,
++     timeline.animations.length,
++     "The number of animations displayed matches the number of animations");
++
++  for (let i = 0; i < timeline.animations.length; i++) {
++    let animation = timeline.animations[i];
++    let animationEl = el.querySelectorAll(".animations .animation")[i];
++
++    ok(animationEl.querySelector(".target"),
++       "The animated node target element is in the DOM");
++    ok(animationEl.querySelector(".time-block"),
++       "The timeline element is in the DOM");
++    is(animationEl.querySelector(".name").textContent,
++       animation.state.name,
++       "The name on the timeline is correct");
++    ok(animationEl.querySelector(".iterations"),
++       "The timeline has iterations displayed");
++  }
++});
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_timeline_waits_for_delay.js
+--- a/browser/devtools/animationinspector/test/browser_animation_timeline_waits_for_delay.js	Tue Jun 09 12:54:11 2015 +0200
++++ /dev/null	Thu Jan 01 00:00:00 1970 +0000
+@@ -1,24 +0,0 @@
+-/* vim: set ts=2 et sw=2 tw=80: */
+-/* Any copyright is dedicated to the Public Domain.
+- http://creativecommons.org/publicdomain/zero/1.0/ */
+-
+-"use strict";
+-
+-// Test that the currentTime timeline doesn't move if the animation is currently
+-// waiting for an animation-delay.
+-
+-add_task(function*() {
+-  yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+-  let {inspector, panel} = yield openAnimationInspector();
+-
+-  info("Select the delayed animation node");
+-  yield selectNode(".delayed", inspector);
+-
+-  let widget = panel.playerWidgets[0];
+-
+-  let timeline = widget.currentTimeEl;
+-  is(timeline.value, 0, "The timeline is at 0 since the animation hasn't started");
+-
+-  let timeLabel = widget.timeDisplayEl;
+-  is(timeLabel.textContent, "0s", "The current time is 0");
+-});
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_toggle_button_toggles_animations.js
+--- a/browser/devtools/animationinspector/test/browser_animation_toggle_button_toggles_animations.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_toggle_button_toggles_animations.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -6,17 +6,17 @@
+ 
+ // Test that the main toggle button actually toggles animations.
+ // This test doesn't need to be extra careful about checking that *all*
+ // animations have been paused (including inside iframes) because there's an
+ // actor test in /toolkit/devtools/server/tests/browser/ that does this.
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+-  let {inspector, panel} = yield openAnimationInspector();
++  let {panel} = yield openAnimationInspector();
+ 
+   info("Click the toggle button");
+   yield panel.toggleAll();
+   yield checkState("paused");
+ 
+   info("Click again the toggle button");
+   yield panel.toggleAll();
+   yield checkState("running");
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_toolbar_exists.js
+--- a/browser/devtools/animationinspector/test/browser_animation_toolbar_exists.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_toolbar_exists.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -4,17 +4,17 @@
+ 
+ "use strict";
+ 
+ // Test that the animation panel has a top toolbar that contains the play/pause
+ // button and that is displayed at all times.
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+-  let {inspector, panel, window} = yield openAnimationInspector();
++  let {inspector, window} = yield openAnimationInspector();
+   let doc = window.document;
+ 
+   let toolbar = doc.querySelector("#toolbar");
+   ok(toolbar, "The panel contains the toolbar element");
+   ok(toolbar.querySelector("#toggle-all"), "The toolbar contains the toggle button");
+   ok(isNodeVisible(toolbar), "The toolbar is visible");
+ 
+   info("Select an animated node");
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/browser_animation_ui_updates_when_animation_data_changes.js
+--- a/browser/devtools/animationinspector/test/browser_animation_ui_updates_when_animation_data_changes.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/browser_animation_ui_updates_when_animation_data_changes.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -4,41 +4,69 @@
+ 
+ "use strict";
+ 
+ // Verify that if the animation's duration, iterations or delay change in
+ // content, then the widget reflects the changes.
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+-  let {panel, inspector} = yield openAnimationInspector();
+ 
++  let ui = yield openAnimationInspector();
++  yield testDataUpdates(ui);
++
++  info("Close the toolbox, reload the tab, and try again with the new UI");
++  ui = yield closeAnimationInspectorAndRestartWithNewUI(true);
++  yield testDataUpdates(ui, true);
++});
++
++function* testDataUpdates({panel, controller, inspector}, isNewUI=false) {
+   info("Select the test node");
+   yield selectNode(".animated", inspector);
+ 
+-  info("Get the player widget");
+-  let widget = panel.playerWidgets[0];
++  let animation = controller.animationPlayers[0];
++  yield setStyle(animation, "animationDuration", "5.5s", isNewUI);
++  yield setStyle(animation, "animationIterationCount", "300", isNewUI);
++  yield setStyle(animation, "animationDelay", "45s", isNewUI);
+ 
+-  yield setStyle(widget, "animationDuration", "5.5s");
+-  is(widget.metaDataComponent.durationValue.textContent, "5.50s",
+-    "The widget shows the new duration");
++  if (isNewUI) {
++    let animationsEl = panel.animationsTimelineComponent.animationsEl;
++    let timeBlockEl = animationsEl.querySelector(".time-block");
+ 
+-  yield setStyle(widget, "animationIterationCount", "300");
+-  is(widget.metaDataComponent.iterationValue.textContent, "300",
+-    "The widget shows the new iteration count");
++    // 45s delay + (300 * 5.5)s duration
++    let expectedTotalDuration = 1695 * 1000;
++    let timeRatio = expectedTotalDuration / timeBlockEl.offsetWidth;
+ 
+-  yield setStyle(widget, "animationDelay", "45s");
+-  is(widget.metaDataComponent.delayValue.textContent, "45s",
+-    "The widget shows the new delay");
+-});
++    // XXX: the nb and size of each iteration cannot be tested easily (displayed
++    // using a linear-gradient background and capped at 2px wide). They should
++    // be tested in bug 1173761.
++    let delayWidth = parseFloat(timeBlockEl.querySelector(".delay").style.width);
++    is(Math.round(delayWidth * timeRatio), 45 * 1000,
++      "The timeline has the right delay");
++  } else {
++    let widget = panel.playerWidgets[0];
++    is(widget.metaDataComponent.durationValue.textContent, "5.50s",
++      "The widget shows the new duration");
++    is(widget.metaDataComponent.iterationValue.textContent, "300",
++      "The widget shows the new iteration count");
++    is(widget.metaDataComponent.delayValue.textContent, "45s",
++      "The widget shows the new delay");
++  }
++}
+ 
+-function* setStyle(widget, name, value) {
++function* setStyle(animation, name, value, isNewUI=false) {
+   info("Change the animation style via the content DOM. Setting " +
+     name + " to " + value);
++
++  let onAnimationChanged = once(animation, "changed");
+   yield executeInContent("devtools:test:setStyle", {
+     selector: ".animated",
+     propertyName: name,
+     propertyValue: value
+   });
++  yield onAnimationChanged;
+ 
+-  info("Wait for the next state update");
+-  yield onceNextPlayerRefresh(widget.player);
++  // If this is the playerWidget-based UI, wait for the auto-refresh event too
++  // to make sure the UI has updated.
++  if (!isNewUI) {
++    yield once(animation, animation.AUTO_REFRESH_EVENT);
++  }
+ }
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/head.js
+--- a/browser/devtools/animationinspector/test/head.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/devtools/animationinspector/test/head.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -2,54 +2,59 @@
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+ const Cu = Components.utils;
+ const {gDevTools} = Cu.import("resource:///modules/devtools/gDevTools.jsm", {});
+ const {devtools} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
++const {require} = devtools;
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const TargetFactory = devtools.TargetFactory;
+-const {console} = Components.utils.import("resource://gre/modules/devtools/Console.jsm", {});
++const {console} = Cu.import("resource://gre/modules/devtools/Console.jsm", {});
+ const {ViewHelpers} = Cu.import("resource:///modules/devtools/ViewHelpers.jsm", {});
+ 
+ // All tests are asynchronous
+ waitForExplicitFinish();
+ 
+ const TEST_URL_ROOT = "http://example.com/browser/browser/devtools/animationinspector/test/";
+ const ROOT_TEST_DIR = getRootDirectory(gTestPath);
+ const FRAME_SCRIPT_URL = ROOT_TEST_DIR + "doc_frame_script.js";
+ const COMMON_FRAME_SCRIPT_URL = "chrome://browser/content/devtools/frame-script-utils.js";
++const NEW_UI_PREF = "devtools.inspector.animationInspectorV3";
+ 
+ // Auto clean-up when a test ends
+ registerCleanupFunction(function*() {
+-  let target = TargetFactory.forTab(gBrowser.selectedTab);
+-  yield gDevTools.closeToolbox(target);
++  yield closeAnimationInspector();
+ 
+   while (gBrowser.tabs.length > 1) {
+     gBrowser.removeCurrentTab();
+   }
+ });
+ 
++// Make sure the new UI is off by default.
++Services.prefs.setBoolPref(NEW_UI_PREF, false);
++
+ // Uncomment this pref to dump all devtools emitted events to the console.
+ // Services.prefs.setBoolPref("devtools.dump.emit", true);
+ 
+ // Uncomment this pref to dump all devtools protocol traffic
+ // Services.prefs.setBoolPref("devtools.debugger.log", true);
+ 
+ // Set the testing flag on gDevTools and reset it when the test ends
+ gDevTools.testing = true;
+ registerCleanupFunction(() => gDevTools.testing = false);
+ 
+ // Clean-up all prefs that might have been changed during a test run
+ // (safer here because if the test fails, then the pref is never reverted)
+ registerCleanupFunction(() => {
+   Services.prefs.clearUserPref("devtools.dump.emit");
+   Services.prefs.clearUserPref("devtools.debugger.log");
++  Services.prefs.clearUserPref(NEW_UI_PREF);
+ });
+ 
+ /**
+  * Add a new test tab in the browser and load the given url.
+  * @param {String} url The url to be loaded in the new tab
+  * @return a promise that resolves to the tab object when the url is loaded
+  */
+ function addTab(url) {
+@@ -73,16 +78,23 @@ function addTab(url) {
+ 
+     def.resolve(tab);
+   }, true);
+ 
+   return def.promise;
+ }
+ 
+ /**
++ * Switch ON the new UI pref.
++ */
++function enableNewUI() {
++  Services.prefs.setBoolPref(NEW_UI_PREF, true);
++}
++
++/**
+  * Reload the current tab location.
+  */
+ function reloadTab() {
+   return executeInContent("devtools:test:reload", {}, {}, false);
+ }
+ 
+ /**
+  * Get the NodeFront for a given css selector, via the protocol
+@@ -115,42 +127,60 @@ let selectNode = Task.async(function*(da
+     nodeFront = yield getNodeFront(data, inspector);
+   }
+   let updated = inspector.once("inspector-updated");
+   inspector.selection.setNodeFront(nodeFront, reason);
+   yield updated;
+ });
+ 
+ /**
++ * Check if there are the expected number of animations being displayed in the
++ * panel right now.
++ * @param {AnimationsPanel} panel
++ * @param {Number} nbAnimations The expected number of animations.
++ * @param {String} msg An optional string to be used as the assertion message.
++ */
++function assertAnimationsDisplayed(panel, nbAnimations, msg="") {
++  let isNewUI = Services.prefs.getBoolPref(NEW_UI_PREF);
++  msg = msg || `There are ${nbAnimations} animations in the panel`;
++  if (isNewUI) {
++    is(panel.animationsTimelineComponent.animationsEl.childNodes.length,
++       nbAnimations, msg);
++  } else {
++    is(panel.playersEl.querySelectorAll(".player-widget").length,
++       nbAnimations, msg);
++  }
++}
++
++/**
+  * Takes an Inspector panel that was just created, and waits
+  * for a "inspector-updated" event as well as the animation inspector
+  * sidebar to be ready. Returns a promise once these are completed.
+  *
+  * @param {InspectorPanel} inspector
+  * @return {Promise}
+  */
+ let waitForAnimationInspectorReady = Task.async(function*(inspector) {
+   let win = inspector.sidebar.getWindowForTab("animationinspector");
+   let updated = inspector.once("inspector-updated");
+ 
+-  // In e10s, if we wait for underlying toolbox actors to
+-  // load (by setting gDevTools.testing to true), we miss the "animationinspector-ready"
+-  // event on the sidebar, so check to see if the iframe
+-  // is already loaded.
++  // In e10s, if we wait for underlying toolbox actors to load (by setting
++  // gDevTools.testing to true), we miss the "animationinspector-ready" event on
++  // the sidebar, so check to see if the iframe is already loaded.
+   let tabReady = win.document.readyState === "complete" ?
+                  promise.resolve() :
+                  inspector.sidebar.once("animationinspector-ready");
+ 
+   return promise.all([updated, tabReady]);
+ });
+ 
+ /**
+  * Open the toolbox, with the inspector tool visible and the animationinspector
+  * sidebar selected.
+- * @return a promise that resolves when the inspector is ready
++ * @return a promise that resolves when the inspector is ready.
+  */
+ let openAnimationInspector = Task.async(function*() {
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+ 
+   info("Opening the toolbox with the inspector selected");
+   let toolbox = yield gDevTools.showToolbox(target, "inspector");
+ 
+   info("Switching to the animationinspector");
+@@ -181,16 +211,55 @@ let openAnimationInspector = Task.async(
+     inspector: inspector,
+     controller: AnimationsController,
+     panel: AnimationsPanel,
+     window: win
+   };
+ });
+ 
+ /**
++ * Turn on the new timeline-based UI pref ON, and then open the toolbox, with
++ * the inspector tool visible and the animationinspector sidebar selected.
++ * @return a promise that resolves when the inspector is ready.
++ */
++function openAnimationInspectorNewUI() {
++  enableNewUI();
++  return openAnimationInspector();
++}
++
++/**
++ * Close the toolbox.
++ * @return a promise that resolves when the toolbox has closed.
++ */
++let closeAnimationInspector = Task.async(function*() {
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++  yield gDevTools.closeToolbox(target);
++});
++
++/**
++ * During the time period we migrate from the playerWidgets-based UI to the new
++ * AnimationTimeline UI, we'll want to run certain tests against both UI.
++ * This closes the toolbox, switch the new UI pref ON, and opens the toolbox
++ * again, with the animation inspector panel selected.
++ * @param {Boolean} reload Optionally reload the page after the toolbox was
++ * closed and before it is opened again.
++ * @return a promise that resolves when the animation inspector is ready.
++ */
++let closeAnimationInspectorAndRestartWithNewUI = Task.async(function*(reload) {
++  info("Close the toolbox and test again with the new UI");
++  yield closeAnimationInspector();
++  if (reload) {
++    yield reloadTab();
++  }
++  enableNewUI();
++  return yield openAnimationInspector();
++});
++
++
++/**
+  * Wait for the toolbox frame to receive focus after it loads
+  * @param {Toolbox} toolbox
+  * @return a promise that resolves when focus has been received
+  */
+ function waitForToolboxFrameFocus(toolbox) {
+   info("Making sure that the toolbox's frame is focused");
+   let def = promise.defer();
+   let win = toolbox.frame.contentWindow;
+@@ -209,17 +278,17 @@ function hasSideBarTab(inspector, id) {
+   return !!inspector.sidebar.getWindowForTab(id);
+ }
+ 
+ /**
+  * Wait for eventName on target.
+  * @param {Object} target An observable object that either supports on/off or
+  * addEventListener/removeEventListener
+  * @param {String} eventName
+- * @param {Boolean} useCapture Optional, for addEventListener/removeEventListener
++ * @param {Boolean} useCapture Optional, for add/removeEventListener
+  * @return A promise that resolves when the event has been handled
+  */
+ function once(target, eventName, useCapture=false) {
+   info("Waiting for event: '" + eventName + "' on " + target + ".");
+ 
+   let deferred = promise.defer();
+ 
+   for (let [add, remove] of [
+@@ -273,32 +342,34 @@ function waitForContentMessage(name) {
+  */
+ function executeInContent(name, data={}, objects={}, expectResponse=true) {
+   info("Sending message " + name + " to content");
+   let mm = gBrowser.selectedBrowser.messageManager;
+ 
+   mm.sendAsyncMessage(name, data, objects);
+   if (expectResponse) {
+     return waitForContentMessage(name);
+-  } else {
+-    return promise.resolve();
+   }
++
++  return promise.resolve();
+ }
+ 
+ function onceNextPlayerRefresh(player) {
+   let onRefresh = promise.defer();
+   player.once(player.AUTO_REFRESH_EVENT, onRefresh.resolve);
+   return onRefresh.promise;
+ }
+ 
+ /**
+  * Simulate a click on the playPause button of a playerWidget.
+  */
+ let togglePlayPauseButton = Task.async(function*(widget) {
+-  let nextState = widget.player.state.playState === "running" ? "paused" : "running";
++  let nextState = widget.player.state.playState === "running"
++                  ? "paused"
++                  : "running";
+ 
+   // Note that instead of simulating a real event here, the callback is just
+   // called. This is better because the callback returns a promise, so we know
+   // when the player is paused, and we don't really care to test that simulating
+   // a DOM event actually works.
+   let onClicked = widget.onPlayPauseBtnClick();
+ 
+   // Verify that the button's state is changed immediately, even if it will be
+@@ -339,17 +410,18 @@ let waitForStateCondition = Task.async(f
+   return def.promise;
+ });
+ 
+ /**
+  * Wait for a player's auto-refresh events and stop when the playState is the
+  * provided string.
+  * @param {AnimationPlayerFront} player
+  * @param {String} playState The playState to expect.
+- * @return {Promise} Resolves when the playState has changed to the expected value.
++ * @return {Promise} Resolves when the playState has changed to the expected
++ * value.
+  */
+ function waitForPlayState(player, playState) {
+   return waitForStateCondition(player, state => {
+     return state.playState === playState;
+   }, "Waiting for animation to be " + playState);
+ }
+ 
+ /**
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/unit/.eslintrc
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/unit/.eslintrc	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,4 @@
++{
++  // Extend from the common devtools xpcshell eslintrc config.
++  "extends": "../../../.eslintrc.xpcshell"
++}
+\ No newline at end of file
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/unit/test_findOptimalTimeInterval.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/unit/test_findOptimalTimeInterval.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,85 @@
++/* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++/* eslint no-eval:0 */
++
++"use strict";
++
++const Cu = Components.utils;
++const {devtools} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
++const {require} = devtools;
++
++const {findOptimalTimeInterval} = require("devtools/animationinspector/utils");
++
++// This test array contains objects that are used to test the
++// findOptimalTimeInterval function. Each object should have the following
++// properties:
++// - desc: an optional string that will be printed out
++// - timeScale: a number that represents how many pixels is 1ms
++// - minSpacing: an optional number that represents the minim space between 2
++//   time graduations
++// - expectedInterval: a number that you expect the findOptimalTimeInterval
++//   function to return as a result.
++//   Optionally you can pass a string where `interval` is the calculated
++//   interval, this string will be eval'd and tested to be truthy.
++const TEST_DATA = [{
++  desc: "With 1px being 1ms and no minSpacing, expect the interval to be the " +
++        "default min spacing",
++  timeScale: 1,
++  minSpacing: undefined,
++  expectedInterval: 10
++}, {
++  desc: "With 1px being 1ms and a custom minSpacing being a multiple of 10 " +
++        "expect the interval to be the custom min spacing",
++  timeScale: 1,
++  minSpacing: 40,
++  expectedInterval: 40
++}, {
++  desc: "With 1px being 1ms and a custom minSpacing not being multiple of 10 " +
++        "expect the interval to be the next multiple of 10",
++  timeScale: 1,
++  minSpacing: 13,
++  expectedInterval: 20
++}, {
++  desc: "If 1ms corresponds to a distance that is greater than the min " +
++        "then, expect the interval to be this distance",
++  timeScale: 20,
++  minSpacing: undefined,
++  expectedInterval: 20
++}, {
++  desc: "If 1ms corresponds to a distance that is greater than the min " +
++        "then, expect the interval to be this distance, even if it isn't a " +
++        "multiple of 10",
++  timeScale: 33,
++  minSpacing: undefined,
++  expectedInterval: 33
++}, {
++  timeScale: 0.001,
++  minSpacing: undefined,
++  expectedInterval: 10.24
++}, {
++  desc: "If the time scale is such that we need to iterate more than the " +
++        "maximum allowed number of iterations, then expect an interval lower " +
++        "than the minimum one",
++  timeScale: 1e-31,
++  minSpacing: undefined,
++  expectedInterval: "interval < 10"
++}];
++
++function run_test() {
++  for (let {timeScale, desc, minSpacing, expectedInterval} of TEST_DATA) {
++    do_print("Testing timeScale: " + timeScale + " and minSpacing: " +
++              minSpacing + ". Expecting " + expectedInterval + ".");
++    if (desc) {
++      do_print(desc);
++    }
++
++    let interval = findOptimalTimeInterval(timeScale, minSpacing);
++    if (typeof expectedInterval == "string") {
++      do_check_true(eval(expectedInterval));
++    } else {
++      do_check_eq(interval, expectedInterval);
++    }
++  }
++}
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/unit/test_timeScale.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/unit/test_timeScale.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,191 @@
++/* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++const Cu = Components.utils;
++const {devtools} = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
++const {require} = devtools;
++
++const {TimeScale} = require("devtools/animationinspector/components");
++
++const TEST_ANIMATIONS = [{
++  startTime: 500,
++  delay: 0,
++  duration: 1000,
++  iterationCount: 1
++}, {
++  startTime: 400,
++  delay: 100,
++  duration: 10,
++  iterationCount: 100
++}, {
++  startTime: 50,
++  delay: 1000,
++  duration: 100,
++  iterationCount: 20
++}];
++const EXPECTED_MIN_START = 50;
++const EXPECTED_MAX_END = 3050;
++
++const TEST_STARTTIME_TO_DISTANCE = [{
++  time: 50,
++  width: 100,
++  expectedDistance: 0
++}, {
++  time: 50,
++  width: 0,
++  expectedDistance: 0
++}, {
++  time: 3050,
++  width: 200,
++  expectedDistance: 200
++}, {
++  time: 1550,
++  width: 200,
++  expectedDistance: 100
++}];
++
++const TEST_DURATION_TO_DISTANCE = [{
++  time: 3000,
++  width: 100,
++  expectedDistance: 100
++}, {
++  time: 0,
++  width: 100,
++  expectedDistance: 0
++}];
++
++const TEST_DISTANCE_TO_TIME = [{
++  distance: 100,
++  width: 100,
++  expectedTime: 3050
++}, {
++  distance: 0,
++  width: 100,
++  expectedTime: 50
++}, {
++  distance: 25,
++  width: 200,
++  expectedTime: 425
++}];
++
++const TEST_DISTANCE_TO_RELATIVE_TIME = [{
++  distance: 100,
++  width: 100,
++  expectedTime: 3000
++}, {
++  distance: 0,
++  width: 100,
++  expectedTime: 0
++}, {
++  distance: 25,
++  width: 200,
++  expectedTime: 375
++}];
++
++const TEST_FORMAT_TIME_MS = [{
++  time: 0,
++  expectedFormattedTime: "0ms"
++}, {
++  time: 3540.341,
++  expectedFormattedTime: "3540ms"
++}, {
++  time: 1.99,
++  expectedFormattedTime: "2ms"
++}, {
++  time: 4000,
++  expectedFormattedTime: "4000ms"
++}];
++
++const TEST_FORMAT_TIME_S = [{
++  time: 0,
++  expectedFormattedTime: "0.0s"
++}, {
++  time: 3540.341,
++  expectedFormattedTime: "3.5s"
++}, {
++  time: 1.99,
++  expectedFormattedTime: "0.0s"
++}, {
++  time: 4000,
++  expectedFormattedTime: "4.0s"
++}, {
++  time: 102540,
++  expectedFormattedTime: "102.5s"
++}, {
++  time: 102940,
++  expectedFormattedTime: "102.9s"
++}];
++
++function run_test() {
++  do_print("Check the default min/max range values");
++  do_check_eq(TimeScale.minStartTime, Infinity);
++  do_check_eq(TimeScale.maxEndTime, 0);
++
++  do_print("Test adding a few animations");
++  for (let {startTime, delay, duration, iterationCount} of TEST_ANIMATIONS) {
++    TimeScale.addAnimation({startTime, delay, duration, iterationCount});
++  }
++  do_check_eq(TimeScale.minStartTime, EXPECTED_MIN_START);
++  do_check_eq(TimeScale.maxEndTime, EXPECTED_MAX_END);
++
++  do_print("Test reseting the animations");
++  TimeScale.reset();
++  do_check_eq(TimeScale.minStartTime, Infinity);
++  do_check_eq(TimeScale.maxEndTime, 0);
++
++  do_print("Test adding the animations again");
++  for (let {startTime, delay, duration, iterationCount} of TEST_ANIMATIONS) {
++    TimeScale.addAnimation({startTime, delay, duration, iterationCount});
++  }
++  do_check_eq(TimeScale.minStartTime, EXPECTED_MIN_START);
++  do_check_eq(TimeScale.maxEndTime, EXPECTED_MAX_END);
++
++  do_print("Test converting start times to distances");
++  for (let {time, width, expectedDistance} of TEST_STARTTIME_TO_DISTANCE) {
++    let distance = TimeScale.startTimeToDistance(time, width);
++    do_check_eq(distance, expectedDistance);
++  }
++
++  do_print("Test converting durations to distances");
++  for (let {time, width, expectedDistance} of TEST_DURATION_TO_DISTANCE) {
++    let distance = TimeScale.durationToDistance(time, width);
++    do_check_eq(distance, expectedDistance);
++  }
++
++  do_print("Test converting distances to times");
++  for (let {distance, width, expectedTime} of TEST_DISTANCE_TO_TIME) {
++    let time = TimeScale.distanceToTime(distance, width);
++    do_check_eq(time, expectedTime);
++  }
++
++  do_print("Test converting distances to relative times");
++  for (let {distance, width, expectedTime} of TEST_DISTANCE_TO_RELATIVE_TIME) {
++    let time = TimeScale.distanceToRelativeTime(distance, width);
++    do_check_eq(time, expectedTime);
++  }
++
++  do_print("Test formatting times (millis)");
++  for (let {time, expectedFormattedTime} of TEST_FORMAT_TIME_MS) {
++    let formattedTime = TimeScale.formatTime(time);
++    do_check_eq(formattedTime, expectedFormattedTime);
++  }
++
++  // Add 1 more animation to increase the range and test more time formatting
++  // cases.
++  TimeScale.addAnimation({
++    startTime: 3000,
++    duration: 5000,
++    delay: 0,
++    iterationCount: 1
++  });
++
++  do_print("Test formatting times (seconds)");
++  for (let {time, expectedFormattedTime} of TEST_FORMAT_TIME_S) {
++    let formattedTime = TimeScale.formatTime(time);
++    do_check_eq(formattedTime, expectedFormattedTime);
++  }
++}
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/test/unit/xpcshell.ini
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/test/unit/xpcshell.ini	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,9 @@
++[DEFAULT]
++tags = devtools
++head =
++tail =
++firefox-appdir = browser
++skip-if = toolkit == 'android' || toolkit == 'gonk'
++
++[test_findOptimalTimeInterval.js]
++[test_timeScale.js]
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/devtools/animationinspector/utils.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/browser/devtools/animationinspector/utils.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -0,0 +1,134 @@
++/* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++// How many times, maximum, can we loop before we find the optimal time
++// interval in the timeline graph.
++const OPTIMAL_TIME_INTERVAL_MAX_ITERS = 100;
++// Background time graduations should be multiple of this number of millis.
++const TIME_INTERVAL_MULTIPLE = 10;
++const TIME_INTERVAL_SCALES = 3;
++// The default minimum spacing between time graduations in px.
++const TIME_GRADUATION_MIN_SPACING = 10;
++// RGB color for the time interval background.
++const TIME_INTERVAL_COLOR = [128, 136, 144];
++const TIME_INTERVAL_OPACITY_MIN = 32; // byte
++const TIME_INTERVAL_OPACITY_ADD = 32; // byte
++
++/**
++ * DOM node creation helper function.
++ * @param {Object} Options to customize the node to be created.
++ * - nodeType {String} Optional, defaults to "div",
++ * - attributes {Object} Optional attributes object like
++ *   {attrName1:value1, attrName2: value2, ...}
++ * - parent {DOMNode} Mandatory node to append the newly created node to.
++ * - textContent {String} Optional text for the node.
++ * @return {DOMNode} The newly created node.
++ */
++function createNode(options) {
++  if (!options.parent) {
++    throw new Error("Missing parent DOMNode to create new node");
++  }
++
++  let type = options.nodeType || "div";
++  let node = options.parent.ownerDocument.createElement(type);
++
++  for (let name in options.attributes || {}) {
++    let value = options.attributes[name];
++    node.setAttribute(name, value);
++  }
++
++  if (options.textContent) {
++    node.textContent = options.textContent;
++  }
++
++  options.parent.appendChild(node);
++  return node;
++}
++
++exports.createNode = createNode;
++
++/**
++ * Given a data-scale, draw the background for a graph (vertical lines) into a
++ * canvas and set that canvas as an image-element with an ID that can be used
++ * from CSS.
++ * @param {Document} document The document where the image-element should be set.
++ * @param {String} id The ID for the image-element.
++ * @param {Number} graphWidth The width of the graph.
++ * @param {Number} timeScale How many px is 1ms in the graph.
++ */
++function drawGraphElementBackground(document, id, graphWidth, timeScale) {
++  let canvas = document.createElement("canvas");
++  let ctx = canvas.getContext("2d");
++
++  // Set the canvas width (as requested) and height (1px, repeated along the Y
++  // axis).
++  canvas.width = graphWidth;
++  canvas.height = 1;
++
++  // Create the image data array which will receive the pixels.
++  let imageData = ctx.createImageData(canvas.width, canvas.height);
++  let pixelArray = imageData.data;
++
++  let buf = new ArrayBuffer(pixelArray.length);
++  let view8bit = new Uint8ClampedArray(buf);
++  let view32bit = new Uint32Array(buf);
++
++  // Build new millisecond tick lines...
++  let [r, g, b] = TIME_INTERVAL_COLOR;
++  let alphaComponent = TIME_INTERVAL_OPACITY_MIN;
++  let interval = findOptimalTimeInterval(timeScale);
++
++  // Insert one pixel for each division on each scale.
++  for (let i = 1; i <= TIME_INTERVAL_SCALES; i++) {
++    let increment = interval * Math.pow(2, i);
++    for (let x = 0; x < canvas.width; x += increment) {
++      let position = x | 0;
++      view32bit[position] = (alphaComponent << 24) | (b << 16) | (g << 8) | r;
++    }
++    alphaComponent += TIME_INTERVAL_OPACITY_ADD;
++  }
++
++  // Flush the image data and cache the waterfall background.
++  pixelArray.set(view8bit);
++  ctx.putImageData(imageData, 0, 0);
++  document.mozSetImageElement(id, canvas);
++}
++
++exports.drawGraphElementBackground = drawGraphElementBackground;
++
++/**
++ * Find the optimal interval between time graduations in the animation timeline
++ * graph based on a time scale and a minimum spacing.
++ * @param {Number} timeScale How many px is 1ms in the graph.
++ * @param {Number} minSpacing The minimum spacing between 2 graduations,
++ * defaults to TIME_GRADUATION_MIN_SPACING.
++ * @return {Number} The optimal interval, in pixels.
++ */
++function findOptimalTimeInterval(timeScale,
++                                 minSpacing=TIME_GRADUATION_MIN_SPACING) {
++  let timingStep = TIME_INTERVAL_MULTIPLE;
++  let numIters = 0;
++
++  if (timeScale > minSpacing) {
++    return timeScale;
++  }
++
++  while (true) {
++    let scaledStep = timeScale * timingStep;
++    if (++numIters > OPTIMAL_TIME_INTERVAL_MAX_ITERS) {
++      return scaledStep;
++    }
++    if (scaledStep < minSpacing) {
++      timingStep *= 2;
++      continue;
++    }
++    return scaledStep;
++  }
++}
++
++exports.findOptimalTimeInterval = findOptimalTimeInterval;
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/locales/en-US/chrome/browser/devtools/animationinspector.properties
+--- a/browser/locales/en-US/chrome/browser/devtools/animationinspector.properties	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/locales/en-US/chrome/browser/devtools/animationinspector.properties	Thu Jun 11 21:57:17 2015 +0200
+@@ -47,8 +47,14 @@ player.infiniteIterationCount=&#8734;
+ # time (in seconds too);
+ player.timeLabel=%Ss
+ 
+ # LOCALIZATION NOTE (player.playbackRateLabel):
+ # This string is displayed in each animation player widget, as the label of
+ # drop-down list items that can be used to change the rate at which the
+ # animation runs (1x being the default, 2x being twice as fast).
+ player.playbackRateLabel=%Sx
++
++# LOCALIZATION NOTE (timeline.timeGraduationLabel):
++# This string is displayed at the top of the animation panel, next to each time
++# graduation, to indicate what duration (in milliseconds) this graduation
++# corresponds to.
++timeline.timeGraduationLabel=%Sms
+diff -r 0d73c1dde1f3 -r f2c61517dc0d browser/themes/shared/devtools/animationinspector.css
+--- a/browser/themes/shared/devtools/animationinspector.css	Tue Jun 09 12:54:11 2015 +0200
++++ b/browser/themes/shared/devtools/animationinspector.css	Thu Jun 11 21:57:17 2015 +0200
+@@ -1,8 +1,22 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/* Animation-inspector specific theme variables */
++
++.theme-dark {
++  --even-animation-timeline-background-color: rgba(255,255,255,0.03);
++}
++
++.theme-light {
++  --even-animation-timeline-background-color: rgba(128,128,128,0.03);
++}
++
+ html {
+   height: 100%;
+ }
+ 
+ body {
+   margin: 0;
+   padding: 0;
+   display : flex;
+@@ -27,34 +41,35 @@ body {
+   padding: 1px 4px;
+ }
+ 
+ #toggle-all {
+   border-width: 0 0 0 1px;
+   min-height: 20px;
+ }
+ 
++/* The main animations container */
++
++#players {
++  height: calc(100% - 20px);
++  overflow: auto;
++}
++
+ /* The error message, shown when an invalid/unanimated element is selected */
+ 
+ #error-message {
+   padding-top: 10%;
+   text-align: center;
+   flex: 1;
+   overflow: auto;
+ 
+   /* The error message is hidden by default */
+   display: none;
+ }
+ 
+-/* The animation players container */
+-
+-#players {
+-  flex: 1;
+-  overflow: auto;
+-}
+ 
+ /* Element picker and toggle-all buttons */
+ 
+ #element-picker,
+ #toggle-all {
+   position: relative;
+ }
+ 
+@@ -94,16 +109,166 @@ body {
+     background-image: url("debugger-pause@2x.png");
+   }
+ 
+   #toggle-all.paused::before {
+     background-image: url("debugger-play@2x.png");
+   }
+ }
+ 
++/* Animation timeline component */
++
++.animation-timeline {
++  height: 100%;
++  overflow: hidden;
++  /* The timeline gets its background-image from a canvas element created in
++     /browser/devtools/animationinspector/utils.js drawGraphElementBackground
++     thanks to document.mozSetImageElement("time-graduations", canvas)
++     This is done so that the background can be built dynamically from script */
++  background-image: -moz-element(#time-graduations);
++  background-repeat: repeat-y;
++  /* The animations are drawn 150px from the left edge so that animated nodes
++     can be displayed in a sidebar */
++  background-position: 150px 0;
++  display: flex;
++  flex-direction: column;
++}
++
++.animation-timeline .time-header {
++  margin-left: 150px;
++  height: 20px;
++  overflow: hidden;
++  position: relative;
++  border-bottom: 1px solid var(--theme-splitter-color);
++}
++
++.animation-timeline .time-header .time-tick {
++  position: absolute;
++  top: 3px;
++}
++
++.animation-timeline .animations {
++  width: 100%;
++  overflow-y: auto;
++  overflow-x: hidden;
++  margin: 0;
++  padding: 0;
++  list-style-type: none;
++}
++
++/* Animation block widgets */
++
++.animation-timeline .animation {
++  margin: 4px 0;
++  height: 20px;
++  position: relative;
++}
++
++.animation-timeline .animation:nth-child(2n) {
++  background-color: var(--even-animation-timeline-background-color);
++}
++
++.animation-timeline .animation .target {
++  width: 150px;
++  overflow: hidden;
++  height: 100%;
++}
++
++.animation-timeline .animation-target {
++  background-color: transparent;
++}
++
++.animation-timeline .animation .time-block {
++  position: absolute;
++  top: 0;
++  left: 150px;
++  right: 0;
++  height: 100%;
++}
++
++/* Animation iterations */
++
++.animation-timeline .animation .iterations {
++  position: relative;
++  height: 100%;
++  border: 1px solid var(--theme-highlight-lightorange);
++  box-sizing: border-box;
++  background: var(--theme-contrast-background);
++  /* Iterations are displayed with a repeating linear-gradient which size is
++     dynamically changed from JS */
++  background-image:
++    linear-gradient(to right,
++                    var(--theme-highlight-lightorange) 0,
++                    var(--theme-highlight-lightorange) 1px,
++                    transparent 1px,
++                    transparent 2px);
++  background-repeat: repeat-x;
++  background-position: -1px 0;
++}
++
++.animation-timeline .animation .iterations.infinite {
++  border-right-width: 0;
++}
++
++.animation-timeline .animation .iterations.infinite::before,
++.animation-timeline .animation .iterations.infinite::after {
++  content: "";
++  position: absolute;
++  top: 0;
++  right: 0;
++  width: 0;
++  height: 0;
++  border-right: 4px solid var(--theme-body-background);
++  border-top: 4px solid transparent;
++  border-bottom: 4px solid transparent;
++}
++
++.animation-timeline .animation .iterations.infinite::after {
++  bottom: 0;
++  top: unset;
++}
++
++.animation-timeline .animation .animation-title {
++  height: 1.5em;
++  width: 100%;
++  box-sizing: border-box;
++  overflow: hidden;
++}
++
++.animation-timeline .animation .delay {
++  position: absolute;
++  top: 0;
++  height: 100%;
++  background-image: linear-gradient(to bottom,
++                                    transparent,
++                                    transparent 9px,
++                                    var(--theme-highlight-lightorange) 9px,
++                                    var(--theme-highlight-lightorange) 11px,
++                                    transparent 11px,
++                                    transparent);
++}
++
++.animation-timeline .animation .delay::before {
++  position: absolute;
++  content: "";
++  left: 0;
++  width: 2px;
++  height: 8px;
++  top: 50%;
++  margin-top: -4px;
++  background: var(--theme-highlight-lightorange);
++}
++
++.animation-timeline .animation .name {
++  position: absolute;
++  z-index: 1;
++  padding: 2px;
++  white-space: nowrap;
++}
++
+ /* Animation target node gutter, contains a preview of the dom node */
+ 
+ .animation-target {
+   background-color: var(--theme-toolbar-background);
+   padding: 1px 4px;
+   box-sizing: border-box;
+   overflow: hidden;
+   text-overflow: ellipsis;
+@@ -248,9 +413,9 @@ body {
+ 
+ .timeline .time-display {
+   display: flex;
+   align-items: center;
+   justify-content: center;
+   width: 50px;
+   border-left: 1px solid var(--theme-splitter-color);
+   background: var(--theme-toolbar-background);
+-}
++}
+\ No newline at end of file
+diff -r 0d73c1dde1f3 -r f2c61517dc0d toolkit/devtools/server/actors/animation.js
+--- a/toolkit/devtools/server/actors/animation.js	Tue Jun 09 12:54:11 2015 +0200
++++ b/toolkit/devtools/server/actors/animation.js	Thu Jun 11 21:57:17 2015 +0200
+@@ -1,16 +1,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ /**
+- * Set of actors that expose the Web Animations API to devtools protocol clients.
++ * Set of actors that expose the Web Animations API to devtools protocol
++ * clients.
+  *
+  * The |Animations| actor is the main entry point. It is used to discover
+  * animation players on given nodes.
+  * There should only be one instance per debugger server.
+  *
+  * The |AnimationPlayer| actor provides attributes and methods to inspect an
+  * animation as well as pause/resume/seek it.
+  *
+@@ -24,53 +25,79 @@
+  *   /dom/webidl/Animation*.webidl
+  */
+ 
+ const {Cu} = require("chrome");
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const {Task} = Cu.import("resource://gre/modules/Task.jsm", {});
+ const {setInterval, clearInterval} = require("sdk/timers");
+ const protocol = require("devtools/server/protocol");
+-const {ActorClass, Actor, FrontClass, Front, Arg, method, RetVal, types} = protocol;
++const {ActorClass, Actor, FrontClass, Front,
++       Arg, method, RetVal, types} = protocol;
++// Make sure the nodeActor type is know here.
+ const {NodeActor} = require("devtools/server/actors/inspector");
+ const events = require("sdk/event/core");
+ 
+-const PLAYER_DEFAULT_AUTO_REFRESH_TIMEOUT = 500; // ms
++// How long (in ms) should we wait before polling again the state of an
++// animationPlayer.
++const PLAYER_DEFAULT_AUTO_REFRESH_TIMEOUT = 500;
+ 
+ /**
+  * The AnimationPlayerActor provides information about a given animation: its
+  * startTime, currentTime, current state, etc.
+  *
+  * Since the state of a player changes as the animation progresses it is often
+  * useful to call getCurrentState at regular intervals to get the current state.
+  *
+  * This actor also allows playing, pausing and seeking the animation.
+  */
+ let AnimationPlayerActor = ActorClass({
+   typeName: "animationplayer",
+ 
++  events: {
++    "changed": {
++      type: "changed",
++      state: Arg(0, "json")
++    }
++  },
++
+   /**
+    * @param {AnimationsActor} The main AnimationsActor instance
+    * @param {AnimationPlayer} The player object returned by getAnimationPlayers
+    * @param {Number} Temporary work-around used to retrieve duration and
+    * iteration count from computed-style rather than from waapi. This is needed
+    * to know which duration to get, in case there are multiple css animations
+    * applied to the same node.
+    */
+   initialize: function(animationsActor, player, playerIndex) {
+     Actor.prototype.initialize.call(this, animationsActor.conn);
+ 
++    this.onAnimationMutation = this.onAnimationMutation.bind(this);
++
++    this.tabActor = animationsActor.tabActor;
+     this.player = player;
+     this.node = player.effect.target;
+     this.playerIndex = playerIndex;
+-    this.styles = this.node.ownerDocument.defaultView.getComputedStyle(this.node);
++
++    let win = this.node.ownerDocument.defaultView;
++    this.styles = win.getComputedStyle(this.node);
++
++    // Listen to animation mutations on the node to alert the front when the
++    // current animation changes.
++    this.observer = new win.MutationObserver(this.onAnimationMutation);
++    this.observer.observe(this.node, {animations: true});
+   },
+ 
+   destroy: function() {
+-    this.player = this.node = this.styles = null;
++    // Only try to disconnect the observer if it's not already dead (i.e. if the
++    // container view hasn't navigated since).
++    if (this.observer && !Cu.isDeadWrapper(this.observer)) {
++      this.observer.disconnect();
++    }
++    this.tabActor = this.player = this.node = this.styles = this.observer = null;
+     Actor.prototype.destroy.call(this);
+   },
+ 
+   /**
+    * Release the actor, when it isn't needed anymore.
+    * Protocol.js uses this release method to call the destroy method.
+    */
+   release: method(function() {}, {release: true}),
+@@ -90,36 +117,36 @@ let AnimationPlayerActor = ActorClass({
+    * Some of the player's properties are retrieved from the node's
+    * computed-styles because the Web Animations API does not provide them yet.
+    * But the computed-styles may contain multiple animations for a node and so
+    * we need to know which is the index of the current animation in the style.
+    * @return {Number}
+    */
+   getPlayerIndex: function() {
+     let names = this.styles.animationName;
++    if (names === "none") {
++      names = this.styles.transitionProperty;
++    }
+ 
+-    // If no names are found, then it's probably a transition, in which case we
+-    // can't find the actual index, so just trust the playerIndex passed by
+-    // the AnimationsActor at initialization time.
+-    // Note that this may be incorrect if by the time the AnimationPlayerActor
+-    // is initialized, one of the transitions has ended, but it's the best we
+-    // can do for now.
+-    if (!names) {
++    // If we still don't have a name, let's fall back to the provided index
++    // which may, by now, be wrong, but it's the best we can do until the waapi
++    // gives us a way to get duration, delay, ... directly.
++    if (!names || names === "none") {
+       return this.playerIndex;
+     }
+ 
+     // If there's only one name.
+     if (names.includes(",") === -1) {
+       return 0;
+     }
+ 
+     // If there are several names, retrieve the index of the animation name in
+     // the list.
+     names = names.split(",").map(n => n.trim());
+-    for (let i = 0; i < names.length; i ++) {
++    for (let i = 0; i < names.length; i++) {
+       if (names[i] === this.player.effect.name) {
+         return i;
+       }
+     }
+   },
+ 
+   /**
+    * Get the animation duration from this player, in milliseconds.
+@@ -240,16 +267,37 @@ let AnimationPlayerActor = ActorClass({
+   }, {
+     request: {},
+     response: {
+       data: RetVal("json")
+     }
+   }),
+ 
+   /**
++   * Executed when the current animation changes, used to emit the new state
++   * the the front.
++   */
++  onAnimationMutation: function(mutations) {
++    let hasChanged = false;
++    for (let {changedAnimations} of mutations) {
++      if (!changedAnimations.length) {
++        return;
++      }
++      if (changedAnimations.some(animation => animation === this.player)) {
++        hasChanged = true;
++        break;
++      }
++    }
++
++    if (hasChanged) {
++      events.emit(this, "changed", this.getCurrentState());
++    }
++  },
++
++  /**
+    * Pause the player.
+    */
+   pause: method(function() {
+     this.player.pause();
+     return this.player.ready;
+   }, {
+     request: {},
+     response: {}
+@@ -343,19 +391,28 @@ let AnimationPlayerFront = FrontClass(An
+       currentTime: this._form.currentTime,
+       playState: this._form.playState,
+       playbackRate: this._form.playbackRate,
+       name: this._form.name,
+       duration: this._form.duration,
+       delay: this._form.delay,
+       iterationCount: this._form.iterationCount,
+       isRunningOnCompositor: this._form.isRunningOnCompositor
+-    }
++    };
+   },
+ 
++  /**
++   * Executed when the AnimationPlayerActor emits a "changed" event. Used to
++   * update the local knowledge of the state.
++   */
++  onChanged: protocol.preEvent("changed", function(partialState) {
++    let {state} = this.reconstructState(partialState);
++    this.state = state;
++  }),
++
+   // About auto-refresh:
+   //
+   // The AnimationPlayerFront is capable of automatically refreshing its state
+   // by calling the getCurrentState method at regular intervals. This allows
+   // consumers to update their knowledge of the player's currentTime, playState,
+   // ... dynamically.
+   //
+   // Calling startAutoRefresh will start the automatic refreshing of the state,
+@@ -411,29 +468,38 @@ let AnimationPlayerFront = FrontClass(An
+   }),
+ 
+   /**
+    * getCurrentState interceptor re-constructs incomplete states since the actor
+    * only sends the values that have changed.
+    */
+   getCurrentState: protocol.custom(function() {
+     this.currentStateHasChanged = false;
+-    return this._getCurrentState().then(data => {
+-      for (let key in this.state) {
+-        if (typeof data[key] === "undefined") {
+-          data[key] = this.state[key];
+-        } else if (data[key] !== this.state[key]) {
+-          this.currentStateHasChanged = true;
+-        }
+-      }
+-      return data;
++    return this._getCurrentState().then(partialData => {
++      let {state, hasChanged} = this.reconstructState(partialData);
++      this.currentStateHasChanged = hasChanged;
++      return state;
+     });
+   }, {
+     impl: "_getCurrentState"
+   }),
++
++  reconstructState: function(data) {
++    let hasChanged = false;
++
++    for (let key in this.state) {
++      if (typeof data[key] === "undefined") {
++        data[key] = this.state[key];
++      } else if (data[key] !== this.state[key]) {
++        hasChanged = true;
++      }
++    }
++
++    return {state: data, hasChanged};
++  }
+ });
+ 
+ /**
+  * Sent with the 'mutations' event as part of an array of changes, used to
+  * inform fronts of the type of change that occured.
+  */
+ types.addDictType("animationMutationChange", {
+   // The type of change ("added" or "removed").
+@@ -444,17 +510,17 @@ types.addDictType("animationMutationChan
+ 
+ /**
+  * The Animations actor lists animation players for a given node.
+  */
+ let AnimationsActor = exports.AnimationsActor = ActorClass({
+   typeName: "animations",
+ 
+   events: {
+-    "mutations" : {
++    "mutations": {
+       type: "mutations",
+       changes: Arg(0, "array:animationMutationChange")
+     }
+   },
+ 
+   initialize: function(conn, tabActor) {
+     Actor.prototype.initialize.call(this, conn);
+     this.tabActor = tabActor;
+@@ -495,17 +561,17 @@ let AnimationsActor = exports.Animations
+     let animations = [
+       ...nodeActor.rawNode.getAnimations(),
+       ...this.getAllAnimations(nodeActor.rawNode)
+     ];
+ 
+     // No care is taken here to destroy the previously stored actors because it
+     // is assumed that the client is responsible for lifetimes of actors.
+     this.actors = [];
+-    for (let i = 0; i < animations.length; i ++) {
++    for (let i = 0; i < animations.length; i++) {
+       // XXX: for now the index is passed along as the AnimationPlayerActor uses
+       // it to retrieve animation information from CSS.
+       let actor = AnimationPlayerActor(this, animations[i], i);
+       this.actors.push(actor);
+     }
+ 
+     // When a front requests the list of players for a node, start listening
+     // for animation mutations on this node to send updates to the front, until
+@@ -527,17 +593,17 @@ let AnimationsActor = exports.Animations
+     response: {
+       players: RetVal("array:animationplayer")
+     }
+   }),
+ 
+   onAnimationMutation: function(mutations) {
+     let eventData = [];
+ 
+-    for (let {addedAnimations, changedAnimations, removedAnimations} of mutations) {
++    for (let {addedAnimations, removedAnimations} of mutations) {
+       for (let player of removedAnimations) {
+         // Note that animations are reported as removed either when they are
+         // actually removed from the node (e.g. css class removed) or when they
+         // are finished and don't have forwards animation-fill-mode.
+         // In the latter case, we don't send an event, because the corresponding
+         // animation can still be seeked/resumed, so we want the client to keep
+         // its reference to the AnimationPlayerActor.
+         if (player.playState !== "idle") {
+@@ -583,19 +649,19 @@ let AnimationsActor = exports.Animations
+     }
+ 
+     if (eventData.length) {
+       events.emit(this, "mutations", eventData);
+     }
+   },
+ 
+   /**
+-   * After the client has called getAnimationPlayersForNode for a given DOM node,
+-   * the actor starts sending animation mutations for this node. If the client
+-   * doesn't want this to happen anymore, it should call this method.
++   * After the client has called getAnimationPlayersForNode for a given DOM
++   * node, the actor starts sending animation mutations for this node. If the
++   * client doesn't want this to happen anymore, it should call this method.
+    */
+   stopAnimationPlayerUpdates: method(function() {
+     if (this.observer && !Cu.isDeadWrapper(this.observer)) {
+       this.observer.disconnect();
+     }
+   }, {
+     request: {},
+     response: {}
+@@ -661,17 +727,17 @@ let AnimationsActor = exports.Animations
+     return promise.all(readyPromises);
+   }, {
+     request: {},
+     response: {}
+   }),
+ 
+   /**
+    * Play all animations in the current tabActor's frames.
+-   * This method only returns when the animations have left their pending states.
++   * This method only returns when animations have left their pending states.
+    */
+   playAll: method(function() {
+     let readyPromises = [];
+     // Until the WebAnimations API provides a way to play/pause via the document
+     // timeline, we have to iterate through the whole DOM to find all players.
+     for (let player of
+          this.getAllAnimations(this.tabActor.window.document, true)) {
+       player.play();
+@@ -682,19 +748,18 @@ let AnimationsActor = exports.Animations
+   }, {
+     request: {},
+     response: {}
+   }),
+ 
+   toggleAll: method(function() {
+     if (this.allAnimationsPaused) {
+       return this.playAll();
+-    } else {
+-      return this.pauseAll();
+     }
++    return this.pauseAll();
+   }, {
+     request: {},
+     response: {}
+   })
+ });
+ 
+ let AnimationsFront = exports.AnimationsFront = FrontClass(AnimationsActor, {
+   initialize: function(client, {animationsActor}) {
