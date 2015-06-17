@@ -1,0 +1,202 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  bab079b99cec263f3fdb7c8d21e8769a8f0321b8
+
+diff --git a/toolkit/devtools/LayoutHelpers.jsm b/toolkit/devtools/LayoutHelpers.jsm
+--- a/toolkit/devtools/LayoutHelpers.jsm
++++ b/toolkit/devtools/LayoutHelpers.jsm
+@@ -561,16 +561,17 @@ LayoutHelpers.isXBLAnonymous = function(
+ LayoutHelpers.isShadowAnonymous = function(node) {
+   let parent = LayoutHelpers.getBindingParent(node);
+   if (!parent) {
+     return false;
+   }
+ 
+   // If there is a shadowRoot and this is part of it then this
+   // is not native anonymous
++  // XXX: This should loop over olderShadowRoots possibly
+   return parent.shadowRoot && parent.shadowRoot.contains(node);
+ };
+ 
+ /**
+  * Get the current zoom factor applied to the container window of a given node.
+  * Container windows are used as a weakmap key to store the corresponding
+  * nsIDOMWindowUtils instance to avoid querying it every time.
+  *
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -3803,125 +3803,159 @@ function DocumentWalker(node, rootWin, w
+   this.walker.showSubDocuments = true;
+   this.walker.showDocumentsAsNodes = true;
+   this.walker.init(rootWin.document, whatToShow);
+   this.filter = filter;
+ 
+   // Make sure that the walker knows about the initial node (which could
+   // be skipped due to a filter).  Note that simply calling parentNode()
+   // causes currentNode to be updated.
+-  this.walker.currentNode = node;
++
++  // XXX: this shouldnt be called if walker.currentNode setter pukes
++  this.currentNode = node;
+   while (node &&
+          this.filter(node) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
+     node = this.walker.parentNode();
+   }
+ }
+ 
+ DocumentWalker.prototype = {
+   get node() {
+     return this.walker.node;
+   },
+   get whatToShow() {
+     return this.walker.whatToShow;
+   },
+   get currentNode() {
+-    return this.walker.currentNode;
++    return this._currentNode;
+   },
+   set currentNode(aVal) {
+-    this.walker.currentNode = aVal;
++    // if (LayoutHelpers.isShadowAnonymous(aVal)) {
++    //   console.log("shadow anon", aVal);
++    // }
++    try {
++      this.walker.currentNode = aVal;
++    } catch(e) {
++      console.log("Puke", e);
++    }
++    this._currentNode = aVal;
+   },
+ 
+   parentNode: function() {
+-    let node = this.walker.currentNode;
++    let node = this.currentNode;
+ 
+     // ShadowHost is the parent of every ShadowRoot
+     if (node.host &&
+         node instanceof node.ownerDocument.defaultView.ShadowRoot) {
+-      this.walker.currentNode = node.host;
++      this.currentNode = node.host;
+       return node.host;
+     }
+ 
+     return this.walker.parentNode();
+   },
+ 
++  createNormalWalker: function(node) {
++    //XXX: try to create a deeptreewalker without showAnonymous as gabor suggestd
++    // this.walker = Cc["@mozilla.org/inspector/deep-tree-walker;1"].createInstance(Ci.inIDeepTreeWalker);
++    // this.walker.showSubDocuments = true;
++    // this.walker.showDocumentsAsNodes = true;
++    // this.walker.init(rootWin.document, whatToShow);
++    return node.ownerDocument.createTreeWalker(
++        node, this.whatToShow);
++  },
++
+   firstChild: function() {
+-    let node = this.walker.currentNode;
++    let node = this.currentNode;
+     if (!node)
+       return null;
+ 
++    if (node.host && node instanceof node.ownerDocument.defaultView.ShadowRoot) {
++      let walker = this.createNormalWalker(node);
++
++      console.log("Walker for shadow root", walker, node);
++
++      let firstChild = walker.firstChild();
++      // while (firstChild && this.filter(firstChild) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
++      //   firstChild = walker.nextSibling();
++      // }
++
++      console.log("Found firstChild", firstChild);
++      this.currentNode = firstChild;
++      return firstChild;
++    }
+     if (node.shadowRoot) {
+-      this.walker.currentNode = node.shadowRoot;
++      this.currentNode = node.shadowRoot;
+       return node.shadowRoot;
+     }
+ 
+     let firstChild = this.walker.firstChild();
+     while (firstChild && this.filter(firstChild) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
+       firstChild = this.walker.nextSibling();
+     }
+ 
+     return firstChild;
+   },
+ 
+   lastChild: function() {
+-    let node = this.walker.currentNode;
++    let node = this.currentNode;
+     if (!node)
+       return null;
+ 
+     let lastChild = this.walker.lastChild();
+     while (lastChild && this.filter(lastChild) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
+       lastChild = this.walker.previousSibling();
+     }
+ 
+     if (lastChild) {
+       return lastChild;
+     }
+ 
+     let root = node.shadowRoot || null;
+     while (root) {
+       root = root.olderShadowRoot;
+-      this.walker.currentNode = root;
++      this.currentNode = root;
+     }
+ 
+     return root;
+   },
+ 
+   previousSibling: function() {
+-    let node = this.walker.currentNode;
++    let node = this.currentNode;
+ 
+     if (node.host && node instanceof node.ownerDocument.defaultView.ShadowRoot) {
+       let host = node.host;
+       let root = host.shadowRoot;
+       if (root == node) {
+         return null;
+       }
+ 
+       while (root && root.olderShadowRoot != node) {
+         root = root.olderShadowRoot;
+-        this.walker.currentNode = root;
++        this.currentNode = root;
+       }
+ 
+       return root;
+     }
+ 
+     let previousSibling = this.walker.previousSibling();
+     while (previousSibling && this.filter(previousSibling) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
+       previousSibling = this.walker.previousSibling();
+     }
+     return previousSibling;
+   },
+ 
+   nextSibling: function() {
+-    let node = this.walker.currentNode;
++    let node = this.currentNode;
+ 
+     if (node instanceof node.ownerDocument.defaultView.ShadowRoot &&
+         node.olderShadowRoot) {
+-      this.walker.currentNode = node.olderShadowRoot;
++      this.currentNode = node.olderShadowRoot;
+       return node.olderShadowRoot;
+     } else if (node instanceof node.ownerDocument.defaultView.ShadowRoot) {
+-      this.walker.currentNode = node.host;
++      this.currentNode = node.host;
+ 
+       let firstChild = this.walker.firstChild();
+       while (firstChild && this.filter(firstChild) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
+         firstChild = this.walker.nextSibling();
+       }
+ 
+       return firstChild;
+     }
