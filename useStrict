@@ -1,0 +1,239 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  f0f057df36e1520dee89735ddba0bc5b8836e83e
+Bug 952848 - Add an option to DebuggerGenericEval to force strict mode
+
+diff --git a/.hgignore b/.hgignore
+--- a/.hgignore
++++ b/.hgignore
+@@ -79,8 +79,10 @@ GPATH
+ ^browser/components/loop/standalone/content/config\.js$
+ ^browser/components/loop/standalone/node_modules/
+ 
+ # Git clone directory for updating web-platform-tests
+ ^testing/web-platform/sync/
+ 
+ # Android Gradle artifacts.
+ ^mobile/android/gradle/.gradle
++
++js/src/build_DBG.OBJ.noindex
+diff --git a/js/src/doc/Debugger/Debugger.Frame.md b/js/src/doc/Debugger/Debugger.Frame.md
+--- a/js/src/doc/Debugger/Debugger.Frame.md
++++ b/js/src/doc/Debugger/Debugger.Frame.md
+@@ -312,16 +312,19 @@ methods of other kinds of objects.
+     <code>url</code>
+     :   The filename or URL to which we should attribute <i>code</i>. If this
+         property is omitted, the URL defaults to `"debugger eval code"`.
+ 
+     <code>lineNumber</code>
+     :   The line number at which the evaluated code should be claimed to begin
+         within <i>url</i>.
+ 
++    <code>useStrict</code>
++    :   Whether to force the <i>code</i> to execute in strict mode.
++
+ <code>evalWithBindings(<i>code</i>, <i>bindings</i>, [<i>options</i>])</code>
+ :   Like `eval`, but evaluate <i>code</i> in the environment of this frame,
+     extended with bindings from the object <i>bindings</i>. For each own
+     enumerable property of <i>bindings</i> named <i>name</i> whose value is
+     <i>value</i>, include a variable in the environment in which
+     <i>code</i> is evaluated named <i>name</i>, whose value is
+     <i>value</i>. Each <i>value</i> must be a debuggee value. (This is not
+     like a `with` statement: <i>code</i> may access, assign to, and delete
+diff --git a/js/src/jit-test/tests/debug/Frame-evalWithBindings-15.js b/js/src/jit-test/tests/debug/Frame-evalWithBindings-15.js
+new file mode 100644
+--- /dev/null
++++ b/js/src/jit-test/tests/debug/Frame-evalWithBindings-15.js
+@@ -0,0 +1,20 @@
++// XXX
++
++// test with stric and without
++// coercion behavior (null / undefined)
++
++var g = newGlobal();
++var dbg = new Debugger(g);
++var hits = 0;
++dbg.onDebuggerStatement = function (frame) {
++    assertEq(frame.evalWithBindings("var i = a*a + b*b; i === 25;", {a: 3, b: 4}).return, true);
++    hits++;
++};
++g.eval("'use strict'; debugger;");
++assertEq(hits, 1);
++assertEq("i" in g, false);
++
++g.eval("function die() { throw fit; }");
++g.eval("Object.defineProperty(this, 'i', {get: die, set: die});");
++g.eval("'use strict'; debugger;");
++assertEq(hits, 2);
+diff --git a/js/src/jit-test/tests/debug/Object-evalInGlobal-10.js b/js/src/jit-test/tests/debug/Object-evalInGlobal-10.js
+new file mode 100644
+--- /dev/null
++++ b/js/src/jit-test/tests/debug/Object-evalInGlobal-10.js
+@@ -0,0 +1,29 @@
++// XXX
++
++load(libdir + 'asserts.js');
++
++(function () {
++  var g = newGlobal();
++  var dbg = new Debugger;
++  var gw = dbg.addDebuggee(g);
++
++  let completion = gw.evalInGlobal("foobar = 17",{useStrict: true});
++  assertEq('throw' in completion, true);
++  assertEq('yield' in completion, false);
++  assertEq('return' in completion, false);
++
++  completion = gw.evalInGlobal("foobar = 17",{useStrict: 1});
++  assertEq('throw' in completion, true);
++  assertEq('yield' in completion, false);
++  assertEq('return' in completion, false);
++
++  completion = gw.evalInGlobal("foobar = 17",{useStrict: false});
++  assertEq('throw' in completion, false);
++  assertEq('yield' in completion, false);
++  assertEq('return' in completion, true);
++
++  completion = gw.evalInGlobal("foobar = 17",{useStrict: undefined});
++  assertEq('throw' in completion, false);
++  assertEq('yield' in completion, false);
++  assertEq('return' in completion, true);
++})();
+diff --git a/js/src/vm/Debugger.cpp b/js/src/vm/Debugger.cpp
+--- a/js/src/vm/Debugger.cpp
++++ b/js/src/vm/Debugger.cpp
+@@ -6240,17 +6240,17 @@ DebuggerFrame_setOnPop(JSContext* cx, un
+  * If |frame| is non-nullptr, evaluate as for a direct eval in that frame; |env|
+  * must be either |frame|'s DebugScopeObject, or some extension of that
+  * environment; either way, |frame|'s scope is where newly declared variables
+  * go. In this case, |frame| must have a computed 'this' value, equal to |thisv|.
+  */
+ static bool
+ EvaluateInEnv(JSContext* cx, Handle<Env*> env, HandleValue thisv, AbstractFramePtr frame,
+               jsbytecode* pc, mozilla::Range<const char16_t> chars, const char* filename,
+-              unsigned lineno, MutableHandleValue rval)
++              unsigned lineno, bool useStrict, MutableHandleValue rval)
+ {
+     assertSameCompartment(cx, env, frame);
+     MOZ_ASSERT_IF(frame, thisv.get() == frame.thisValue());
+     MOZ_ASSERT_IF(frame, pc);
+ 
+     /*
+      * NB: This function breaks the assumption that the compiler can see all
+      * calls and properly compute a static level. In practice, any non-zero
+@@ -6269,17 +6269,17 @@ EvaluateInEnv(JSContext* cx, Handle<Env*
+         return false;
+     CompileOptions options(cx);
+     options.setIsRunOnce(true)
+            .setForEval(true)
+            .setNoScriptRval(false)
+            .setFileAndLine(filename, lineno)
+            .setCanLazilyParse(false)
+            .setIntroductionType("debugger eval")
+-           .maybeMakeStrictMode(frame ? frame.script()->strict() : false);
++           .maybeMakeStrictMode(frame ? frame.script()->strict() : useStrict);
+     RootedScript callerScript(cx, frame ? frame.script() : nullptr);
+     SourceBufferHolder srcBuf(chars.start().get(), chars.length(), SourceBufferHolder::NoOwnership);
+     RootedScript script(cx, frontend::CompileScript(cx, &cx->tempLifoAlloc(), env, staticScope,
+                                                     callerScript, options, srcBuf,
+                                                     /* source = */ nullptr,
+                                                     /* staticLevel = */ frame ? 1 : 0));
+     if (!script)
+         return false;
+@@ -6344,22 +6344,29 @@ DebuggerGenericEval(JSContext* cx, const
+                 return false;
+             }
+         }
+     }
+ 
+     /* Set options from object if provided. */
+     JSAutoByteString url_bytes;
+     char* url = nullptr;
++    bool useStrict = false;
+     unsigned lineNumber = 1;
+ 
+     if (options.isObject()) {
+         RootedObject opts(cx, &options.toObject());
+         RootedValue v(cx);
+ 
++        if (!JS_GetProperty(cx, opts, "useStrict", &v))
++            return false;
++        if (!v.isUndefined()) {
++            useStrict = ToBoolean(v);
++        }
++
+         if (!JS_GetProperty(cx, opts, "url", &v))
+             return false;
+         if (!v.isUndefined()) {
+             RootedString url_str(cx, ToString<CanGC>(cx, v));
+             if (!url_str)
+                 return false;
+             url = url_bytes.encodeLatin1(cx, url_str);
+             if (!url)
+@@ -6437,17 +6444,17 @@ DebuggerGenericEval(JSContext* cx, const
+     AbstractFramePtr frame = iter ? iter->abstractFramePtr() : NullFramePtr();
+     jsbytecode* pc = iter ? iter->pc() : nullptr;
+     AutoStableStringChars stableChars(cx);
+     if (!stableChars.initTwoByte(cx, linear))
+         return false;
+ 
+     mozilla::Range<const char16_t> chars = stableChars.twoByteRange();
+     bool ok = EvaluateInEnv(cx, env, thisv, frame, pc, chars, url ? url : "debugger eval code",
+-                            lineNumber, &rval);
++                            lineNumber, useStrict, &rval);
+     return dbg->receiveCompletionValue(ac, ok, rval, vp);
+ }
+ 
+ static bool
+ DebuggerFrame_eval(JSContext* cx, unsigned argc, Value* vp)
+ {
+     THIS_FRAME_ITER(cx, argc, vp, "eval", args, thisobj, _, iter);
+     if (!args.requireAtLeast(cx, "Debugger.Frame.prototype.eval", 1))
+diff --git a/toolkit/devtools/server/actors/webconsole.js b/toolkit/devtools/server/actors/webconsole.js
+--- a/toolkit/devtools/server/actors/webconsole.js
++++ b/toolkit/devtools/server/actors/webconsole.js
+@@ -801,16 +801,17 @@ WebConsoleActor.prototype =
+     let input = aRequest.text;
+     let timestamp = Date.now();
+ 
+     let evalOptions = {
+       bindObjectActor: aRequest.bindObjectActor,
+       frameActor: aRequest.frameActor,
+       url: aRequest.url,
+       selectedNodeActor: aRequest.selectedNodeActor,
++      useStrict: true,
+     };
+ 
+     let evalInfo = this.evalWithDebugger(input, evalOptions);
+     let evalResult = evalInfo.result;
+     let helperResult = evalInfo.helperResult;
+ 
+     let result, errorMessage, errorGrip = null;
+     if (evalResult) {
+@@ -1177,21 +1178,24 @@ WebConsoleActor.prototype =
+     if (found$$) {
+       $$ = bindings.$$;
+       delete bindings.$$;
+     }
+ 
+     // Ready to evaluate the string.
+     helpers.evalInput = aString;
+ 
+-    let evalOptions;
++    let evalOptions = {};
+     if (typeof aOptions.url == "string") {
+-      evalOptions = { url: aOptions.url };
++      evalOptions.url = aOptions.url;
+     }
+ 
++    evalOptions.useStrict = aOptions.useStrict;
++    console.log("Calling with options", evalOptions);
++
+     let result;
+     if (frame) {
+       result = frame.evalWithBindings(aString, bindings, evalOptions);
+     }
+     else {
+       result = dbgWindow.evalInGlobalWithBindings(aString, bindings, evalOptions);
+     }
+ 
