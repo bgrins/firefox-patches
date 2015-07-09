@@ -1,0 +1,492 @@
+# HG changeset patch
+# User Gabriel Luong <gabriel.luong@gmail.com>
+# Parent  4d9982b02e3375ef757194d3e2dcdf91f4cbfee9
+Bug 1178535 - Part 2: Highlight pseudoclass and attribute texts in the selector text of the rule view r=bgrins
+
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -12,18 +12,24 @@
+ const {Promise: promise} = Cu.import("resource://gre/modules/Promise.jsm", {});
+ const {CssLogic} = require("devtools/styleinspector/css-logic");
+ const {InplaceEditor, editableField, editableItem} =
+       require("devtools/shared/inplace-editor");
+ const {ELEMENT_STYLE, PSEUDO_ELEMENTS} =
+       require("devtools/server/actors/styles");
+ const {OutputParser} = require("devtools/output-parser");
+ const {PrefObserver, PREF_ORIG_SOURCES} = require("devtools/styleeditor/utils");
+-const {parseSingleValue, parseDeclarations} =
+-      require("devtools/styleinspector/css-parsing-utils");
++const {
++  parseDeclarations,
++  parseSingleValue,
++  parsePseudoClassesAndAttributes,
++  SELECTOR_ATTRIBUTE,
++  SELECTOR_ELEMENT,
++  SELECTOR_PSEUDO_CLASS
++} = require("devtools/styleinspector/css-parsing-utils");
+ const overlays = require("devtools/styleinspector/style-inspector-overlays");
+ const EventEmitter = require("devtools/toolkit/event-emitter");
+
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+
+ const HTML_NS = "http://www.w3.org/1999/xhtml";
+ const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+@@ -1552,17 +1558,21 @@
+         enabled: prop.enabled,
+         overridden: prop.overridden,
+         pseudoElement: prop.rule.pseudoElement,
+         sheetHref: prop.rule.domRule.href,
+         textProperty: prop
+       };
+     } else if (classes.contains("ruleview-selector-unmatched") ||
+                classes.contains("ruleview-selector-matched") ||
+-               classes.contains("ruleview-selector")) {
++               classes.contains("ruleview-selectorcontainer") ||
++               classes.contains("ruleview-selector") ||
++               classes.contains("ruleview-selector-attribute") ||
++               classes.contains("ruleview-selector-pseudo-class") ||
++               classes.contains("ruleview-selector-pseudo-class-lock")) {
+       type = overlays.VIEW_NODE_SELECTOR_TYPE;
+       value = node.offsetParent._ruleEditor.selectorText.textContent;
+     } else if (classes.contains("ruleview-rule-source")) {
+       type = overlays.VIEW_NODE_LOCATION_TYPE;
+       let ruleEditor = node.offsetParent._ruleEditor;
+       let rule = ruleEditor.rule;
+       value = (rule.sheet && rule.sheet.href) ? rule.sheet.href : rule.title;
+     } else {
+@@ -2705,52 +2715,48 @@
+     this.updateSourceLink();
+
+     let code = createChild(this.element, "div", {
+       class: "ruleview-code"
+     });
+
+     let header = createChild(code, "div", {});
+
+-    this.selectorContainer = createChild(header, "span", {
+-      class: "ruleview-selectorcontainer"
++    this.selectorText = createChild(header, "span", {
++      class: "ruleview-selectorcontainer theme-fg-color3",
++      tabindex: this.isSelectorEditable ? "0" : "-1",
+     });
+
++    if (this.isSelectorEditable) {
++      this.selectorText.addEventListener("click", aEvent => {
++        // Clicks within the selector shouldn't propagate any further.
++        aEvent.stopPropagation();
++      }, false);
++
++      editableField({
++        element: this.selectorText,
++        done: this._onSelectorDone,
++      });
++    }
++
+     if (this.rule.domRule.type !== Ci.nsIDOMCSSRule.KEYFRAME_RULE &&
+         this.rule.domRule.selectors) {
+       let selector = this.rule.domRule.selectors.join(", ");
+
+       let selectorHighlighter = createChild(header, "span", {
+         class: "ruleview-selectorhighlighter" +
+                (this.ruleView.highlightedSelector === selector ?
+                 " highlighted" : ""),
+         title: CssLogic.l10n("rule.selectorHighlighter.tooltip")
+       });
+       selectorHighlighter.addEventListener("click", () => {
+         this.ruleView.toggleSelectorHighlighter(selectorHighlighter, selector);
+       });
+     }
+
+-    this.selectorText = createChild(this.selectorContainer, "span", {
+-      class: "ruleview-selector theme-fg-color3",
+-      tabindex: this.isSelectorEditable ? "0" : "-1",
+-    });
+-
+-    if (this.isSelectorEditable) {
+-      this.selectorContainer.addEventListener("click", aEvent => {
+-        // Clicks within the selector shouldn't propagate any further.
+-        aEvent.stopPropagation();
+-      }, false);
+-
+-      editableField({
+-        element: this.selectorText,
+-        done: this._onSelectorDone,
+-      });
+-    }
+-
+     this.openBrace = createChild(header, "span", {
+       class: "ruleview-ruleopen",
+       textContent: " {"
+     });
+
+     this.propertyList = createChild(code, "ul", {
+       class: "ruleview-propertylist"
+     });
+@@ -2838,26 +2844,51 @@
+     } else {
+       this.rule.domRule.selectors.forEach((selector, i) => {
+         if (i != 0) {
+           createChild(this.selectorText, "span", {
+             class: "ruleview-selector-separator",
+             textContent: ", "
+           });
+         }
+-        let cls;
+-        if (this.rule.matchedSelectors.indexOf(selector) > -1) {
+-          cls = "ruleview-selector-matched";
+-        } else {
+-          cls = "ruleview-selector-unmatched";
++
++        let containerClass =
++          (this.rule.matchedSelectors.indexOf(selector) > -1) ?
++          "ruleview-selector-matched" : "ruleview-selector-unmatched";
++        let selectorContainer = createChild(this.selectorText, "span", {
++          class: containerClass
++        });
++
++        let parsedSelector = parsePseudoClassesAndAttributes(selector);
++
++        for (let selectorText of parsedSelector) {
++          let selectorClass = "";
++
++          switch (selectorText.type) {
++            case SELECTOR_ATTRIBUTE:
++              selectorClass = "ruleview-selector-attribute";
++              break;
++            case SELECTOR_ELEMENT:
++              selectorClass = "ruleview-selector";
++              break;
++            case SELECTOR_PSEUDO_CLASS:
++              selectorClass =
++                [":active", ":focus", ":hover"].includes(selectorText.value) ?
++                "ruleview-selector-pseudo-class-lock" :
++                "ruleview-selector-pseudo-class";
++              break;
++            default:
++              break;
++          }
++
++          createChild(selectorContainer, "span", {
++            textContent: selectorText.value,
++            class: selectorClass
++          });
+         }
+-        createChild(this.selectorText, "span", {
+-          class: cls,
+-          textContent: selector
+-        });
+       });
+     }
+
+     for (let prop of this.rule.textProps) {
+       if (!prop.editor) {
+         let editor = new TextPropertyEditor(this, prop);
+         this.propertyList.appendChild(editor.element);
+       }
+diff --git a/browser/devtools/styleinspector/ruleview.css b/browser/devtools/styleinspector/ruleview.css
+--- a/browser/devtools/styleinspector/ruleview.css
++++ b/browser/devtools/styleinspector/ruleview.css
+@@ -59,18 +59,17 @@
+ .ruleview-code {
+   direction: ltr;
+ }
+
+ .ruleview-property:not(:hover) > .ruleview-enableproperty {
+   pointer-events: none;
+ }
+
+-.ruleview-namecontainer,
+-.ruleview-selectorcontainer {
++.ruleview-namecontainer {
+   cursor: text;
+ }
+
+ .ruleview-propertyvaluecontainer {
+   cursor: text;
+   padding-right: 15px;
+ }
+
+diff --git a/browser/devtools/styleinspector/test/browser.ini b/browser/devtools/styleinspector/test/browser.ini
+--- a/browser/devtools/styleinspector/test/browser.ini
++++ b/browser/devtools/styleinspector/test/browser.ini
+@@ -148,16 +148,17 @@
+ [browser_ruleview_search-filter_13.js]
+ [browser_ruleview_search-filter_clear.js]
+ [browser_ruleview_search-filter_context-menu.js]
+ [browser_ruleview_search-filter_escape-keypress.js]
+ [browser_ruleview_select-and-copy-styles.js]
+ [browser_ruleview_selector-highlighter_01.js]
+ [browser_ruleview_selector-highlighter_02.js]
+ [browser_ruleview_selector-highlighter_03.js]
++[browser_ruleview_selector_highlight.js]
+ [browser_ruleview_style-editor-link.js]
+ skip-if = e10s # bug 1040670 Cannot open inline styles in viewSourceUtils
+ [browser_ruleview_urls-clickable.js]
+ [browser_ruleview_user-agent-styles.js]
+ [browser_ruleview_user-agent-styles-uneditable.js]
+ [browser_ruleview_user-property-reset.js]
+ [browser_styleinspector_context-menu-copy-color_01.js]
+ [browser_styleinspector_context-menu-copy-color_02.js]
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_content_02.js b/browser/devtools/styleinspector/test/browser_ruleview_content_02.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_content_02.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_content_02.js
+@@ -64,17 +64,17 @@
+   is(headers[2].textContent,
+     STRINGS.formatStringFromName("rule.inheritedFrom", ["body"], 1),
+     "The third header is correct");
+
+   let rules = doc.querySelectorAll(".ruleview-rule");
+   is(rules.length, 4, "There are 4 rules in the view");
+
+   for (let rule of rules) {
+-    let selector = rule.querySelector(".ruleview-selector");
++    let selector = rule.querySelector(".ruleview-selectorcontainer");
+     is(selector.textContent,
+       STRINGS.GetStringFromName("rule.sourceElement"),
+       "The rule's selector is correct");
+
+     let propertyNames = [...rule.querySelectorAll(".ruleview-propertyname")];
+     is(propertyNames.length, 1, "There's only one property name, as expected");
+
+     let propertyValues = [...rule.querySelectorAll(".ruleview-propertyvalue")];
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_refresh-on-attribute-change_01.js b/browser/devtools/styleinspector/test/browser_ruleview_refresh-on-attribute-change_01.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_refresh-on-attribute-change_01.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_refresh-on-attribute-change_01.js
+@@ -42,17 +42,17 @@
+   testElement.setAttribute("id", "testid");
+   yield ruleViewRefreshed;
+
+   info("Checking that the rule-view has all the selectors again");
+   checkRuleViewContent(view, ["element", "#testid", ".testclass"]);
+ });
+
+ function checkRuleViewContent(view, expectedSelectors) {
+-  let selectors = view.doc.querySelectorAll(".ruleview-selector");
++  let selectors = view.doc.querySelectorAll(".ruleview-selectorcontainer");
+
+   is(selectors.length, expectedSelectors.length,
+     expectedSelectors.length + " selectors are displayed");
+
+   for (let i = 0; i < expectedSelectors.length; i ++) {
+     is(selectors[i].textContent.indexOf(expectedSelectors[i]), 0,
+       "Selector " + (i + 1) + " is " + expectedSelectors[i]);
+   }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_selector_highlight.js b/browser/devtools/styleinspector/test/browser_ruleview_selector_highlight.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_selector_highlight.js
+@@ -0,0 +1,146 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the rule view selector text is highlighted correctly according
++// to the components of the selector.
++
++const SEARCH = "00F";
++
++const TEST_URI = [
++  "<style type='text/css'>",
++  "  h1 {}",
++  "  h1#testid {}",
++  "  h1 + p {}",
++  "  div[hidden=\"true\"] {}",
++  "  div[title=\"test\"][checked=true] {}",
++  "  p:empty {}",
++  "  p:lang(en) {}",
++  "  .testclass:active {}",
++  "  .testclass:focus {}",
++  "  .testclass:hover {}",
++  "</style>",
++  "<h1>Styled Node</h1>",
++  "<p>Paragraph</p>",
++  "<h1 id=\"testid\">Styled Node</h1>",
++  "<div hidden=\"true\"></div>",
++  "<div title=\"test\" checked=\"true\"></div>",
++  "<p></p>",
++  "<p lang=\"en\">Paragraph<p>",
++  "<div class=\"testclass\">Styled Node</div>"
++].join("\n");
++
++const SELECTOR_ATTRIBUTE = "ruleview-selector-attribute";
++const SELECTOR_ELEMENT = "ruleview-selector";
++const SELECTOR_PSEUDO_CLASS = "ruleview-selector-pseudo-class";
++const SELECTOR_PSEUDO_CLASS_LOCK = "ruleview-selector-pseudo-class-lock";
++
++const TEST_DATA = [
++  {
++    node: "h1",
++    expected: [
++      { value: "h1", class: SELECTOR_ELEMENT }
++    ]
++  },
++  {
++    node: "h1 + p",
++    expected: [
++      { value: "h1 + p", class: SELECTOR_ELEMENT }
++    ]
++  },
++  {
++    node: "h1#testid",
++    expected: [
++      { value: "h1#testid", class: SELECTOR_ELEMENT }
++    ]
++  },
++  {
++    node: "div[hidden='true']",
++    expected: [
++      { value: "div", class: SELECTOR_ELEMENT },
++      { value: "[hidden=\"true\"]", class: SELECTOR_ATTRIBUTE }
++    ]
++  },
++  {
++    node: "div[title=\"test\"][checked=\"true\"]",
++    expected: [
++      { value: "div", class: SELECTOR_ELEMENT },
++      { value: "[title=\"test\"]", class: SELECTOR_ATTRIBUTE },
++      { value: "[checked=\"true\"]", class: SELECTOR_ATTRIBUTE }
++    ]
++  },
++  {
++    node: "p:empty",
++    expected: [
++      { value: "p", class: SELECTOR_ELEMENT },
++      { value: ":empty", class: SELECTOR_PSEUDO_CLASS }
++    ]
++  },
++  {
++    node: "p:lang(en)",
++    expected: [
++      { value: "p", class: SELECTOR_ELEMENT },
++      { value: ":lang(en)", class: SELECTOR_PSEUDO_CLASS }
++    ]
++  },
++  {
++    node: ".testclass",
++    pseudoClass: ":active",
++    expected: [
++      { value: ".testclass", class: SELECTOR_ELEMENT },
++      { value: ":active", class: SELECTOR_PSEUDO_CLASS_LOCK }
++    ]
++  },
++  {
++    node: ".testclass",
++    pseudoClass: ":focus",
++    expected: [
++      { value: ".testclass", class: SELECTOR_ELEMENT },
++      { value: ":focus", class: SELECTOR_PSEUDO_CLASS_LOCK }
++    ]
++  },
++  {
++    node: ".testclass",
++    pseudoClass: ":hover",
++    expected: [
++      { value: ".testclass", class: SELECTOR_ELEMENT },
++      { value: ":hover", class: SELECTOR_PSEUDO_CLASS_LOCK }
++    ]
++  },
++];
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {inspector, view} = yield openRuleView();
++
++  for (let {node, pseudoClass, expected} of TEST_DATA) {
++    yield selectNode(node, inspector);
++
++    if (pseudoClass) {
++      let onRefresh = inspector.once("rule-view-refreshed");
++      inspector.togglePseudoClass(pseudoClass);
++      yield onRefresh;
++    }
++
++    let selectorContainer =
++      getRuleViewRuleEditor(view, 1).selectorText.firstChild;
++
++    if (selectorContainer.children.length === expected.length) {
++      for (let i = 0; i < expected.length; i++) {
++        is(expected[i].value, selectorContainer.children[i].textContent,
++          "Got expected selector value: " + expected[i].value + " == " +
++          selectorContainer.children[i].textContent);
++        is(expected[i].class, selectorContainer.children[i].className,
++          "Got expected class name: " + expected[i].class + " == " +
++          selectorContainer.children[i].className);
++      }
++    } else {
++      for (let selector of selectorContainer.children) {
++        info("Actual selector components: { value: " + selector.textContent +
++          ", class: " + selector.className + " }\n");
++      }
++    }
++  }
++});
+diff --git a/browser/devtools/styleinspector/test/head.js b/browser/devtools/styleinspector/test/head.js
+--- a/browser/devtools/styleinspector/test/head.js
++++ b/browser/devtools/styleinspector/test/head.js
+@@ -625,17 +625,18 @@
+  * @param {CssRuleView} view The instance of the rule-view panel
+  * @param {String} selectorText The selector in the rule-view for which the rule
+  * object is wanted
+  * @return {DOMNode}
+  */
+ function getRuleViewRule(view, selectorText) {
+   let rule;
+   for (let r of view.doc.querySelectorAll(".ruleview-rule")) {
+-    let selector = r.querySelector(".ruleview-selector, .ruleview-selector-matched");
++    let selector = r.querySelector(".ruleview-selectorcontainer, " +
++                                   ".ruleview-selector-matched");
+     if (selector && selector.textContent === selectorText) {
+       rule = r;
+       break;
+     }
+   }
+
+   return rule;
+ }
+diff --git a/browser/themes/shared/devtools/ruleview.css b/browser/themes/shared/devtools/ruleview.css
+--- a/browser/themes/shared/devtools/ruleview.css
++++ b/browser/themes/shared/devtools/ruleview.css
+@@ -240,24 +240,38 @@
+   border-bottom: 1px dashed transparent;
+ }
+
+ .ruleview-namecontainer:hover > .ruleview-propertyname,
+ .ruleview-propertyvaluecontainer:hover > .ruleview-propertyvalue {
+   border-bottom-color: hsl(0,0%,50%);
+ }
+
+-.ruleview-selector {
++.ruleview-selectorcontainer {
+   word-wrap: break-word;
++  cursor: text;
+ }
+
+ .ruleview-selector-separator, .ruleview-selector-unmatched {
+   color: #888;
+ }
+
++.ruleview-selector-matched > .ruleview-selector-attribute {
++  color: var(--theme-highlight-purple);
++}
++
++.ruleview-selector-matched > .ruleview-selector-pseudo-class {
++  color: var(--theme-highlight-green);
++}
++
++.ruleview-selector-matched > .ruleview-selector-pseudo-class-lock {
++  font-weight: bold;
++  color: var(--theme-highlight-orange);
++}
++
+ .ruleview-selectorhighlighter {
+   background: url("chrome://browser/skin/devtools/vview-open-inspector.png") no-repeat 0 0;
+   padding-left: 16px;
+   margin-left: 5px;
+   cursor: pointer;
+ }
+
+ .ruleview-selectorhighlighter:hover {
