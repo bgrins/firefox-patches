@@ -1,10 +1,36 @@
-# HG changeset patch
-# Parent  9c936468510777075f46714ea4e736d86aab3866
-
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -1913,16 +1913,18 @@ pref("experiments.supported", true);
+ pref("media.gmp-provider.enabled", true);
+ 
+ pref("browser.apps.URL", "https://marketplace.firefox.com/discovery/");
+ 
+ #ifdef NIGHTLY_BUILD
+ pref("browser.polaris.enabled", false);
+ pref("privacy.trackingprotection.ui.enabled", false);
+ #endif
++pref("privacy.trackingprotection.introCount", 0);
++pref("privacy.trackingprotection.introURL", "https://support.mozilla.org/kb/tracking-protection-firefox");
+ 
+ #ifdef NIGHTLY_BUILD
+ // At the moment, autostart.2 is used, while autostart.1 is unused.
+ // We leave it here set to false to reset users' defaults and allow
+ // us to change everybody to true in the future, when desired.
+ pref("browser.tabs.remote.autostart.1", false);
+ pref("browser.tabs.remote.autostart.2", true);
+ #endif
 diff --git a/browser/base/content/browser-trackingprotection.js b/browser/base/content/browser-trackingprotection.js
 --- a/browser/base/content/browser-trackingprotection.js
 +++ b/browser/base/content/browser-trackingprotection.js
-@@ -7,16 +7,17 @@ let TrackingProtection = {
+@@ -1,13 +1,14 @@
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ let TrackingProtection = {
++  MAX_INTROS: 1,
+   PREF_ENABLED_GLOBALLY: "privacy.trackingprotection.enabled",
    PREF_ENABLED_IN_PRIVATE_WINDOWS: "privacy.trackingprotection.pbmode.enabled",
    enabledGlobally: false,
    enabledInPrivateWindows: false,
@@ -12,381 +38,668 @@ diff --git a/browser/base/content/browser-trackingprotection.js b/browser/base/c
    init() {
      let $ = selector => document.querySelector(selector);
      this.container = $("#tracking-protection-container");
-     this.content = $("#tracking-protection-content");
-+    this.icon = $("#tracking-protection-icon");
+@@ -102,9 +103,52 @@ let TrackingProtection = {
+     Services.perms.remove(gBrowser.selectedBrowser.currentURI,
+       "trackingprotection");
  
-     this.updateEnabled();
-     Services.prefs.addObserver(this.PREF_ENABLED_GLOBALLY, this, false);
-     Services.prefs.addObserver(this.PREF_ENABLED_IN_PRIVATE_WINDOWS, this, false);
+     // Telemetry for enable protection.
+     this.eventsHistogram.add(2);
  
-     this.enabledHistogram.add(this.enabledGlobally);
+     BrowserReload();
    },
++
++  showIntroPanel: Task.async(function* TrackingProtection_showIntroPanel() {
++    let mm = gBrowser.selectedBrowser.messageManager;
++    let brandBundle = document.getElementById("bundle_brand");
++    let brandShortName = brandBundle.getString("brandShortName");
++
++    let openStep2 = () => {
++      // When the user proceeds in the tour, adjust the counter to indicate that
++      // the user doesn't need to see the intro anymore.
++      gPrefService.setIntPref("privacy.trackingprotection.introCount",
++                              this.MAX_INTROS);
++      gPrefService.savePrefFile(null);
++
++      let nextURL = Services.urlFormatter.formatURLPref("privacy.trackingprotection.introURL") +
++                    "#step2";
++      switchToTabHavingURI(nextURL, true, {
++        // Ignore the fragment in case the intro is shown on the tour page
++        // (e.g. if the user manually visited the tour or clicked the link from
++        // about:privatebrowsing) so we can avoid a reload.
++        ignoreFragment: true,
++      });
++    };
++
++    let buttons = [
++      {
++        label: gNavigatorBundle.getString("trackingProtection.intro.step1of3"),
++        style: "text",
++      },
++      {
++        callback: openStep2,
++        label: gNavigatorBundle.getString("trackingProtection.intro.nextButton.label"),
++        style: "primary",
++      },
++    ];
++
++    let panelTarget = yield UITour.getTarget(window, "siteIdentity");
++    UITour.initForBrowser(gBrowser.selectedBrowser);
++    UITour.showInfo(window, mm, panelTarget,
++                    gNavigatorBundle.getString("trackingProtection.intro.title"),
++                    gNavigatorBundle.getFormattedString("trackingProtection.intro.description",
++                                                        [brandShortName]),
++                    undefined, buttons);
++  }),
+ };
+diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+--- a/browser/base/content/browser.js
++++ b/browser/base/content/browser.js
+@@ -6834,38 +6834,50 @@ var gIdentityHandler = {
+     let options = {
+       /* keep doorhanger collapsed */
+       dismissed: true,
+       state: state
+     };
  
-@@ -55,25 +56,24 @@ let TrackingProtection = {
-     if (!this.enabled) {
-       return;
+     // default
+     let iconState = "bad-content-blocked-notification-icon";
++    let trackingContentBlocked = false;
+ 
+     // Telemetry for whether the shield was due to tracking protection or not
+     let histogram = Services.telemetry.getHistogramById
+                       ("TRACKING_PROTECTION_SHIELD");
+     if (state & Ci.nsIWebProgressListener.STATE_LOADED_TRACKING_CONTENT) {
+       histogram.add(1);
+     } else if (state &
+                Ci.nsIWebProgressListener.STATE_BLOCKED_TRACKING_CONTENT) {
+       histogram.add(2);
++      trackingContentBlocked = true;
+     } else if (gPrefService.getBoolPref("privacy.trackingprotection.enabled")) {
+       // Tracking protection is enabled but no tracking elements are loaded,
+       // the shield is due to mixed content.
+       histogram.add(3);
+     }
+     if (state &
+         (Ci.nsIWebProgressListener.STATE_LOADED_MIXED_ACTIVE_CONTENT |
+          Ci.nsIWebProgressListener.STATE_LOADED_TRACKING_CONTENT)) {
+       iconState = "bad-content-unblocked-notification-icon";
      }
  
-     let {
-       STATE_BLOCKED_TRACKING_CONTENT, STATE_LOADED_TRACKING_CONTENT
-     } = Ci.nsIWebProgressListener;
- 
--    if (state & STATE_BLOCKED_TRACKING_CONTENT) {
--      this.content.setAttribute("block-active", true);
--      this.content.removeAttribute("block-disabled");
--    } else if (state & STATE_LOADED_TRACKING_CONTENT) {
--      this.content.setAttribute("block-disabled", true);
--      this.content.removeAttribute("block-active");
--    } else {
--      this.content.removeAttribute("block-disabled");
--      this.content.removeAttribute("block-active");
-+    for (let element of [this.icon, this.content]) {
-+      if (state & STATE_BLOCKED_TRACKING_CONTENT) {
-+        element.setAttribute("state", "blocked-tracking-content");
-+      } else if (state & STATE_LOADED_TRACKING_CONTENT) {
-+        element.setAttribute("state", "loaded-tracking-content");
-+      } else {
-+        element.removeAttribute("state");
+     PopupNotifications.show(gBrowser.selectedBrowser, "bad-content",
+                             "", iconState, null, null, options);
++
++    // Open the tracking protection introduction panel, if applicable, after showing the anchor.
++    if (trackingContentBlocked) {
++      let introCount = gPrefService.getIntPref("privacy.trackingprotection.introCount");
++      if (introCount < TrackingProtection.MAX_INTROS) {
++        gPrefService.setIntPref("privacy.trackingprotection.introCount", ++introCount);
++        gPrefService.savePrefFile(null);
++        TrackingProtection.showIntroPanel();
 +      }
-     }
- 
-     // Telemetry for state change.
-     this.eventsHistogram.add(0);
++    }
    },
  
-   disableForCurrentPage() {
-     // Convert document URI into the format used by
-diff --git a/browser/base/content/browser.xul b/browser/base/content/browser.xul
---- a/browser/base/content/browser.xul
-+++ b/browser/base/content/browser.xul
-@@ -756,16 +756,17 @@
-                    code fires onmousedown, and hence eats our favicon drag events.
-                    We only add the identity-box button to the tab order when the location bar
-                    has focus, otherwise pressing F6 focuses it instead of the location bar -->
-               <box id="identity-box" role="button"
-                    align="center"
-                    onclick="gIdentityHandler.handleIdentityButtonEvent(event);"
-                    onkeypress="gIdentityHandler.handleIdentityButtonEvent(event);"
-                    ondragstart="gIdentityHandler.onDragStart(event);">
-+                <image id="tracking-protection-icon"/>
-                 <image id="page-proxy-favicon"
-                        consumeanchor="identity-box"
-                        onclick="PageProxyClickHandler(event);"
-                        pageproxystate="invalid"/>
-                 <hbox id="identity-icon-labels">
-                   <label id="identity-icon-label" class="plain" flex="1"/>
-                   <label id="identity-icon-country-label" class="plain"/>
-                 </hbox>
-diff --git a/browser/base/content/test/general/browser_trackingUI_1.js b/browser/base/content/test/general/browser_trackingUI_1.js
---- a/browser/base/content/test/general/browser_trackingUI_1.js
-+++ b/browser/base/content/test/general/browser_trackingUI_1.js
-@@ -36,49 +36,56 @@ function clickButton(sel) {
-   let win = browser.ownerGlobal;
-   let el = win.document.querySelector(sel);
-   el.doCommand();
- }
+   /**
+    * Return the eTLD+1 version of the current hostname
+    */
+   getEffectiveHost : function() {
+     if (!this._IDNService)
+       this._IDNService = Cc["@mozilla.org/network/idn-service;1"]
+diff --git a/browser/components/uitour/UITour.jsm b/browser/components/uitour/UITour.jsm
+--- a/browser/components/uitour/UITour.jsm
++++ b/browser/components/uitour/UITour.jsm
+@@ -258,16 +258,19 @@ this.UITour = {
+                                                                "anonid",
+                                                                "tab-icon-image");
+         if (!element || !UITour.isElementVisible(element)) {
+           return null;
+         }
+         return element;
+       },
+     }],
++    ["siteIdentity", {
++      query: "#page-proxy-favicon",
++    }],
+     ["urlbar",      {
+       query: "#urlbar",
+       widgetName: "urlbar-container",
+     }],
+     ["webide",      {query: "#webide-button"}],
+   ]),
  
- function testBenignPage() {
-   info("Non-tracking content must not be blocked");
-   ok (!TrackingProtection.container.hidden, "The container is visible");
--  ok (!TrackingProtection.content.hasAttribute("block-disabled"), "blocking not disabled");
--  ok (!TrackingProtection.content.hasAttribute("block-active"), "blocking is not active");
-+  ok (!TrackingProtection.content.hasAttribute("state"), "content: no state");
-+  ok (!TrackingProtection.icon.hasAttribute("state"), "icon: no state");
+   init: function() {
+@@ -405,19 +408,16 @@ this.UITour = {
  
-+  ok (hidden("#tracking-protection-icon"), "icon is hidden");
-   ok (hidden("#tracking-action-block"), "blockButton is hidden");
-   ok (hidden("#tracking-action-unblock"), "unblockButton is hidden");
+     if ((aEvent.pageVisibilityState == "hidden" ||
+          aEvent.pageVisibilityState == "unloaded") &&
+         !BACKGROUND_PAGE_ACTIONS_ALLOWED.has(action)) {
+       log.warn("Ignoring disallowed action from a hidden page:", action);
+       return false;
+     }
  
-   // Make sure that the no tracking elements message appears
-   ok (!hidden("#tracking-not-detected"), "labelNoTracking is visible");
-   ok (hidden("#tracking-loaded"), "labelTrackingLoaded is hidden");
-   ok (hidden("#tracking-blocked"), "labelTrackingBlocked is hidden");
- }
- 
- function testTrackingPage() {
-   info("Tracking content must be blocked");
-   ok (!TrackingProtection.container.hidden, "The container is visible");
--  ok (!TrackingProtection.content.hasAttribute("block-disabled"), "blocking not disabled");
--  ok (TrackingProtection.content.hasAttribute("block-active"), "blocking is active");
-+  is (TrackingProtection.content.getAttribute("state"), "blocked-tracking-content",
-+      'content: state="blocked-tracking-content"');
-+  is (TrackingProtection.icon.getAttribute("state"), "blocked-tracking-content",
-+      'icon: state="blocked-tracking-content"');
- 
-+  ok (!hidden("#tracking-protection-icon"), "icon is visible");
-   ok (hidden("#tracking-action-block"), "blockButton is hidden");
-   ok (!hidden("#tracking-action-unblock"), "unblockButton is visible");
- 
-   // Make sure that the blocked tracking elements message appears
-   ok (hidden("#tracking-not-detected"), "labelNoTracking is hidden");
-   ok (hidden("#tracking-loaded"), "labelTrackingLoaded is hidden");
-   ok (!hidden("#tracking-blocked"), "labelTrackingBlocked is visible");
- }
- 
--function testTrackingPageWhitelisted() {
-+function testTrackingPageUnblocked() {
-   info("Tracking content must be white-listed and not blocked");
-   ok (!TrackingProtection.container.hidden, "The container is visible");
--  ok (TrackingProtection.content.hasAttribute("block-disabled"), "blocking is disabled");
--  ok (!TrackingProtection.content.hasAttribute("block-active"), "blocking is not active");
-+  is (TrackingProtection.content.getAttribute("state"), "loaded-tracking-content",
-+      'content: state="loaded-tracking-content"');
-+  is (TrackingProtection.icon.getAttribute("state"), "loaded-tracking-content",
-+      'icon: state="loaded-tracking-content"');
- 
-+  ok (!hidden("#tracking-protection-icon"), "icon is visible");
-   ok (!hidden("#tracking-action-block"), "blockButton is visible");
-   ok (hidden("#tracking-action-unblock"), "unblockButton is hidden");
- 
-   // Make sure that the blocked tracking elements message appears
-   ok (hidden("#tracking-not-detected"), "labelNoTracking is hidden");
-   ok (!hidden("#tracking-loaded"), "labelTrackingLoaded is visible");
-   ok (hidden("#tracking-blocked"), "labelTrackingBlocked is hidden");
- }
-@@ -88,27 +95,25 @@ function* testTrackingProtectionForTab(t
-   yield promiseTabLoadEvent(tab, BENIGN_PAGE);
-   testBenignPage();
- 
-   info("Load a test page containing tracking elements");
-   yield promiseTabLoadEvent(tab, TRACKING_PAGE);
-   testTrackingPage();
- 
-   info("Disable TP for the page (which reloads the page)");
-+  let tabReloadPromise = promiseTabLoadEvent(tab);
-   clickButton("#tracking-action-unblock");
+-    // Do this before bailing if there's no tab, so later we can pick up the pieces:
+-    window.gBrowser.tabContainer.addEventListener("TabSelect", this);
 -
--  info("Wait for tab to reload following TP white-listing");
--  yield promiseTabLoadEvent(tab);
--  testTrackingPageWhitelisted();
-+  yield tabReloadPromise;
-+  testTrackingPageUnblocked();
+     switch (action) {
+       case "registerPageID": {
+         if (typeof data.pageID != "string") {
+           log.warn("registerPageID: pageID must be a string");
+           break;
+         }
  
-   info("Re-enable TP for the page (which reloads the page)");
-+  tabReloadPromise = promiseTabLoadEvent(tab);
-   clickButton("#tracking-action-block");
+         this.pageIDsForSession.set(data.pageID, {lastSeen: Date.now()});
+@@ -498,19 +498,22 @@ this.UITour = {
+             iconURL = this.resolveURL(browser, data.icon);
+ 
+           let buttons = [];
+           if (Array.isArray(data.buttons) && data.buttons.length > 0) {
+             for (let buttonData of data.buttons) {
+               if (typeof buttonData == "object" &&
+                   typeof buttonData.label == "string" &&
+                   typeof buttonData.callbackID == "string") {
++                let callback = buttonData.callbackID;
+                 let button = {
+                   label: buttonData.label,
+-                  callbackID: buttonData.callbackID,
++                  callback: event => {
++                    this.sendPageCallback(messageManager, callback);
++                  },
+                 };
+ 
+                 if (typeof buttonData.icon == "string")
+                   button.iconURL = this.resolveURL(browser, buttonData.icon);
+ 
+                 if (typeof buttonData.style == "string")
+                   button.style = buttonData.style;
+ 
+@@ -725,26 +728,34 @@ this.UITour = {
+         let targetPromise = this.getTarget(window, "readerMode-urlBar");
+         targetPromise.then(target => {
+           ReaderParent.toggleReaderMode({target: target.node});
+         });
+         break;
+       }
+     }
+ 
++    this.initForBrowser(browser);
++
++    return true;
++  },
++
++  initForBrowser(aBrowser) {
++    let window = aBrowser.ownerDocument.defaultView;
++
++    window.gBrowser.tabContainer.addEventListener("TabSelect", this);
++
+     if (!this.tourBrowsersByWindow.has(window)) {
+       this.tourBrowsersByWindow.set(window, new Set());
+     }
+-    this.tourBrowsersByWindow.get(window).add(browser);
++    this.tourBrowsersByWindow.get(window).add(aBrowser);
+ 
+     Services.obs.addObserver(this, "message-manager-close", false);
+ 
+     window.addEventListener("SSWindowClosing", this);
 -
--  info("Wait for tab to reload following TP black-listing");
--  yield promiseTabLoadEvent(tab);
-+  yield tabReloadPromise;
-   testTrackingPage();
- }
+-    return true;
+   },
  
- add_task(function* testNormalBrowsing() {
-   yield updateTrackingProtectionDatabase();
+   handleEvent: function(aEvent) {
+     log.debug("handleEvent: type =", aEvent.type, "event =", aEvent);
+     switch (aEvent.type) {
+       case "pagehide": {
+         let window = this.getChromeWindow(aEvent.target);
+         this.teardownTourForWindow(window);
+@@ -1395,32 +1406,38 @@ this.UITour = {
+       tooltipDesc.textContent = aDescription || "";
+       tooltipIcon.src = aIconURL || "";
+       tooltipIconContainer.hidden = !aIconURL;
  
-   browser = gBrowser;
-   let tab = browser.selectedTab = browser.addTab();
-diff --git a/browser/themes/linux/jar.mn b/browser/themes/linux/jar.mn
---- a/browser/themes/linux/jar.mn
-+++ b/browser/themes/linux/jar.mn
-@@ -46,16 +46,18 @@ browser.jar:
-   skin/classic/browser/heartbeat-icon.svg                   (../shared/heartbeat-icon.svg)
-   skin/classic/browser/heartbeat-star-lit.svg               (../shared/heartbeat-star-lit.svg)
-   skin/classic/browser/heartbeat-star-off.svg               (../shared/heartbeat-star-off.svg)
-   skin/classic/browser/identity-not-secure.svg              (../shared/identity-block/identity-not-secure.svg)
-   skin/classic/browser/identity-secure.svg                  (../shared/identity-block/identity-secure.svg)
-   skin/classic/browser/identity-mixed-active-blocked.svg    (../shared/identity-block/identity-mixed-active-blocked.svg)
-   skin/classic/browser/identity-mixed-passive-loaded.svg    (../shared/identity-block/identity-mixed-passive-loaded.svg)
-   skin/classic/browser/identity-mixed-active-loaded.svg     (../shared/identity-block/identity-mixed-active-loaded.svg)
-+  skin/classic/browser/tracking-protection-16.svg           (../shared/identity-block/tracking-protection-16.svg)
-+  skin/classic/browser/tracking-protection-disabled-16.svg  (../shared/identity-block/tracking-protection-disabled-16.svg)
-   skin/classic/browser/Info.png
-   skin/classic/browser/magnifier.png                        (../shared/magnifier.png)
-   skin/classic/browser/magnifier@2x.png                     (../shared/magnifier@2x.png)
-   skin/classic/browser/mask.png                             (../shared/mask.png)
-   skin/classic/browser/mask@2x.png                          (../shared/mask@2x.png)
-   skin/classic/browser/menuPanel.png
-   skin/classic/browser/menuPanel@2x.png
-   skin/classic/browser/menuPanel-customize.png
-diff --git a/browser/themes/osx/jar.mn b/browser/themes/osx/jar.mn
---- a/browser/themes/osx/jar.mn
-+++ b/browser/themes/osx/jar.mn
-@@ -50,16 +50,18 @@ browser.jar:
-   skin/classic/browser/heartbeat-icon.svg                   (../shared/heartbeat-icon.svg)
-   skin/classic/browser/heartbeat-star-lit.svg               (../shared/heartbeat-star-lit.svg)
-   skin/classic/browser/heartbeat-star-off.svg               (../shared/heartbeat-star-off.svg)
-   skin/classic/browser/identity-not-secure.svg              (../shared/identity-block/identity-not-secure.svg)
-   skin/classic/browser/identity-secure.svg                  (../shared/identity-block/identity-secure.svg)
-   skin/classic/browser/identity-mixed-active-blocked.svg    (../shared/identity-block/identity-mixed-active-blocked.svg)
-   skin/classic/browser/identity-mixed-passive-loaded.svg    (../shared/identity-block/identity-mixed-passive-loaded.svg)
-   skin/classic/browser/identity-mixed-active-loaded.svg     (../shared/identity-block/identity-mixed-active-loaded.svg)
-+  skin/classic/browser/tracking-protection-16.svg           (../shared/identity-block/tracking-protection-16.svg)
-+  skin/classic/browser/tracking-protection-disabled-16.svg  (../shared/identity-block/tracking-protection-disabled-16.svg)
-   skin/classic/browser/Info.png
-   skin/classic/browser/keyhole-circle.png
-   skin/classic/browser/keyhole-circle@2x.png
-   skin/classic/browser/KUI-background.png
-   skin/classic/browser/subtle-pattern.png
-   skin/classic/browser/menu-back.png
-   skin/classic/browser/menu-forward.png
-   skin/classic/browser/notification-16.png
-diff --git a/browser/themes/shared/controlcenter/panel.inc.css b/browser/themes/shared/controlcenter/panel.inc.css
---- a/browser/themes/shared/controlcenter/panel.inc.css
-+++ b/browser/themes/shared/controlcenter/panel.inc.css
-@@ -238,32 +238,31 @@
- }
+       while (tooltipButtons.firstChild)
+         tooltipButtons.firstChild.remove();
  
- /* TRACKING PROTECTION */
+       for (let button of aButtons) {
+-        let el = document.createElement("button");
+-        el.setAttribute("label", button.label);
+-        if (button.iconURL)
+-          el.setAttribute("image", button.iconURL);
++        let isButton = button.style == "text" ? false : true;
++        let el = document.createElement(isButton ? "button" : "label");
++        el.setAttribute(isButton ? "label" : "value", button.label);
  
- #tracking-protection-content {
-   background-image: url("chrome://browser/skin/controlcenter/tracking-protection.svg");
- }
+-        if (button.style == "link")
+-          el.setAttribute("class", "button-link");
++        if (isButton) {
++          if (button.iconURL)
++            el.setAttribute("image", button.iconURL);
  
--#tracking-protection-content[block-disabled]  {
-+#tracking-protection-content[state="loaded-tracking-content"]  {
-   background-image: url("chrome://browser/skin/controlcenter/tracking-protection-disabled.svg");
- }
+-        if (button.style == "primary")
+-          el.setAttribute("class", "button-primary");
++          if (button.style == "link")
++            el.setAttribute("class", "button-link");
  
- #tracking-action-block,
- #tracking-action-unblock {
-   margin: 1em 0 0;
- }
- 
--#tracking-protection-content[block-active] > #tracking-not-detected,
--#tracking-protection-content[block-disabled] > #tracking-not-detected,
--#tracking-protection-content:not([block-active]) > #tracking-blocked,
--#tracking-protection-content:not([block-active]) #tracking-action-unblock,
--#tracking-protection-content:not([block-disabled]) > #tracking-loaded,
--#tracking-protection-content:not([block-disabled]) #tracking-action-block,
--#tracking-protection-content:not([block-active]):not([block-disabled]) > #tracking-actions {
-+#tracking-protection-content[state] > #tracking-not-detected,
-+#tracking-protection-content:not([state="blocked-tracking-content"]) > #tracking-blocked,
-+#tracking-protection-content:not([state="blocked-tracking-content"]) #tracking-action-unblock,
-+#tracking-protection-content:not([state="loaded-tracking-content"]) > #tracking-loaded,
-+#tracking-protection-content:not([state="loaded-tracking-content"]) #tracking-action-block,
-+#tracking-protection-content:not([state]) > #tracking-actions {
-   display: none;
- }
- 
- /* PERMISSIONS */
- 
- #identity-popup-permissions-content {
-   background-image: url(chrome://browser/skin/controlcenter/permissions.svg);
- }
-diff --git a/browser/themes/shared/identity-block/identity-block.inc.css b/browser/themes/shared/identity-block/identity-block.inc.css
---- a/browser/themes/shared/identity-block/identity-block.inc.css
-+++ b/browser/themes/shared/identity-block/identity-block.inc.css
-@@ -58,17 +58,33 @@
-   background-image: var(--identity-box-verified-background-image);
- }
- 
- #urlbar[pageproxystate="valid"] > #identity-box.chromeUI {
-   color: var(--identity-box-chrome-color);
-   background-image: var(--identity-box-chrome-background-image);
- }
- 
--/* page proxy icon */
-+/* TRACKING PROTECTION ICON */
+-        let callbackID = button.callbackID;
+-        el.addEventListener("command", event => {
+-          tooltip.hidePopup();
+-          this.sendPageCallback(aMessageManager, callbackID);
+-        });
++          if (button.style == "primary")
++            el.setAttribute("class", "button-primary");
 +
-+#tracking-protection-icon {
-+  width: 16px;
-+  height: 16px;
-+  list-style-image: url(chrome://browser/skin/tracking-protection-16.svg);
++          // Don't close the popup or call the callback for style=text as they
++          // aren't links/buttons.
++          let callback = button.callback;
++          el.addEventListener("command", event => {
++            tooltip.hidePopup();
++            callback(event);
++          });
++        }
+ 
+         tooltipButtons.appendChild(el);
+       }
+ 
+       tooltipButtons.hidden = !aButtons.length;
+ 
+       let tooltipClose = document.getElementById("UITourTooltipClose");
+       let closeButtonCallback = (event) => {
+diff --git a/browser/components/uitour/test/browser.ini b/browser/components/uitour/test/browser.ini
+--- a/browser/components/uitour/test/browser.ini
++++ b/browser/components/uitour/test/browser.ini
+@@ -7,16 +7,18 @@ support-files =
+ 
+ [browser_backgroundTab.js]
+ skip-if = e10s # Bug 941428 - UITour.jsm not e10s friendly
+ [browser_no_tabs.js]
+ [browser_openPreferences.js]
+ skip-if = e10s # Bug 1073247 - UITour tests not e10s friendly
+ [browser_openSearchPanel.js]
+ skip-if = true # Bug 1113038 - Intermittent "Popup was opened"
++[browser_trackingProtection.js]
++tag = trackingprotection
+ [browser_UITour.js]
+ skip-if = os == "linux" || e10s # Intermittent failures, bug 951965
+ [browser_UITour2.js]
+ skip-if = e10s # Bug 1073247 - UITour.jsm not e10s friendly
+ [browser_UITour3.js]
+ skip-if = os == "linux" || e10s # Linux: Bug 986760, Bug 989101; e10s: Bug 1073247 - UITour.jsm not e10s friendly
+ [browser_UITour_availableTargets.js]
+ skip-if = e10s # Bug 1073247 - UITour.jsm not e10s friendly
+diff --git a/browser/components/uitour/test/browser_UITour3.js b/browser/components/uitour/test/browser_UITour3.js
+--- a/browser/components/uitour/test/browser_UITour3.js
++++ b/browser/components/uitour/test/browser_UITour3.js
+@@ -53,62 +53,80 @@ let tests = [
+     is(title.textContent, "another title", "Popup should have correct title");
+     is(desc.textContent, "moar text", "Popup should have correct description text");
+ 
+     let imageURL = getRootDirectory(gTestPath) + "image.png";
+     imageURL = imageURL.replace("chrome://mochitests/content/", "https://example.com/");
+     is(icon.src, imageURL,  "Popup should have correct icon shown");
+ 
+     buttons = document.getElementById("UITourTooltipButtons");
+-    is(buttons.childElementCount, 2, "Popup should have two buttons");
++    is(buttons.childElementCount, 4, "Popup should have four buttons");
+ 
+-    is(buttons.childNodes[0].getAttribute("label"), "Button 1", "First button should have correct label");
+-    is(buttons.childNodes[0].getAttribute("image"), "", "First button should have no image");
++    is(buttons.childNodes[0].nodeName, "label", "Text label should be a <label>");
++    is(buttons.childNodes[0].getAttribute("value"), "Regular text", "Text label should have correct value");
++    is(buttons.childNodes[0].getAttribute("image"), "", "Text should have no image");
++    is(buttons.childNodes[0].className, "", "Text should have no class");
+ 
+-    is(buttons.childNodes[1].getAttribute("label"), "Button 2", "Second button should have correct label");
+-    is(buttons.childNodes[1].getAttribute("image"), imageURL, "Second button should have correct image");
++    is(buttons.childNodes[1].nodeName, "button", "Link should be a <button>");
++    is(buttons.childNodes[1].getAttribute("label"), "Link", "Link should have correct label");
++    is(buttons.childNodes[1].getAttribute("image"), "", "Link should have no image");
++    is(buttons.childNodes[1].className, "button-link", "Check link class");
++
++    is(buttons.childNodes[2].nodeName, "button", "Button 1 should be a <button>");
++    is(buttons.childNodes[2].getAttribute("label"), "Button 1", "First button should have correct label");
++    is(buttons.childNodes[2].getAttribute("image"), "", "First button should have no image");
++    is(buttons.childNodes[2].className, "", "Button 1 should have no class");
++
++    is(buttons.childNodes[3].nodeName, "button", "Button 2 should be a <button>");
++    is(buttons.childNodes[3].getAttribute("label"), "Button 2", "Second button should have correct label");
++    is(buttons.childNodes[3].getAttribute("image"), imageURL, "Second button should have correct image");
++    is(buttons.childNodes[3].className, "button-primary", "Check button 2 class");
+ 
+     let promiseHidden = promisePanelElementHidden(window, popup);
+-    EventUtils.synthesizeMouseAtCenter(buttons.childNodes[0], {}, window);
++    EventUtils.synthesizeMouseAtCenter(buttons.childNodes[2], {}, window);
+     yield promiseHidden;
+ 
+     ok(true, "Popup should close automatically");
+ 
+     yield waitForCallbackResultPromise();
+ 
+     is(gContentWindow.callbackResult, "button1", "Correct callback should have been called");
+   }),
+   taskify(function* test_info_buttons_2() {
+     let popup = document.getElementById("UITourTooltip");
+     let title = document.getElementById("UITourTooltipTitle");
+     let desc = document.getElementById("UITourTooltipDescription");
+     let icon = document.getElementById("UITourTooltipIcon");
+ 
+     let buttons = gContentWindow.makeButtons();
+ 
+-    yield showInfoPromise("urlbar", "another title", "moar text", "./image.png", buttons);
++    yield showInfoPromise("siteIdentity", "another title", "moar text", "./image.png", buttons);
+ 
+     is(title.textContent, "another title", "Popup should have correct title");
+     is(desc.textContent, "moar text", "Popup should have correct description text");
+ 
+     let imageURL = getRootDirectory(gTestPath) + "image.png";
+     imageURL = imageURL.replace("chrome://mochitests/content/", "https://example.com/");
+     is(icon.src, imageURL,  "Popup should have correct icon shown");
+ 
+     buttons = document.getElementById("UITourTooltipButtons");
+-    is(buttons.childElementCount, 2, "Popup should have two buttons");
++    is(buttons.childElementCount, 4, "Popup should have four buttons");
+ 
+-    is(buttons.childNodes[0].getAttribute("label"), "Button 1", "First button should have correct label");
+-    is(buttons.childNodes[0].getAttribute("image"), "", "First button should have no image");
++    is(buttons.childNodes[1].getAttribute("label"), "Link", "Link should have correct label");
++    is(buttons.childNodes[1].getAttribute("image"), "", "Link should have no image");
++    ok(buttons.childNodes[1].classList.contains("button-link"), "Link should have button-link class");
+ 
+-    is(buttons.childNodes[1].getAttribute("label"), "Button 2", "Second button should have correct label");
+-    is(buttons.childNodes[1].getAttribute("image"), imageURL, "Second button should have correct image");
++    is(buttons.childNodes[2].getAttribute("label"), "Button 1", "First button should have correct label");
++    is(buttons.childNodes[2].getAttribute("image"), "", "First button should have no image");
++
++    is(buttons.childNodes[3].getAttribute("label"), "Button 2", "Second button should have correct label");
++    is(buttons.childNodes[3].getAttribute("image"), imageURL, "Second button should have correct image");
+ 
+     let promiseHidden = promisePanelElementHidden(window, popup);
+-    EventUtils.synthesizeMouseAtCenter(buttons.childNodes[1], {}, window);
++    EventUtils.synthesizeMouseAtCenter(buttons.childNodes[3], {}, window);
+     yield promiseHidden;
+ 
+     ok(true, "Popup should close automatically");
+ 
+     yield waitForCallbackResultPromise();
+ 
+     is(gContentWindow.callbackResult, "button2", "Correct callback should have been called");
+   }),
+diff --git a/browser/components/uitour/test/browser_UITour_availableTargets.js b/browser/components/uitour/test/browser_UITour_availableTargets.js
+--- a/browser/components/uitour/test/browser_UITour_availableTargets.js
++++ b/browser/components/uitour/test/browser_UITour_availableTargets.js
+@@ -58,16 +58,17 @@ let tests = [
+         "loop",
+         "devtools",
+         ...(hasPocket ? ["pocket"] : []),
+         "privateWindow",
+         "quit",
+         "readerMode-urlBar",
+         "search",
+         "searchIcon",
++        "siteIdentity",
+         "urlbar",
+         ...searchEngineTargets(),
+         ...(hasWebIDE ? ["webide"] : [])
+       ]);
+ 
+       ok(UITour.availableTargetsCache.has(window),
+          "Targets should now be cached");
+       done();
+@@ -90,16 +91,17 @@ let tests = [
+         "devtools",
+         "home",
+         ...(hasPocket ? ["pocket"] : []),
+         "privateWindow",
+         "quit",
+         "readerMode-urlBar",
+         "search",
+         "searchIcon",
++        "siteIdentity",
+         "urlbar",
+         ...searchEngineTargets(),
+         ...(hasWebIDE ? ["webide"] : [])
+       ]);
+ 
+       ok(UITour.availableTargetsCache.has(window),
+          "Targets should now be cached again");
+       CustomizableUI.reset();
+@@ -125,16 +127,17 @@ let tests = [
+         "help",
+         "home",
+         "loop",
+         "devtools",
+         ...(hasPocket ? ["pocket"] : []),
+         "privateWindow",
+         "quit",
+         "readerMode-urlBar",
++        "siteIdentity",
+         "urlbar",
+         ...(hasWebIDE ? ["webide"] : [])
+       ]);
+ 
+       CustomizableUI.reset();
+       done();
+     });
+   },
+diff --git a/browser/components/uitour/test/browser_trackingProtection.js b/browser/components/uitour/test/browser_trackingProtection.js
+new file mode 100644
+--- /dev/null
++++ b/browser/components/uitour/test/browser_trackingProtection.js
+@@ -0,0 +1,90 @@
++"use strict";
++
++const {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
++const PREF_INTRO_COUNT = "privacy.trackingprotection.introCount";
++const PREF_TP_ENABLED = "privacy.trackingprotection.enabled";
++const BENIGN_PAGE = "http://tracking.example.org/browser/browser/base/content/test/general/benignPage.html";
++const TRACKING_PAGE = "http://tracking.example.org/browser/browser/base/content/test/general/trackingPage.html";
++const TOOLTIP_PANEL = document.getElementById("UITourTooltip");
++const TOOLTIP_ANCHOR = document.getElementById("page-proxy-favicon");
++
++let {UrlClassifierTestUtils} = Cu.import("resource://testing-common/UrlClassifierTestUtils.jsm", {});
++
++registerCleanupFunction(function() {
++  UrlClassifierTestUtils.cleanupTestTrackers();
++  Services.prefs.clearUserPref(PREF_TP_ENABLED);
++  Services.prefs.clearUserPref(PREF_INTRO_COUNT);
++});
++
++function allowOneIntro() {
++  Services.prefs.setIntPref(PREF_INTRO_COUNT, TrackingProtection.MAX_INTROS - 1);
 +}
 +
-+#tracking-protection-icon[state="loaded-tracking-content"] {
-+  list-style-image: url(chrome://browser/skin/tracking-protection-disabled-16.svg);
-+}
++add_task(function* setup_test() {
++  yield UrlClassifierTestUtils.addTestTrackers();
++  Services.prefs.setBoolPref(PREF_TP_ENABLED, true);
++});
 +
-+#tracking-protection-icon:not([state]) {
-+  display: none;
-+}
++add_task(function* test_benignPage() {
++  info("Load a test page not containing tracking elements");
++  allowOneIntro();
++  yield BrowserTestUtils.withNewTab({gBrowser, url: BENIGN_PAGE}, function*() {
++    yield waitForConditionPromise(() => {
++      return is_visible(TOOLTIP_PANEL);
++    }, "Info panel shouldn't appear on a benign page").
++      then(() => ok(false, "Info panel shouldn't appear"),
++           () => {
++             ok(true, "Info panel didn't appear on a benign page");
++           });
 +
-+/* MAIN IDENTITY ICON */
++  });
++});
++
++add_task(function* test_trackingPages() {
++  info("Load a test page containing tracking elements");
++  allowOneIntro();
++  yield BrowserTestUtils.withNewTab({gBrowser, url: TRACKING_PAGE}, function*() {
++    yield new Promise((resolve, reject) => {
++      waitForPopupAtAnchor(TOOLTIP_PANEL, TOOLTIP_ANCHOR, resolve,
++                           "Intro panel should appear");
++    });
++
++    is(Services.prefs.getIntPref(PREF_INTRO_COUNT), TrackingProtection.MAX_INTROS, "Check intro count increased");
++
++    let step2URL = Services.urlFormatter.formatURLPref("privacy.trackingprotection.introURL") +
++                    "#step2";
++    let buttons = document.getElementById("UITourTooltipButtons");
++
++    info("Click the step text and nothing should happen");
++    let tabCount = gBrowser.tabs.length;
++    yield EventUtils.synthesizeMouseAtCenter(buttons.children[0], {});
++    is(gBrowser.tabs.length, tabCount, "Same number of tabs should be open");
++
++    info("Resetting count to test that viewing the tour prevents future panels");
++    allowOneIntro();
++
++    let panelHiddenPromise = promisePanelElementHidden(window, TOOLTIP_PANEL);
++    let tabPromise = BrowserTestUtils.waitForNewTab(gBrowser, step2URL);
++    info("Clicking the main button");
++    EventUtils.synthesizeMouseAtCenter(buttons.children[1], {});
++    let tab = yield tabPromise;
++    is(Services.prefs.getIntPref(PREF_INTRO_COUNT), TrackingProtection.MAX_INTROS,
++       "Check intro count is at the max after opening step 2");
++    is(gBrowser.tabs.length, tabCount + 1, "Tour step 2 tab opened");
++    yield panelHiddenPromise;
++    ok(true, "Panel hid when the button was clicked");
++    yield BrowserTestUtils.removeTab(tab);
++  });
++
++  info("Open another tracking page and make sure we don't show the panel again");
++  yield BrowserTestUtils.withNewTab({gBrowser, url: TRACKING_PAGE}, function*() {
++    yield waitForConditionPromise(() => {
++      return is_visible(TOOLTIP_PANEL);
++    }, "Info panel shouldn't appear more than MAX_INTROS").
++      then(() => ok(false, "Info panel shouldn't appear again"),
++           () => {
++             ok(true, "Info panel didn't appear more than MAX_INTROS on tracking pages");
++           });
++
++  });
++});
+diff --git a/browser/components/uitour/test/uitour.html b/browser/components/uitour/test/uitour.html
+--- a/browser/components/uitour/test/uitour.html
++++ b/browser/components/uitour/test/uitour.html
+@@ -12,18 +12,21 @@
+           callbackResult = name;
+           callbackData = data;
+         });
+       }
  
- #page-proxy-favicon {
+       // Defined in content to avoid weird issues when crossing between chrome/content.
+       function makeButtons() {
+         return [
++          {label: "Regular text", style: "text"},
++          {label: "Link", callback: makeCallback("link"), style: "link"},
+           {label: "Button 1", callback: makeCallback("button1")},
+-          {label: "Button 2", callback: makeCallback("button2"), icon: "image.png"}
++          {label: "Button 2", callback: makeCallback("button2"), icon: "image.png",
++           style: "primary"}
+         ];
+       }
+ 
+       function makeInfoOptions() {
+         return {
+           closeButtonCallback: makeCallback("closeButton"),
+           targetCallback: makeCallback("target"),
+         };
+diff --git a/browser/locales/en-US/chrome/browser/browser.properties b/browser/locales/en-US/chrome/browser/browser.properties
+--- a/browser/locales/en-US/chrome/browser/browser.properties
++++ b/browser/locales/en-US/chrome/browser/browser.properties
+@@ -331,16 +331,23 @@ identity.identified.state_and_country=%S
+ 
+ identity.not_secure=Your connection to this site is not private. Information you submit could be viewable to others (for example passwords, messages, credit cards, etc.).
+ identity.uses_weak_cipher=Your connection to this website uses weak encryption and is not private. Other people can view your information or modify the website's behavior.
+ identity.mixed_display_loaded=The connection to this website is not fully secure because it contains unencrypted elements (such as images).
+ identity.mixed_active_loaded2=This website contains interactive content that isn't encrypted (such as scripts). Other people can view your information or modify the website's behavior.
+ 
+ identity.unknown.tooltip=This website does not supply identity information.
+ 
++trackingProtection.intro.title=How Tracking Protection works
++# LOCALIZATION NOTE (trackingProtection.intro.description): %S is brandShortName
++trackingProtection.intro.description=When the shield is visible, that means Firefox is actively blocking content that tracks you.
++# LOCALIZATION NOTE (trackingProtection.intro.step1of3): Indicates that the intro panel is step one of three in a tour.
++trackingProtection.intro.step1of3=1 of 3
++trackingProtection.intro.nextButton.label=Next
++
+ # Edit Bookmark UI
+ editBookmarkPanel.pageBookmarkedTitle=Page Bookmarked
+ editBookmarkPanel.pageBookmarkedDescription=%S will always remember this page for you.
+ editBookmarkPanel.bookmarkedRemovedTitle=Bookmark Removed
+ editBookmarkPanel.editBookmarkTitle=Edit This Bookmark
+ 
+ # LOCALIZATION NOTE (editBookmark.removeBookmarks.label): Semicolon-separated list of plural forms.
+ # See: http://developer.mozilla.org/en/docs/Localization_and_Plurals
+diff --git a/browser/themes/shared/UITour.inc.css b/browser/themes/shared/UITour.inc.css
+--- a/browser/themes/shared/UITour.inc.css
++++ b/browser/themes/shared/UITour.inc.css
+@@ -81,30 +81,33 @@
+ #UITourTooltipButtons {
+   -moz-box-pack: end;
+   background-color: hsla(210,4%,10%,.07);
+   border-top: 1px solid hsla(210,4%,10%,.14);
+   margin: 24px -16px -16px;
+   padding: 2em 15px;
+ }
+ 
++#UITourTooltipButtons > label,
+ #UITourTooltipButtons > button {
+   margin: 0 15px;
+ }
+ 
++#UITourTooltipButtons > label:first-child,
+ #UITourTooltipButtons > button:first-child {
+   -moz-margin-start: 0;
+ }
+ 
+ #UITourTooltipButtons > button[image] > .button-box > .button-icon {
    width: 16px;
    height: 16px;
-   list-style-image: url(chrome://browser/skin/identity-not-secure.svg);
+   -moz-margin-end: 5px;
  }
  
- .chromeUI > #page-proxy-favicon[pageproxystate="valid"] {
-diff --git a/browser/themes/shared/identity-block/tracking-protection-16.svg b/browser/themes/shared/identity-block/tracking-protection-16.svg
-new file mode 100755
---- /dev/null
-+++ b/browser/themes/shared/identity-block/tracking-protection-16.svg
-@@ -0,0 +1,27 @@
-+<?xml version="1.0" encoding="utf-8"?>
-+<!-- This Source Code Form is subject to the terms of the Mozilla Public
-+   - License, v. 2.0. If a copy of the MPL was not distributed with this
-+   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
-+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
-+     width="16" height="16" viewBox="0 0 16 16">
-+  <style>
-+    .icon-default {
-+      fill: #808080;
-+    }
-+  </style>
-+
-+  <defs>
-+    <path id="shape-shield-outer" d="M8,1L2.8,1.9C2.4,1.9,2,2.4,2,2.8C2,4,2,6.1,2.1,7.1c0.3,2.7,0.8,4,1.9,5.6C5.6,14.7,8,15,8,15s2.4-0.3,4-2.4 c1.2-1.5,1.7-2.9,1.9-5.6C14,6.1,14,4,14,2.8c0-0.5-0.4-0.9-0.8-1L8,1L8,1z"/>
-+    <path id="shape-shield-inner" d="M8,2l5,0.8c0,2,0,3.5-0.1,4.1c-0.3,2.7-0.8,3.8-1.7,5.1c-1.1,1.5-2.7,1.9-3.2,2c-0.4-0.1-2.1-0.5-3.2-2 c-1-1.3-1.5-2.4-1.7-5.1C3,6.3,3,4.8,3,2.8L8,2"/>
-+    <path id="shape-shield-detail" d="M8,13c-0.5-0.1-1.6-0.5-2.4-1.5c-0.9-1.2-1.3-2.1-1.5-4.6C4,6.3,4,5.2,4,3.7L8,3 V13z"/>
-+
-+    <mask id="mask-shield-cutout">
-+      <rect width="16" height="16" fill="#000" />
-+      <use xlink:href="#shape-shield-outer" fill="#fff" />
-+      <use xlink:href="#shape-shield-inner" fill="#000" />
-+      <use xlink:href="#shape-shield-detail" fill="#fff" />
-+    </mask>
-+  </defs>
-+
-+  <use xlink:href="#shape-shield-outer" mask="url(#mask-shield-cutout)" class="icon-default" />
-+</svg>
-diff --git a/browser/themes/shared/identity-block/tracking-protection-disabled-16.svg b/browser/themes/shared/identity-block/tracking-protection-disabled-16.svg
-new file mode 100755
---- /dev/null
-+++ b/browser/themes/shared/identity-block/tracking-protection-disabled-16.svg
-@@ -0,0 +1,29 @@
-+<?xml version="1.0" encoding="utf-8"?>
-+<!-- This Source Code Form is subject to the terms of the Mozilla Public
-+   - License, v. 2.0. If a copy of the MPL was not distributed with this
-+   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
-+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
-+     width="16" height="16" viewBox="0 0 16 16">
-+  <style>
-+    .icon-default {
-+      fill: #808080;
-+    }
-+  </style>
-+
-+  <defs>
-+    <path id="shape-shield-outer" d="M8,1L2.8,1.9C2.4,1.9,2,2.4,2,2.8C2,4,2,6.1,2.1,7.1c0.3,2.7,0.8,4,1.9,5.6C5.6,14.7,8,15,8,15s2.4-0.3,4-2.4 c1.2-1.5,1.7-2.9,1.9-5.6C14,6.1,14,4,14,2.8c0-0.5-0.4-0.9-0.8-1L8,1L8,1z"/>
-+    <path id="shape-shield-inner" d="M8,2l5,0.8c0,2,0,3.5-0.1,4.1c-0.3,2.7-0.8,3.8-1.7,5.1c-1.1,1.5-2.7,1.9-3.2,2c-0.4-0.1-2.1-0.5-3.2-2 c-1-1.3-1.5-2.4-1.7-5.1C3,6.3,3,4.8,3,2.8L8,2"/>
-+    <path id="shape-shield-detail" d="M8,13c-0.5-0.1-1.6-0.5-2.4-1.5c-0.9-1.2-1.3-2.1-1.5-4.6C4,6.3,4,5.2,4,3.7L8,3 V13z"/>
-+
-+    <mask id="mask-shield-cutout">
-+      <rect width="16" height="16" fill="#000" />
-+      <use xlink:href="#shape-shield-outer" fill="#fff" />
-+      <use xlink:href="#shape-shield-inner" fill="#000" />
-+      <use xlink:href="#shape-shield-detail" fill="#fff" />
-+      <line x1="3" y1="15" x2="15" y2="3" stroke="#000" stroke-width="2" />
-+    </mask>
-+  </defs>
-+
-+  <use xlink:href="#shape-shield-outer" mask="url(#mask-shield-cutout)" class="icon-default" />
-+  <line x1="3" y1="14" x2="15" y2="2" stroke="#d92d21" stroke-width="2" />
-+</svg>
-diff --git a/browser/themes/windows/jar.mn b/browser/themes/windows/jar.mn
---- a/browser/themes/windows/jar.mn
-+++ b/browser/themes/windows/jar.mn
-@@ -47,16 +47,18 @@ browser.jar:
-         skin/classic/browser/heartbeat-star-off.svg                  (../shared/heartbeat-star-off.svg)
-         skin/classic/browser/Info.png
-         skin/classic/browser/Info-XP.png
-         skin/classic/browser/identity-not-secure.svg                 (../shared/identity-block/identity-not-secure.svg)
-         skin/classic/browser/identity-secure.svg                     (../shared/identity-block/identity-secure.svg)
-         skin/classic/browser/identity-mixed-active-blocked.svg       (../shared/identity-block/identity-mixed-active-blocked.svg)
-         skin/classic/browser/identity-mixed-passive-loaded.svg       (../shared/identity-block/identity-mixed-passive-loaded.svg)
-         skin/classic/browser/identity-mixed-active-loaded.svg        (../shared/identity-block/identity-mixed-active-loaded.svg)
-+        skin/classic/browser/tracking-protection-16.svg              (../shared/identity-block/tracking-protection-16.svg)
-+        skin/classic/browser/tracking-protection-disabled-16.svg     (../shared/identity-block/tracking-protection-disabled-16.svg)
-         skin/classic/browser/keyhole-forward-mask.svg
-         skin/classic/browser/KUI-background.png
-         skin/classic/browser/livemark-folder.png
-         skin/classic/browser/livemark-folder-XP.png
-         skin/classic/browser/magnifier.png                          (../shared/magnifier.png)
-         skin/classic/browser/magnifier@2x.png                       (../shared/magnifier@2x.png)
-         skin/classic/browser/mask.png                               (../shared/mask.png)
-         skin/classic/browser/mask@2x.png                            (../shared/mask@2x.png)
++#UITourTooltipButtons > label,
+ #UITourTooltipButtons > button .button-text {
+   font-size: 1.15rem;
+ }
+ 
+ #UITourTooltipButtons > button:not(.button-link) {
+   -moz-appearance: none;
+   background-color: rgb(251,251,251);
+   border-radius: 3px;
+@@ -117,16 +120,17 @@
+ }
+ 
+ #UITourTooltipButtons > button:not(.button-link):not(:active):hover {
+   background-color: hsla(210,4%,10%,.15);
+   border-color: hsla(210,4%,10%,.15);
+   box-shadow: 0 1px 0 0 hsla(210,4%,10%,.05) inset;
+ }
+ 
++#UITourTooltipButtons > label,
+ #UITourTooltipButtons > button.button-link {
+   -moz-appearance: none;
+   background: transparent;
+   border: none;
+   box-shadow: none;
+   color: rgba(0,0,0,0.35);
+   padding-left: 10px;
+   padding-right: 10px;
+diff --git a/testing/profiles/prefs_general.js b/testing/profiles/prefs_general.js
+--- a/testing/profiles/prefs_general.js
++++ b/testing/profiles/prefs_general.js
+@@ -85,16 +85,17 @@ user_pref("geo.wifi.logging.enabled", tr
+ // Make url-classifier updates so rare that they won't affect tests
+ user_pref("urlclassifier.updateinterval", 172800);
+ // Point the url-classifier to the local testing server for fast failures
+ user_pref("browser.safebrowsing.gethashURL", "http://%(server)s/safebrowsing-dummy/gethash");
+ user_pref("browser.safebrowsing.updateURL", "http://%(server)s/safebrowsing-dummy/update");
+ user_pref("browser.safebrowsing.appRepURL", "http://%(server)s/safebrowsing-dummy/update");
+ user_pref("browser.trackingprotection.gethashURL", "http://%(server)s/safebrowsing-dummy/gethash");
+ user_pref("browser.trackingprotection.updateURL", "http://%(server)s/safebrowsing-dummy/update");
++user_pref("privacy.trackingprotection.introURL", "http://%(server)s/trackingprotection/tour");
+ // Point update checks to the local testing server for fast failures
+ user_pref("extensions.update.url", "http://%(server)s/extensions-dummy/updateURL");
+ user_pref("extensions.update.background.url", "http://%(server)s/extensions-dummy/updateBackgroundURL");
+ user_pref("extensions.blocklist.url", "http://%(server)s/extensions-dummy/blocklistURL");
+ user_pref("extensions.hotfix.url", "http://%(server)s/extensions-dummy/hotfixURL");
+ // Turn off extension updates so they don't bother tests
+ user_pref("extensions.update.enabled", false);
+ // Make sure opening about:addons won't hit the network
+
