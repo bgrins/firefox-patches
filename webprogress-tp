@@ -1,12 +1,30 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  5e5b14cd0b33c4832cfeb07cf28129e0778d813b
+# Parent  d8c51227006bb2382aa79cd4111778ec8f0f4456
 Try to detect a tab switch differently from a reload
 
 diff --git a/browser/base/content/browser-trackingprotection.js b/browser/base/content/browser-trackingprotection.js
 --- a/browser/base/content/browser-trackingprotection.js
 +++ b/browser/base/content/browser-trackingprotection.js
-@@ -47,25 +47,31 @@ let TrackingProtection = {
+@@ -2,16 +2,17 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ let TrackingProtection = {
+   PREF_ENABLED_GLOBALLY: "privacy.trackingprotection.enabled",
+   PREF_ENABLED_IN_PRIVATE_WINDOWS: "privacy.trackingprotection.pbmode.enabled",
+   enabledGlobally: false,
+   enabledInPrivateWindows: false,
++  _loadingSpec: null,
+ 
+   init() {
+     let $ = selector => document.querySelector(selector);
+     this.container = $("#tracking-protection-container");
+     this.content = $("#tracking-protection-content");
+     this.icon = $("#tracking-protection-icon");
+ 
+     this.updateEnabled();
+@@ -47,21 +48,34 @@ let TrackingProtection = {
    get enabledHistogram() {
      return Services.telemetry.getHistogramById("TRACKING_PROTECTION_ENABLED");
    },
@@ -16,33 +34,36 @@ diff --git a/browser/base/content/browser-trackingprotection.js b/browser/base/c
    },
  
 -  onSecurityChange(state) {
-+  onSecurityChange(state, lastLocation, aRequest, aWebProgress) {
-+    console.trace();
-+    console.log(state, lastLocation, aRequest, aWebProgress);
++  onSecurityChange(state, request) {
      if (!this.enabled) {
        return;
      }
  
++    // Only animate the shield on an actual request (not on a tab switch).
++    // On a tab switch, a single securityChange is fired without a request.
++    // On an actual request, we get two securityChange calls.  The first
++    // has a request, and the second doesn't.  And we don't want to cancel
++    // the animation when the second securityChange fires.
++    let spec = gBrowser.currentURI.spec;
++    if (request) {
++      this._loadingSpec = spec;
++      this.icon.setAttribute("animate", "true");
++    } else if (spec != this._loadingSpec) {
++      this.icon.removeAttribute("animate");
++    }
 +
      let {
        STATE_BLOCKED_TRACKING_CONTENT, STATE_LOADED_TRACKING_CONTENT
      } = Ci.nsIWebProgressListener;
  
-+    console.log("Blocked? ", state & STATE_BLOCKED_TRACKING_CONTENT);
-+    console.log("Loaded? ", state & STATE_LOADED_TRACKING_CONTENT);
-+
      for (let element of [this.icon, this.content]) {
        if (state & STATE_BLOCKED_TRACKING_CONTENT) {
          element.setAttribute("state", "blocked-tracking-content");
        } else if (state & STATE_LOADED_TRACKING_CONTENT) {
-         element.setAttribute("state", "loaded-tracking-content");
-       } else {
-         element.removeAttribute("state");
-       }
 diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
 --- a/browser/base/content/browser.js
 +++ b/browser/base/content/browser.js
-@@ -4385,17 +4385,17 @@ var XULBrowserWindow = {
+@@ -4399,17 +4399,17 @@ var XULBrowserWindow = {
      // Make sure the "https" part of the URL is striked out or not,
      // depending on the current mixed active content blocking state.
      gURLBar.formatValue();
@@ -52,7 +73,7 @@ diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
      } catch (e) {}
      gIdentityHandler.checkIdentity(this._state, uri);
 -    TrackingProtection.onSecurityChange(this._state);
-+    TrackingProtection.onSecurityChange(this._state, this._lastLocation, aRequest, aWebProgress);
++    TrackingProtection.onSecurityChange(this._state, aRequest);
    },
  
    // simulate all change notifications after switching tabs
@@ -61,3 +82,157 @@ diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
        FullZoom.onLocationChange(gBrowser.currentURI, true);
      var nsIWebProgressListener = Components.interfaces.nsIWebProgressListener;
      var loadingDone = aStateFlags & nsIWebProgressListener.STATE_STOP;
+@@ -6823,27 +6823,27 @@ var gIdentityHandler = {
+       this.setMode(this.IDENTITY_MODE_UNKNOWN);
+     }
+ 
+     // Show the doorhanger when:
+     // - mixed active content is blocked
+     // - mixed active content is loaded (detected but not blocked)
+     // - tracking content is blocked
+     // - tracking content is not blocked
+-    if (state &
+-        (nsIWebProgressListener.STATE_BLOCKED_MIXED_ACTIVE_CONTENT |
+-         nsIWebProgressListener.STATE_LOADED_MIXED_ACTIVE_CONTENT  |
+-         nsIWebProgressListener.STATE_BLOCKED_TRACKING_CONTENT     |
+-         nsIWebProgressListener.STATE_LOADED_TRACKING_CONTENT)) {
+-      this.showBadContentDoorhanger(state);
+-    } else if (TrackingProtection.enabled) {
+-      // We didn't show the shield
+-      Services.telemetry.getHistogramById("TRACKING_PROTECTION_SHIELD")
+-        .add(0);
+-    }
++    // if (state &
++    //     (nsIWebProgressListener.STATE_BLOCKED_MIXED_ACTIVE_CONTENT |
++    //      nsIWebProgressListener.STATE_LOADED_MIXED_ACTIVE_CONTENT  |
++    //      nsIWebProgressListener.STATE_BLOCKED_TRACKING_CONTENT     |
++    //      nsIWebProgressListener.STATE_LOADED_TRACKING_CONTENT)) {
++    //   this.showBadContentDoorhanger(state);
++    // } else if (TrackingProtection.enabled) {
++    //   // We didn't show the shield
++    //   Services.telemetry.getHistogramById("TRACKING_PROTECTION_SHIELD")
++    //     .add(0);
++    // }
+   },
+ 
+   showBadContentDoorhanger : function(state) {
+     var currentNotification =
+       PopupNotifications.getNotification("bad-content",
+         gBrowser.selectedBrowser);
+ 
+     // Avoid showing the same notification (same state) repeatedly.
+diff --git a/browser/base/content/test/general/browser_trackingUI_1.js b/browser/base/content/test/general/browser_trackingUI_1.js
+--- a/browser/base/content/test/general/browser_trackingUI_1.js
++++ b/browser/base/content/test/general/browser_trackingUI_1.js
+@@ -28,17 +28,18 @@ registerCleanupFunction(function() {
+     gBrowser.removeCurrentTab();
+   }
+ });
+ 
+ function hidden(sel) {
+   let win = browser.ownerGlobal;
+   let el = win.document.querySelector(sel);
+   let display = win.getComputedStyle(el).getPropertyValue("display", null);
+-  return display === "none";
++  let opacity = win.getComputedStyle(el).getPropertyValue("opacity", null);
++  return display === "none" || opacity === "0";
+ }
+ 
+ function clickButton(sel) {
+   let win = browser.ownerGlobal;
+   let el = win.document.querySelector(sel);
+   el.doCommand();
+ }
+ 
+@@ -51,16 +52,19 @@ function testBenignPage() {
+   ok (hidden("#tracking-protection-icon"), "icon is hidden");
+   ok (hidden("#tracking-action-block"), "blockButton is hidden");
+   ok (hidden("#tracking-action-unblock"), "unblockButton is hidden");
+ 
+   // Make sure that the no tracking elements message appears
+   ok (!hidden("#tracking-not-detected"), "labelNoTracking is visible");
+   ok (hidden("#tracking-loaded"), "labelTrackingLoaded is hidden");
+   ok (hidden("#tracking-blocked"), "labelTrackingBlocked is hidden");
++
++  // Icon animation state
++  is (TrackingProtection._loadingSpec, BENIGN_PAGE, "TP is keeping track of correct URL");
+ }
+ 
+ function testTrackingPage(window) {
+   info("Tracking content must be blocked");
+   ok (!TrackingProtection.container.hidden, "The container is visible");
+   is (TrackingProtection.content.getAttribute("state"), "blocked-tracking-content",
+       'content: state="blocked-tracking-content"');
+   is (TrackingProtection.icon.getAttribute("state"), "blocked-tracking-content",
+@@ -77,16 +81,19 @@ function testTrackingPage(window) {
+     ok(!hidden("#tracking-action-unblock"), "unblockButton is visible");
+     ok(hidden("#tracking-action-unblock-private"), "unblockButtonPrivate is hidden");
+   }
+ 
+   // Make sure that the blocked tracking elements message appears
+   ok (hidden("#tracking-not-detected"), "labelNoTracking is hidden");
+   ok (hidden("#tracking-loaded"), "labelTrackingLoaded is hidden");
+   ok (!hidden("#tracking-blocked"), "labelTrackingBlocked is visible");
++
++  // Icon animation state
++  is (TrackingProtection._loadingSpec, TRACKING_PAGE, "TP is keeping track of correct URL");
+ }
+ 
+ function testTrackingPageUnblocked() {
+   info("Tracking content must be white-listed and not blocked");
+   ok (!TrackingProtection.container.hidden, "The container is visible");
+   is (TrackingProtection.content.getAttribute("state"), "loaded-tracking-content",
+       'content: state="loaded-tracking-content"');
+   is (TrackingProtection.icon.getAttribute("state"), "loaded-tracking-content",
+@@ -95,16 +102,19 @@ function testTrackingPageUnblocked() {
+   ok (!hidden("#tracking-protection-icon"), "icon is visible");
+   ok (!hidden("#tracking-action-block"), "blockButton is visible");
+   ok (hidden("#tracking-action-unblock"), "unblockButton is hidden");
+ 
+   // Make sure that the blocked tracking elements message appears
+   ok (hidden("#tracking-not-detected"), "labelNoTracking is hidden");
+   ok (!hidden("#tracking-loaded"), "labelTrackingLoaded is visible");
+   ok (hidden("#tracking-blocked"), "labelTrackingBlocked is hidden");
++
++  // Icon animation state
++  is (TrackingProtection._loadingSpec, TRACKING_PAGE, "TP is keeping track of correct URL");
+ }
+ 
+ function* testTrackingProtectionForTab(tab) {
+   info("Load a test page not containing tracking elements");
+   yield promiseTabLoadEvent(tab, BENIGN_PAGE);
+   testBenignPage();
+ 
+   info("Load a test page containing tracking elements");
+diff --git a/browser/themes/shared/identity-block/identity-block.inc.css b/browser/themes/shared/identity-block/identity-block.inc.css
+--- a/browser/themes/shared/identity-block/identity-block.inc.css
++++ b/browser/themes/shared/identity-block/identity-block.inc.css
+@@ -67,24 +67,27 @@
+ 
+ /* TRACKING PROTECTION ICON */
+ 
+ #tracking-protection-icon {
+   width: 16px;
+   height: 16px;
+   list-style-image: url(chrome://browser/skin/tracking-protection-16.svg);
+   margin-left: 0;
+-  transition: margin-left 200ms ease-out;
+   opacity: 1;
+ }
+ 
+ #tracking-protection-icon[state="loaded-tracking-content"] {
+   list-style-image: url(chrome://browser/skin/tracking-protection-disabled-16.svg);
+ }
+ 
++#tracking-protection-icon[animate] {
++  transition: margin-left 200ms ease-out;
++}
++
+ #tracking-protection-icon:not([state]) {
+   margin-left: -16px;
+   pointer-events: none;
+   opacity: 0;
+   /* Only animate the shield in, when it disappears hide it immediately. */
+   transition: none;
+ }
+ 
