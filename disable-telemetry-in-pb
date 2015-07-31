@@ -1,0 +1,243 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  c8e055a05ea84f06266ac00650ce3f0362352488
+Bug
+
+diff --git a/browser/base/content/browser-trackingprotection.js b/browser/base/content/browser-trackingprotection.js
+--- a/browser/base/content/browser-trackingprotection.js
++++ b/browser/base/content/browser-trackingprotection.js
+@@ -51,24 +51,36 @@ let TrackingProtection = {
+     this.enabledGlobally =
+       Services.prefs.getBoolPref(this.PREF_ENABLED_GLOBALLY);
+     this.enabledInPrivateWindows =
+       Services.prefs.getBoolPref(this.PREF_ENABLED_IN_PRIVATE_WINDOWS);
+     this.container.hidden = !this.enabled;
+   },
+ 
+   get enabledHistogram() {
++    // Return a fake histogram for private windows
++    if (PrivateBrowsingUtils.isWindowPrivate(window)) {
++      return {add:() => {}};
++    }
+     return Services.telemetry.getHistogramById("TRACKING_PROTECTION_ENABLED");
+   },
+ 
+   get eventsHistogram() {
++    // Return a fake histogram for private windows
++    if (PrivateBrowsingUtils.isWindowPrivate(window)) {
++      return {add:() => {}};
++    }
+     return Services.telemetry.getHistogramById("TRACKING_PROTECTION_EVENTS");
+   },
+ 
+   get shieldHistogram() {
++    // Return a fake histogram for private windows
++    if (PrivateBrowsingUtils.isWindowPrivate(window)) {
++      return {add:() => {}};
++    }
+     return Services.telemetry.getHistogramById("TRACKING_PROTECTION_SHIELD");
+   },
+ 
+   onSecurityChange(state, isSimulated) {
+     if (!this.enabled) {
+       return;
+     }
+ 
+@@ -78,16 +90,17 @@ let TrackingProtection = {
+       this.icon.removeAttribute("animate");
+     } else {
+       this.icon.setAttribute("animate", "true");
+     }
+ 
+     let isBlocking = state & Ci.nsIWebProgressListener.STATE_BLOCKED_TRACKING_CONTENT;
+     let isAllowing = state & Ci.nsIWebProgressListener.STATE_LOADED_TRACKING_CONTENT;
+ 
++    console.log("onSecurityChange for", gBrowser.currentURI.spec, isBlocking, isAllowing)
+     if (isBlocking) {
+       this.icon.setAttribute("tooltiptext", this.activeTooltipText);
+       this.icon.setAttribute("state", "blocked-tracking-content");
+       this.content.setAttribute("state", "blocked-tracking-content");
+ 
+       // Open the tracking protection introduction panel, if applicable.
+       let introCount = gPrefService.getIntPref("privacy.trackingprotection.introCount");
+       if (introCount < TrackingProtection.MAX_INTROS) {
+@@ -98,20 +111,23 @@ let TrackingProtection = {
+     } else if (isAllowing) {
+       this.icon.setAttribute("tooltiptext", this.disabledTooltipText);
+       this.icon.setAttribute("state", "loaded-tracking-content");
+       this.content.setAttribute("state", "loaded-tracking-content");
+     } else {
+       this.icon.removeAttribute("tooltiptext");
+       this.icon.removeAttribute("state");
+       this.content.removeAttribute("state");
++
++      console.log("Shield hist!!!", gBrowser.currentURI.spec);
+       // We didn't show the shield
+       this.shieldHistogram.add(0);
+     }
+ 
++
+     // Telemetry for state change.
+     this.eventsHistogram.add(0);
+   },
+ 
+   disableForCurrentPage() {
+     // Convert document URI into the format used by
+     // nsChannelClassifier::ShouldEnableTrackingProtection.
+     // Any scheme turned into https is correct.
+diff --git a/browser/base/content/test/general/browser.ini b/browser/base/content/test/general/browser.ini
+--- a/browser/base/content/test/general/browser.ini
++++ b/browser/base/content/test/general/browser.ini
+@@ -433,16 +433,20 @@ tags = trackingprotection
+ tags = trackingprotection
+ support-files =
+   trackingPage.html
+   benignPage.html
+ [browser_trackingUI_5.js]
+ tags = trackingprotection
+ support-files =
+   trackingPage.html
++[browser_trackingUI_6.js]
++tags = trackingprotection
++support-files =
++  trackingPage.html
+ [browser_typeAheadFind.js]
+ skip-if = buildapp == 'mulet'
+ [browser_unknownContentType_title.js]
+ [browser_unloaddialogs.js]
+ skip-if = e10s # Bug 1100700 - test relies on unload event firing on closed tabs, which it doesn't
+ [browser_urlHighlight.js]
+ [browser_urlbarAutoFillTrimURLs.js]
+ [browser_urlbarCopying.js]
+diff --git a/browser/base/content/test/general/browser_trackingUI_6.js b/browser/base/content/test/general/browser_trackingUI_6.js
+new file mode 100644
+--- /dev/null
++++ b/browser/base/content/test/general/browser_trackingUI_6.js
+@@ -0,0 +1,127 @@
++/*
++ * Test telemetry for Tracking Protection
++ */
++
++const {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
++const PREF = "privacy.trackingprotection.enabled";
++const BENIGN_PAGE = "http://tracking.example.org/browser/browser/base/content/test/general/benignPage.html";
++const TRACKING_PAGE = "http://tracking.example.org/browser/browser/base/content/test/general/trackingPage.html";
++const {UrlClassifierTestUtils} = Cu.import("resource://testing-common/UrlClassifierTestUtils.jsm", {});
++
++/**
++ * Enable local telemetry recording for the duration of the tests.
++ */
++let oldCanRecord = Services.telemetry.canRecordExtended;
++Services.telemetry.canRecordExtended = true;
++Services.prefs.setBoolPref(PREF, false);
++Services.telemetry.getHistogramById("TRACKING_PROTECTION_ENABLED").clear();
++registerCleanupFunction(function () {
++  UrlClassifierTestUtils.cleanupTestTrackers();
++  Services.telemetry.canRecordExtended = oldCanRecord;
++  Services.prefs.clearUserPref(PREF);
++});
++
++function getShieldCounts() {
++  return Services.telemetry.getHistogramById("TRACKING_PROTECTION_SHIELD").snapshot().counts;
++}
++
++function getEnabledCounts() {
++  return Services.telemetry.getHistogramById("TRACKING_PROTECTION_ENABLED").snapshot().counts;
++}
++
++function getEventCounts() {
++  return Services.telemetry.getHistogramById("TRACKING_PROTECTION_EVENTS").snapshot().counts;
++}
++
++add_task(function* setup() {
++  yield UrlClassifierTestUtils.addTestTrackers();
++
++  let TrackingProtection = gBrowser.ownerGlobal.TrackingProtection;
++  ok(TrackingProtection, "TP is attached to the browser window");
++  ok(!TrackingProtection.enabled, "TP is not enabled");
++
++  is (TrackingProtection.enabledHistogram.toString(),
++  	  "[object JSHistogram]",
++  	  "Enabled histogram exists");
++  is (TrackingProtection.eventsHistogram.toString(),
++  	  "[object JSHistogram]",
++  	  "Events histogram exists");
++  is (TrackingProtection.shieldHistogram.toString(),
++  	  "[object JSHistogram]",
++  	  "Shield histogram exists");
++
++  // Open a window with TP disabled to make sure 'enabled' is logged correctly.
++  let newWin = yield promiseOpenAndLoadWindow({}, true);
++  newWin.close();
++
++  is (getEnabledCounts()[0], 1, "TP was disabled once on start up");
++  is (getEnabledCounts()[1], 0, "TP was not enabled on start up");
++
++  // Enable TP so the next browser to open will log 'enabled'
++  Services.prefs.setBoolPref(PREF, true);
++});
++
++
++add_task(function* testNewWindow() {
++  let newWin = yield promiseOpenAndLoadWindow({}, true);
++  let tab = newWin.gBrowser.selectedTab = newWin.gBrowser.addTab();
++  TrackingProtection = newWin.TrackingProtection;
++  ok(TrackingProtection, "TP is attached to the browser window");
++
++  is (getEnabledCounts()[0], 1, "TP was disabled once on start up");
++  is (getEnabledCounts()[1], 1, "TP was enabled once on start up");
++
++  // Reset these to make counting easier
++  TrackingProtection.eventsHistogram.clear();
++  TrackingProtection.shieldHistogram.clear();
++
++  yield promiseTabLoadEvent(tab, BENIGN_PAGE);
++  is (getEventCounts()[0], 1, "Total page loads");
++  is (getEventCounts()[1], 0, "Disable actions");
++  is (getEventCounts()[2], 0, "Enable actions");
++  is (getShieldCounts()[0], 1, "Page loads without tracking");
++
++  yield promiseTabLoadEvent(tab, TRACKING_PAGE);
++  is (getEventCounts()[0], 2, "Total page loads");
++  is (getEventCounts()[1], 0, "Disable actions");
++  is (getEventCounts()[2], 0, "Enable actions");
++  is (getShieldCounts()[0], 1, "Page loads without tracking");
++
++  info("Disable TP for the page (which reloads the page)");
++  let tabReloadPromise = promiseTabLoadEvent(tab);
++  newWin.document.querySelector("#tracking-action-unblock").doCommand();
++  yield tabReloadPromise;
++  is (getEventCounts()[0], 3, "Total page loads");
++  is (getEventCounts()[1], 1, "Disable actions");
++  is (getEventCounts()[2], 0, "Enable actions");
++  is (getShieldCounts()[0], 1, "Page loads without tracking");
++
++  info("Re-enable TP for the page (which reloads the page)");
++  tabReloadPromise = promiseTabLoadEvent(tab);
++  newWin.document.querySelector("#tracking-action-block").doCommand();
++  yield tabReloadPromise;
++  is (getEventCounts()[0], 4, "Total page loads");
++  is (getEventCounts()[1], 1, "Disable actions");
++  is (getEventCounts()[2], 1, "Enable actions");
++  is (getShieldCounts()[0], 1, "Page loads without tracking");
++
++  newWin.close();
++});
++
++add_task(function* testPrivateBrowsing() {
++  let privateWin = yield promiseOpenAndLoadWindow({private: true}, true);
++  let TrackingProtection = privateWin.TrackingProtection;
++  ok(TrackingProtection, "TP is attached to the browser window");
++
++  is (TrackingProtection.enabledHistogram.toString(),
++  	  "[object Object]",
++  	  "Enabled histogram is faked");
++  is (TrackingProtection.eventsHistogram.toString(),
++  	  "[object Object]",
++  	  "Events histogram is faked");
++  is (TrackingProtection.shieldHistogram.toString(),
++  	  "[object Object]",
++  	  "Shield histogram is faked");
++
++  privateWin.close();
++});
