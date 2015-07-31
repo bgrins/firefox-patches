@@ -1,0 +1,166 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  3e37f8f832995c9a28691b3f003bc5eccfa4b5dc
+Bug 1187482 - Skip XBL and native anonymous content inside non-XUL documents;r=jryans
+
+This will allow the walker to skip scrollbar elements passed in from the highlighter.
+We used to allow anonymous content just so that feedSubscribeLine contents could be
+inspected, but that's much less important than the problem it's causing.  With this
+change we still show ::before/::after but nothing else.
+
+Note that this doesn't affect the Browser Toolbox at all, which uses another filter.
+
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -108,17 +108,16 @@ const PSEUDO_SELECTORS = [
+   [":empty", 0],
+   [":target", 0],
+   [":enabled", 0],
+   [":disabled", 0],
+   [":checked", 1],
+   ["::selection", 0]
+ ];
+ 
+-
+ let HELPER_SHEET = ".__fx-devtools-hide-shortcut__ { visibility: hidden !important } ";
+ HELPER_SHEET += ":-moz-devtools-highlighted { outline: 2px dashed #F06!important; outline-offset: -2px!important } ";
+ 
+ loader.lazyRequireGetter(this, "DevToolsUtils",
+                          "devtools/toolkit/DevToolsUtils");
+ 
+ loader.lazyGetter(this, "DOMParser", function() {
+   return Cc["@mozilla.org/xmlextras/domparser;1"].createInstance(Ci.nsIDOMParser);
+@@ -307,34 +306,30 @@ var NodeActor = exports.NodeActor = prot
+   // a call to children() if possible.
+   get numChildren() {
+     // For pseudo elements, childNodes.length returns 1, but the walker
+     // will return 0.
+     if (this.isBeforePseudoElement || this.isAfterPseudoElement) {
+       return 0;
+     }
+ 
+-    let numChildren = this.rawNode.childNodes.length;
++    let rawNode = this.rawNode;
++    let numChildren = rawNode.childNodes.length;
++    let hasAnonChildren = rawNode.nodeType === Ci.nsIDOMNode.ELEMENT_NODE &&
++                          rawNode.ownerDocument.getAnonymousNodes(rawNode);
++
+     if (numChildren === 0 &&
+-        (this.rawNode.contentDocument || this.rawNode.getSVGDocument)) {
++        (rawNode.contentDocument || rawNode.getSVGDocument)) {
+       // This might be an iframe with virtual children.
+       numChildren = 1;
+     }
+ 
+-    // Count any anonymous children
+-    if (this.rawNode.nodeType === Ci.nsIDOMNode.ELEMENT_NODE) {
+-      let anonChildren = this.rawNode.ownerDocument.getAnonymousNodes(this.rawNode);
+-      if (anonChildren) {
+-        numChildren += anonChildren.length;
+-      }
+-    }
+-
+-    // Normal counting misses ::before/::after, so we have to check to make sure
+-    // we aren't missing anything
+-    if (numChildren === 0) {
++    // Normal counting misses ::before/::after.  Also, some anonymous children
++    // may ultimately be skipped, so we have to consult with the walker.
++    if (numChildren === 0 || hasAnonChildren) {
+       numChildren = this.walker.children(this).nodes.length;
+     }
+ 
+     return numChildren;
+   },
+ 
+   get computedStyle() {
+     return CssLogic.getComputedStyle(this.rawNode);
+@@ -3856,45 +3851,49 @@ DocumentWalker.prototype = {
+     let node = this.walker.nextSibling();
+     while (node && this.filter(node) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
+       node = this.walker.nextSibling();
+     }
+     return node;
+   }
+ };
+ 
+-function isXULElement(el) {
+-  return el &&
+-         el.namespaceURI === XUL_NS;
++function isInXULDocument(el) {
++  let doc = nodeDocument(el);
++  return doc &&
++         doc.documentElement &&
++         doc.documentElement.namespaceURI === XUL_NS;
+ }
+ 
+ /**
+  * This DeepTreeWalker filter skips whitespace text nodes and anonymous
+  * content with the exception of ::before and ::after and anonymous content
+  * in XUL document (needed to show all elements in the browser toolbox).
+  */
+ function standardTreeWalkerFilter(aNode) {
++  // ::before and ::after are native anonymous content, but we always
++  // want to show them
++  if (aNode.nodeName === "_moz_generated_content_before" ||
++      aNode.nodeName === "_moz_generated_content_after") {
++    return Ci.nsIDOMNodeFilter.FILTER_ACCEPT;
++  }
++
+   // Ignore empty whitespace text nodes.
+   if (aNode.nodeType == Ci.nsIDOMNode.TEXT_NODE &&
+       !/[^\s]/.exec(aNode.nodeValue)) {
+     return Ci.nsIDOMNodeFilter.FILTER_SKIP;
+   }
+ 
+-  // Ignore all native anonymous content (like internals for form
+-  // controls).  Except for:
+-  //   1) Anonymous content in a XUL document. This is needed for all
+-  //      elements within the Browser Toolbox to properly show up.
+-  //   2) ::before/::after - we do want this to show in the walker so
+-  //      they can be inspected.
+-  if (LayoutHelpers.isNativeAnonymous(aNode) &&
+-      !isXULElement(aNode.parentNode) &&
+-      (
+-        aNode.nodeName !== "_moz_generated_content_before" &&
+-        aNode.nodeName !== "_moz_generated_content_after")
+-      ) {
++  // Ignore all native and XBL anonymous content inside a non-XUL document
++  if (!isInXULDocument(aNode) && (LayoutHelpers.isXBLAnonymous(aNode) ||
++                                  LayoutHelpers.isNativeAnonymous(aNode))) {
++    // Note: this will skip inspecting the contents of feedSubscribeLine since
++    // that's XUL content injected in an HTML document, but we need to because
++    // this also skips many other elements that need to be skipped - like form
++    // controls, scrollbars, video controls, etc (see bug 11874820).
+     return Ci.nsIDOMNodeFilter.FILTER_SKIP;
+   }
+ 
+   return Ci.nsIDOMNodeFilter.FILTER_ACCEPT;
+ }
+ 
+ /**
+  * This DeepTreeWalker filter is like standardTreeWalkerFilter except that
+diff --git a/toolkit/devtools/server/tests/mochitest/test_inspector-anonymous.html b/toolkit/devtools/server/tests/mochitest/test_inspector-anonymous.html
+--- a/toolkit/devtools/server/tests/mochitest/test_inspector-anonymous.html
++++ b/toolkit/devtools/server/tests/mochitest/test_inspector-anonymous.html
+@@ -49,18 +49,18 @@ window.onload = function() {
+   addAsyncTest(function* testXBLAnonymousInHTMLDocument() {
+     info ("Testing XBL anonymous in an HTML document.");
+     let rawToolbarbutton = gInspectee.createElementNS(XUL_NS, "toolbarbutton");
+     gInspectee.documentElement.appendChild(rawToolbarbutton);
+ 
+     let toolbarbutton = yield gWalker.querySelector(gWalker.rootNode, "toolbarbutton");
+     let children = yield gWalker.children(toolbarbutton);
+ 
+-    is (toolbarbutton.numChildren, 3, "XBL content is visible even in HTML doc");
+-    is (children.nodes.length, 3, "XBL content is returned even in HTML doc");
++    is (toolbarbutton.numChildren, 0, "XBL content is not visible in HTML doc");
++    is (children.nodes.length, 0, "XBL content is not returned in HTML doc");
+ 
+     runNextTest();
+   });
+ 
+   addAsyncTest(function* testNativeAnonymous() {
+     info ("Testing native anonymous content with walker.");
+ 
+     let select = yield gWalker.querySelector(gWalker.rootNode, "select");
