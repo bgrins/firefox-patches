@@ -1,0 +1,1097 @@
+# HG changeset patch
+# User Gabriel Luong <gabriel.luong@gmail.com>
+# Parent  650547731e72048b519999cd577ae46e59c3d4c7
+Bug 1188897 - [Rule View] Ensure the correct editable property is focused when editing and removing properties in the rule view r=bgrins
+
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -928,49 +928,44 @@
+       match.prop.set(aNewProp);
+       return true;
+     }
+ 
+     return false;
+   },
+ 
+   /**
+-   * Jump between editable properties in the UI.  Will begin editing the next
+-   * name, if possible.  If this is the last element in the set, then begin
+-   * editing the previous value.  If this is the *only* element in the set,
+-   * then settle for focusing the new property editor.
++   * Jump between editable properties in the UI. If the focus direction is
++   * forward, begin editing the next property name if available or focus the
++   * new property editor otherwise. If the focus direction is backward,
++   * begin editing the previous property value or focus the selector editor if
++   * this is the first element in the property list.
+    *
+-   * @param {TextProperty} aTextProperty
++   * @param {TextProperty} textProperty
+    *        The text property that will be left to focus on a sibling.
+-   *
++   * @param {number} direction
++   *        The move focus direction number.
+    */
+-  editClosestTextProperty: function(aTextProperty) {
+-    let index = this.textProps.indexOf(aTextProperty);
+-    let previous = false;
+-
+-    // If this is the last element, move to the previous instead of next
+-    if (index === this.textProps.length - 1) {
+-      index = index - 1;
+-      previous = true;
+-    } else {
+-      index = index + 1;
+-    }
+-
+-    let nextProp = this.textProps[index];
+-
+-    // If possible, begin editing the next name or previous value.
+-    // Otherwise, settle for focusing the new property element.
+-    if (nextProp) {
+-      if (previous) {
+-        nextProp.editor.valueSpan.click();
++  editClosestTextProperty: function(textProperty, direction) {
++    let index = this.textProps.indexOf(textProperty);
++
++    if (direction == Ci.nsIFocusManager.MOVEFOCUS_FORWARD) {
++      if (index == this.textProps.length - 1) {
++        textProperty.rule.editor.closeBrace.click();
+       } else {
++        let nextProp = this.textProps[index + 1];
+         nextProp.editor.nameSpan.click();
+       }
+-    } else {
+-      aTextProperty.rule.editor.closeBrace.focus();
++    } else if (direction == Ci.nsIFocusManager.MOVEFOCUS_BACKWARD) {
++      if (index == 0) {
++        textProperty.editor.ruleEditor.selectorText.click();
++      } else {
++        let prevProp = this.textProps[index - 1];
++        prevProp.editor.valueSpan.click();
++      }
+     }
+   },
+ 
+   /**
+    * Return a string representation of the rule.
+    */
+   stringifyRule: function() {
+     let selectorText = this.selectorText;
+@@ -2837,17 +2832,16 @@
+ function TextPropertyEditor(aRuleEditor, aProperty) {
+   this.ruleEditor = aRuleEditor;
+   this.ruleView = this.ruleEditor.ruleView;
+   this.doc = this.ruleEditor.doc;
+   this.popup = this.ruleView.popup;
+   this.prop = aProperty;
+   this.prop.editor = this;
+   this.browserWindow = this.doc.defaultView.top;
+-  this.removeOnRevert = this.prop.value === "";
+ 
+   this._onEnableClicked = this._onEnableClicked.bind(this);
+   this._onExpandClicked = this._onExpandClicked.bind(this);
+   this._onStartEditing = this._onStartEditing.bind(this);
+   this._onNameDone = this._onNameDone.bind(this);
+   this._onValueDone = this._onValueDone.bind(this);
+   this._onSwatchPreview = this._onSwatchPreview.bind(this);
+   this._onSwatchRevert = this._onSwatchRevert.bind(this);
+@@ -3315,42 +3309,42 @@
+     }
+   },
+ 
+   /**
+    * Called when the property name's inplace editor is closed.
+    * Ignores the change if the user pressed escape, otherwise
+    * commits it.
+    *
+-   * @param {string} aValue
++   * @param {string} value
+    *        The value contained in the editor.
+-   * @param {boolean} aCommit
++   * @param {boolean} commit
+    *        True if the change should be applied.
++   * @param {number} direction
++   *        The move focus direction number.
+    */
+-  _onNameDone: function(aValue, aCommit) {
+-    if ((!aCommit && this.ruleEditor.isEditing) ||
+-        this.committed.name == aValue) {
+-      // Disable the property if the property was originally disabled.
+-      if (!this.prop.enabled) {
+-        this.rule.setPropertyEnabled(this.prop, this.prop.enabled);
+-      }
+-
++  _onNameDone: function(value, commit, direction) {
++    if (this.prop.value && ((!commit && !this.ruleEditor.isEditing) ||
++        this.committed.name == value)) {
+       return;
+     }
+ 
+-    // Unlike the value editor, if a name is empty the entire property
+-    // should always be removed.
+-    if (aValue.trim() === "") {
+-      this.remove();
++    // If a name is empty or value is empty and the focus is going moving
++    // backward or escape was pressed, the entire property should always be
++    // removed.
++    if (!value.trim() ||
++        (!this.prop.value &&
++         (!direction || direction == Ci.nsIFocusManager.MOVEFOCUS_BACKWARD))) {
++      this.remove(direction);
+       return;
+     }
+ 
+     // Adding multiple rules inside of name field overwrites the current
+     // property with the first, then adds any more onto the property list.
+-    let properties = parseDeclarations(aValue);
++    let properties = parseDeclarations(value);
+ 
+     if (properties.length) {
+       this.prop.setName(properties[0].name);
+       this.committed.name = this.prop.name;
+ 
+       if (!this.prop.enabled) {
+         this.prop.setEnabled(true);
+       }
+@@ -3359,83 +3353,87 @@
+         this.prop.setValue(properties[0].value, properties[0].priority);
+         this.ruleEditor.addProperties(properties.slice(1), this.prop);
+       }
+     }
+   },
+ 
+   /**
+    * Remove property from style and the editors from DOM.
+-   * Begin editing next available property.
++   * Begin editing next or previous available property given the focus
++   * direction.
++   *
++   * @param {number} direction
++   *        The move focus direction number.
+    */
+-  remove: function() {
++  remove: function(direction) {
+     if (this._colorSwatchSpans && this._colorSwatchSpans.length) {
+       for (let span of this._colorSwatchSpans) {
+         this.ruleView.tooltips.colorPicker.removeSwatch(span);
+       }
+     }
+ 
+     this.element.parentNode.removeChild(this.element);
+-    this.ruleEditor.rule.editClosestTextProperty(this.prop);
++    this.ruleEditor.rule.editClosestTextProperty(this.prop, direction);
+     this.nameSpan.textProperty = null;
+     this.valueSpan.textProperty = null;
+     this.prop.remove();
+   },
+ 
+   /**
+    * Called when a value editor closes.  If the user pressed escape,
+    * revert to the value this property had before editing.
+    *
+-   * @param {string} aValue
++   * @param {string} value
+    *        The value contained in the editor.
+-   * @param {bool} aCommit
++   * @param {bool} commit
+    *        True if the change should be applied.
++   * @param {number} direction
++   *        The move focus direction number.
+    */
+-  _onValueDone: function(aValue="", aCommit) {
+-    let parsedProperties = this._getValueAndExtraProperties(aValue);
++  _onValueDone: function(value="", commit, direction) {
++    let parsedProperties = this._getValueAndExtraProperties(value);
+     let val = parseSingleValue(parsedProperties.firstValue);
+     let isValueUnchanged =
+       !parsedProperties.propertiesToAdd.length &&
+       this.committed.value == val.value &&
+       this.committed.priority == val.priority;
+ 
+-    if ((!aCommit && !this.ruleEditor.isEditing) || isValueUnchanged) {
+-      // A new property should be removed when escape is pressed.
+-      if (this.removeOnRevert) {
+-        this.remove();
+-      } else {
+-        // Disable the property if the property was originally disabled.
+-        this.rule.setPropertyEnabled(this.prop, this.prop.enabled);
+-      }
++    if (value.trim() &&
++        ((!commit && !this.ruleEditor.isEditing && !direction) ||
++          isValueUnchanged)) {
++      // Disable the property if the property was originally disabled.
++      this.rule.setPropertyEnabled(this.prop, this.prop.enabled);
++
+       return;
+     }
+ 
+     // First, set this property value (common case, only modified a property)
+     this.prop.setValue(val.value, val.priority);
+ 
+     if (!this.prop.enabled) {
+       this.prop.setEnabled(true);
+     }
+ 
+-    this.removeOnRevert = false;
+     this.committed.value = this.prop.value;
+     this.committed.priority = this.prop.priority;
+ 
+     // If needed, add any new properties after this.prop.
+     this.ruleEditor.addProperties(parsedProperties.propertiesToAdd, this.prop);
+ 
+-    // If the name or value is not actively being edited, and the value is
+-    // empty, then remove the whole property.
++    // If the input value is empty and the focus is moving forward to the next
++    // editable field, then remove the whole property.
+     // A timeout is used here to accurately check the state, since the inplace
+     // editor `done` and `destroy` events fire before the next editor
+     // is focused.
+-    if (val.value.trim() === "") {
++    if (!value.trim() &&
++        direction != Ci.nsIFocusManager.MOVEFOCUS_BACKWARD) {
+       setTimeout(() => {
+         if (!this.editing) {
+-          this.remove();
++          this.remove(direction);
+         }
+       }, 0);
+     }
+   },
+ 
+   /**
+    * Called when the swatch editor wants to preview a value change.
+    * @param  {String} value
+diff --git a/browser/devtools/styleinspector/test/browser.ini b/browser/devtools/styleinspector/test/browser.ini
+--- a/browser/devtools/styleinspector/test/browser.ini
++++ b/browser/devtools/styleinspector/test/browser.ini
+@@ -80,33 +80,40 @@
+ [browser_ruleview_context-menu-show-mdn-docs-01.js]
+ [browser_ruleview_context-menu-show-mdn-docs-02.js]
+ [browser_ruleview_context-menu-show-mdn-docs-03.js]
+ [browser_ruleview_copy_styles.js]
+ [browser_ruleview_cubicbezier-appears-on-swatch-click.js]
+ [browser_ruleview_cubicbezier-commit-on-ENTER.js]
+ [browser_ruleview_cubicbezier-revert-on-ESC.js]
+ [browser_ruleview_custom.js]
++[browser_ruleview_cycle-color.js]
++[browser_ruleview_edit-property-cancel.js]
+ [browser_ruleview_edit-property-commit.js]
+ [browser_ruleview_edit-property-computed.js]
+ [browser_ruleview_edit-property-increments.js]
+ [browser_ruleview_edit-property-order.js]
++[browser_ruleview_edit-property-remove_01.js]
++[browser_ruleview_edit-property-remove_02.js]
++[browser_ruleview_edit-property-remove_03.js]
+ [browser_ruleview_edit-property_01.js]
+ [browser_ruleview_edit-property_02.js]
+ [browser_ruleview_edit-property_03.js]
+ [browser_ruleview_edit-property_04.js]
+ [browser_ruleview_edit-property_05.js]
+ [browser_ruleview_edit-property_06.js]
+ [browser_ruleview_edit-property_07.js]
+ [browser_ruleview_edit-selector-commit.js]
+ [browser_ruleview_edit-selector_01.js]
+ [browser_ruleview_edit-selector_02.js]
+ [browser_ruleview_edit-selector_03.js]
+ [browser_ruleview_edit-selector_04.js]
+ [browser_ruleview_edit-selector_05.js]
++[browser_ruleview_editable-field-focus_01.js]
++[browser_ruleview_editable-field-focus_02.js]
+ [browser_ruleview_eyedropper.js]
+ [browser_ruleview_filtereditor-appears-on-swatch-click.js]
+ [browser_ruleview_filtereditor-commit-on-ENTER.js]
+ [browser_ruleview_filtereditor-revert-on-ESC.js]
+ skip-if = (os == "win" && debug) || e10s # bug 963492: win. bug 1040653: e10s.
+ [browser_ruleview_inherit.js]
+ [browser_ruleview_keybindings.js]
+ [browser_ruleview_keyframes-rule_01.js]
+@@ -121,17 +128,16 @@
+ [browser_ruleview_media-queries.js]
+ [browser_ruleview_multiple-properties-duplicates.js]
+ [browser_ruleview_multiple-properties-priority.js]
+ [browser_ruleview_multiple-properties-unfinished_01.js]
+ [browser_ruleview_multiple-properties-unfinished_02.js]
+ [browser_ruleview_multiple_properties_01.js]
+ [browser_ruleview_multiple_properties_02.js]
+ [browser_ruleview_original-source-link.js]
+-[browser_ruleview_cycle-color.js]
+ [browser_ruleview_pseudo-element_01.js]
+ [browser_ruleview_pseudo-element_02.js]
+ skip-if = e10s # Bug 1090340
+ [browser_ruleview_pseudo_lock_options.js]
+ [browser_ruleview_refresh-on-attribute-change_01.js]
+ [browser_ruleview_refresh-on-attribute-change_02.js]
+ [browser_ruleview_refresh-on-style-change.js]
+ [browser_ruleview_search-filter-computed-list_01.js]
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_01.js b/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_01.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_01.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_01.js
+@@ -1,55 +1,48 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+-// Testing various inplace-editor behaviors in the rule-view
++// Tests adding a new property and escapes the new empty property name editor
+ 
+-let TEST_URL = 'url("' + TEST_URL_ROOT + 'doc_test_image.png")';
+-let PAGE_CONTENT = [
+-  '<style type="text/css">',
+-  '  #testid {',
+-  '    background-color: blue;',
+-  '  }',
+-  '  .testclass {',
+-  '    background-color: green;',
+-  '  }',
+-  '</style>',
+-  '<div id="testid" class="testclass">Styled Node</div>'
++let TEST_URI = [
++  "<style type='text/css'>",
++  "  #testid {",
++  "    background-color: blue;",
++  "  }",
++  "  .testclass {",
++  "    background-color: green;",
++  "  }",
++  "</style>",
++  "<div id='testid' class='testclass'>Styled Node</div>"
+ ].join("\n");
+ 
+ add_task(function*() {
+-  yield addTab("data:text/html;charset=utf-8,test rule view user changes");
+-
+-  info("Creating the test document");
+-  content.document.body.innerHTML = PAGE_CONTENT;
+-
+-  info("Opening the rule-view");
+-  let {toolbox, inspector, view} = yield openRuleView();
+-
+-  info("Selecting the test element");
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+-
+   yield testCancelNew(view);
+ });
+ 
+ function* testCancelNew(view) {
+-  info("Test adding a new rule to the element's style declaration and leaving it empty.");
++  let elementRuleEditor = getRuleViewRuleEditor(view, 0);
++  let editor = yield focusEditableField(view, elementRuleEditor.closeBrace);
++  is(inplaceEditor(elementRuleEditor.newPropSpan), editor,
++    "The new property editor got focused");
+ 
+-  let elementRuleEditor = getRuleViewRuleEditor(view, 0);
+-
+-  info("Focusing a new property name in the rule-view");
+-  let editor = yield focusEditableField(view, elementRuleEditor.closeBrace);
+-  is(inplaceEditor(elementRuleEditor.newPropSpan), editor, "The new property editor got focused");
+-
+-  info("Bluring the editor input");
++  info("Escape the new property editor");
+   let onBlur = once(editor.input, "blur");
+-  editor.input.blur();
++  EventUtils.synthesizeKey("VK_ESCAPE", {}, view.styleWindow);
+   yield onBlur;
+ 
+-  info("Checking the state of canceling a new property name editor");
+-  ok(!elementRuleEditor.rule._applyingModifications, "Shouldn't have an outstanding request after a cancel.");
+-  is(elementRuleEditor.rule.textProps.length,  0, "Should have canceled creating a new text property.");
+-  ok(!elementRuleEditor.propertyList.hasChildNodes(), "Should not have any properties.");
++  info("Checking the state of cancelling a new property name editor");
++  ok(!elementRuleEditor.rule._applyingModifications,
++    "Shouldn't have an outstanding request after a cancel.");
++  is(elementRuleEditor.rule.textProps.length, 0,
++    "Should have cancelled creating a new text property.");
++  ok(!elementRuleEditor.propertyList.hasChildNodes(),
++    "Should not have any properties.");
++  is(view.styleDocument.body, view.styleDocument.activeElement,
++    "Correct element has focus");
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_02.js b/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_02.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_02.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_02.js
+@@ -1,76 +1,69 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+-// Testing various inplace-editor behaviors in the rule-view
++// Tests adding a new property  and escapes the new empty property value editor
+ 
+-let TEST_URL = 'url("' + TEST_URL_ROOT + 'doc_test_image.png")';
+-let PAGE_CONTENT = [
+-  '<style type="text/css">',
+-  '  #testid {',
+-  '    background-color: blue;',
+-  '  }',
+-  '</style>',
+-  '<div id="testid">Styled Node</div>'
++let TEST_URI = [
++  "<style type='text/css'>",
++  "  #testid {",
++  "    background-color: blue;",
++  "  }",
++  "</style>",
++  "<div id='testid'>Styled Node</div>"
+ ].join("\n");
+ 
+ add_task(function*() {
+-  yield addTab("data:text/html;charset=utf-8,test rule view user changes");
+-
+-  info("Creating the test document");
+-  content.document.body.innerHTML = PAGE_CONTENT;
+-
+-  info("Opening the rule-view");
+-  let {toolbox, inspector, view} = yield openRuleView();
+-
+-  info("Selecting the test element");
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {inspector, view} = yield openRuleView();
+   yield selectNode("#testid", inspector);
+ 
+   info("Test creating a new property and escaping");
+ 
+   let elementRuleEditor = getRuleViewRuleEditor(view, 1);
+ 
+   info("Focusing a new property name in the rule-view");
+   let editor = yield focusEditableField(view, elementRuleEditor.closeBrace);
+ 
+-  is(inplaceEditor(elementRuleEditor.newPropSpan), editor, "The new property editor got focused.");
++  is(inplaceEditor(elementRuleEditor.newPropSpan), editor,
++    "The new property editor got focused.");
+ 
+   info("Entering a value in the property name editor");
+   editor.input.value = "color";
+ 
+   info("Pressing return to commit and focus the new value field");
+   let onValueFocus = once(elementRuleEditor.element, "focus", true);
+   let onRuleViewChanged = view.once("ruleview-changed");
+   EventUtils.synthesizeKey("VK_RETURN", {}, view.styleWindow);
+   yield onValueFocus;
+   yield onRuleViewChanged;
+ 
+   // Getting the new value editor after focus
+   editor = inplaceEditor(view.styleDocument.activeElement);
+   let textProp = elementRuleEditor.rule.textProps[1];
+ 
+-  is(elementRuleEditor.rule.textProps.length,  2, "Created a new text property.");
+-  is(elementRuleEditor.propertyList.children.length, 2, "Created a property editor.");
+-  is(editor, inplaceEditor(textProp.editor.valueSpan), "Editing the value span now.");
++  is(elementRuleEditor.rule.textProps.length, 2,
++    "Created a new text property.");
++  is(elementRuleEditor.propertyList.children.length, 2,
++    "Created a property editor.");
++  is(editor, inplaceEditor(textProp.editor.valueSpan),
++    "Editing the value span now.");
+ 
+   info("Entering a property value");
+   editor.input.value = "red";
+ 
+   info("Escaping out of the field");
+   onRuleViewChanged = view.once("ruleview-changed");
+   EventUtils.synthesizeKey("VK_ESCAPE", {}, view.styleWindow);
+   yield onRuleViewChanged;
+ 
+-  info("Checking that the previous field is focused");
+-  let focusedElement = inplaceEditor(elementRuleEditor.rule.textProps[0].editor.valueSpan).input;
+-  is(focusedElement, focusedElement.ownerDocument.activeElement, "Correct element has focus");
++  is(view.styleDocument.body, view.styleDocument.activeElement,
++    "Correct element has focus");
+ 
+-  onRuleViewChanged = view.once("ruleview-changed");
+-  EventUtils.synthesizeKey("VK_ESCAPE", {}, view.styleWindow);
+-  yield onRuleViewChanged;
+-
+-  is(elementRuleEditor.rule.textProps.length,  1, "Removed the new text property.");
+-  is(elementRuleEditor.propertyList.children.length, 1, "Removed the property editor.");
++  is(elementRuleEditor.rule.textProps.length, 1,
++    "Removed the new text property.");
++  is(elementRuleEditor.propertyList.children.length, 1,
++    "Removed the property editor.");
+ });
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_03.js b/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_03.js
+--- a/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_03.js
++++ b/browser/devtools/styleinspector/test/browser_ruleview_add-property-cancel_03.js
+@@ -1,62 +1,52 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+-// Test cancelling the addition of a new property in the rule-view
++// Tests adding a new property and escapes the property name editor with a value
+ 
+-const TEST_URI = [
+-  "<style>",
+-  "#testid {background-color: blue;}",
+-  ".testclass, .unmatched {background-color: green;}",
++let TEST_URI = [
++  "<style type='text/css'>",
++  "  #testid {",
++  "    background-color: blue;",
++  "  }",
++  "  .testclass {",
++  "    background-color: green;",
++  "  }",
+   "</style>",
+-  "<div id='testid' class='testclass'>Styled Node</div>",
+-  "<div id='testid2'>Styled Node</div>"
+-].join("");
++  "<div id='testid' class='testclass'>Styled Node</div>"
++].join("\n");
+ 
+ add_task(function*() {
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+-  let {toolbox, inspector, view} = yield openRuleView();
+-  yield testCancelNew(inspector, view);
++  let {inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
+   yield testCancelNewOnEscape(inspector, view);
+ });
+ 
+-function* testCancelNew(inspector, ruleView) {
+-  // Start at the beginning: start to add a rule to the element's style
+-  // declaration, but leave it empty.
+-
+-  let elementRuleEditor = getRuleViewRuleEditor(ruleView, 0);
+-  let editor = yield focusEditableField(ruleView, elementRuleEditor.closeBrace);
+-
+-  is(inplaceEditor(elementRuleEditor.newPropSpan), editor,
+-    "Property editor is focused");
+-
+-  let onBlur = once(editor.input, "blur");
+-  editor.input.blur();
+-  yield onBlur;
+-
+-  ok(!elementRuleEditor.rule._applyingModifications, "Shouldn't have an outstanding modification request after a cancel.");
+-  is(elementRuleEditor.rule.textProps.length, 0, "Should have canceled creating a new text property.");
+-  ok(!elementRuleEditor.propertyList.hasChildNodes(), "Should not have any properties.");
+-}
+-
+-function* testCancelNewOnEscape(inspector, ruleView) {
++function* testCancelNewOnEscape(inspector, view) {
+   // Start at the beginning: start to add a rule to the element's style
+   // declaration, add some text, then press escape.
+ 
+-  let elementRuleEditor = getRuleViewRuleEditor(ruleView, 0);
+-  let editor = yield focusEditableField(ruleView, elementRuleEditor.closeBrace);
++  let elementRuleEditor = getRuleViewRuleEditor(view, 0);
++  let editor = yield focusEditableField(view, elementRuleEditor.closeBrace);
+ 
+-  is(inplaceEditor(elementRuleEditor.newPropSpan), editor, "Next focused editor should be the new property editor.");
++  is(inplaceEditor(elementRuleEditor.newPropSpan), editor,
++    "Next focused editor should be the new property editor.");
+ 
+-  EventUtils.sendString("background", ruleView.styleWindow)
++  EventUtils.sendString("background", view.styleWindow);
+ 
+   let onBlur = once(editor.input, "blur");
+   EventUtils.synthesizeKey("VK_ESCAPE", {});
+   yield onBlur;
+ 
+-  ok(!elementRuleEditor.rule._applyingModifications, "Shouldn't have an outstanding modification request after a cancel.");
+-  is(elementRuleEditor.rule.textProps.length, 0, "Should have canceled creating a new text property.");
+-  ok(!elementRuleEditor.propertyList.hasChildNodes(), "Should not have any properties.");
++  ok(!elementRuleEditor.rule._applyingModifications,
++    "Shouldn't have an outstanding modification request after a cancel.");
++  is(elementRuleEditor.rule.textProps.length, 0,
++    "Should have canceled creating a new text property.");
++  ok(!elementRuleEditor.propertyList.hasChildNodes(),
++    "Should not have any properties.");
++  is(view.styleDocument.body, view.styleDocument.activeElement,
++    "Correct element has focus");
+ }
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_edit-property-cancel.js b/browser/devtools/styleinspector/test/browser_ruleview_edit-property-cancel.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_edit-property-cancel.js
+@@ -0,0 +1,57 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests editing a property name or value and escaping will revert the
++// changes and restore the original value.
++
++let TEST_URI = [
++  "<style type='text/css'>",
++  "#testid {",
++  "  background-color: #00F;",
++  "}",
++  "</style>",
++  "<div id='testid'>Styled Node</div>",
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testEditPropertyAndCancel(inspector, view);
++});
++
++function* testEditPropertyAndCancel(inspector, view) {
++  let ruleEditor = getRuleViewRuleEditor(view, 1);
++  let propEditor = ruleEditor.rule.textProps[0].editor;
++
++  yield focusEditableField(view, propEditor.nameSpan);
++  yield sendCharsAndWaitForFocus(view, ruleEditor.element,
++    ["VK_DELETE", "VK_ESCAPE"]);
++  yield ruleEditor.rule._applyingModifications;
++
++  is(propEditor.nameSpan.textContent, "background-color",
++    "'background-color' property name is correctly set.");
++  is((yield getComputedStyleProperty("#testid", null, "background-color")),
++    "rgb(0, 0, 255)", "#00F background color is set.");
++
++  yield focusEditableField(view, propEditor.valueSpan);
++  yield sendCharsAndWaitForFocus(view, ruleEditor.element,
++    ["VK_DELETE", "VK_ESCAPE"]);
++  yield ruleEditor.rule._applyingModifications;
++
++  is(propEditor.valueSpan.textContent, "#00F",
++    "'#00F' property value is correctly set.");
++  is((yield getComputedStyleProperty("#testid", null, "background-color")),
++    "rgb(0, 0, 255)", "#00F background color is set.");
++}
++
++function* sendCharsAndWaitForFocus(view, element, chars) {
++  let onFocus = once(element, "focus", true);
++  for (let ch of chars) {
++    EventUtils.sendChar(ch, view.styleWindow);
++  }
++  yield onFocus;
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_edit-property-remove_01.js b/browser/devtools/styleinspector/test/browser_ruleview_edit-property-remove_01.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_edit-property-remove_01.js
+@@ -0,0 +1,76 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests removing a property by clearing the property name and pressing the
++// return key, and checks if the focus is moved to the appropriate editable
++// field.
++
++let TEST_URI = [
++  "<style type='text/css'>",
++  "#testid {",
++  "  background-color: #00F;",
++  "  color: #00F;",
++  "}",
++  "</style>",
++  "<div id='testid'>Styled Node</div>",
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testEditPropertyAndRemove(inspector, view);
++});
++
++function* testEditPropertyAndRemove(inspector, view) {
++  let ruleEditor = getRuleViewRuleEditor(view, 1);
++  let propEditor = ruleEditor.rule.textProps[0].editor;
++
++  yield focusEditableField(view, propEditor.nameSpan);
++  yield sendKeysAndWaitForFocus(view, ruleEditor.element,
++    ["VK_DELETE", "VK_RETURN"]);
++  yield ruleEditor.rule._applyingModifications;
++
++  let newValue = yield executeInContent("Test:GetRulePropertyValue", {
++    styleSheetIndex: 0,
++    ruleIndex: 0,
++    name: "background-color"
++  });
++  is(newValue, "", "background-color should have been unset.");
++
++  propEditor = ruleEditor.rule.textProps[0].editor;
++
++  let editor = inplaceEditor(view.styleDocument.activeElement);
++  is(inplaceEditor(propEditor.nameSpan), editor,
++    "Focus should have moved to the next property name");
++
++  yield sendKeysAndWaitForFocus(view, ruleEditor.element,
++    ["VK_DELETE", "VK_RETURN"]);
++  yield ruleEditor.rule._applyingModifications;
++
++  newValue = yield executeInContent("Test:GetRulePropertyValue", {
++    styleSheetIndex: 0,
++    ruleIndex: 0,
++    name: "color"
++  });
++  is(newValue, "", "color should have been unset.");
++
++  editor = inplaceEditor(view.styleDocument.activeElement);
++  is(inplaceEditor(ruleEditor.newPropSpan), editor,
++    "Focus should have moved to the new property span");
++  is(ruleEditor.rule.textProps.length, 0,
++    "All properties should have been removed.");
++  is(ruleEditor.propertyList.children.length, 1,
++    "Should have the new property span.");
++}
++
++function* sendKeysAndWaitForFocus(view, element, keys) {
++  let onFocus = once(element, "focus", true);
++  for (let key of keys) {
++    EventUtils.synthesizeKey(key, {}, view.styleWindow);
++  }
++  yield onFocus;
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_edit-property-remove_02.js b/browser/devtools/styleinspector/test/browser_ruleview_edit-property-remove_02.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_edit-property-remove_02.js
+@@ -0,0 +1,77 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests removing a property by clearing the property value and pressing the
++// return key, and checks if the focus is moved to the appropriate editable
++// field.
++
++let TEST_URI = [
++  "<style type='text/css'>",
++  "#testid {",
++  "  background-color: #00F;",
++  "  color: #00F;",
++  "}",
++  "</style>",
++  "<div id='testid'>Styled Node</div>",
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testEditPropertyAndRemove(inspector, view);
++});
++
++function* testEditPropertyAndRemove(inspector, view) {
++  let ruleEditor = getRuleViewRuleEditor(view, 1);
++  let propEditor = ruleEditor.rule.textProps[0].editor;
++
++  yield focusEditableField(view, propEditor.valueSpan);
++  yield sendKeysAndWaitForFocus(view, ruleEditor.element,
++    ["VK_DELETE", "VK_RETURN"]);
++  yield ruleEditor.rule._applyingModifications;
++
++  let newValue = yield executeInContent("Test:GetRulePropertyValue", {
++    styleSheetIndex: 0,
++    ruleIndex: 0,
++    name: "background-color"
++  });
++  is(newValue, "", "background-color should have been unset.");
++
++  propEditor = ruleEditor.rule.textProps[0].editor;
++
++  let editor = inplaceEditor(view.styleDocument.activeElement);
++  is(inplaceEditor(propEditor.nameSpan), editor,
++    "Focus should have moved to the next property name");
++
++  info("Focus the property value and remove the property");
++  yield sendKeysAndWaitForFocus(view, ruleEditor.element,
++    ["VK_TAB", "VK_DELETE", "VK_RETURN"]);
++  yield ruleEditor.rule._applyingModifications;
++
++  newValue = yield executeInContent("Test:GetRulePropertyValue", {
++    styleSheetIndex: 0,
++    ruleIndex: 0,
++    name: "color"
++  });
++  is(newValue, "", "color should have been unset.");
++
++  editor = inplaceEditor(view.styleDocument.activeElement);
++  is(inplaceEditor(ruleEditor.newPropSpan), editor,
++    "Focus should have moved to the new property span");
++  is(ruleEditor.rule.textProps.length, 0,
++    "All properties should have been removed.");
++  is(ruleEditor.propertyList.children.length, 1,
++    "Should have the new property span.");
++}
++
++function* sendKeysAndWaitForFocus(view, element, keys) {
++  let onFocus = once(element, "focus", true);
++  for (let key of keys) {
++    EventUtils.synthesizeKey(key, {}, view.styleWindow);
++  }
++  yield onFocus;
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_edit-property-remove_03.js b/browser/devtools/styleinspector/test/browser_ruleview_edit-property-remove_03.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_edit-property-remove_03.js
+@@ -0,0 +1,89 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests removing a property by clearing the property name and pressing shift
++// and tab keys, and checks if the focus is moved to the appropriate editable
++// field.
++let TEST_URI = [
++  "<style type='text/css'>",
++  "#testid {",
++  "  background-color: #00F;",
++  "  color: #00F;",
++  "}",
++  "</style>",
++  "<div id='testid'>Styled Node</div>",
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testEditPropertyAndRemove(inspector, view);
++});
++
++function* testEditPropertyAndRemove(inspector, view) {
++  let ruleEditor = getRuleViewRuleEditor(view, 1);
++  let propEditor = ruleEditor.rule.textProps[1].editor;
++
++  yield focusEditableField(view, propEditor.valueSpan);
++  yield sendKeysAndWaitForFocus(view, ruleEditor.element, [
++    { key: "VK_DELETE", modifiers: {} },
++    { key: "VK_TAB", modifiers: { shiftKey: true } }
++  ]);
++  yield ruleEditor.rule._applyingModifications;
++
++  let newValue = yield executeInContent("Test:GetRulePropertyValue", {
++    styleSheetIndex: 0,
++    ruleIndex: 0,
++    name: "color"
++  });
++  is(newValue, "", "color should have been unset.");
++  is(propEditor.valueSpan.textContent, "",
++    "'' property value is correctly set.");
++
++  yield sendKeysAndWaitForFocus(view, ruleEditor.element, [
++    { key: "VK_TAB", modifiers: { shiftKey: true } }
++  ]);
++  yield ruleEditor.rule._applyingModifications;
++
++  propEditor = ruleEditor.rule.textProps[0].editor;
++
++  let editor = inplaceEditor(view.styleDocument.activeElement);
++  is(inplaceEditor(propEditor.valueSpan), editor,
++    "Focus should have moved to the previous property value");
++
++  info("Focus the property name and remove the property");
++  yield sendKeysAndWaitForFocus(view, ruleEditor.element, [
++    { key: "VK_TAB", modifiers: { shiftKey: true } },
++    { key: "VK_DELETE", modifiers: {} },
++    { key: "VK_TAB", modifiers: { shiftKey: true } }
++  ]);
++
++  yield ruleEditor.rule._applyingModifications;
++
++  newValue = yield executeInContent("Test:GetRulePropertyValue", {
++    styleSheetIndex: 0,
++    ruleIndex: 0,
++    name: "background-color"
++  });
++  is(newValue, "", "background-color should have been unset.");
++
++  editor = inplaceEditor(view.styleDocument.activeElement);
++  is(inplaceEditor(ruleEditor.selectorText), editor,
++    "Focus should have moved to the selector text.");
++  is(ruleEditor.rule.textProps.length, 0,
++    "All properties should have been removed.");
++  ok(!ruleEditor.propertyList.hasChildNodes(),
++    "Should not have any properties.");
++}
++
++function* sendKeysAndWaitForFocus(view, element, keys) {
++  let onFocus = once(element, "focus", true);
++  for (let {key, modifiers} of keys) {
++    EventUtils.synthesizeKey(key, modifiers, view.styleWindow);
++  }
++  yield onFocus;
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_editable-field-focus_01.js b/browser/devtools/styleinspector/test/browser_ruleview_editable-field-focus_01.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_editable-field-focus_01.js
+@@ -0,0 +1,80 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the correct editable fields are focused when tabbing and entering
++// through the rule view.
++
++let TEST_URI = [
++  "<style type='text/css'>",
++  "#testid {",
++  "  background-color: blue;",
++  "  color: red;",
++  "  margin: 0;",
++  "  padding: 0;",
++  "}",
++  "div {",
++  "  border-color: red",
++  "}",
++  "</style>",
++  "<div id='testid'>Styled Node</div>",
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testEditableFieldFocus(inspector, view, "VK_RETURN");
++  yield testEditableFieldFocus(inspector, view, "VK_TAB");
++});
++
++function* testEditableFieldFocus(inspector, view, commitKey, options={}) {
++  let ruleEditor = getRuleViewRuleEditor(view, 0);
++
++  let onFocus = once(ruleEditor.element, "focus", true);
++  ruleEditor.selectorText.click();
++  yield onFocus;
++  assertEditor(view, ruleEditor.newPropSpan,
++    "Focus should be in the element property span");
++
++  ruleEditor = getRuleViewRuleEditor(view, 1);
++
++  yield focusNextEditableField(view, ruleEditor, commitKey, options);
++  yield assertEditor(view, ruleEditor.selectorText,
++    "Focus should have moved to the next rule selector");
++
++  for (let textProp of ruleEditor.rule.textProps) {
++    let propEditor = textProp.editor;
++
++    yield focusNextEditableField(view, ruleEditor, commitKey, options);
++    yield assertEditor(view, propEditor.nameSpan,
++      "Focus should have moved to the property name");
++
++    yield focusNextEditableField(view, ruleEditor, commitKey, options);
++    yield assertEditor(view, propEditor.valueSpan,
++      "Focus should have moved to the property value");
++  }
++
++  yield focusNextEditableField(view, ruleEditor, commitKey, options);
++  yield assertEditor(view, ruleEditor.newPropSpan,
++    "Focus should have moved to the new property span");
++
++  ruleEditor = getRuleViewRuleEditor(view, 2);
++
++  yield focusNextEditableField(view, ruleEditor, commitKey, options);
++  yield assertEditor(view, ruleEditor.selectorText,
++    "Focus should have moved to the next rule selector");
++}
++
++function* focusNextEditableField(view, ruleEditor, commitKey, options) {
++  let onFocus = once(ruleEditor.element, "focus", true);
++  EventUtils.synthesizeKey(commitKey, options, view.styleWindow);
++  yield onFocus;
++}
++
++function* assertEditor(view, element, message) {
++  let editor = inplaceEditor(view.styleDocument.activeElement);
++  is(inplaceEditor(element), editor, message);
++}
+diff --git a/browser/devtools/styleinspector/test/browser_ruleview_editable-field-focus_02.js b/browser/devtools/styleinspector/test/browser_ruleview_editable-field-focus_02.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/styleinspector/test/browser_ruleview_editable-field-focus_02.js
+@@ -0,0 +1,78 @@
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Tests that the correct editable fields are focused when shift tabbing
++// through the rule view.
++
++let TEST_URI = [
++  "<style type='text/css'>",
++  "#testid {",
++  "  background-color: blue;",
++  "  color: red;",
++  "  margin: 0;",
++  "  padding: 0;",
++  "}",
++  "div {",
++  "  border-color: red",
++  "}",
++  "</style>",
++  "<div id='testid'>Styled Node</div>",
++].join("\n");
++
++add_task(function*() {
++  yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
++  let {inspector, view} = yield openRuleView();
++  yield selectNode("#testid", inspector);
++  yield testEditableFieldFocus(inspector, view, "VK_TAB", { shiftKey: true });
++});
++
++function* testEditableFieldFocus(inspector, view, commitKey, options={}) {
++  let ruleEditor = getRuleViewRuleEditor(view, 2);
++  let editor = yield focusEditableField(view, ruleEditor.selectorText);
++  is(inplaceEditor(ruleEditor.selectorText), editor,
++    "Focus should be in the 'div' rule selector");
++
++  ruleEditor = getRuleViewRuleEditor(view, 1);
++
++  yield focusNextEditableField(view, ruleEditor, commitKey, options);
++  assertEditor(view, ruleEditor.newPropSpan,
++    "Focus should have moved to the new property span");
++
++  for (let textProp of ruleEditor.rule.textProps.slice(0).reverse()) {
++    let propEditor = textProp.editor;
++
++    yield focusNextEditableField(view, ruleEditor, commitKey, options);
++    yield assertEditor(view, propEditor.valueSpan,
++      "Focus should have moved to the property value");
++
++    yield focusNextEditableField(view, ruleEditor, commitKey, options);
++    yield assertEditor(view, propEditor.nameSpan,
++      "Focus should have moved to the property name");
++  }
++
++  ruleEditor = getRuleViewRuleEditor(view, 1);
++
++  yield focusNextEditableField(view, ruleEditor, commitKey, options);
++  yield assertEditor(view, ruleEditor.selectorText,
++    "Focus should have moved to the '#testid' rule selector");
++
++  ruleEditor = getRuleViewRuleEditor(view, 0);
++
++  yield focusNextEditableField(view, ruleEditor, commitKey, options);
++  assertEditor(view, ruleEditor.newPropSpan,
++    "Focus should have moved to the new property span");
++}
++
++function* focusNextEditableField(view, ruleEditor, commitKey, options) {
++  let onFocus = once(ruleEditor.element, "focus", true);
++  EventUtils.synthesizeKey(commitKey, options, view.styleWindow);
++  yield onFocus;
++}
++
++function* assertEditor(view, element, message) {
++  let editor = inplaceEditor(view.styleDocument.activeElement);
++  is(inplaceEditor(element), editor, message);
++}
