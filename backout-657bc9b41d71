@@ -1,0 +1,1031 @@
+# HG changeset patch
+# Parent  89986907d37d4fca0b6bb29e0e0a5505314b9cee
+Backed out changeset 657bc9b41d71 (bug 1175702)
+
+diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+--- a/browser/base/content/browser.js
++++ b/browser/base/content/browser.js
+@@ -6673,20 +6673,22 @@ var gIdentityHandler = {
+   IDENTITY_MODE_UNKNOWN                                : "unknownIdentity",  // No trusted identity information
+   IDENTITY_MODE_USES_WEAK_CIPHER                       : "unknownIdentity weakCipher",  // SSL with RC4 cipher suite or SSL3
+   IDENTITY_MODE_MIXED_DISPLAY_LOADED                   : "unknownIdentity mixedContent mixedDisplayContent",  // SSL with unauthenticated display content
+   IDENTITY_MODE_MIXED_ACTIVE_LOADED                    : "unknownIdentity mixedContent mixedActiveContent",  // SSL with unauthenticated active (and perhaps also display) content
+   IDENTITY_MODE_MIXED_DISPLAY_LOADED_ACTIVE_BLOCKED    : "unknownIdentity mixedContent mixedDisplayContentLoadedActiveBlocked",  // SSL with unauthenticated display content; unauthenticated active content is blocked.
+   IDENTITY_MODE_MIXED_ACTIVE_BLOCKED                   : "verifiedDomain mixedContent mixedActiveBlocked",  // SSL with unauthenticated active content blocked; no unauthenticated display content
+   IDENTITY_MODE_MIXED_ACTIVE_BLOCKED_IDENTIFIED        : "verifiedIdentity mixedContent mixedActiveBlocked",  // SSL with unauthenticated active content blocked; no unauthenticated display content
+   IDENTITY_MODE_CHROMEUI                               : "chromeUI",         // Part of the product's UI
+-
+-  _isChromeUI: false,
+-  _sslStatus: null,
+-  _uri: null,
++  IDENTITY_MODE_FILE_URI                               : "fileURI",  // File path
++
++  // Cache the most recent SSLStatus and Location seen in checkIdentity
++  _lastStatus : null,
++  _lastUri : null,
++  _mode : "unknownIdentity",
+ 
+   // smart getters
+   get _identityPopup () {
+     delete this._identityPopup;
+     return this._identityPopup = document.getElementById("identity-popup");
+   },
+   get _identityBox () {
+     delete this._identityBox;
+@@ -6707,20 +6709,30 @@ var gIdentityHandler = {
+     return this._identityPopupContentSupp =
+       document.getElementById("identity-popup-content-supplemental");
+   },
+   get _identityPopupContentVerif () {
+     delete this._identityPopupContentVerif;
+     return this._identityPopupContentVerif =
+       document.getElementById("identity-popup-content-verifier");
+   },
+-  get _identityPopupMixedContentLearnMore () {
+-    delete this._identityPopupMixedContentLearnMore;
+-    return this._identityPopupMixedContentLearnMore =
+-      document.getElementById("identity-popup-mcb-learn-more");
++  get _identityPopupSecurityContent () {
++    delete this._identityPopupSecurityContent;
++    return this._identityPopupSecurityContent =
++      document.getElementById("identity-popup-security-content");
++  },
++  get _identityPopupSecurityView () {
++    delete this._identityPopupSecurityView;
++    return this._identityPopupSecurityView =
++      document.getElementById("identity-popup-securityView");
++  },
++  get _identityPopupMainView () {
++    delete this._identityPopupMainView;
++    return this._identityPopupMainView =
++      document.getElementById("identity-popup-mainView");
+   },
+   get _identityIconLabel () {
+     delete this._identityIconLabel;
+     return this._identityIconLabel = document.getElementById("identity-icon-label");
+   },
+   get _overrideService () {
+     delete this._overrideService;
+     return this._overrideService = Cc["@mozilla.org/security/certoverride;1"]
+@@ -6789,43 +6801,23 @@ var gIdentityHandler = {
+     // If an element is focused that's not the anchor, clear the focus.
+     // Elements of hidden views have -moz-user-focus:ignore but setting that
+     // per CSS selector doesn't blur a focused element in those hidden views.
+     if (Services.focus.focusedElement != anchor) {
+       Services.focus.clearFocus(window);
+     }
+   },
+ 
+-  disableMixedContentProtection() {
+-    // Use telemetry to measure how often unblocking happens
+-    const kMIXED_CONTENT_UNBLOCK_EVENT = 2;
+-    let histogram =
+-      Services.telemetry.getHistogramById(
+-        "MIXED_CONTENT_UNBLOCK_COUNTER");
+-    histogram.add(kMIXED_CONTENT_UNBLOCK_EVENT);
+-    // Reload the page with the content unblocked
+-    BrowserReloadWithFlags(
+-      Ci.nsIWebNavigation.LOAD_FLAGS_ALLOW_MIXED_CONTENT);
+-    this._identityPopup.hidePopup();
+-  },
+-
+-  enableMixedContentProtection() {
+-    gBrowser.selectedBrowser.messageManager.sendAsyncMessage(
+-      "MixedContent:ReenableProtection", {});
+-    BrowserReload();
+-    this._identityPopup.hidePopup();
+-  },
+-
+   /**
+-   * Helper to parse out the important parts of _sslStatus (of the SSL cert in
++   * Helper to parse out the important parts of _lastStatus (of the SSL cert in
+    * particular) for use in constructing identity UI strings
+   */
+   getIdentityData : function() {
+     var result = {};
+-    var status = this._sslStatus.QueryInterface(Ci.nsISSLStatus);
++    var status = this._lastStatus.QueryInterface(Components.interfaces.nsISSLStatus);
+     var cert = status.serverCert;
+ 
+     // Human readable name of Subject
+     result.subjectOrg = cert.organization;
+ 
+     // SubjectName fields, broken up for individual access
+     if (cert.subjectName) {
+       result.subjectNameFields = {};
+@@ -6851,67 +6843,77 @@ var gIdentityHandler = {
+    * Determine the identity of the page being displayed by examining its SSL cert
+    * (if available) and, if necessary, update the UI to reflect this.  Intended to
+    * be called by onSecurityChange
+    *
+    * @param PRUint32 state
+    * @param nsIURI uri The address for which the UI should be updated.
+    */
+   checkIdentity : function(state, uri) {
++    var currentStatus = gBrowser.securityUI
++                                .QueryInterface(Components.interfaces.nsISSLStatusProvider)
++                                .SSLStatus;
++    this._lastStatus = currentStatus;
++    this._lastUri = uri;
++
+     let nsIWebProgressListener = Ci.nsIWebProgressListener;
+ 
++    // For some URIs like data: we can't get a host and so can't do
++    // anything useful here.
++    let unknown = false;
++    try {
++      uri.host;
++    } catch (e) { unknown = true; }
++
+     // Chrome URIs however get special treatment. Some chrome URIs are
+     // whitelisted to provide a positive security signal to the user.
+     let whitelist = /^about:(accounts|addons|app-manager|config|crashes|customizing|downloads|healthreport|home|license|newaddon|permissions|preferences|privatebrowsing|rights|sessionrestore|support|welcomeback)/i;
+     let isChromeUI = uri.schemeIs("about") && whitelist.test(uri.spec);
+-    let mode = this.IDENTITY_MODE_UNKNOWN;
+-
+     if (isChromeUI) {
+-      mode = this.IDENTITY_MODE_CHROMEUI;
++      this.setMode(this.IDENTITY_MODE_CHROMEUI);
++    } else if (unknown) {
++      this.setMode(this.IDENTITY_MODE_UNKNOWN);
+     } else if (state & nsIWebProgressListener.STATE_IDENTITY_EV_TOPLEVEL) {
+       if (state & nsIWebProgressListener.STATE_BLOCKED_MIXED_ACTIVE_CONTENT) {
+-        mode = this.IDENTITY_MODE_MIXED_ACTIVE_BLOCKED_IDENTIFIED;
++        this.setMode(this.IDENTITY_MODE_MIXED_ACTIVE_BLOCKED_IDENTIFIED);
+       } else {
+-        mode = this.IDENTITY_MODE_IDENTIFIED;
++        this.setMode(this.IDENTITY_MODE_IDENTIFIED);
+       }
+     } else if (state & nsIWebProgressListener.STATE_IS_SECURE) {
+       if (state & nsIWebProgressListener.STATE_BLOCKED_MIXED_ACTIVE_CONTENT) {
+-        mode = this.IDENTITY_MODE_MIXED_ACTIVE_BLOCKED;
++        this.setMode(this.IDENTITY_MODE_MIXED_ACTIVE_BLOCKED);
+       } else {
+-        mode = this.IDENTITY_MODE_DOMAIN_VERIFIED;
++        this.setMode(this.IDENTITY_MODE_DOMAIN_VERIFIED);
+       }
+     } else if (state & nsIWebProgressListener.STATE_IS_BROKEN) {
+       if (state & nsIWebProgressListener.STATE_LOADED_MIXED_ACTIVE_CONTENT) {
+-        mode = this.IDENTITY_MODE_MIXED_ACTIVE_LOADED;
++        this.setMode(this.IDENTITY_MODE_MIXED_ACTIVE_LOADED);
+       } else if (state & nsIWebProgressListener.STATE_BLOCKED_MIXED_ACTIVE_CONTENT) {
+-        mode = this.IDENTITY_MODE_MIXED_DISPLAY_LOADED_ACTIVE_BLOCKED;
++        this.setMode(this.IDENTITY_MODE_MIXED_DISPLAY_LOADED_ACTIVE_BLOCKED);
+       } else if (state & nsIWebProgressListener.STATE_LOADED_MIXED_DISPLAY_CONTENT) {
+-        mode = this.IDENTITY_MODE_MIXED_DISPLAY_LOADED;
++        this.setMode(this.IDENTITY_MODE_MIXED_DISPLAY_LOADED);
+       } else {
+-        mode = this.IDENTITY_MODE_USES_WEAK_CIPHER;
++        this.setMode(this.IDENTITY_MODE_USES_WEAK_CIPHER);
+       }
+-    }
+-
+-    // We need those values later when populating the control center.
+-    this._uri = uri;
+-    this._state = state;
+-    this._isChromeUI = isChromeUI;
+-    this._sslStatus =
+-      gBrowser.securityUI.QueryInterface(Ci.nsISSLStatusProvider).SSLStatus;
+-
+-    // Update the identity block.
+-    if (this._identityBox) {
+-      this._identityBox.className = mode;
+-      this.refreshIdentityBlock(mode);
+-    }
+-
+-    // NOTE: We do NOT update the identity popup (the control center) when
+-    // we receive a new security state. If the user opened the popup and looks
+-    // at the provided information we don't want to suddenly change the panel
+-    // contents.
++    } else {
++      // Create a channel for the sole purpose of getting the resolved URI
++      // of the request to determine if it's loaded from the file system.
++      let resolvedURI = NetUtil.newChannel({uri,loadUsingSystemPrincipal:true}).URI;
++      if (resolvedURI.schemeIs("jar")) {
++        // Given a URI "jar:<jar-file-uri>!/<jar-entry>"
++        // create a new URI using <jar-file-uri>!/<jar-entry>
++        resolvedURI = NetUtil.newURI(resolvedURI.path);
++      }
++
++      if (resolvedURI.schemeIs("file")) {
++        this.setMode(this.IDENTITY_MODE_FILE_URI);
++      } else {
++        this.setMode(this.IDENTITY_MODE_UNKNOWN);
++      }
++    }
+ 
+     // Show the doorhanger when:
+     // - mixed active content is blocked
+     // - mixed active content is loaded (detected but not blocked)
+     // - tracking content is blocked
+     // - tracking content is not blocked
+     if (state &
+         (nsIWebProgressListener.STATE_BLOCKED_MIXED_ACTIVE_CONTENT |
+@@ -6954,53 +6956,77 @@ var gIdentityHandler = {
+    * Return the eTLD+1 version of the current hostname
+    */
+   getEffectiveHost : function() {
+     if (!this._IDNService)
+       this._IDNService = Cc["@mozilla.org/network/idn-service;1"]
+                          .getService(Ci.nsIIDNService);
+     try {
+       let baseDomain =
+-        Services.eTLD.getBaseDomainFromHost(this._uri.host);
++        Services.eTLD.getBaseDomainFromHost(this._lastUri.host);
+       return this._IDNService.convertToDisplayIDN(baseDomain, {});
+     } catch (e) {
+       // If something goes wrong (e.g. host is an IP address) just fail back
+       // to the full domain.
+-      return this._uri.host;
+-    }
++      return this._lastUri.host;
++    }
++  },
++
++  /**
++   * Update the UI to reflect the specified mode, which should be one of the
++   * IDENTITY_MODE_* constants.
++   */
++  setMode : function(newMode) {
++    if (!this._identityBox) {
++      // No identity box means the identity box is not visible, in which
++      // case there's nothing to do.
++      return;
++    }
++
++    this._identityPopup.className = newMode;
++    this._identityBox.className = newMode;
++    this.setIdentityMessages(newMode);
++
++    // Update the popup too, if it's open
++    if (this._identityPopup.state == "open") {
++      this.setPopupMessages(newMode);
++      this.updateSitePermissions();
++    }
++
++    this._mode = newMode;
+   },
+ 
+   /**
+    * Set up the messages for the primary identity UI based on the specified mode,
+    * and the details of the SSL cert, where applicable
+    *
+    * @param newMode The newly set identity mode.  Should be one of the IDENTITY_MODE_* constants.
+    */
+-  refreshIdentityBlock(newMode) {
++  setIdentityMessages : function(newMode) {
+     let icon_label = "";
+     let tooltip = "";
+     let icon_country_label = "";
+     let icon_labels_dir = "ltr";
+ 
+     switch (newMode) {
+     case this.IDENTITY_MODE_DOMAIN_VERIFIED:
+     case this.IDENTITY_MODE_MIXED_ACTIVE_BLOCKED: {
+       let iData = this.getIdentityData();
+ 
+       // Verifier is either the CA Org, for a normal cert, or a special string
+       // for certs that are trusted because of a security exception.
+       tooltip = gNavigatorBundle.getFormattedString("identity.identified.verifier",
+                                                     [iData.caOrg]);
+ 
+       // This can't throw, because URI's with a host that throw don't end up in this case.
+-      let host = this._uri.host;
++      let host = this._lastUri.host;
+       let port = 443;
+       try {
+-        if (this._uri.port > 0)
+-          port = this._uri.port;
++        if (this._lastUri.port > 0)
++          port = this._lastUri.port;
+       } catch (e) {}
+ 
+       if (this._overrideService.hasMatchingOverride(host, port, iData.cert, {}, {}))
+         tooltip = gNavigatorBundle.getString("identity.identified.verified_by_you");
+ 
+       break; }
+     case this.IDENTITY_MODE_IDENTIFIED:
+     case this.IDENTITY_MODE_MIXED_ACTIVE_BLOCKED_IDENTIFIED: {
+@@ -7039,162 +7065,92 @@ var gIdentityHandler = {
+     // Hide completely if the organization label is empty
+     this._identityIconLabel.parentNode.collapsed = icon_label ? false : true;
+   },
+ 
+   /**
+    * Set up the title and content messages for the identity message popup,
+    * based on the specified mode, and the details of the SSL cert, where
+    * applicable
++   *
++   * @param newMode The newly set identity mode.  Should be one of the IDENTITY_MODE_* constants.
+    */
+-  refreshIdentityPopup() {
+-    // Update the "Learn More" hrefs for Mixed Content Blocking.
+-    let baseURL = Services.urlFormatter.formatURLPref("app.support.baseURL");
+-    let learnMoreHref = `${baseURL}mixed-content`;
+-    this._identityPopupMixedContentLearnMore.setAttribute("href", learnMoreHref);
+-
+-    // Basic connection properties.
+-    let isBroken = this._state & Ci.nsIWebProgressListener.STATE_IS_BROKEN;
+-    let isSecure = this._state & Ci.nsIWebProgressListener.STATE_IS_SECURE;
+-    let isEV = this._state & Ci.nsIWebProgressListener.STATE_IDENTITY_EV_TOPLEVEL;
+-
+-    // Determine connection security information.
+-    let connection = "not-secure";
+-    if (this._isChromeUI) {
+-      connection = "chrome";
+-    } else if (this._isURILoadedFromFile(this._uri)) {
+-      connection = "file";
+-    } else if (isEV) {
+-      connection = "secure-ev";
+-    } else if (isSecure) {
+-      connection = "secure";
+-    }
+-
+-    // Mixed content flags.
+-    let isMixedActiveContentLoaded =
+-      this._state & Ci.nsIWebProgressListener.STATE_LOADED_MIXED_ACTIVE_CONTENT;
+-    let isMixedActiveContentBlocked =
+-      this._state & Ci.nsIWebProgressListener.STATE_BLOCKED_MIXED_ACTIVE_CONTENT;
+-    let isMixedPassiveContentLoaded =
+-      this._state & Ci.nsIWebProgressListener.STATE_LOADED_MIXED_DISPLAY_CONTENT;
+-
+-    // Determine the mixed content state.
+-    let mixedcontent = [];
+-    if (isMixedPassiveContentLoaded) {
+-      mixedcontent.push("passive-loaded");
+-    }
+-    if (isMixedActiveContentLoaded) {
+-      mixedcontent.push("active-loaded");
+-    } else if (isMixedActiveContentBlocked) {
+-      mixedcontent.push("active-blocked");
+-    }
+-    mixedcontent = mixedcontent.join(" ");
+-
+-    // We have no specific flags for weak ciphers (yet). If a connection is
+-    // broken and we can't detect any mixed active content loaded then it's
+-    // a weak cipher.
+-    let ciphers = "";
+-    if (isBroken && !isMixedActiveContentLoaded) {
+-      ciphers = "weak";
+-    }
+-
+-    // Update all elements.
+-    let elementIDs = [
+-      "identity-popup",
+-      "identity-popup-securityView-body",
+-    ];
+-
+-    function updateAttribute(elem, attr, value) {
+-      if (value) {
+-        elem.setAttribute(attr, value);
+-      } else {
+-        elem.removeAttribute(attr);
+-      }
+-    }
+-
+-    for (let id of elementIDs) {
+-      let element = document.getElementById(id);
+-      updateAttribute(element, "connection", connection);
+-      updateAttribute(element, "ciphers", ciphers);
+-      updateAttribute(element, "mixedcontent", mixedcontent);
+-    }
++  setPopupMessages : function(newMode) {
++
++    this._identityPopup.className = newMode;
++    this._identityPopupMainView.className = newMode;
++    this._identityPopupSecurityView.className = newMode;
++    this._identityPopupSecurityContent.className = newMode;
+ 
+     // Initialize the optional strings to empty values
+     let supplemental = "";
+     let verifier = "";
+     let host = "";
+     let owner = "";
+ 
+     try {
+       host = this.getEffectiveHost();
+     } catch (e) {
+       // Some URIs might have no hosts.
+     }
+ 
+-    // Fallback for special protocols.
+     if (!host) {
+-      host = this._uri.specIgnoringRef;
+-    }
+-
+-    // Fill in the CA name if we have a valid TLS certificate.
+-    if (isSecure) {
++      // Fallback for special protocols.
++      host = this._lastUri.specIgnoringRef;
++    }
++
++    switch (newMode) {
++    case this.IDENTITY_MODE_DOMAIN_VERIFIED:
++    case this.IDENTITY_MODE_MIXED_ACTIVE_BLOCKED:
+       verifier = this._identityBox.tooltipText;
+-    }
+-
+-    // Fill in organization information if we have a valid EV certificate.
+-    if (isEV) {
++      break;
++    case this.IDENTITY_MODE_IDENTIFIED:
++    case this.IDENTITY_MODE_MIXED_ACTIVE_BLOCKED_IDENTIFIED: {
++      // If it's identified, then we can populate the dialog with credentials
+       let iData = this.getIdentityData();
+       host = owner = iData.subjectOrg;
+       verifier = this._identityBox.tooltipText;
+ 
+       // Build an appropriate supplemental block out of whatever location data we have
+       if (iData.city)
+         supplemental += iData.city + "\n";
+       if (iData.state && iData.country)
+         supplemental += gNavigatorBundle.getFormattedString("identity.identified.state_and_country",
+                                                             [iData.state, iData.country]);
+       else if (iData.state) // State only
+         supplemental += iData.state;
+       else if (iData.country) // Country only
+         supplemental += iData.country;
++      break;
++    }
++    case this.IDENTITY_MODE_UNKNOWN:
++      supplemental = gNavigatorBundle.getString("identity.not_secure");
++      break;
++    case this.IDENTITY_MODE_USES_WEAK_CIPHER:
++      supplemental = gNavigatorBundle.getString("identity.uses_weak_cipher");
++      break;
++    case this.IDENTITY_MODE_MIXED_DISPLAY_LOADED:
++    case this.IDENTITY_MODE_MIXED_DISPLAY_LOADED_ACTIVE_BLOCKED:
++      supplemental = gNavigatorBundle.getString("identity.mixed_display_loaded");
++      break;
++    case this.IDENTITY_MODE_MIXED_ACTIVE_LOADED:
++      supplemental = gNavigatorBundle.getString("identity.mixed_active_loaded2");
++      break;
+     }
+ 
+     // Push the appropriate strings out to the UI. Need to use |value| for the
+     // host as it's a <label> that will be cropped if too long. Using
+     // |textContent| would simply wrap the value.
+     this._identityPopupContentHost.setAttribute("value", host);
+     this._identityPopupContentOwner.textContent = owner;
+     this._identityPopupContentSupp.textContent = supplemental;
+     this._identityPopupContentVerif.textContent = verifier;
+ 
+-    // Update per-site permissions section.
+-    this.updateSitePermissions();
+-  },
+-
+-  _isURILoadedFromFile(uri) {
+-    try {
+-      uri.host;
+-      // No internal/file URI if we have a host.
+-      return false;
+-    } catch (e) {
+-      // All good, let's continue.
+-    }
+-
+-    // Create a channel for the sole purpose of getting the resolved URI
+-    // of the request to determine if it's loaded from the file system.
+-    let chanOptions = {uri, loadUsingSystemPrincipal: true};
+-    let resolvedURI = NetUtil.newChannel(chanOptions).URI;
+-    if (resolvedURI.schemeIs("jar")) {
+-      // Given a URI "jar:<jar-file-uri>!/<jar-entry>"
+-      // create a new URI using <jar-file-uri>!/<jar-entry>
+-      resolvedURI = NetUtil.newURI(resolvedURI.path);
+-    }
+-
+-    // Check the URI again after resolving.
+-    return resolvedURI.schemeIs("file");
++    // Hide subviews when updating panel information.
++    document.getElementById("identity-popup-multiView").showMainView();
+   },
+ 
+   /**
+    * Click handler for the identity-box element in primary chrome.
+    */
+   handleIdentityButtonEvent : function(event) {
+     event.stopPropagation();
+ 
+@@ -7209,17 +7165,19 @@ var gIdentityHandler = {
+       return;
+     }
+ 
+     // Make sure that the display:none style we set in xul is removed now that
+     // the popup is actually needed
+     this._identityPopup.hidden = false;
+ 
+     // Update the popup strings
+-    this.refreshIdentityPopup();
++    this.setPopupMessages(this._identityBox.className);
++
++    this.updateSitePermissions();
+ 
+     // Add the "open" attribute to the identity box for styling
+     this._identityBox.setAttribute("open", "true");
+ 
+     // Now open the popup, anchored off the primary chrome element
+     this._identityPopup.openPopup(this._identityIcons, "bottomcenter topleft");
+   },
+ 
+diff --git a/browser/components/controlcenter/content/panel.inc.xul b/browser/components/controlcenter/content/panel.inc.xul
+--- a/browser/components/controlcenter/content/panel.inc.xul
++++ b/browser/components/controlcenter/content/panel.inc.xul
+@@ -5,69 +5,57 @@
+ <panel id="identity-popup"
+        type="arrow"
+        hidden="true"
+        onpopupshown="gIdentityHandler.onPopupShown(event);"
+        onpopuphidden="gIdentityHandler.onPopupHidden(event);"
+        orient="vertical">
+ 
+   <broadcasterset>
+-    <broadcaster id="identity-popup-content-host" class="identity-popup-headline" crop="end"/>
+-    <broadcaster id="identity-popup-mcb-learn-more" class="text-link plain" value="&identity.learnMore;"/>
++    <broadcaster id="identity-popup-content-host" value=""/>
+   </broadcasterset>
+ 
+   <panelmultiview id="identity-popup-multiView"
+                   mainViewId="identity-popup-mainView">
+     <panelview id="identity-popup-mainView" flex="1">
+ 
+       <!-- Security Section -->
+-      <hbox id="identity-popup-security" class="identity-popup-section">
++      <hbox class="identity-popup-section">
+         <vbox id="identity-popup-security-content" flex="1">
+-          <label observes="identity-popup-content-host"/>
+-          <description class="identity-popup-connection-not-secure"
+-                       value="&identity.connectionNotSecure;"
+-                       when-connection="not-secure"/>
+-          <description class="identity-popup-connection-secure"
+-                       value="&identity.connectionSecure;"
+-                       when-connection="secure secure-ev"/>
+-          <description value="&identity.connectionInternal;"
+-                       when-connection="chrome"/>
+-          <description value="&identity.connectionFile;"
+-                       when-connection="file"/>
+-
+-          <vbox id="identity-popup-security-descriptions">
+-            <description class="identity-popup-warning-gray"
+-                         when-mixedcontent="active-blocked">&identity.activeBlocked;</description>
+-            <description class="identity-popup-warning-yellow"
+-                         when-mixedcontent="passive-loaded">&identity.passiveLoaded;</description>
+-            <description when-mixedcontent="active-loaded">&identity.activeLoaded;</description>
+-            <description class="identity-popup-warning-yellow"
+-                         when-ciphers="weak">&identity.weakEncryption;</description>
+-          </vbox>
++          <label class="identity-popup-headline" crop="end">
++            <observes element="identity-popup-content-host" attribute="value"/>
++          </label>
++          <label class="identity-popup-connection-secure identity-popup-text"
++                 value="&identity.connectionSecure;"/>
++          <label class="identity-popup-connection-not-secure identity-popup-text"
++                 value="&identity.connectionNotSecure;"/>
++          <label class="identity-popup-connection-file-uri identity-popup-text"
++                 value="&identity.connectionFile;"/>
++          <label class="identity-popup-connection-internal identity-popup-text"
++                 value="&identity.connectionInternal;"/>
+         </vbox>
+-        <button id="identity-popup-security-expander"
+-                class="identity-popup-expander"
+-                when-connection="not-secure secure secure-ev"
++        <button class="identity-popup-expander"
+                 oncommand="gIdentityHandler.toggleSubView('security', this)"/>
+       </hbox>
+ 
+       <!-- Tracking Protection Section -->
+-      <hbox id="tracking-protection-container"
+-            class="identity-popup-section"
+-            when-connection="not-secure secure secure-ev file">
++      <hbox id="tracking-protection-container" class="identity-popup-section">
+         <vbox id="tracking-protection-content" flex="1">
+-          <description class="identity-popup-headline"
++          <description class="identity-popup-text identity-popup-headline"
+                        crop="end"
+                        value="&trackingProtection.title;" />
+ 
+           <label id="tracking-blocked"
++                 class="identity-popup-text"
+                  crop="end">&trackingProtection.detectedBlocked2;</label>
+           <label id="tracking-loaded"
++                 class="identity-popup-text"
+                  crop="end">&trackingProtection.detectedNotBlocked2;</label>
+           <label id="tracking-not-detected"
++                 class="identity-popup-text"
+                  crop="end">&trackingProtection.notDetected2;</label>
+ 
+           <button id="tracking-action-unblock"
+                   label="&trackingProtection.unblock.label;"
+                   accesskey="&trackingProtection.unblock.accesskey;"
+                   oncommand="TrackingProtection.disableForCurrentPage();" />
+           <button id="tracking-action-unblock-private"
+                   label="&trackingProtection.unblockPrivate.label;"
+@@ -78,17 +66,17 @@
+                   accesskey="&trackingProtection.block2.accesskey;"
+                   oncommand="TrackingProtection.enableForCurrentPage();" />
+         </vbox>
+       </hbox>
+ 
+       <!-- Permissions Section -->
+       <hbox id="identity-popup-permissions" class="identity-popup-section">
+         <vbox id="identity-popup-permissions-content" flex="1">
+-          <label class="identity-popup-headline"
++          <label class="identity-popup-text identity-popup-headline"
+                  value="&identity.permissions;"/>
+           <vbox id="identity-popup-permission-list"/>
+         </vbox>
+       </hbox>
+ 
+       <spacer flex="1"/>
+ 
+       <!-- More Information Button -->
+@@ -97,68 +85,34 @@
+                 label="&identity.moreInfoLinkText2;"
+                 oncommand="gIdentityHandler.handleMoreInfoClick(event);"/>
+       </hbox>
+     </panelview>
+ 
+     <!-- Security SubView -->
+     <panelview id="identity-popup-securityView" flex="1">
+       <vbox id="identity-popup-securityView-header">
+-        <label observes="identity-popup-content-host"/>
+-        <description class="identity-popup-connection-not-secure"
+-                     value="&identity.connectionNotSecure;"
+-                     when-connection="not-secure"/>
+-        <description class="identity-popup-connection-secure"
+-                     value="&identity.connectionSecure;"
+-                     when-connection="secure secure-ev"/>
++        <label class="identity-popup-headline" crop="end">
++          <observes element="identity-popup-content-host" attribute="value"/>
++        </label>
++        <label class="identity-popup-connection-secure identity-popup-text"
++               value="&identity.connectionSecure;"/>
++        <label class="identity-popup-connection-not-secure identity-popup-text"
++               value="&identity.connectionNotSecure;"/>
++        <label class="identity-popup-connection-file-uri identity-popup-text"
++               value="&identity.connectionFile;"/>
++        <label class="identity-popup-connection-internal identity-popup-text"
++               value="&identity.connectionInternal;"/>
+       </vbox>
+ 
+-      <vbox id="identity-popup-securityView-body">
+-        <!-- (EV) Certificate Information -->
+-        <description id="identity-popup-content-verified-by"
+-                     when-connection="secure-ev">&identity.connectionVerified;</description>
+-        <description id="identity-popup-content-owner"
+-                     when-connection="secure-ev"
+-                     class="header"/>
+-        <description id="identity-popup-content-supplemental"
+-                     when-connection="secure-ev"/>
+-        <description id="identity-popup-content-verifier"
+-                     when-connection="secure secure-ev"/>
++      <description id="identity-popup-content-verifier"
++                   class="identity-popup-text"/>
+ 
+-        <!-- Connection is Not Secure -->
+-        <description when-connection="not-secure">&identity.description.insecure;</description>
++      <description id="identity-popup-securityView-connection"
++                   class="identity-popup-text">&identity.connectionVerified;</description>
+ 
+-        <!-- Weak Cipher -->
+-        <description when-ciphers="weak">&identity.description.weakCipher;</description>
+-        <description class="identity-popup-warning-yellow"
+-                     when-ciphers="weak">&identity.description.weakCipher2;</description>
+-
+-        <!-- Active Mixed Content Blocked -->
+-        <description class="identity-popup-warning-gray"
+-                     when-mixedcontent="active-blocked">&identity.description.activeBlocked; <label observes="identity-popup-mcb-learn-more"/></description>
+-
+-        <!-- Passive Mixed Content Loaded -->
+-        <description when-mixedcontent="passive-loaded">&identity.description.passiveLoaded;</description>
+-        <description class="identity-popup-warning-yellow"
+-                     when-mixedcontent="passive-loaded">&identity.description.passiveLoaded2; <label observes="identity-popup-mcb-learn-more"/></description>
+-
+-        <!-- Passive Mixed Content Loaded, Active Mixed Content Blocked -->
+-        <description when-mixedcontent="passive-loaded active-blocked">&identity.description.passiveLoaded;</description>
+-        <description when-mixedcontent="passive-loaded active-blocked"
+-                     class="identity-popup-warning-yellow">&identity.description.passiveLoaded3; <label observes="identity-popup-mcb-learn-more"/></description>
+-
+-        <!-- Active Mixed Content Blocking Disabled -->
+-        <description when-mixedcontent="active-loaded">&identity.description.activeLoaded;</description>
+-        <description when-mixedcontent="active-loaded">&identity.description.activeLoaded2;</description>
+-
+-        <!-- Buttons to enable/disable mixed content blocking. -->
+-        <button when-mixedcontent="active-blocked"
+-                label="&identity.disableMixedContentBlocking.label;"
+-                accesskey="&identity.disableMixedContentBlocking.accesskey;"
+-                oncommand="gIdentityHandler.disableMixedContentProtection()"/>
+-        <button when-mixedcontent="active-loaded"
+-                label="&identity.enableMixedContentBlocking.label;"
+-                accesskey="&identity.enableMixedContentBlocking.accesskey;"
+-                oncommand="gIdentityHandler.enableMixedContentProtection()"/>
+-      </vbox>
++      <description id="identity-popup-content-owner"
++                   class="identity-popup-text"/>
++      <description id="identity-popup-content-supplemental"
++                   class="identity-popup-text"/>
+     </panelview>
+   </panelmultiview>
+ </panel>
+diff --git a/browser/locales/en-US/chrome/browser/browser.dtd b/browser/locales/en-US/chrome/browser/browser.dtd
+--- a/browser/locales/en-US/chrome/browser/browser.dtd
++++ b/browser/locales/en-US/chrome/browser/browser.dtd
+@@ -679,39 +679,16 @@ you can use these alternative items. Oth
+ <!ENTITY editBookmark.removeBookmark.accessKey       "R">
+ 
+ <!ENTITY identity.connectionSecure "Secure Connection">
+ <!ENTITY identity.connectionNotSecure "Connection is Not Secure">
+ <!ENTITY identity.connectionFile "This page is stored on your computer.">
+ <!ENTITY identity.connectionVerified "&brandShortName; verified that you are securely connected to this site, run by:">
+ <!ENTITY identity.connectionInternal "This is a secure &brandShortName; page.">
+ 
+-<!-- Strings for connection state warnings. -->
+-<!ENTITY identity.activeBlocked "&brandShortName; has blocked parts of this page that are not secure.">
+-<!ENTITY identity.passiveLoaded "Parts of this page are not secure (such as images).">
+-<!ENTITY identity.activeLoaded "You have disabled protection on this page.">
+-<!ENTITY identity.weakEncryption "This page uses weak encryption.">
+-
+-<!-- Strings for connection state warnings in the subview. -->
+-<!ENTITY identity.description.insecure "Your connection to this site is not private. Information you submit could be viewed by others (like passwords, messages, credit cards, etc.).">
+-<!ENTITY identity.description.weakCipher "Your connection to this website uses weak encryption and is not private.">
+-<!ENTITY identity.description.weakCipher2 "Other people can view your information or modify the website's behavior.">
+-<!ENTITY identity.description.activeBlocked "&brandShortName; has blocked parts of this page that are not secure.">
+-<!ENTITY identity.description.passiveLoaded "Your connection is not private and information you share with the site could be viewed by others.">
+-<!ENTITY identity.description.passiveLoaded2 "This website contains content that is not secure (such as images).">
+-<!ENTITY identity.description.passiveLoaded3 "Although &brandShortName; has blocked some content, there is still content on the page that is not secure (such as images).">
+-<!ENTITY identity.description.activeLoaded "This website contains content that is not secure (such as scripts) and your connection to it is not private.">
+-<!ENTITY identity.description.activeLoaded2 "Information you share with this site could be viewed by others (like passwords, messages, credit cards, etc.).">
+-
+-<!ENTITY identity.enableMixedContentBlocking.label "Enable protection">
+-<!ENTITY identity.enableMixedContentBlocking.accesskey "E">
+-<!ENTITY identity.disableMixedContentBlocking.label "Disable protection for now">
+-<!ENTITY identity.disableMixedContentBlocking.accesskey "D">
+-<!ENTITY identity.learnMore "Learn More">
+-
+ <!ENTITY identity.moreInfoLinkText2 "More Information">
+ 
+ <!ENTITY identity.permissions "Permissions">
+ 
+ <!-- Name for the tabs toolbar as spoken by screen readers.
+      The word "toolbar" is appended automatically and should not be contained below! -->
+ <!ENTITY tabsToolbar.label "Browser tabs">
+ 
+diff --git a/browser/locales/en-US/chrome/browser/browser.properties b/browser/locales/en-US/chrome/browser/browser.properties
+--- a/browser/locales/en-US/chrome/browser/browser.properties
++++ b/browser/locales/en-US/chrome/browser/browser.properties
+@@ -324,16 +324,21 @@ offlineApps.notNowAccessKey=N
+ offlineApps.usage=This website (%S) is now storing more than %SMB of data on your computer for offline use.
+ offlineApps.manageUsage=Show settings
+ offlineApps.manageUsageAccessKey=S
+ 
+ identity.identified.verifier=Verified by: %S
+ identity.identified.verified_by_you=You have added a security exception for this site.
+ identity.identified.state_and_country=%S, %S
+ 
++identity.not_secure=Your connection to this site is not private. Information you submit could be viewable to others (for example passwords, messages, credit cards, etc.).
++identity.uses_weak_cipher=Your connection to this website uses weak encryption and is not private. Other people can view your information or modify the website's behavior.
++identity.mixed_display_loaded=The connection to this website is not fully secure because it contains unencrypted elements (such as images).
++identity.mixed_active_loaded2=This website contains interactive content that isn't encrypted (such as scripts). Other people can view your information or modify the website's behavior.
++
+ identity.unknown.tooltip=This website does not supply identity information.
+ 
+ trackingProtection.intro.title=How Tracking Protection works
+ # LOCALIZATION NOTE (trackingProtection.intro.description): %S is brandShortName
+ trackingProtection.intro.description=When the shield is visible, that means Firefox is actively blocking content that tracks you.
+ # LOCALIZATION NOTE (trackingProtection.intro.step1of3): Indicates that the intro panel is step one of three in a tour.
+ trackingProtection.intro.step1of3=1 of 3
+ trackingProtection.intro.nextButton.label=Next
+diff --git a/browser/themes/osx/controlcenter/panel.css b/browser/themes/osx/controlcenter/panel.css
+--- a/browser/themes/osx/controlcenter/panel.css
++++ b/browser/themes/osx/controlcenter/panel.css
+@@ -16,28 +16,25 @@
+ 
+ .identity-popup-expander:-moz-focusring > .button-box,
+ #identity-popup-more-info-button:-moz-focusring > .button-box {
+   @hudButtonFocused@
+ }
+ 
+ #tracking-action-block,
+ #tracking-action-unblock,
+-#tracking-action-unblock-private,
+-#identity-popup-securityView-body > button {
++#tracking-action-unblock-private {
+   @hudButton@
+   min-height: 30px;
+ }
+ 
+ #tracking-action-block:hover:active,
+ #tracking-action-unblock:hover:active,
+-#tracking-action-unblock-private:hover:active,
+-#identity-popup-securityView-body > button:hover:active {
++#tracking-action-unblock-private:hover:active {
+   @hudButtonPressed@
+ }
+ 
+ #tracking-action-block:-moz-focusring,
+ #tracking-action-unblock:-moz-focusring,
+-#tracking-action-unblock-private:-moz-focusring,
+-#identity-popup-securityView-body > button:-moz-focusring {
++#tracking-action-unblock-private:-moz-focusring {
+   @hudButtonFocused@
+ }
+ 
+diff --git a/browser/themes/osx/jar.mn b/browser/themes/osx/jar.mn
+--- a/browser/themes/osx/jar.mn
++++ b/browser/themes/osx/jar.mn
+@@ -189,20 +189,18 @@ browser.jar:
+ * skin/classic/browser/controlcenter/panel.css        (controlcenter/panel.css)
+   skin/classic/browser/controlcenter/arrow-subview.svg  (../shared/controlcenter/arrow-subview.svg)
+   skin/classic/browser/controlcenter/arrow-subview-back.svg  (../shared/controlcenter/arrow-subview-back.svg)
+   skin/classic/browser/controlcenter/conn-not-secure.svg  (../shared/controlcenter/conn-not-secure.svg)
+   skin/classic/browser/controlcenter/conn-secure.svg  (../shared/controlcenter/conn-secure.svg)
+   skin/classic/browser/controlcenter/conn-degraded.svg  (../shared/controlcenter/conn-degraded.svg)
+   skin/classic/browser/controlcenter/mcb-disabled.svg  (../shared/controlcenter/mcb-disabled.svg)
+   skin/classic/browser/controlcenter/permissions.svg  (../shared/controlcenter/permissions.svg)
+-  skin/classic/browser/controlcenter/tracking-protection.svg  (../shared/controlcenter/tracking-protection.svg)
+-  skin/classic/browser/controlcenter/tracking-protection-disabled.svg  (../shared/controlcenter/tracking-protection-disabled.svg)
+-  skin/classic/browser/controlcenter/warning-gray.svg  (../shared/controlcenter/warning-gray.svg)
+-  skin/classic/browser/controlcenter/warning-yellow.svg  (../shared/controlcenter/warning-yellow.svg)
++  skin/classic/browser/controlcenter/tracking-protection.svg                 (../shared/controlcenter/tracking-protection.svg)
++  skin/classic/browser/controlcenter/tracking-protection-disabled.svg        (../shared/controlcenter/tracking-protection-disabled.svg)
+   skin/classic/browser/customizableui/background-noise-toolbar.png  (customizableui/background-noise-toolbar.png)
+   skin/classic/browser/customizableui/customize-titleBar-toggle.png  (customizableui/customize-titleBar-toggle.png)
+   skin/classic/browser/customizableui/customize-titleBar-toggle@2x.png  (customizableui/customize-titleBar-toggle@2x.png)
+   skin/classic/browser/customizableui/customize-illustration.png  (../shared/customizableui/customize-illustration.png)
+   skin/classic/browser/customizableui/customize-illustration@2x.png  (../shared/customizableui/customize-illustration@2x.png)
+   skin/classic/browser/customizableui/customize-illustration-rtl.png  (../shared/customizableui/customize-illustration-rtl.png)
+   skin/classic/browser/customizableui/customize-illustration-rtl@2x.png  (../shared/customizableui/customize-illustration-rtl@2x.png)
+   skin/classic/browser/customizableui/customizeFavicon.ico  (../shared/customizableui/customizeFavicon.ico)
+diff --git a/browser/themes/shared/controlcenter/panel.inc.css b/browser/themes/shared/controlcenter/panel.inc.css
+--- a/browser/themes/shared/controlcenter/panel.inc.css
++++ b/browser/themes/shared/controlcenter/panel.inc.css
+@@ -138,114 +138,97 @@
+ 
+ .identity-popup-expander:hover:active {
+   background-color: hsla(210,4%,10%,.12);
+   box-shadow: 0 1px 0 hsla(210,4%,10%,.05) inset;
+ }
+ 
+ /* CONTENT */
+ 
+-#identity-popup-security-content > description,
+-#identity-popup-security-descriptions > description,
+-#identity-popup-securityView-header > description,
+-#identity-popup-securityView-body > description,
+-#tracking-protection-content > label {
++.identity-popup-text {
+   white-space: pre-wrap;
+   font-size: 110%;
+   margin: 0;
+ }
+ 
+ .identity-popup-headline {
+   margin: 2px 0 4px;
+   font-size: 150%;
+ }
+ 
+-.identity-popup-warning-gray {
+-  -moz-padding-start: 24px;
+-  background: url(chrome://browser/skin/controlcenter/warning-gray.svg) no-repeat 0 50%;
++/* SECURITY */
++
++#identity-popup-securityView > .identity-popup-text:not(#identity-popup-content-owner) {
++  margin: 2px 0 4px;
+ }
+ 
+-.identity-popup-warning-yellow {
+-  -moz-padding-start: 24px;
+-  background: url(chrome://browser/skin/controlcenter/warning-yellow.svg) no-repeat 0 50%;
+-}
+-
+-/* SECURITY */
+-
+ .identity-popup-connection-secure {
+   color: #418220;
+ }
+ 
+ .identity-popup-connection-not-secure {
+   color: #d74345;
+ }
+ 
++#identity-popup-security-content.chromeUI {
++  background-image: url(chrome://branding/content/icon48.png);
++}
++
++/* SECURITY SUBVIEW */
++
+ #identity-popup-securityView {
+   padding-bottom: 2em;
+   overflow: hidden;
+ }
+ 
+ #identity-popup-securityView,
+ #identity-popup-security-content {
+   background-image: url(chrome://browser/skin/controlcenter/conn-not-secure.svg);
+ }
+ 
+-#identity-popup[connection=chrome] #identity-popup-securityView,
+-#identity-popup[connection=chrome] #identity-popup-security-content {
+-  background-image: url(chrome://branding/content/icon48.png);
+-}
+-
+-#identity-popup[connection^=secure] #identity-popup-securityView,
+-#identity-popup[connection^=secure] #identity-popup-security-content {
++#identity-popup-securityView.verifiedDomain,
++#identity-popup-securityView.verifiedIdentity,
++#identity-popup-security-content.verifiedDomain,
++#identity-popup-security-content.verifiedIdentity {
+   background-image: url(chrome://browser/skin/controlcenter/conn-secure.svg);
+ }
+ 
+-#identity-popup[ciphers=weak] #identity-popup-securityView,
+-#identity-popup[ciphers=weak] #identity-popup-security-content,
+-#identity-popup[mixedcontent~=passive-loaded] #identity-popup-securityView,
+-#identity-popup[mixedcontent~=passive-loaded] #identity-popup-security-content {
++#identity-popup-securityView.weakCipher,
++#identity-popup-securityView.mixedDisplayContent,
++#identity-popup-securityView.mixedDisplayContentLoadedActiveBlocked,
++#identity-popup-security-content.weakCipher,
++#identity-popup-security-content.mixedDisplayContent,
++#identity-popup-security-content.mixedDisplayContentLoadedActiveBlocked {
+   background-image: url(chrome://browser/skin/controlcenter/conn-degraded.svg);
+ }
+ 
+-#identity-popup[mixedcontent~=active-loaded] #identity-popup-securityView,
+-#identity-popup[mixedcontent~=active-loaded] #identity-popup-security-content {
++#identity-popup-securityView.mixedActiveContent,
++#identity-popup-security-content.mixedActiveContent {
+   background-image: url(chrome://browser/skin/controlcenter/mcb-disabled.svg);
+ }
+ 
+-#identity-popup-security-descriptions > description {
+-  margin-top: 6px;
+-  color: Graytext;
+-}
+-
+ #identity-popup-securityView-header {
+   border-bottom: 1px solid var(--panel-separator-color);
+   padding-bottom: 1em;
++  margin-bottom: 1em;
+ }
+ 
+-#identity-popup-securityView-body {
+-  -moz-padding-end: 1em;
++#identity-popup-content-owner {
++  font-weight: 700;
+ }
+ 
+-#identity-popup-content-verifier ~ description {
+-  margin-top: 1em;
++#identity-popup-content-verifier {
+   color: Graytext;
+ }
+ 
+-description#identity-popup-content-verified-by,
+-description#identity-popup-content-owner,
+-description#identity-popup-content-verifier,
+-#identity-popup-securityView-body > button {
++#identity-popup-content-owner,
++#identity-popup-securityView > #identity-popup-securityView-connection.identity-popup-text {
+   margin-top: 1em;
+ }
+ 
+-#identity-popup-securityView-body > button {
+-  margin-inline-start: 0;
+-  margin-inline-end: 0;
+-}
+-
+ /* TRACKING PROTECTION */
+ 
+ #tracking-protection-content {
+   background-image: url("chrome://browser/skin/controlcenter/tracking-protection.svg");
+ }
+ 
+ #tracking-protection-content[state="loaded-tracking-content"]  {
+   background-image: url("chrome://browser/skin/controlcenter/tracking-protection-disabled.svg");
+diff --git a/browser/themes/shared/controlcenter/warning-gray.svg b/browser/themes/shared/controlcenter/warning-gray.svg
+deleted file mode 100644
+--- a/browser/themes/shared/controlcenter/warning-gray.svg
++++ /dev/null
+@@ -1,9 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!-- This Source Code Form is subject to the terms of the Mozilla Public
+-   - License, v. 2.0. If a copy of the MPL was not distributed with this
+-   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+-     width="16" height="16" viewBox="0 0 16 16">
+-  <path fill="#808080" d="M14.8,12.5L9.3,1.9C9,1.3,8.5,1,8,1C7.5,1,7,1.3,6.7,1.9L1.2,12.5c-0.3,0.6-0.3,1.2,0,1.7C1.5,14.7,2,15,2.6,15h10.8 c0.6,0,1.1-0.3,1.4-0.8C15.1,13.7,15.1,13.1,14.8,12.5z"/>
+-  <path fill="#fff" d="M8,11c-0.8,0-1.5,0.7-1.5,1.5C6.5,13.3,7.2,14,8,14 c0.8,0,1.5-0.7,1.5-1.5C9.5,11.7,8.8,11,8,11z M8,10L8,10C8.6,10,9,9.6,9,9l0.2-4.2c0-0.7-0.5-1.2-1.2-1.2S6.8,4.1,6.8,4.8L7,9 C7,9.6,7.4,10,8,10z"/>
+-</svg>
+diff --git a/browser/themes/shared/controlcenter/warning-yellow.svg b/browser/themes/shared/controlcenter/warning-yellow.svg
+deleted file mode 100644
+--- a/browser/themes/shared/controlcenter/warning-yellow.svg
++++ /dev/null
+@@ -1,9 +0,0 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<!-- This Source Code Form is subject to the terms of the Mozilla Public
+-   - License, v. 2.0. If a copy of the MPL was not distributed with this
+-   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+-     width="16" height="16" viewBox="0 0 16 16">
+-  <path fill="#ffbf00" d="M14.8,12.5L9.3,1.9C9,1.3,8.5,1,8,1C7.5,1,7,1.3,6.7,1.9L1.2,12.5c-0.3,0.6-0.3,1.2,0,1.7C1.5,14.7,2,15,2.6,15h10.8 c0.6,0,1.1-0.3,1.4-0.8C15.1,13.7,15.1,13.1,14.8,12.5z"/>
+-  <path fill="#fff" d="M8,11c-0.8,0-1.5,0.7-1.5,1.5C6.5,13.3,7.2,14,8,14 c0.8,0,1.5-0.7,1.5-1.5C9.5,11.7,8.8,11,8,11z M8,10L8,10C8.6,10,9,9.6,9,9l0.2-4.2c0-0.7-0.5-1.2-1.2-1.2S6.8,4.1,6.8,4.8L7,9 C7,9.6,7.4,10,8,10z"/>
+-</svg>
