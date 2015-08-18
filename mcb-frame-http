@@ -1,8 +1,29 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  ed330384b899edd297e60867425e70b0a5520f0f
+# Parent  c9e9cc44bed88d674260659c01718bce4b0370cb
 Bug 1192162 - Show not-secure icon in Control Center for http pages that have https frames with MCB;r=tanvi
 
+diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+--- a/browser/base/content/browser.js
++++ b/browser/base/content/browser.js
+@@ -7074,16 +7074,17 @@ var gIdentityHandler = {
+       }
+     }
+ 
+     for (let id of elementIDs) {
+       let element = document.getElementById(id);
+       updateAttribute(element, "connection", connection);
+       updateAttribute(element, "ciphers", ciphers);
+       updateAttribute(element, "mixedcontent", mixedcontent);
++      updateAttribute(element, "isbroken", isBroken);
+     }
+ 
+     // Initialize the optional strings to empty values
+     let supplemental = "";
+     let verifier = "";
+     let host = "";
+     let owner = "";
+ 
 diff --git a/browser/base/content/test/general/browser_mixedContentFramesOnHttp.js b/browser/base/content/test/general/browser_mixedContentFramesOnHttp.js
 --- a/browser/base/content/test/general/browser_mixedContentFramesOnHttp.js
 +++ b/browser/base/content/test/general/browser_mixedContentFramesOnHttp.js
@@ -24,10 +45,118 @@ diff --git a/browser/base/content/test/general/browser_mixedContentFramesOnHttp.
    aElement.addEventListener("load", function onLoad() {
      aElement.removeEventListener("load", onLoad, true);
      executeSoon(aCallback);
+diff --git a/browser/base/content/test/general/browser_mixedContentFromOnunload.js b/browser/base/content/test/general/browser_mixedContentFromOnunload.js
+--- a/browser/base/content/test/general/browser_mixedContentFromOnunload.js
++++ b/browser/base/content/test/general/browser_mixedContentFromOnunload.js
+@@ -43,34 +43,36 @@ function SecStateTest1A() {
+   let url = gHttpsTestRoot1 + "file_mixedContentFromOnunload_test1.html";
+   gTestBrowser.contentWindow.location = url;
+ }
+ 
+ function SecStateTest1B() {
+   // check security state.  Since current url is https and doesn't have any
+   // mixed content resources, we expect it to be secure.
+   isSecurityState("secure");
++  assertMixedContentBlockingState(gTestBrowser, {activeLoaded: false, activeBlocked: false, passiveLoaded: false});
+ 
+   whenLoaded(gTestBrowser, SecStateTest2A);
+ 
+   // change locations and proceed with the second test
+   let url = gHttpTestRoot2 + "file_mixedContentFromOnunload.html";
+   gTestBrowser.contentWindow.location = url;
+ }
+ 
+ // Navigation from an http page to a https page that has mixed display content
+-// The http page loads an http image on unload
++// The https page loads an http image on unload
+ function SecStateTest2A() {
+   whenLoaded(gTestBrowser, SecStateTest2B);
+   let url = gHttpsTestRoot2 + "file_mixedContentFromOnunload_test2.html";
+   gTestBrowser.contentWindow.location = url;
+ }
+ 
+ function SecStateTest2B() {
+   isSecurityState("broken");
++  assertMixedContentBlockingState(gTestBrowser, {activeLoaded: false, activeBlocked: false, passiveLoaded: true});
+ 
+   SecStateTestsCompleted();
+ }
+ 
+ function whenLoaded(aElement, aCallback) {
+   aElement.addEventListener("load", function onLoad() {
+     aElement.removeEventListener("load", onLoad, true);
+     executeSoon(aCallback);
 diff --git a/browser/base/content/test/general/head.js b/browser/base/content/test/general/head.js
 --- a/browser/base/content/test/general/head.js
 +++ b/browser/base/content/test/general/head.js
-@@ -810,16 +810,35 @@ function assertMixedContentBlockingState
+@@ -777,28 +777,55 @@ function assertMixedContentBlockingState
+     throw new Error("assertMixedContentBlockingState requires a browser and a states object");
+   }
+ 
+   let {passiveLoaded,activeLoaded,activeBlocked} = states;
+   let {gIdentityHandler} = tabbrowser.ownerGlobal;
+   let doc = tabbrowser.ownerDocument;
+   let identityBox = gIdentityHandler._identityBox;
+   let classList = identityBox.classList;
++  let identityBoxImage = tabbrowser.ownerGlobal.getComputedStyle(doc.getElementById("page-proxy-favicon"), "").
++                         getPropertyValue("list-style-image");
+ 
+-  // Make sure the identity box UI has the correct mixedcontent states
+-  is(classList.contains("mixedActiveContent"), activeLoaded,
+-      "identityBox has expected class for activeLoaded");
+-  is(classList.contains("mixedActiveBlocked"), activeBlocked && !passiveLoaded,
+-      "identityBox has expected class for activeBlocked && !passiveLoaded");
+-  is(classList.contains("mixedDisplayContent"), passiveLoaded && !activeLoaded,
+-     "identityBox has expected class for passiveLoaded && activeLoaded");
+-  is(classList.contains("mixedDisplayContentLoadedActiveBlocked"), passiveLoaded && activeBlocked,
+-     "identityBox has expected class for passiveLoaded && activeBlocked");
+-  is (classList.contains("mixedContent"), activeBlocked || activeLoaded || passiveLoaded,
+-     "identityBox is showing no mixed content");
++  let stateEV = gIdentityHandler._state & Ci.nsIWebProgressListener.STATE_IDENTITY_EV_TOPLEVEL;
++  let stateSecure = gIdentityHandler._state & Ci.nsIWebProgressListener.STATE_IS_SECURE;
++  let stateBroken = gIdentityHandler._state & Ci.nsIWebProgressListener.STATE_IS_BROKEN;
++
++  if (!stateEV && !stateSecure && !stateBroken) {
++    // HTTP request, there should be no MCB classes for the identity box and the non secure icon
++    // should always be visible regardless of MCB state.
++    ok(classList.contains("unknownIdentity"), "unknownIdentity on HTTP page");
++    is(identityBoxImage, "url(\"chrome://browser/skin/identity-not-secure.svg\")", "Using 'non-secure' icon");
++    ok(!classList.contains("mixedActiveContent"), "No MCB on HTTP page");
++    ok(!classList.contains("mixedActiveBlocked"), "No MCB on HTTP page");
++    ok(!classList.contains("mixedDisplayContent"), "No MCB on HTTP page");
++    ok(!classList.contains("mixedDisplayContentLoadedActiveBlocked"), "No MCB on HTTP page");
++    ok(!classList.contains("mixedContent"), "No MCB on HTTP page");
++  } else {
++    // Make sure the identity box UI has the correct mixedcontent states and icons
++    if (activeLoaded) {
++      ok(classList.contains("mixedActiveContent"), "identityBox has expected class for activeLoaded");
++      is(identityBoxImage, "url(\"chrome://browser/skin/identity-mixed-active-loaded.svg\")", "Using active loaded icon");
++    }
++    if (activeBlocked && !passiveLoaded) {
++      ok(classList.contains("mixedActiveBlocked"), "identityBox has expected class for activeBlocked && !passiveLoaded");
++      is(identityBoxImage, "url(\"chrome://browser/skin/identity-mixed-active-blocked.svg\")", "Using active blocked icon");
++    }
++    if (passiveLoaded && !activeLoaded) {
++      ok(classList.contains("mixedDisplayContent"), "identityBox has expected class for passiveLoaded && activeLoaded");
++      is(identityBoxImage, "url(\"chrome://browser/skin/identity-mixed-passive-loaded.svg\")", "Using passive loaded icon");
++    }
++    if (passiveLoaded && activeBlocked) {
++      ok(classList.contains("mixedDisplayContentLoadedActiveBlocked"), "identityBox has expected class for passiveLoaded && activeBlocked");
++      is(identityBoxImage, "url(\"chrome://browser/skin/identity-mixed-passive-loaded.svg\")", "Using active blocked and passive loaded icon");
++    }
++    if (activeBlocked || activeLoaded || passiveLoaded) {
++      ok(classList.contains("mixedContent"), "identityBox is showing mixed content");
++    }
++  }
+ 
+   // Make sure the identity popup has the correct mixedcontent states
+   gIdentityHandler._identityBox.click();
+   let popupAttr = doc.getElementById("identity-popup").getAttribute("mixedcontent");
+   let bodyAttr = doc.getElementById("identity-popup-securityView-body").getAttribute("mixedcontent");
+ 
+   is(popupAttr.contains("active-loaded"), activeLoaded,
+       "identity-popup has expected attr for activeLoaded");
+@@ -810,16 +837,44 @@ function assertMixedContentBlockingState
    is(bodyAttr.contains("active-blocked"), activeBlocked,
        "securityView-body has expected attr for activeBlocked");
  
@@ -36,24 +165,33 @@ diff --git a/browser/base/content/test/general/head.js b/browser/base/content/te
    is(bodyAttr.contains("passive-loaded"), passiveLoaded,
        "securityView-body has expected attr for passiveLoaded");
  
++  // Make sure the correct icon is visible in the Control Center.
++  // This logic is controlled with CSS, so this helps prevent regressions there.
 +  let securityView = doc.getElementById("identity-popup-securityView");
 +  let securityContent = doc.getElementById("identity-popup-security-content");
++  let securityViewBG = tabbrowser.ownerGlobal.getComputedStyle(securityView, "").
++                       getPropertyValue("background-image");
++  let securityContentBG = tabbrowser.ownerGlobal.getComputedStyle(securityView, "").
++                          getPropertyValue("background-image");
 +
-+  let securityViewBG = tabbrowser.ownerGlobal.getComputedStyle(securityView, "").getPropertyValue("background-image");
-+  let securityContentBG = tabbrowser.ownerGlobal.getComputedStyle(securityView, "").getPropertyValue("background-image");
-+
-+  if (activeBlocked) {
-+    is(securityViewBG, "chrome://browser/skin/controlcenter/conn-not-secure.svg", "Using active blocked icon");
-+    is(securityContentBG, "chrome://browser/skin/controlcenter/conn-not-secure.svg", "Using active blocked icon");
-+  } else if (activeLoaded) {
-+    is(securityViewBG, "chrome://browser/skin/controlcenter/mcb-disabled.svg", "Using active loaded icon");
-+    is(securityContentBG, "chrome://browser/skin/controlcenter/mcb-disabled.svg", "Using active loaded icon");
-+  } else if (passiveLoaded) {
-+    is(securityViewBG, "chrome://browser/skin/controlcenter/conn-degraded.svg", "Using active loaded icon");
-+    is(securityContentBG, "chrome://browser/skin/controlcenter/conn-degraded.svg", "Using active loaded icon");
++  if (stateSecure) {
++    is(securityViewBG, "url(\"chrome://browser/skin/controlcenter/conn-secure.svg\")", "CC using secure icon");
++    is(securityContentBG, "url(\"chrome://browser/skin/controlcenter/conn-secure.svg\")", "CC using secure icon");
++  } else if (stateBroken) {
++    if (activeBlocked) {
++      is(securityViewBG, "url(\"chrome://browser/skin/controlcenter/conn-not-secure.svg\")", "CC using active blocked icon");
++      is(securityContentBG, "url(\"chrome://browser/skin/controlcenter/conn-not-secure.svg\")", "CC using active blocked icon");
++    } else if (activeLoaded) {
++      is(securityViewBG, "url(\"chrome://browser/skin/controlcenter/mcb-disabled.svg\")", "CC using active loaded icon");
++      is(securityContentBG, "url(\"chrome://browser/skin/controlcenter/mcb-disabled.svg\")", "CC using active loaded icon");
++    } else if (passiveLoaded) {
++      is(securityViewBG, "url(\"chrome://browser/skin/controlcenter/conn-degraded.svg\")", "CC using passive loaded icon");
++      is(securityContentBG, "url(\"chrome://browser/skin/controlcenter/conn-degraded.svg\")", "CC using passive loaded icon");
++    }
++  } else {
++    is(securityViewBG, "url(\"chrome://browser/skin/controlcenter/conn-not-secure.svg\")", "CC using 'not secure' icon");
++    is(securityContentBG, "url(\"chrome://browser/skin/controlcenter/conn-not-secure.svg\")", "CC using 'not secure' icon");
 +  }
-+
-+  is(securityViewBG, "chrome://browser/skin/controlcenter/conn-not-secure.svg", "what");
 +
    gIdentityHandler._identityPopup.hidden = true;
  }
@@ -66,27 +204,34 @@ diff --git a/browser/base/content/test/general/head.js b/browser/base/content/te
 diff --git a/browser/themes/shared/controlcenter/panel.inc.css b/browser/themes/shared/controlcenter/panel.inc.css
 --- a/browser/themes/shared/controlcenter/panel.inc.css
 +++ b/browser/themes/shared/controlcenter/panel.inc.css
-@@ -217,16 +217,23 @@
+@@ -205,25 +205,26 @@
+   background-image: url(chrome://branding/content/icon48.png);
+ }
+ 
+ #identity-popup[connection^=secure] #identity-popup-securityView,
+ #identity-popup[connection^=secure] #identity-popup-security-content {
+   background-image: url(chrome://browser/skin/controlcenter/conn-secure.svg);
+ }
+ 
++/* Use [isbroken] to make sure we don't show a lock on an http page. See Bug 1192162. */
+ #identity-popup[ciphers=weak] #identity-popup-securityView,
+ #identity-popup[ciphers=weak] #identity-popup-security-content,
+-#identity-popup[mixedcontent~=passive-loaded] #identity-popup-securityView,
+-#identity-popup[mixedcontent~=passive-loaded] #identity-popup-security-content {
++#identity-popup[mixedcontent~=passive-loaded][isbroken] #identity-popup-securityView,
++#identity-popup[mixedcontent~=passive-loaded][isbroken] #identity-popup-security-content {
    background-image: url(chrome://browser/skin/controlcenter/conn-degraded.svg);
  }
  
- #identity-popup[mixedcontent~=active-loaded] #identity-popup-securityView,
- #identity-popup[mixedcontent~=active-loaded] #identity-popup-security-content {
+-#identity-popup[mixedcontent~=active-loaded] #identity-popup-securityView,
+-#identity-popup[mixedcontent~=active-loaded] #identity-popup-security-content {
++#identity-popup[mixedcontent~=active-loaded][isbroken] #identity-popup-securityView,
++#identity-popup[mixedcontent~=active-loaded][isbroken] #identity-popup-security-content {
    background-image: url(chrome://browser/skin/controlcenter/mcb-disabled.svg);
  }
  
-+/* Make sure that non-secure connections always show the correct icon. Works
-+   around case where there is an https iframe with MCB inside an http page. */
-+#identity-popup[connection=not-secure] #identity-popup-securityView,
-+#identity-popup[connection=not-secure] #identity-popup-security-content {
-+  background-image: url(chrome://browser/skin/controlcenter/conn-not-secure.svg);
-+}
-+
  #identity-popup-security-descriptions > description {
    margin-top: 6px;
    color: Graytext;
  }
  
- #identity-popup-securityView-header {
-   border-bottom: 1px solid var(--panel-separator-color);
-   padding-bottom: 1em;
