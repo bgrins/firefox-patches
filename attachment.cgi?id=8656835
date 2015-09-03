@@ -1,0 +1,318 @@
+From: Jordan Santell <jsantell@mozilla.com>
+Date: Sat, 29 Aug 2015 15:49:22 -0700
+Subject: Bug 1201700 - Create skeleton memory tool. r=fitzgen
+
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+index b9ab868..d9828ea 100644
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -1419,16 +1419,19 @@ pref("devtools.debugger.promise", false);
+ // The default Debugger UI settings
+ pref("devtools.debugger.ui.panes-workers-and-sources-width", 200);
+ pref("devtools.debugger.ui.panes-instruments-width", 300);
+ pref("devtools.debugger.ui.panes-visible-on-startup", false);
+ pref("devtools.debugger.ui.variables-sorting-enabled", true);
+ pref("devtools.debugger.ui.variables-only-enum-visible", false);
+ pref("devtools.debugger.ui.variables-searchbox-visible", false);
+ 
++// Enable the Memory tools
++pref("devtools.memory.enabled", false);
++
+ // Enable the Performance tools
+ pref("devtools.performance.enabled", true);
+ 
+ // The default Performance UI settings
+ pref("devtools.performance.memory.sample-probability", "0.05");
+ // Can't go higher than this without causing internal allocation overflows while
+ // serializing the allocations data over the RDP.
+ pref("devtools.performance.memory.max-log-length", 125000);
+diff --git a/browser/devtools/definitions.js b/browser/devtools/definitions.js
+index 14fa11e..991dcd9 100644
+--- a/browser/devtools/definitions.js
++++ b/browser/devtools/definitions.js
+@@ -14,16 +14,17 @@ loader.lazyGetter(this, "osString", () => Cc["@mozilla.org/xre/app-info;1"].getS
+ loader.lazyGetter(this, "OptionsPanel", () => require("devtools/framework/toolbox-options").OptionsPanel);
+ loader.lazyGetter(this, "InspectorPanel", () => require("devtools/inspector/inspector-panel").InspectorPanel);
+ loader.lazyGetter(this, "WebConsolePanel", () => require("devtools/webconsole/panel").WebConsolePanel);
+ loader.lazyGetter(this, "DebuggerPanel", () => require("devtools/debugger/panel").DebuggerPanel);
+ loader.lazyGetter(this, "StyleEditorPanel", () => require("devtools/styleeditor/styleeditor-panel").StyleEditorPanel);
+ loader.lazyGetter(this, "ShaderEditorPanel", () => require("devtools/shadereditor/panel").ShaderEditorPanel);
+ loader.lazyGetter(this, "CanvasDebuggerPanel", () => require("devtools/canvasdebugger/panel").CanvasDebuggerPanel);
+ loader.lazyGetter(this, "WebAudioEditorPanel", () => require("devtools/webaudioeditor/panel").WebAudioEditorPanel);
++loader.lazyGetter(this, "MemoryPanel", () => require("devtools/memory/panel").MemoryPanel);
+ loader.lazyGetter(this, "PerformancePanel", () => require("devtools/performance/panel").PerformancePanel);
+ loader.lazyGetter(this, "NetMonitorPanel", () => require("devtools/netmonitor/panel").NetMonitorPanel);
+ loader.lazyGetter(this, "StoragePanel", () => require("devtools/storage/panel").StoragePanel);
+ loader.lazyGetter(this, "ScratchpadPanel", () => require("devtools/scratchpad/scratchpad-panel").ScratchpadPanel);
+ 
+ // Strings
+ const toolboxProps = "chrome://browser/locale/devtools/toolbox.properties";
+ const inspectorProps = "chrome://browser/locale/devtools/inspector.properties";
+@@ -368,29 +369,54 @@ Tools.scratchpad = {
+     return target.isRemote;
+   },
+ 
+   build: function(iframeWindow, toolbox) {
+     return new ScratchpadPanel(iframeWindow, toolbox);
+   }
+ };
+ 
++Tools.memory = {
++  id: "memory",
++  ordinal: 13,
++  icon: "chrome://browser/skin/devtools/tool-styleeditor.svg",
++  invertIconForLightTheme: true,
++  url: "chrome://browser/content/devtools/memory.xul",
++  visibilityswitch: "devtools.memory.enabled",
++  label: "Memory",
++  panelLabel: "Memory Panel",
++  tooltip: "Memory (keyboardshortcut)",
++  displayInOptions: false,
++
++  isTargetSupported: function (target) {
++    // TODO Once Fx44 lands, we should add a root trait `memoryTool`
++    // to indicate that the memory actor can handle this.
++    // Shouldn't make this change until Fx44, however.
++    return true; // target.getTrait("memoryTool");
++  },
++
++  build: function (frame, target) {
++    return new MemoryPanel(frame, target);
++  }
++};
++
+ let defaultTools = [
+   Tools.options,
+   Tools.webConsole,
+   Tools.inspector,
+   Tools.jsdebugger,
+   Tools.styleEditor,
+   Tools.shaderEditor,
+   Tools.canvasDebugger,
+   Tools.webAudioEditor,
+   Tools.performance,
+   Tools.netMonitor,
+   Tools.storage,
+-  Tools.scratchpad
++  Tools.scratchpad,
++  Tools.memory,
+ ];
+ 
+ exports.defaultTools = defaultTools;
+ 
+ Tools.darkTheme = {
+   id: "dark",
+   label: l10n("options.darkTheme.label", toolboxStrings),
+   ordinal: 1,
+diff --git a/browser/devtools/framework/toolbox-options.js b/browser/devtools/framework/toolbox-options.js
+index 2e8defe..f34b987 100644
+--- a/browser/devtools/framework/toolbox-options.js
++++ b/browser/devtools/framework/toolbox-options.js
+@@ -225,17 +225,17 @@ OptionsPanel.prototype = {
+       }
+       checkbox.setAttribute("checked", InfallibleGetBoolPref(tool.visibilityswitch));
+       checkbox.addEventListener("command", onCheckboxClick.bind(checkbox, tool.id));
+       return checkbox;
+     };
+ 
+     // Populating the default tools lists
+     let toggleableTools = gDevTools.getDefaultTools().filter(tool => {
+-      return tool.visibilityswitch;
++      return tool.visibilityswitch && tool.displayInOptions !== false;
+     });
+ 
+     for (let tool of toggleableTools) {
+       defaultToolsBox.appendChild(createToolCheckbox(tool));
+     }
+ 
+     // Populating the additional tools list that came from add-ons.
+     let atleastOneAddon = false;
+diff --git a/browser/devtools/jar.mn b/browser/devtools/jar.mn
+index b29ea34..9af78a1 100644
+--- a/browser/devtools/jar.mn
++++ b/browser/devtools/jar.mn
+@@ -105,16 +105,18 @@ browser.jar:
+     content/browser/devtools/performance/views/details-subview.js      (performance/views/details-abstract-subview.js)
+     content/browser/devtools/performance/views/details-waterfall.js    (performance/views/details-waterfall.js)
+     content/browser/devtools/performance/views/details-js-call-tree.js      (performance/views/details-js-call-tree.js)
+     content/browser/devtools/performance/views/details-js-flamegraph.js     (performance/views/details-js-flamegraph.js)
+     content/browser/devtools/performance/views/details-memory-call-tree.js  (performance/views/details-memory-call-tree.js)
+     content/browser/devtools/performance/views/details-memory-flamegraph.js (performance/views/details-memory-flamegraph.js)
+     content/browser/devtools/performance/views/optimizations-list.js        (performance/views/optimizations-list.js)
+     content/browser/devtools/performance/views/recordings.js           (performance/views/recordings.js)
++    content/browser/devtools/memory.xul                                (memory/memory.xul)
++    content/browser/devtools/memory/controller.js                      (memory/controller.js)
+     content/browser/devtools/promisedebugger/promise-controller.js     (promisedebugger/promise-controller.js)
+     content/browser/devtools/promisedebugger/promise-panel.js          (promisedebugger/promise-panel.js)
+     content/browser/devtools/promisedebugger/promise-debugger.xhtml    (promisedebugger/promise-debugger.xhtml)
+     content/browser/devtools/commandline.css                           (commandline/commandline.css)
+     content/browser/devtools/commandlineoutput.xhtml                   (commandline/commandlineoutput.xhtml)
+     content/browser/devtools/commandlinetooltip.xhtml                  (commandline/commandlinetooltip.xhtml)
+ *   content/browser/devtools/framework/toolbox-window.xul              (framework/toolbox-window.xul)
+     content/browser/devtools/framework/toolbox-options.xul             (framework/toolbox-options.xul)
+diff --git a/browser/devtools/memory/controller.js b/browser/devtools/memory/controller.js
+new file mode 100644
+index 0000000..363091e
+--- /dev/null
++++ b/browser/devtools/memory/controller.js
+@@ -0,0 +1,28 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++"use strict";
++
++const { classes: Cc, interfaces: Ci, utils: Cu, results: Cr } = Components;
++const { loader, require } = Cu.import("resource://gre/modules/devtools/Loader.jsm", {});
++
++const { Task } = require("resource://gre/modules/Task.jsm");
++const { Heritage, ViewHelpers, WidgetMethods } = require("resource:///modules/devtools/ViewHelpers.jsm");
++
++/**
++ * The current target, toolbox and MemoryFront, set by this tool's host.
++ */
++let gToolbox, gTarget, gFront;
++
++/**
++ * Initializes the profiler controller and views.
++ */
++const MemoryController = {
++  initialize: Task.async(function *() {
++
++  }),
++
++  destroy: Task.async(function *() {
++
++  })
++};
+diff --git a/browser/devtools/memory/memory.xul b/browser/devtools/memory/memory.xul
+new file mode 100644
+index 0000000..056206c
+--- /dev/null
++++ b/browser/devtools/memory/memory.xul
+@@ -0,0 +1,40 @@
++<?xml version="1.0"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<?xml-stylesheet href="chrome://browser/skin/" type="text/css"?>
++<?xml-stylesheet href="chrome://browser/content/devtools/widgets.css" type="text/css"?>
++<?xml-stylesheet href="chrome://browser/skin/devtools/common.css" type="text/css"?>
++<?xml-stylesheet href="chrome://browser/skin/devtools/widgets.css" type="text/css"?>
++<?xml-stylesheet href="chrome://browser/skin/devtools/memory.css" type="text/css"?>
++<!DOCTYPE window [
++  <!ENTITY % debuggerDTD SYSTEM "chrome://browser/locale/devtools/performance.dtd">
++  %debuggerDTD;
++]>
++
++<window xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
++
++  <script type="application/javascript;version=1.8"
++          src="chrome://browser/content/devtools/theme-switching.js"/>
++
++  <script type="application/javascript" src="memory/controller.js"/>
++
++  <vbox class="theme-body" flex="1">
++    <toolbar class="devtools-toolbar">
++      <toolbarbutton id="snapshot-button" class="devtools-toolbarbutton"
++                     tabindex="0"/>
++      <spacer flex="1"></spacer>
++    </toolbar>
++    <splitter class="devtools-horizontal-splitter"/>
++    <vbox id="memory-content"
++         class="devtools-responsive-container"
++         flex="1">
++      <toolbar class="devtools-toolbar">
++        <spacer flex="1"></spacer>
++      </toolbar>
++      <hbox flex="1">
++      </hbox>
++    </vbox>
++  </vbox>
++
++</window>
+diff --git a/browser/devtools/memory/moz.build b/browser/devtools/memory/moz.build
+index fe5d620..77fdb7a 100644
+--- a/browser/devtools/memory/moz.build
++++ b/browser/devtools/memory/moz.build
+@@ -1,12 +1,13 @@
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ EXTRA_JS_MODULES.devtools.memory += [
+     'modules/census-view.js',
+     'modules/census.js',
++    'panel.js',
+ ]
+ 
+ XPCSHELL_TESTS_MANIFESTS += ['test/unit/xpcshell.ini']
+ MOCHITEST_CHROME_MANIFESTS += ['test/mochitest/chrome.ini']
+diff --git a/browser/devtools/memory/panel.js b/browser/devtools/memory/panel.js
+new file mode 100644
+index 0000000..fb1587d
+--- /dev/null
++++ b/browser/devtools/memory/panel.js
+@@ -0,0 +1,59 @@
++/* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++"use strict";
++
++const { Cc, Ci, Cu, Cr } = require("chrome");
++const { Task } = require("resource://gre/modules/Task.jsm");
++const EventEmitter = require("devtools/toolkit/event-emitter");
++const { MemoryFront } = require("devtools/server/actors/memory");
++const promise = require("promise");
++
++function MemoryPanel (iframeWindow, toolbox) {
++  this.panelWin = iframeWindow;
++  this._toolbox = toolbox;
++
++  EventEmitter.decorate(this);
++}
++
++MemoryPanel.prototype = {
++  open: Task.async(function *() {
++    if (this._opening) {
++      return this._opening;
++    }
++
++    this.panelWin.gToolbox = this._toolbox;
++    this.panelWin.gTarget = this.target;
++    this.panelWin.gFront = new MemoryFront(this.target.client, this.target.form);
++
++    return this._opening = this.panelWin.MemoryController.initialize().then(() => {
++      this.isReady = true;
++      this.emit("ready");
++      return this;
++    });
++  }),
++
++  // DevToolPanel API
++
++  get target() {
++    return this._toolbox.target;
++  },
++
++  destroy: function () {
++    // Make sure this panel is not already destroyed.
++    if (this._destroyer) {
++      return this._destroyer;
++    }
++
++    return this._destroyer = this.panelWin.MemoryController.destroy().then(() => {
++      // Destroy front to ensure packet handler is removed from client
++      this.panelWin.gFront.destroy();
++      this.emit("destroyed");
++      return this;
++    });
++  }
++};
++
++exports.MemoryPanel = MemoryPanel;
+-- 
+2.2.1
+
