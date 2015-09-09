@@ -1,0 +1,146 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  8968d387064d001fe3a8eac583d9b48a26c58140
+Bug 985517 - Keep pseudo class locks around even when switching nodes in the markup view;r=pbrosset
+
+diff --git a/browser/devtools/inspector/inspector-panel.js b/browser/devtools/inspector/inspector-panel.js
+--- a/browser/devtools/inspector/inspector-panel.js
++++ b/browser/devtools/inspector/inspector-panel.js
+@@ -145,18 +145,16 @@ InspectorPanel.prototype = {
+     this.lastNodemenuItem = this.nodemenu.lastChild;
+     this._setupNodeMenu = this._setupNodeMenu.bind(this);
+     this._resetNodeMenu = this._resetNodeMenu.bind(this);
+     this.nodemenu.addEventListener("popupshowing", this._setupNodeMenu, true);
+     this.nodemenu.addEventListener("popuphiding", this._resetNodeMenu, true);
+ 
+     this.onNewSelection = this.onNewSelection.bind(this);
+     this.selection.on("new-node-front", this.onNewSelection);
+-    this.onBeforeNewSelection = this.onBeforeNewSelection.bind(this);
+-    this.selection.on("before-new-node-front", this.onBeforeNewSelection);
+     this.onDetached = this.onDetached.bind(this);
+     this.selection.on("detached-front", this.onDetached);
+ 
+     this.breadcrumbs = new HTMLBreadcrumbs(this);
+ 
+     this.onToolboxHostChanged = this.onToolboxHostChanged.bind(this);
+     this._toolbox.on("host-changed", this.onToolboxHostChanged);
+ 
+@@ -526,26 +524,16 @@ InspectorPanel.prototype = {
+   /**
+    * Cancel notification of inspector updates.
+    */
+   cancelUpdate: function() {
+     this._updateProgress = null;
+   },
+ 
+   /**
+-   * When a new node is selected, before the selection has changed.
+-   */
+-  onBeforeNewSelection: function(event, node) {
+-    if (this.breadcrumbs.indexOf(node) == -1) {
+-      // only clear locks if we'd have to update breadcrumbs
+-      this.clearPseudoClasses();
+-    }
+-  },
+-
+-  /**
+    * When a node is deleted, select its parent node or the defaultNode if no
+    * parent is found (may happen when deleting an iframe inside which the
+    * node was selected).
+    */
+   onDetached: function(event, parentNode) {
+     this.cancelLayoutChange();
+     this.breadcrumbs.cutAfter(this.breadcrumbs.indexOf(parentNode));
+     this.selection.setNodeFront(parentNode ? parentNode : this._defaultNode, "detached");
+@@ -587,18 +575,16 @@ InspectorPanel.prototype = {
+     this.nodemenu.removeEventListener("popuphiding", this._resetNodeMenu, true);
+     this.breadcrumbs.destroy();
+     this._paneToggleButton.removeEventListener("mousedown",
+       this.onPaneToggleButtonClicked);
+     this._paneToggleButton = null;
+     this.searchSuggestions.destroy();
+     this.searchBox = null;
+     this.selection.off("new-node-front", this.onNewSelection);
+-    this.selection.off("before-new-node", this.onBeforeNewSelection);
+-    this.selection.off("before-new-node-front", this.onBeforeNewSelection);
+     this.selection.off("detached-front", this.onDetached);
+     let markupDestroyer = this._destroyMarkup();
+     this.panelWin.inspector = null;
+     this.target = null;
+     this.panelDoc = null;
+     this.panelWin = null;
+     this.breadcrumbs = null;
+     this.searchSuggestions = null;
+@@ -1002,26 +988,16 @@ InspectorPanel.prototype = {
+       jsterm.requestEvaluation(evalString, options).then((res) => {
+         jsterm.setInputValue(res.result);
+         this.emit("console-var-ready");
+       });
+     });
+   },
+ 
+   /**
+-   * Clear any pseudo-class locks applied to the current hierarchy.
+-   */
+-  clearPseudoClasses: function() {
+-    if (!this.walker) {
+-      return;
+-    }
+-    return this.walker.clearPseudoClassLocks().then(null, console.error);
+-  },
+-
+-  /**
+    * Edit the outerHTML of the selected Node.
+    */
+   editHTML: function() {
+     if (!this.selection.isNode()) {
+       return;
+     }
+     if (this.markup) {
+       this.markup.beginEditingOuterHTML(this.selection.nodeFront);
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -1338,21 +1338,21 @@ var WalkerActor = protocol.ActorClass({
+     }
+     protocol.Actor.prototype.destroy.call(this);
+   },
+ 
+   release: method(function() {}, { release: true }),
+ 
+   unmanage: function(actor) {
+     if (actor instanceof NodeActor) {
++      this._refMap.delete(actor.rawNode);
+       if (this._activePseudoClassLocks &&
+           this._activePseudoClassLocks.has(actor)) {
+         this.clearPseudoClassLocks(actor);
+       }
+-      this._refMap.delete(actor.rawNode);
+     }
+     protocol.Actor.prototype.unmanage.call(this, actor);
+   },
+ 
+   hasNode: function(node) {
+     return this._refMap.has(node);
+   },
+ 
+@@ -2224,16 +2224,19 @@ var WalkerActor = protocol.ActorClass({
+       node: Arg(0, "domnode"),
+       pseudoClass: Arg(1),
+       parents: Option(2)
+     },
+     response: {}
+   }),
+ 
+   _queuePseudoClassMutation: function(node) {
++    if (!this._refMap.get(node.rawNode)) {
++      return;
++    }
+     this.queueMutation({
+       target: node.actorID,
+       type: "pseudoClassLock",
+       pseudoClassLocks: node.writePseudoClassLocks()
+     });
+   },
+ 
+   _addPseudoClassLock: function(node, pseudo) {
