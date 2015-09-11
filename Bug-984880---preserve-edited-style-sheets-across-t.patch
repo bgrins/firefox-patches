@@ -1,0 +1,110 @@
+# vim: se ft=diff :
+# HG changeset patch
+# User Tom Tromey <tromey@mozilla.com>
+# Date 2015-09-11 12:55
+Bug 984880 - preserve edited style sheets across toolbox closes
+
+diff --git a/browser/devtools/styleeditor/test/browser_styleeditor_sync.js b/browser/devtools/styleeditor/test/browser_styleeditor_sync.js
+index 18f24b9..d170e68 100644
+--- a/browser/devtools/styleeditor/test/browser_styleeditor_sync.js
++++ b/browser/devtools/styleeditor/test/browser_styleeditor_sync.js
+@@ -41,9 +41,19 @@ add_task(function*() {
+   propEditor.enable.click();
+   yield ruleEditor.rule._applyingModifications;
+ 
+   let { ui } = yield openStyleEditor();
+ 
+   let editor = yield ui.editors[0].getSourceEditor();
+   let text = editor.sourceEditor.getText();
+   is(text, expectedText, "style inspector changes are synced");
++
++  // Close and reopen the toolbox, to see that the edited text remains
++  // available.
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++  yield gDevTools.closeToolbox(target);
++
++  let { ui: newui } = yield openStyleEditor();
++  editor = yield newui.editors[0].getSourceEditor();
++  text = editor.sourceEditor.getText();
++  is(text, expectedText, "changes remain after close and reopen");
+ });
+diff --git a/toolkit/devtools/server/actors/stylesheets.js b/toolkit/devtools/server/actors/stylesheets.js
+index 896f8d2..f64a1a0 100644
+--- a/toolkit/devtools/server/actors/stylesheets.js
++++ b/toolkit/devtools/server/actors/stylesheets.js
+@@ -44,16 +44,23 @@ types.addActorType("originalsource");
+ // UPDATE_PRESERVING_RULES means that the update is guaranteed to
+ // preserve the number and order of rules on the style sheet.
+ // UPDATE_GENERAL covers any other kind of change to the style sheet.
+ let UPDATE_PRESERVING_RULES = 0;
+ exports.UPDATE_PRESERVING_RULES = UPDATE_PRESERVING_RULES;
+ let UPDATE_GENERAL = 1;
+ exports.UPDATE_GENERAL = UPDATE_GENERAL;
+ 
++// If the user edits a style sheet, we stash a copy of the edited text
++// here, keyed by the document.  This way, if the tools are closed and
++// then reopened, the edited text will be available.  A weak map is
++// used so that navigation by the user will eventually cause the
++// edited text to be collected.
++let modifiedStyleSheets = new WeakMap();
++
+ /**
+  * Creates a StyleSheetsActor. StyleSheetsActor provides remote access to the
+  * stylesheets of a document.
+  */
+ let StyleSheetsActor = exports.StyleSheetsActor = protocol.ActorClass({
+   typeName: "stylesheets",
+ 
+   /**
+@@ -602,16 +609,26 @@ let StyleSheetActor = protocol.ActorClass({
+    * @return {Promise}
+    *         Promise that resolves with a string text of the stylesheet.
+    */
+   _getText: function() {
+     if (typeof (this.text) === "string") {
+       return promise.resolve(this.text);
+     }
+ 
++    let styleMap = modifiedStyleSheets.get(this.document);
++    if (styleMap) {
++      let key = this.href ? this.href : this.ownerNode;
++      let cssText = styleMap.get(key);
++      if (cssText) {
++        this.text = cssText;
++        return promise.resolve(cssText);
++      }
++    }
++
+     if (!this.href) {
+       // this is an inline <style> sheet
+       let content = this.ownerNode.textContent;
+       this.text = content;
+       return promise.resolve(content);
+     }
+ 
+     let options = {
+@@ -882,16 +899,24 @@ let StyleSheetActor = protocol.ActorClass({
+    * @param  {object} request
+    *         'text' - new text
+    *         'transition' - whether to do CSS transition for change.
+    *         'kind' - either UPDATE_PRESERVING_RULES or UPDATE_GENERAL
+    */
+   update: method(function(text, transition, kind = UPDATE_GENERAL) {
+     DOMUtils.parseStyleSheet(this.rawSheet, text);
+ 
++    let styleMap = modifiedStyleSheets.get(this.document);
++    if (!styleMap) {
++      styleMap = new Map();
++      modifiedStyleSheets.set(this.document, styleMap);
++    }
++    let key = this.href ? this.href : this.ownerNode;
++    styleMap.set(key, text);
++
+     this.text = text;
+ 
+     this._notifyPropertyChanged("ruleCount");
+ 
+     if (transition) {
+       this._insertTransistionRule(kind);
+     }
+     else {

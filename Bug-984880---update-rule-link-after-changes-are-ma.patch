@@ -1,0 +1,283 @@
+# vim: se ft=diff :
+# HG changeset patch
+# User Tom Tromey <tromey@mozilla.com>
+# Date 2015-09-11 12:55
+Bug 984880 - update rule link after changes are made
+
+diff --git a/browser/devtools/styleinspector/rule-view.js b/browser/devtools/styleinspector/rule-view.js
+index b4d6d40..b69f344 100644
+--- a/browser/devtools/styleinspector/rule-view.js
++++ b/browser/devtools/styleinspector/rule-view.js
+@@ -182,16 +182,22 @@ ElementStyle.prototype = {
+   },
+ 
+   destroy: function() {
+     if (this.destroyed) {
+       return;
+     }
+     this.destroyed = true;
+ 
++    for (let rule of this.rules) {
++      if (rule.editor) {
++        rule.editor.destroy();
++      }
++    }
++
+     this.dummyElement = null;
+     this.dummyElementPromise.then(dummyElement => {
+       dummyElement.remove();
+       this.dummyElementPromise = null;
+     }, console.error);
+   },
+ 
+   /**
+@@ -239,16 +245,21 @@ ElementStyle.prototype = {
+         }
+ 
+         // Mark overridden computed styles.
+         this.markOverriddenAll();
+ 
+         this._sortRulesForPseudoElement();
+ 
+         // We're done with the previous list of rules.
++        for (let r of this._refreshRules) {
++          if (r && r.editor) {
++            r.editor.destroy();
++          }
++        }
+         delete this._refreshRules;
+       });
+     }).then(null, e => {
+       // populate is often called after a setTimeout,
+       // the connection may already be closed.
+       if (this.destroyed) {
+         return promise.resolve(undefined);
+       }
+@@ -480,27 +491,22 @@ function Rule(elementStyle, options) {
+   this.textProps = this._getTextProperties();
+   this.textProps = this.textProps.concat(this._getDisabledProperties());
+ }
+ 
+ Rule.prototype = {
+   mediaText: "",
+ 
+   get title() {
+-    if (this._title) {
+-      return this._title;
+-    }
+-    this._title = CssLogic.shortSource(this.sheet);
++    let title = CssLogic.shortSource(this.sheet);
+     if (this.domRule.type !== ELEMENT_STYLE && this.ruleLine > 0) {
+-      this._title += ":" + this.ruleLine;
++      title += ":" + this.ruleLine;
+     }
+ 
+-    this._title = this._title +
+-      (this.mediaText ? " @media " + this.mediaText : "");
+-    return this._title;
++    return title + (this.mediaText ? " @media " + this.mediaText : "");
+   },
+ 
+   get inheritedSource() {
+     if (this._inheritedSource) {
+       return this._inheritedSource;
+     }
+     this._inheritedSource = "";
+     if (this.inherited) {
+@@ -2561,21 +2567,28 @@ function RuleEditor(aRuleView, aRule) {
+   this.isEditable = !aRule.isSystem;
+   // Flag that blocks updates of the selector and properties when it is
+   // being edited
+   this.isEditing = false;
+ 
+   this._onNewProperty = this._onNewProperty.bind(this);
+   this._newPropertyDestroy = this._newPropertyDestroy.bind(this);
+   this._onSelectorDone = this._onSelectorDone.bind(this);
++  this._propertyChanged = this._propertyChanged.bind(this);
++
++  this.rule.domRule.on("property-change", this._propertyChanged);
+ 
+   this._create();
+ }
+ 
+ RuleEditor.prototype = {
++  destroy: function() {
++    this.rule.domRule.off("property-change");
++  },
++
+   get isSelectorEditable() {
+     let toolbox = this.ruleView.inspector.toolbox;
+     let trait = this.isEditable &&
+       toolbox.target.client.traits.selectorEditable &&
+       this.rule.domRule.type !== ELEMENT_STYLE &&
+       this.rule.domRule.type !== Ci.nsIDOMCSSRule.KEYFRAME_RULE;
+ 
+     // Do not allow editing anonymousselectors until we can
+@@ -2680,38 +2693,49 @@ RuleEditor.prototype = {
+ 
+       // Create a property editor when the close brace is clicked.
+       editableItem({ element: this.closeBrace }, () => {
+         this.newProperty();
+       });
+     }
+   },
+ 
++  /**
++   * Event handler called when a property changes on the
++   * StyleRuleActor.
++   */
++  _propertyChanged: function(name) {
++    if (name === "line") {
++      this.updateSourceLink();
++    }
++  },
++
+   updateSourceLink: function() {
+     let sourceLabel = this.element.querySelector(".ruleview-rule-source-label");
++    let title = this.rule.title;
+     let sourceHref = (this.rule.sheet && this.rule.sheet.href) ?
+-      this.rule.sheet.href : this.rule.title;
++      this.rule.sheet.href : title;
+     let sourceLine = this.rule.ruleLine > 0 ? ":" + this.rule.ruleLine : "";
+ 
+     sourceLabel.setAttribute("tooltiptext", sourceHref + sourceLine);
+ 
+     if (this.rule.isSystem) {
+       let uaLabel = _strings.GetStringFromName("rule.userAgentStyles");
+-      sourceLabel.setAttribute("value", uaLabel + " " + this.rule.title);
++      sourceLabel.setAttribute("value", uaLabel + " " + title);
+ 
+       // Special case about:PreferenceStyleSheet, as it is generated on the
+       // fly and the URI is not registered with the about: handler.
+       // https://bugzilla.mozilla.org/show_bug.cgi?id=935803#c37
+       if (sourceHref === "about:PreferenceStyleSheet") {
+         sourceLabel.parentNode.setAttribute("unselectable", "true");
+         sourceLabel.setAttribute("value", uaLabel);
+         sourceLabel.removeAttribute("tooltiptext");
+       }
+     } else {
+-      sourceLabel.setAttribute("value", this.rule.title);
++      sourceLabel.setAttribute("value", title);
+       if (this.rule.ruleLine === -1 && this.rule.domRule.parentStyleSheet) {
+         sourceLabel.parentNode.setAttribute("unselectable", "true");
+       }
+     }
+ 
+     let showOrig = Services.prefs.getBoolPref(PREF_ORIG_SOURCES);
+     if (showOrig && !this.rule.isSystem &&
+         this.rule.domRule.type !== ELEMENT_STYLE) {
+diff --git a/toolkit/devtools/server/actors/styles.js b/toolkit/devtools/server/actors/styles.js
+index b831536..039816b 100644
+--- a/toolkit/devtools/server/actors/styles.js
++++ b/toolkit/devtools/server/actors/styles.js
+@@ -1020,16 +1020,25 @@ let PageStyleFront = protocol.FrontClass(PageStyleActor, {
+  *
+  * We slightly flatten the CSSOM for this actor, it represents
+  * both the CSSRule and CSSStyle objects in one actor.  For nodes
+  * (which have a CSSStyle but no CSSRule) we create a StyleRuleActor
+  * with a special rule type (100).
+  */
+ let StyleRuleActor = protocol.ActorClass({
+   typeName: "domstylerule",
++
++  events: {
++    "property-change": {
++      type: "propertyChange",
++      property: Arg(0, "string"),
++      value: Arg(1, "json")
++    },
++  },
++
+   initialize: function(pageStyle, item) {
+     protocol.Actor.prototype.initialize.call(this, null);
+     this.pageStyle = pageStyle;
+     this.rawStyle = item.style;
+     this._parentSheet = null;
+ 
+     if (item instanceof (Ci.nsIDOMCSSRule)) {
+       this.type = item.type;
+@@ -1151,16 +1160,29 @@ let StyleRuleActor = protocol.ActorClass({
+         form.keyText = this.rawRule.keyText || "";
+         break;
+     }
+ 
+     return form;
+   },
+ 
+   /**
++   * Send an event notifying that a property of the stylesheet
++   * has changed.
++   *
++   * @param {String} property
++   *        Name of the changed property
++   * @param {any} value
++   *        The new value
++   */
++  _notifyPropertyChanged: function(property, value) {
++    events.emit(this, "property-change", property, value);
++  },
++
++  /**
+    * Compute the index of this actor's raw rule in its parent style
+    * sheet.
+    */
+   _getRuleIndex: function() {
+     let rule = this.rawRule;
+     let cssRules = this._parentSheet.cssRules;
+     this._ruleIndex = -1;
+     for (let i = 0; i < cssRules.length; i++) {
+@@ -1181,19 +1203,26 @@ let StyleRuleActor = protocol.ActorClass({
+       // so stop listening to events now.
+       let sheetActor = this.pageStyle._sheetRef(this._parentSheet);
+       sheetActor.off("style-applied", this._styleApplied);
+     } else if (this._ruleIndex >= 0) {
+       // The sheet was updated by this actor, in a way that preserves
+       // the rules.  Now, recompute our new rule from the style sheet,
+       // so that we aren't left with a reference to a dangling rule.
+       this.rawRule = this._parentSheet.cssRules[this._ruleIndex];
+-      // FIXME emit an event here for the front end if the values change
+-      this.line = DOMUtils.getRelativeRuleLine(this.rawRule);
+-      this.column = DOMUtils.getRuleColumn(this.rawRule);
++      let line = DOMUtils.getRelativeRuleLine(this.rawRule);
++      let column = DOMUtils.getRuleColumn(this.rawRule);
++      if (line !== this.line) {
++        this.line = line;
++        this._notifyPropertyChanged("line", line);
++      }
++      if (column !== this.column) {
++        this.column = column;
++        this._notifyPropertyChanged("column", column);
++      }
+     }
+   },
+ 
+   /**
+    * Return the authored form of a rule's text.  This will include
+    * invalid and otherwise ignored properties.
+    */
+   getAuthoredCssText: function*() {
+@@ -1490,16 +1519,24 @@ let StyleRuleFront = protocol.FrontClass(StyleRuleActor, {
+     this.actorID = form.actor;
+     this._form = form;
+     if (this._mediaText) {
+       this._mediaText = null;
+     }
+   },
+ 
+   /**
++   * Ensure _form is updated when property-change is emitted.
++   */
++  _propertyChangePre: protocol.preEvent("property-change", function(name,
++                                                                    value) {
++    this._form[name] = value;
++  }),
++
++  /**
+    * Return a new RuleModificationList or RuleRewriter for this node.
+    * A RuleRewriter will be returned when the rule's canSetRuleText
+    * trait is true; otherwise a RuleModificationList will be
+    * returned.
+    */
+   startModifyingProperties: function() {
+     if (this.canSetRuleText) {
+       return new RuleRewriter(this, this.authoredText);

@@ -1,0 +1,169 @@
+# vim: se ft=diff :
+# HG changeset patch
+# User Tom Tromey <tromey@mozilla.com>
+# Date 2015-09-11 12:51
+Bug 984880 - update style editor when stylesheet contents change
+
+diff --git a/browser/devtools/styleeditor/StyleSheetEditor.jsm b/browser/devtools/styleeditor/StyleSheetEditor.jsm
+index 51fc7ab..bd8c058 100644
+--- a/browser/devtools/styleeditor/StyleSheetEditor.jsm
++++ b/browser/devtools/styleeditor/StyleSheetEditor.jsm
+@@ -81,16 +81,22 @@ function StyleSheetEditor(styleSheet, win, file, isNew, walker, highlighter) {
+   this.styleSheet = styleSheet;
+   this._inputElement = null;
+   this.sourceEditor = null;
+   this._window = win;
+   this._isNew = isNew;
+   this.walker = walker;
+   this.highlighter = highlighter;
+ 
++  // True when we've called update() on the style sheet.
++  this._isUpdating = false;
++  // True when we've just set the editor text based on a style-applied
++  // event from the StyleSheetActor.
++  this._justSetText = false;
++
+   this._state = {   // state to use when inputElement attaches
+     text: "",
+     selection: {
+       start: {line: 0, ch: 0},
+       end: {line: 0, ch: 0}
+     }
+   };
+ 
+@@ -98,31 +104,33 @@ function StyleSheetEditor(styleSheet, win, file, isNew, walker, highlighter) {
+   if (styleSheet.href &&
+       Services.io.extractScheme(this.styleSheet.href) == "file") {
+     this._styleSheetFilePath = this.styleSheet.href;
+   }
+ 
+   this._onPropertyChange = this._onPropertyChange.bind(this);
+   this._onError = this._onError.bind(this);
+   this._onMediaRuleMatchesChange = this._onMediaRuleMatchesChange.bind(this);
+-  this._onMediaRulesChanged = this._onMediaRulesChanged.bind(this)
++  this._onMediaRulesChanged = this._onMediaRulesChanged.bind(this);
++  this._onStyleApplied = this._onStyleApplied.bind(this);
+   this.checkLinkedFileForChanges = this.checkLinkedFileForChanges.bind(this);
+   this.markLinkedFileBroken = this.markLinkedFileBroken.bind(this);
+   this.saveToFile = this.saveToFile.bind(this);
+   this.updateStyleSheet = this.updateStyleSheet.bind(this);
+   this._onMouseMove = this._onMouseMove.bind(this);
+ 
+   this._focusOnSourceEditorReady = false;
+   this.cssSheet.on("property-change", this._onPropertyChange);
+   this.styleSheet.on("error", this._onError);
+   this.mediaRules = [];
+   if (this.cssSheet.getMediaRules) {
+     this.cssSheet.getMediaRules().then(this._onMediaRulesChanged, Cu.reportError);
+   }
+   this.cssSheet.on("media-rules-changed", this._onMediaRulesChanged);
++  this.cssSheet.on("style-applied", this._onStyleApplied);
+   this.savedFile = file;
+   this.linkCSSFile();
+ }
+ 
+ StyleSheetEditor.prototype = {
+   /**
+    * Whether there are unsaved changes in the editor
+    */
+@@ -309,16 +317,43 @@ StyleSheetEditor.prototype = {
+    * @param  {string} property
+    *         Property that has changed on sheet
+    */
+   _onPropertyChange: function(property, value) {
+     this.emit("property-change", property, value);
+   },
+ 
+   /**
++   * Called when the stylesheet text changes.
++   */
++  _onStyleApplied: function() {
++    if (this._isUpdating) {
++      // We just applied an edit in the editor, so we can drop this
++      // notification.
++      this._isUpdating = false;
++    } else if (this.sourceEditor) {
++      Task.spawn(function*() {
++        let longStr = yield this.styleSheet.getText();
++        let newText = yield longStr.string();
++        if (!this.styleSheet.isOriginalSource) {
++          let ruleCount = this.styleSheet.ruleCount;
++          newText = CssLogic.prettifyCSS(newText, ruleCount);
++        }
++        this._state.text = newText;
++        this._justSetText = true;
++        let firstLine = this.sourceEditor.getFirstVisibleLine();
++        let pos = this.sourceEditor.getCursor();
++        this.sourceEditor.setText(newText);
++        this.sourceEditor.setFirstVisibleLine(firstLine);
++        this.sourceEditor.setCursor(pos);
++      }.bind(this));
++    }
++  },
++
++  /**
+    * Handles changes to the list of @media rules in the stylesheet.
+    * Emits 'media-rules-changed' if the list has changed.
+    *
+    * @param  {array} rules
+    *         Array of MediaRuleFronts for new media rules of sheet.
+    */
+   _onMediaRulesChanged: function(rules) {
+     if (!rules.length && !this.mediaRules.length) {
+@@ -481,27 +516,33 @@ StyleSheetEditor.prototype = {
+   /**
+    * Update live style sheet according to modifications.
+    */
+   _updateStyleSheet: function() {
+     if (this.styleSheet.disabled) {
+       return;  // TODO: do we want to do this?
+     }
+ 
++    if (this._justSetText) {
++      this._justSetText = false;
++      return;
++    }
++
+     this._updateTask = null; // reset only if we actually perform an update
+                              // (stylesheet is enabled) so that 'missed' updates
+                              // while the stylesheet is disabled can be performed
+                              // when it is enabled back. @see enableStylesheet
+ 
+     if (this.sourceEditor) {
+       this._state.text = this.sourceEditor.getText();
+     }
+ 
+     let transitionsEnabled = Services.prefs.getBoolPref(TRANSITION_PREF);
+ 
++    this._isUpdating = true;
+     this.styleSheet.update(this._state.text, transitionsEnabled)
+                    .then(null, Cu.reportError);
+   },
+ 
+   /**
+    * Handle mousemove events, calling _highlightSelectorAt after a delay only
+    * and reseting the delay everytime.
+    */
+@@ -720,20 +761,21 @@ StyleSheetEditor.prototype = {
+       if (this.highlighter && this.walker && this._sourceEditor.container) {
+         this._sourceEditor.container.removeEventListener("mousemove",
+           this._onMouseMove);
+       }
+       this._sourceEditor.destroy();
+     }
+     this.cssSheet.off("property-change", this._onPropertyChange);
+     this.cssSheet.off("media-rules-changed", this._onMediaRulesChanged);
++    this.cssSheet.off("style-applied", this._onStyleApplied);
+     this.styleSheet.off("error", this._onError);
+     this._isDestroyed = true;
+   }
+-}
++};
+ 
+ /**
+  * Find a path on disk for a file given it's hosted uri, the uri of the
+  * original resource that generated it (e.g. Sass file), and the location of the
+  * local file for that source.
+  *
+  * @param {nsIURI} uri
+  *        The uri of the resource
