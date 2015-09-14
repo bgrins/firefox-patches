@@ -1,0 +1,608 @@
+# HG changeset patch
+# Parent 56b736e32ae613dcbbe06968751d47e9f19d40e8
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  c02888af0ecb02bdfbee0be464079dafcc35e49b
+Bug 1034110 - Provide a way to observe mutations for ::before/::after pseudo elements
+* * *
+ssd:
+
+diff --git a/accessible/generic/DocAccessible.cpp b/accessible/generic/DocAccessible.cpp
+--- a/accessible/generic/DocAccessible.cpp
++++ b/accessible/generic/DocAccessible.cpp
+@@ -726,16 +726,22 @@ DocAccessible::AttributeWillChange(nsIDo
+   }
+ 
+   if (aAttribute == nsGkAtoms::aria_disabled ||
+       aAttribute == nsGkAtoms::disabled)
+     mStateBitWasOn = accessible->Unavailable();
+ }
+ 
+ void
++DocAccessible::NativeAnonymousNodeBound(nsIDocument* aDocument,
++                                        mozilla::dom::Element* aElement)
++{
++}
++
++void
+ DocAccessible::AttributeChanged(nsIDocument* aDocument,
+                                 dom::Element* aElement,
+                                 int32_t aNameSpaceID, nsIAtom* aAttribute,
+                                 int32_t aModType,
+                                 const nsAttrValue* aOldValue)
+ {
+   NS_ASSERTION(!IsDefunct(),
+                "Attribute changed called on defunct document accessible!");
+diff --git a/docshell/shistory/nsSHEntryShared.cpp b/docshell/shistory/nsSHEntryShared.cpp
+--- a/docshell/shistory/nsSHEntryShared.cpp
++++ b/docshell/shistory/nsSHEntryShared.cpp
+@@ -328,16 +328,22 @@ nsSHEntryShared::AttributeWillChange(nsI
+                                      int32_t aNameSpaceID,
+                                      nsIAtom* aAttribute,
+                                      int32_t aModType,
+                                      const nsAttrValue* aNewValue)
+ {
+ }
+ 
+ void
++nsSHEntryShared::NativeAnonymousNodeBound(nsIDocument* aDocument,
++                                        mozilla::dom::Element* aElement)
++{
++}
++
++void
+ nsSHEntryShared::AttributeChanged(nsIDocument* aDocument,
+                                   dom::Element* aElement,
+                                   int32_t aNameSpaceID,
+                                   nsIAtom* aAttribute,
+                                   int32_t aModType,
+                                   const nsAttrValue* aOldValue)
+ {
+   RemoveFromBFCacheAsync();
+diff --git a/dom/base/Element.cpp b/dom/base/Element.cpp
+--- a/dom/base/Element.cpp
++++ b/dom/base/Element.cpp
+@@ -1457,16 +1457,18 @@ Element::BindToTree(nsIDocument* aDocume
+   }
+   NS_ASSERTION(!aBindingParent || IsRootOfNativeAnonymousSubtree() ||
+                !HasFlag(NODE_IS_IN_NATIVE_ANONYMOUS_SUBTREE) ||
+                (aParent && aParent->IsInNativeAnonymousSubtree()),
+                "Trying to re-bind content from native anonymous subtree to "
+                "non-native anonymous parent!");
+   if (aParent) {
+     if (aParent->IsInNativeAnonymousSubtree()) {
++      printf("Is native anonymous subtree \n");
++      nsNodeUtils::NativeAnonymousNodeBound(this);
+       SetFlags(NODE_IS_IN_NATIVE_ANONYMOUS_SUBTREE);
+     }
+     if (aParent->HasFlag(NODE_CHROME_ONLY_ACCESS)) {
+       SetFlags(NODE_CHROME_ONLY_ACCESS);
+     }
+     if (aParent->IsInShadowTree()) {
+       ClearSubtreeRootPointer();
+       SetFlags(NODE_IS_IN_SHADOW_TREE);
+@@ -1624,16 +1626,19 @@ Element::BindToTree(nsIDocument* aDocume
+           parent->ChangeEditableDescendantCount(editableDescendantChange);
+           parent = parent->GetParent();
+         }
+       }
+     }
+   }
+ 
+   nsNodeUtils::ParentChainChanged(this);
++  if (this->IsInNativeAnonymousSubtree()) {
++	  nsNodeUtils::NativeAnonymousNodeBound(this);
++  }
+ 
+   if (HasID()) {
+     AddToIdTable(DoGetID());
+   }
+ 
+   if (MayHaveStyle() && !IsXULElement()) {
+     // XXXbz if we already have a style attr parsed, this won't do
+     // anything... need to fix that.
+diff --git a/dom/base/nsDOMMutationObserver.cpp b/dom/base/nsDOMMutationObserver.cpp
+--- a/dom/base/nsDOMMutationObserver.cpp
++++ b/dom/base/nsDOMMutationObserver.cpp
+@@ -109,16 +109,41 @@ nsMutationReceiver::Disconnect(bool aRem
+     if (aRemoveFromObserver) {
+       static_cast<nsDOMMutationObserver*>(observer)->RemoveReceiver(this);
+     }
+     // UnbindObject may delete 'this'!
+     target->UnbindObject(observer);
+   }
+ }
+ 
++/**
++ * XXX: Notification that an attribute of an element has been
++ * set to the value it already had.
++ *
++ * @param aDocument    The owner-document of aContent.
++ * @param aElement     The element whose attribute changed
++ * @param aNameSpaceID The namespace id of the changed attribute
++ * @param aAttribute   The name of the changed attribute
++ */
++void
++nsMutationReceiver::NativeAnonymousNodeBound(nsIDocument* aDocument,
++                                        mozilla::dom::Element* aElement) {
++
++	printf("Into implementation\n");
++	/*nsINode* parent = NODE_FROM(aElement, aDocument);
++	if (Subtree() && parent->SubtreeRoot() != RegisterTarget()->SubtreeRoot()) {
++		return;
++	}*/
++	nsDOMMutationRecord* m =
++		Observer()->CurrentRecord(nsGkAtoms::nativeAnonymousNodeBound);
++	if (!m->mTarget) {
++		m->mTarget = aElement;
++	}
++}
++
+ void
+ nsMutationReceiver::AttributeWillChange(nsIDocument* aDocument,
+                                         mozilla::dom::Element* aElement,
+                                         int32_t aNameSpaceID,
+                                         nsIAtom* aAttribute,
+                                         int32_t aModType,
+                                         const nsAttrValue* aNewValue)
+ {
+@@ -580,34 +605,42 @@ nsDOMMutationObserver::Observe(nsINode& 
+     aOptions.mAttributes.WasPassed() &&
+     aOptions.mAttributes.Value();
+   bool characterData =
+     aOptions.mCharacterData.WasPassed() &&
+     aOptions.mCharacterData.Value();
+   bool subtree = aOptions.mSubtree;
+   bool attributeOldValue =
+     aOptions.mAttributeOldValue.WasPassed() &&
+-    aOptions.mAttributeOldValue.Value();
++	aOptions.mAttributeOldValue.Value();
++  bool nativeAnonymousNodeBound =
++	  aOptions.mNativeAnonymousNodeBound.WasPassed() &&
++	  aOptions.mNativeAnonymousNodeBound.Value();
+   bool characterDataOldValue =
+-    aOptions.mCharacterDataOldValue.WasPassed() &&
+-    aOptions.mCharacterDataOldValue.Value();
++	  aOptions.mCharacterDataOldValue.WasPassed() &&
++	  aOptions.mCharacterDataOldValue.Value();
+   bool animations =
+     aOptions.mAnimations.WasPassed() &&
+     aOptions.mAnimations.Value() &&
+     nsContentUtils::ThreadsafeIsCallerChrome();
+ 
+   if (!aOptions.mAttributes.WasPassed() &&
+       (aOptions.mAttributeOldValue.WasPassed() ||
+        aOptions.mAttributeFilter.WasPassed())) {
+     attributes = true;
+   }
+ 
+   if (!aOptions.mCharacterData.WasPassed() &&
+-      aOptions.mCharacterDataOldValue.WasPassed()) {
+-    characterData = true;
++	  aOptions.mCharacterDataOldValue.WasPassed()) {
++	  characterData = true;
++  }
++
++  if (!aOptions.mNativeAnonymousNodeBound.WasPassed() &&
++	  aOptions.mNativeAnonymousNodeBound.WasPassed()) {
++	  nativeAnonymousNodeBound = true;
+   }
+ 
+   if (!(childList || attributes || characterData || animations)) {
+     aRv.Throw(NS_ERROR_DOM_TYPE_ERR);
+     return;
+   }
+ 
+   if (aOptions.mAttributeOldValue.WasPassed() &&
+@@ -650,16 +683,17 @@ nsDOMMutationObserver::Observe(nsINode& 
+ 
+   nsMutationReceiver* r = GetReceiverFor(&aTarget, true, animations);
+   r->SetChildList(childList);
+   r->SetAttributes(attributes);
+   r->SetCharacterData(characterData);
+   r->SetSubtree(subtree);
+   r->SetAttributeOldValue(attributeOldValue);
+   r->SetCharacterDataOldValue(characterDataOldValue);
++  r->SetNativeAnonymousNodeBound(nativeAnonymousNodeBound);
+   r->SetAttributeFilter(filters);
+   r->SetAllAttributes(allAttrs);
+   r->SetAnimations(animations);
+   r->RemoveClones();
+ 
+ #ifdef DEBUG
+   for (int32_t i = 0; i < mReceivers.Count(); ++i) {
+     NS_WARN_IF_FALSE(mReceivers[i]->Target(),
+@@ -708,18 +742,19 @@ nsDOMMutationObserver::GetObservingInfo(
+   aResult.SetCapacity(mReceivers.Count());
+   for (int32_t i = 0; i < mReceivers.Count(); ++i) {
+     MutationObservingInfo& info = aResult.AppendElement()->SetValue();
+     nsMutationReceiver* mr = mReceivers[i];
+     info.mChildList = mr->ChildList();
+     info.mAttributes.Construct(mr->Attributes());
+     info.mCharacterData.Construct(mr->CharacterData());
+     info.mSubtree = mr->Subtree();
+-    info.mAttributeOldValue.Construct(mr->AttributeOldValue());
+-    info.mCharacterDataOldValue.Construct(mr->CharacterDataOldValue());
++	info.mAttributeOldValue.Construct(mr->AttributeOldValue());
++	info.mCharacterDataOldValue.Construct(mr->CharacterDataOldValue());
++	info.mNativeAnonymousNodeBound.Construct(true); //xxx
+     info.mAnimations.Construct(mr->Animations());
+     nsCOMArray<nsIAtom>& filters = mr->AttributeFilter();
+     if (filters.Count()) {
+       info.mAttributeFilter.Construct();
+       mozilla::dom::Sequence<nsString>& filtersAsStrings =
+         info.mAttributeFilter.Value();
+       for (int32_t j = 0; j < filters.Count(); ++j) {
+         if (!filtersAsStrings.AppendElement(nsDependentAtomString(filters[j]),
+diff --git a/dom/base/nsDOMMutationObserver.h b/dom/base/nsDOMMutationObserver.h
+--- a/dom/base/nsDOMMutationObserver.h
++++ b/dom/base/nsDOMMutationObserver.h
+@@ -159,22 +159,32 @@ public:
+   void SetCharacterData(bool aCharacterData)
+   {
+     NS_ASSERTION(!mParent, "Shouldn't have parent");
+     mCharacterData = aCharacterData;
+   }
+ 
+   bool CharacterDataOldValue()
+   {
+-    return mParent ? mParent->CharacterDataOldValue() : mCharacterDataOldValue;
++	  return mParent ? mParent->CharacterDataOldValue() : mCharacterDataOldValue;
+   }
+   void SetCharacterDataOldValue(bool aOldValue)
+   {
+-    NS_ASSERTION(!mParent, "Shouldn't have parent");
+-    mCharacterDataOldValue = aOldValue;
++	  NS_ASSERTION(!mParent, "Shouldn't have parent");
++	  mCharacterDataOldValue = aOldValue;
++  }
++
++  bool NativeAnonymousNodeBound()
++  {
++	  return mParent ? mParent->NativeAnonymousNodeBound() : mNativeAnonymousNodeBound;
++  }
++  void SetNativeAnonymousNodeBound(bool aOldValue)
++  {
++	  NS_ASSERTION(!mParent, "Shouldn't have parent");
++	  mNativeAnonymousNodeBound = aOldValue;
+   }
+ 
+   bool Attributes() { return mParent ? mParent->Attributes() : mAttributes; }
+   void SetAttributes(bool aAttributes)
+   {
+     NS_ASSERTION(!mParent, "Shouldn't have parent");
+     mAttributes = aAttributes;
+   }
+@@ -293,16 +303,17 @@ protected:
+   // alive so it doesn't go away and disconnect all its transient receivers.
+   nsCOMPtr<nsINode>                  mKungFuDeathGrip;
+   
+ private:
+   bool                               mSubtree;
+   bool                               mChildList;
+   bool                               mCharacterData;
+   bool                               mCharacterDataOldValue;
++  bool                               mNativeAnonymousNodeBound;
+   bool                               mAttributes;
+   bool                               mAllAttributes;
+   bool                               mAttributeOldValue;
+   bool                               mAnimations;
+   nsCOMArray<nsIAtom>                mAttributeFilter;
+ };
+ 
+ 
+@@ -356,16 +367,17 @@ public:
+   }
+ 
+   void Disconnect(bool aRemoveFromObserver);
+ 
+   NS_DECL_AND_IMPL_ZEROING_OPERATOR_NEW
+   NS_DECL_ISUPPORTS
+ 
+   NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTEWILLCHANGE
++  NS_DECL_NSIMUTATIONOBSERVER_NATIVEANONYMOUSNODEBOUND
+   NS_DECL_NSIMUTATIONOBSERVER_CHARACTERDATAWILLCHANGE
+   NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
+   NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
+   NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+   NS_DECL_NSIMUTATIONOBSERVER_NODEWILLBEDESTROYED
+ 
+   virtual void AttributeSetToCurrentValue(nsIDocument* aDocument,
+                                           mozilla::dom::Element* aElement,
+diff --git a/dom/base/nsGkAtomList.h b/dom/base/nsGkAtomList.h
+--- a/dom/base/nsGkAtomList.h
++++ b/dom/base/nsGkAtomList.h
+@@ -628,16 +628,17 @@ GK_ATOM(msthemecompatible, "msthemecompa
+ GK_ATOM(multicol, "multicol")
+ GK_ATOM(multiple, "multiple")
+ GK_ATOM(muted, "muted")
+ GK_ATOM(name, "name")
+ GK_ATOM(_namespace, "namespace")
+ GK_ATOM(namespaceAlias, "namespace-alias")
+ GK_ATOM(namespaceUri, "namespace-uri")
+ GK_ATOM(NaN, "NaN")
++GK_ATOM(nativeAnonymousNodeBound, "nativeAnonymousNodeBound")
+ GK_ATOM(nav, "nav")
+ GK_ATOM(negate, "negate")
+ GK_ATOM(never, "never")
+ GK_ATOM(_new, "new")
+ GK_ATOM(newline, "newline")
+ GK_ATOM(nextBidi, "NextBidi")
+ GK_ATOM(no, "no")
+ GK_ATOM(noautofocus, "noautofocus")
+diff --git a/dom/base/nsIMutationObserver.h b/dom/base/nsIMutationObserver.h
+--- a/dom/base/nsIMutationObserver.h
++++ b/dom/base/nsIMutationObserver.h
+@@ -196,16 +196,28 @@ public:
+   virtual void AttributeChanged(nsIDocument* aDocument,
+                                 mozilla::dom::Element* aElement,
+                                 int32_t      aNameSpaceID,
+                                 nsIAtom*     aAttribute,
+                                 int32_t      aModType,
+                                 const nsAttrValue* aOldValue) = 0;
+ 
+   /**
++   * XXX: Notification that an attribute of an element has been
++   * set to the value it already had.
++   *
++   * @param aDocument    The owner-document of aContent.
++   * @param aElement     The element whose attribute changed
++   * @param aNameSpaceID The namespace id of the changed attribute
++   * @param aAttribute   The name of the changed attribute
++   */
++  virtual void NativeAnonymousNodeBound(nsIDocument* aDocument,
++                                          mozilla::dom::Element* aElement) {}
++
++  /**
+    * Notification that an attribute of an element has been
+    * set to the value it already had.
+    *
+    * @param aDocument    The owner-document of aContent.
+    * @param aElement     The element whose attribute changed
+    * @param aNameSpaceID The namespace id of the changed attribute
+    * @param aAttribute   The name of the changed attribute
+    */
+@@ -341,16 +353,20 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsIMutatio
+ #define NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTEWILLCHANGE                      \
+     virtual void AttributeWillChange(nsIDocument* aDocument,                 \
+                                      mozilla::dom::Element* aElement,        \
+                                      int32_t aNameSpaceID,                   \
+                                      nsIAtom* aAttribute,                    \
+                                      int32_t aModType,                       \
+                                      const nsAttrValue* aNewValue) override;
+ 
++#define NS_DECL_NSIMUTATIONOBSERVER_NATIVEANONYMOUSNODEBOUND                      \
++    virtual void NativeAnonymousNodeBound(nsIDocument* aDocument,                 \
++                                     mozilla::dom::Element* aElement) override;
++
+ #define NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED                         \
+     virtual void AttributeChanged(nsIDocument* aDocument,                    \
+                                   mozilla::dom::Element* aElement,           \
+                                   int32_t aNameSpaceID,                      \
+                                   nsIAtom* aAttribute,                       \
+                                   int32_t aModType,                          \
+                                   const nsAttrValue* aOldValue) override;
+ 
+@@ -378,16 +394,17 @@ NS_DEFINE_STATIC_IID_ACCESSOR(nsIMutatio
+ 
+ #define NS_DECL_NSIMUTATIONOBSERVER_PARENTCHAINCHANGED                       \
+     virtual void ParentChainChanged(nsIContent *aContent) override;
+ 
+ #define NS_DECL_NSIMUTATIONOBSERVER                                          \
+     NS_DECL_NSIMUTATIONOBSERVER_CHARACTERDATAWILLCHANGE                      \
+     NS_DECL_NSIMUTATIONOBSERVER_CHARACTERDATACHANGED                         \
+     NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTEWILLCHANGE                          \
++    NS_DECL_NSIMUTATIONOBSERVER_NATIVEANONYMOUSNODEBOUND                     \
+     NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTECHANGED                             \
+     NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED                              \
+     NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED                              \
+     NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED                               \
+     NS_DECL_NSIMUTATIONOBSERVER_NODEWILLBEDESTROYED                          \
+     NS_DECL_NSIMUTATIONOBSERVER_PARENTCHAINCHANGED
+ 
+ #define NS_IMPL_NSIMUTATIONOBSERVER_CORE_STUB(_class)                     \
+@@ -412,16 +429,21 @@ void                                    
+ void                                                                      \
+ _class::AttributeWillChange(nsIDocument* aDocument,                       \
+                             mozilla::dom::Element* aElement,              \
+                             int32_t aNameSpaceID,                         \
+                             nsIAtom* aAttribute,                          \
+                             int32_t aModType,                             \
+                             const nsAttrValue* aNewValue)                 \
+ {                                                                         \
++}                                                                        \
++void                                                                      \
++_class::NativeAnonymousNodeBound(nsIDocument* aDocument,                  \
++                            mozilla::dom::Element* aElement)              \
++{                                                                         \
+ }                                                                         \
+ void                                                                      \
+ _class::AttributeChanged(nsIDocument* aDocument,                          \
+                          mozilla::dom::Element* aElement,                 \
+                          int32_t aNameSpaceID,                            \
+                          nsIAtom* aAttribute,                             \
+                          int32_t aModType,                                \
+                          const nsAttrValue* aOldValue)                    \
+diff --git a/dom/base/nsNodeUtils.cpp b/dom/base/nsNodeUtils.cpp
+--- a/dom/base/nsNodeUtils.cpp
++++ b/dom/base/nsNodeUtils.cpp
+@@ -156,23 +156,35 @@ nsNodeUtils::AttributeSetToCurrentValue(
+ }
+ 
+ void
+ nsNodeUtils::ContentAppended(nsIContent* aContainer,
+                              nsIContent* aFirstNewContent,
+                              int32_t aNewIndexInContainer)
+ {
+   nsIDocument* doc = aContainer->OwnerDoc();
+-
+   IMPL_MUTATION_NOTIFICATION(ContentAppended, aContainer,
+                              (doc, aContainer, aFirstNewContent,
+                               aNewIndexInContainer));
+ }
+ 
+ void
++nsNodeUtils::NativeAnonymousNodeBound(mozilla::dom::Element* aElement)
++{
++  nsAutoString innerHTML;
++  aElement->GetInnerHTML(innerHTML);
++
++  printf("Native anonymous node bound\n\n");
++  nsIDocument* doc = aElement->OwnerDoc();
++
++  IMPL_MUTATION_NOTIFICATION(NativeAnonymousNodeBound, aElement,
++                            (doc, aElement));
++}
++
++void
+ nsNodeUtils::ContentInserted(nsINode* aContainer,
+                              nsIContent* aChild,
+                              int32_t aIndexInContainer)
+ {
+   NS_PRECONDITION(aContainer->IsNodeOfType(nsINode::eCONTENT) ||
+                   aContainer->IsNodeOfType(nsINode::eDOCUMENT),
+                   "container must be an nsIContent or an nsIDocument");
+   nsIContent* container;
+diff --git a/dom/base/nsNodeUtils.h b/dom/base/nsNodeUtils.h
+--- a/dom/base/nsNodeUtils.h
++++ b/dom/base/nsNodeUtils.h
+@@ -92,16 +92,25 @@ public:
+    * @param aNewIndexInContainer Index of first new child
+    * @see nsIMutationObserver::ContentAppended
+    */
+   static void ContentAppended(nsIContent* aContainer,
+                               nsIContent* aFirstNewContent,
+                               int32_t aNewIndexInContainer);
+ 
+   /**
++   * XXXXX: Send ContentAppended notifications to nsIMutationObservers
++   * @param aContainer           Node into which new child/children were added
++   * @param aFirstNewContent     First new child
++   * @param aNewIndexInContainer Index of first new child
++   * @see nsIMutationObserver::ContentAppended
++   */
++  static void NativeAnonymousNodeBound(mozilla::dom::Element* aElement);
++
++  /**
+    * Send ContentInserted notifications to nsIMutationObservers
+    * @param aContainer        Node into which new child was inserted
+    * @param aChild            Newly inserted child
+    * @param aIndexInContainer Index of new child
+    * @see nsIMutationObserver::ContentInserted
+    */
+   static void ContentInserted(nsINode* aContainer,
+                               nsIContent* aChild,
+diff --git a/dom/webidl/MutationObserver.webidl b/dom/webidl/MutationObserver.webidl
+--- a/dom/webidl/MutationObserver.webidl
++++ b/dom/webidl/MutationObserver.webidl
+@@ -55,16 +55,17 @@ callback MutationCallback = void (sequen
+ 
+ dictionary MutationObserverInit {
+   boolean childList = false;
+   boolean attributes;
+   boolean characterData;
+   boolean subtree = false;
+   boolean attributeOldValue;
+   boolean characterDataOldValue;
++  boolean nativeAnonymousNodeBound;
+   // [ChromeOnly]
+   boolean animations;
+   sequence<DOMString> attributeFilter;
+ };
+ 
+ dictionary MutationObservingInfo : MutationObserverInit
+ {
+   Node? observedNode = null;
+diff --git a/toolkit/components/satchel/nsFormFillController.cpp b/toolkit/components/satchel/nsFormFillController.cpp
+--- a/toolkit/components/satchel/nsFormFillController.cpp
++++ b/toolkit/components/satchel/nsFormFillController.cpp
+@@ -190,16 +190,22 @@ nsFormFillController::AttributeWillChang
+                                           mozilla::dom::Element* aElement,
+                                           int32_t aNameSpaceID,
+                                           nsIAtom* aAttribute, int32_t aModType,
+                                           const nsAttrValue* aNewValue)
+ {
+ }
+ 
+ void
++nsFormFillController::NativeAnonymousNodeBound(nsIDocument* aDocument,
++                                        mozilla::dom::Element* aElement)
++{
++}
++
++void
+ nsFormFillController::ParentChainChanged(nsIContent* aContent)
+ {
+ }
+ 
+ void
+ nsFormFillController::NodeWillBeDestroyed(const nsINode* aNode)
+ {
+   mPwmgrInputs.Remove(aNode);
+diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/server/actors/inspector.js
+--- a/toolkit/devtools/server/actors/inspector.js
++++ b/toolkit/devtools/server/actors/inspector.js
+@@ -1470,17 +1470,19 @@ var WalkerActor = protocol.ActorClass({
+    */
+   _watchDocument: function(actor) {
+     let node = actor.rawNode;
+     // Create the observer on the node's actor.  The node will make sure
+     // the observer is cleaned up when the actor is released.
+     actor.observer = new actor.rawNode.defaultView.MutationObserver(this.onMutations);
+     actor.observer.mergeAttributeRecords = true;
+     actor.observer.observe(node, {
+-      attributes: true,
++        nativeAnonymousNodeBound: true,
++        nativeAnonymousNodeBound2: true,
++        attributes: true,
+       characterData: true,
+       childList: true,
+       subtree: true
+     });
+   },
+ 
+   /**
+    * Return the document node that contains the given node,
+@@ -2766,17 +2768,18 @@ var WalkerActor = protocol.ActorClass({
+   },
+ 
+   /**
+    * Handles mutations from the DOM mutation observer API.
+    *
+    * @param array[MutationRecord] mutations
+    *    See https://developer.mozilla.org/en-US/docs/Web/API/MutationObserver#MutationRecord
+    */
+-  onMutations: function(mutations) {
++onMutations: function(mutations) {
++    console.log("On mutations", mutations);
+     for (let change of mutations) {
+       let targetActor = this._refMap.get(change.target);
+       if (!targetActor) {
+         continue;
+       }
+       let targetNode = change.target;
+       let mutation = {
+         type: change.type,
+diff --git a/widget/cocoa/nsMenuGroupOwnerX.mm b/widget/cocoa/nsMenuGroupOwnerX.mm
+--- a/widget/cocoa/nsMenuGroupOwnerX.mm
++++ b/widget/cocoa/nsMenuGroupOwnerX.mm
+@@ -101,16 +101,20 @@ void nsMenuGroupOwnerX::AttributeWillCha
+                                             dom::Element* aContent,
+                                             int32_t aNameSpaceID,
+                                             nsIAtom* aAttribute,
+                                             int32_t aModType,
+                                             const nsAttrValue* aNewValue)
+ {
+ }
+ 
++void nsMenuGroupOwnerX::NativeAnonymousNodeBound(nsIDocument* aDocument,
++                                                 dom::Element* aElement)
++{
++}
+ 
+ void nsMenuGroupOwnerX::AttributeChanged(nsIDocument* aDocument,
+                                          dom::Element* aElement,
+                                          int32_t aNameSpaceID,
+                                          nsIAtom* aAttribute,
+                                          int32_t aModType,
+                                          const nsAttrValue* aOldValue)
+ {
