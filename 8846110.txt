@@ -1,7 +1,7 @@
 # HG changeset patch
 # Parent 56b736e32ae613dcbbe06968751d47e9f19d40e8
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  c02888af0ecb02bdfbee0be464079dafcc35e49b
+# Parent  6dbfe6719621efde26304de20ebf9c6e2cf1f1b2
 Bug 1034110 - Provide a way to observe mutations for ::before/::after pseudo elements
 * * *
 ssd:
@@ -61,26 +61,7 @@ diff --git a/docshell/shistory/nsSHEntryShared.cpp b/docshell/shistory/nsSHEntry
 diff --git a/dom/base/Element.cpp b/dom/base/Element.cpp
 --- a/dom/base/Element.cpp
 +++ b/dom/base/Element.cpp
-@@ -1457,16 +1457,18 @@ Element::BindToTree(nsIDocument* aDocume
-   }
-   NS_ASSERTION(!aBindingParent || IsRootOfNativeAnonymousSubtree() ||
-                !HasFlag(NODE_IS_IN_NATIVE_ANONYMOUS_SUBTREE) ||
-                (aParent && aParent->IsInNativeAnonymousSubtree()),
-                "Trying to re-bind content from native anonymous subtree to "
-                "non-native anonymous parent!");
-   if (aParent) {
-     if (aParent->IsInNativeAnonymousSubtree()) {
-+      printf("Is native anonymous subtree \n");
-+      nsNodeUtils::NativeAnonymousNodeBound(this);
-       SetFlags(NODE_IS_IN_NATIVE_ANONYMOUS_SUBTREE);
-     }
-     if (aParent->HasFlag(NODE_CHROME_ONLY_ACCESS)) {
-       SetFlags(NODE_CHROME_ONLY_ACCESS);
-     }
-     if (aParent->IsInShadowTree()) {
-       ClearSubtreeRootPointer();
-       SetFlags(NODE_IS_IN_SHADOW_TREE);
-@@ -1624,16 +1626,19 @@ Element::BindToTree(nsIDocument* aDocume
+@@ -1624,16 +1624,19 @@ Element::BindToTree(nsIDocument* aDocume
            parent->ChangeEditableDescendantCount(editableDescendantChange);
            parent = parent->GetParent();
          }
@@ -89,8 +70,8 @@ diff --git a/dom/base/Element.cpp b/dom/base/Element.cpp
    }
  
    nsNodeUtils::ParentChainChanged(this);
-+  if (this->IsInNativeAnonymousSubtree()) {
-+	  nsNodeUtils::NativeAnonymousNodeBound(this);
++  if (this->IsRootOfNativeAnonymousSubtree()) {
++	  nsNodeUtils::NativeAnonymousNodeBound(this, false);
 +  }
  
    if (HasID()) {
@@ -100,10 +81,50 @@ diff --git a/dom/base/Element.cpp b/dom/base/Element.cpp
    if (MayHaveStyle() && !IsXULElement()) {
      // XXXbz if we already have a style attr parsed, this won't do
      // anything... need to fix that.
+@@ -1739,16 +1742,19 @@ Element::UnbindFromTree(bool aDeep, bool
+         while (parent) {
+           parent->ChangeEditableDescendantCount(editableDescendantChange);
+           parent = parent->GetParent();
+         }
+       }
+     }
+ 
+     if (GetParent()) {
++      if (this->IsRootOfNativeAnonymousSubtree()) {
++        nsNodeUtils::NativeAnonymousNodeBound(this, true);
++      }
+       nsINode* p = mParent;
+       mParent = nullptr;
+       NS_RELEASE(p);
+     } else {
+       mParent = nullptr;
+     }
+     SetParentIsContent(false);
+   }
+@@ -1838,16 +1844,19 @@ Element::UnbindFromTree(bool aDeep, bool
+       // Note that we pass false for aNullParent here, since we don't want
+       // the kids to forget us.  We _do_ want them to forget their binding
+       // parent, though, since this only walks non-anonymous kids.
+       mAttrsAndChildren.ChildAt(i)->UnbindFromTree(true, false);
+     }
+   }
+ 
+   nsNodeUtils::ParentChainChanged(this);
++  if (this->IsRootOfNativeAnonymousSubtree()) {
++    nsNodeUtils::NativeAnonymousNodeBound(this, true);
++  }
+ 
+   // Unbind children of shadow root.
+   ShadowRoot* shadowRoot = GetShadowRoot();
+   if (shadowRoot) {
+     for (nsIContent* child = shadowRoot->GetFirstChild(); child;
+          child = child->GetNextSibling()) {
+       child->UnbindFromTree(true, false);
+     }
 diff --git a/dom/base/nsDOMMutationObserver.cpp b/dom/base/nsDOMMutationObserver.cpp
 --- a/dom/base/nsDOMMutationObserver.cpp
 +++ b/dom/base/nsDOMMutationObserver.cpp
-@@ -109,16 +109,41 @@ nsMutationReceiver::Disconnect(bool aRem
+@@ -109,16 +109,44 @@ nsMutationReceiver::Disconnect(bool aRem
      if (aRemoveFromObserver) {
        static_cast<nsDOMMutationObserver*>(observer)->RemoveReceiver(this);
      }
@@ -123,18 +144,21 @@ diff --git a/dom/base/nsDOMMutationObserver.cpp b/dom/base/nsDOMMutationObserver
 + */
 +void
 +nsMutationReceiver::NativeAnonymousNodeBound(nsIDocument* aDocument,
-+                                        mozilla::dom::Element* aElement) {
++                                             mozilla::dom::Element* aElement) {
 +
-+	printf("Into implementation\n");
-+	/*nsINode* parent = NODE_FROM(aElement, aDocument);
++	nsINode* parent = NODE_FROM(aElement, aDocument);
 +	if (Subtree() && parent->SubtreeRoot() != RegisterTarget()->SubtreeRoot()) {
 +		return;
-+	}*/
++	}
++  printf("Into implementation\n");
 +	nsDOMMutationRecord* m =
 +		Observer()->CurrentRecord(nsGkAtoms::nativeAnonymousNodeBound);
 +	if (!m->mTarget) {
-+		m->mTarget = aElement;
++		m->mTarget = aElement->GetParent();
 +	}
++
++  // m->mRemovedNodes = new nsSimpleContentList(aElement->GetParent());
++  // m->mRemovedNodes->AppendElement(aChild);
 +}
 +
  void
@@ -145,7 +169,7 @@ diff --git a/dom/base/nsDOMMutationObserver.cpp b/dom/base/nsDOMMutationObserver
                                          int32_t aModType,
                                          const nsAttrValue* aNewValue)
  {
-@@ -580,34 +605,42 @@ nsDOMMutationObserver::Observe(nsINode& 
+@@ -580,34 +608,42 @@ nsDOMMutationObserver::Observe(nsINode& 
      aOptions.mAttributes.WasPassed() &&
      aOptions.mAttributes.Value();
    bool characterData =
@@ -193,7 +217,7 @@ diff --git a/dom/base/nsDOMMutationObserver.cpp b/dom/base/nsDOMMutationObserver
    }
  
    if (aOptions.mAttributeOldValue.WasPassed() &&
-@@ -650,16 +683,17 @@ nsDOMMutationObserver::Observe(nsINode& 
+@@ -650,16 +686,17 @@ nsDOMMutationObserver::Observe(nsINode& 
  
    nsMutationReceiver* r = GetReceiverFor(&aTarget, true, animations);
    r->SetChildList(childList);
@@ -211,7 +235,7 @@ diff --git a/dom/base/nsDOMMutationObserver.cpp b/dom/base/nsDOMMutationObserver
  #ifdef DEBUG
    for (int32_t i = 0; i < mReceivers.Count(); ++i) {
      NS_WARN_IF_FALSE(mReceivers[i]->Target(),
-@@ -708,18 +742,19 @@ nsDOMMutationObserver::GetObservingInfo(
+@@ -708,18 +745,19 @@ nsDOMMutationObserver::GetObservingInfo(
    aResult.SetCapacity(mReceivers.Count());
    for (int32_t i = 0; i < mReceivers.Count(); ++i) {
      MutationObservingInfo& info = aResult.AppendElement()->SetValue();
@@ -290,7 +314,7 @@ diff --git a/dom/base/nsDOMMutationObserver.h b/dom/base/nsDOMMutationObserver.h
  };
  
  
-@@ -356,16 +367,17 @@ public:
+@@ -357,16 +368,17 @@ public:
    }
  
    void Disconnect(bool aRemoveFromObserver);
@@ -425,7 +449,7 @@ diff --git a/dom/base/nsIMutationObserver.h b/dom/base/nsIMutationObserver.h
 diff --git a/dom/base/nsNodeUtils.cpp b/dom/base/nsNodeUtils.cpp
 --- a/dom/base/nsNodeUtils.cpp
 +++ b/dom/base/nsNodeUtils.cpp
-@@ -156,23 +156,35 @@ nsNodeUtils::AttributeSetToCurrentValue(
+@@ -156,23 +156,36 @@ nsNodeUtils::AttributeSetToCurrentValue(
  }
  
  void
@@ -441,12 +465,13 @@ diff --git a/dom/base/nsNodeUtils.cpp b/dom/base/nsNodeUtils.cpp
  }
  
  void
-+nsNodeUtils::NativeAnonymousNodeBound(mozilla::dom::Element* aElement)
++nsNodeUtils::NativeAnonymousNodeBound(mozilla::dom::Element* aElement,
++                                      bool isRemove)
 +{
-+  nsAutoString innerHTML;
-+  aElement->GetInnerHTML(innerHTML);
++  // nsAutoString innerHTML;
++  // aElement->GetInnerHTML(innerHTML);
 +
-+  printf("Native anonymous node bound\n\n");
++  printf("Native anonymous node bound %d\n\n", isRemove);
 +  nsIDocument* doc = aElement->OwnerDoc();
 +
 +  IMPL_MUTATION_NOTIFICATION(NativeAnonymousNodeBound, aElement,
@@ -465,7 +490,7 @@ diff --git a/dom/base/nsNodeUtils.cpp b/dom/base/nsNodeUtils.cpp
 diff --git a/dom/base/nsNodeUtils.h b/dom/base/nsNodeUtils.h
 --- a/dom/base/nsNodeUtils.h
 +++ b/dom/base/nsNodeUtils.h
-@@ -92,16 +92,25 @@ public:
+@@ -92,16 +92,26 @@ public:
     * @param aNewIndexInContainer Index of first new child
     * @see nsIMutationObserver::ContentAppended
     */
@@ -480,7 +505,8 @@ diff --git a/dom/base/nsNodeUtils.h b/dom/base/nsNodeUtils.h
 +   * @param aNewIndexInContainer Index of first new child
 +   * @see nsIMutationObserver::ContentAppended
 +   */
-+  static void NativeAnonymousNodeBound(mozilla::dom::Element* aElement);
++  static void NativeAnonymousNodeBound(mozilla::dom::Element* aElement,
++                                       bool isRemove);
 +
 +  /**
     * Send ContentInserted notifications to nsIMutationObservers
@@ -573,7 +599,7 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
     */
 -  onMutations: function(mutations) {
 +onMutations: function(mutations) {
-+    console.log("On mutations", mutations);
++    console.log("On mutations", mutations, mutations.map(t=>t.target));
      for (let change of mutations) {
        let targetActor = this._refMap.get(change.target);
        if (!targetActor) {
@@ -582,6 +608,30 @@ diff --git a/toolkit/devtools/server/actors/inspector.js b/toolkit/devtools/serv
        let targetNode = change.target;
        let mutation = {
          type: change.type,
+@@ -2830,16 +2833,23 @@ var WalkerActor = protocol.ActorClass({
+         mutation.numChildren = targetActor.numChildren;
+         mutation.removed = removedActors;
+         mutation.added = addedActors;
+ 
+         let singleTextChild = this.singleTextChild(targetActor);
+         if (singleTextChild) {
+           mutation.singleTextChild = singleTextChild.form();
+         }
++      } else if (mutation.type === "nativeAnonymousNodeBound") {
++          console.log("Found a mutation we care about", mutation,
++            mutation.target.nodeName);
++        if (mutation.target.nodeName === "_moz_generated_content_before" ||
++            mutation.target.nodeName === "_moz_generated_content_after") {
++          console.log("Found a mutation we care about", mutation);
++        }
+       }
+       this.queueMutation(mutation);
+     }
+   },
+ 
+   onFrameLoad: function({ window, isTopLevel }) {
+     if (!this.rootDoc && isTopLevel) {
+       this.rootDoc = window.document;
 diff --git a/widget/cocoa/nsMenuGroupOwnerX.mm b/widget/cocoa/nsMenuGroupOwnerX.mm
 --- a/widget/cocoa/nsMenuGroupOwnerX.mm
 +++ b/widget/cocoa/nsMenuGroupOwnerX.mm
