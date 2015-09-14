@@ -1,0 +1,293 @@
+# HG changeset patch
+# User Hallvord R. M. Steen <hsteen@mozilla.com>
+# Date 1442264820 -7200
+#      Mon Sep 14 23:07:00 2015 +0200
+# Node ID 0a8ab61495e596baa46d3e6af1f7ffa95d352598
+# Parent  139446daedab3d00b9f0faba25e1e82191c8c8d1
+Debugger shortcut keys should work when split console has focus below debugger, bug 1183325
+
+diff --git a/browser/devtools/debugger/debugger-controller.js b/browser/devtools/debugger/debugger-controller.js
+--- a/browser/devtools/debugger/debugger-controller.js
++++ b/browser/devtools/debugger/debugger-controller.js
+@@ -697,17 +697,23 @@ StackFrames.prototype = {
+       case "interrupted":
+         if (!aPacket.why.onNext) {
+           return;
+         }
+         break;
+     }
+ 
+     this.activeThread.fillFrames(CALL_STACK_PAGE_SIZE);
+-    DebuggerView.editor.focus();
++    // Focus the debugger editor - but only if focus is not already inside a TEXTAREA,
++    // such as the one inside a split console pane
++    let currentlyFocusedElement = Services.focus.focusedWindow ?
++      Services.focus.focusedWindow.document.activeElement : null;
++    if(!(currentlyFocusedElement && currentlyFocusedElement.localName === 'textarea')){
++      DebuggerView.editor.focus();
++    }
+   },
+ 
+   /**
+    * Handler for the thread client's resumed notification.
+    */
+   _onResumed: function() {
+     // Prepare the watch expression evaluation string for the next pause.
+     if (this._currentFrameDescription != FRAME_TYPE.WATCH_EXPRESSIONS_EVAL) {
+diff --git a/browser/devtools/debugger/panel.js b/browser/devtools/debugger/panel.js
+--- a/browser/devtools/debugger/panel.js
++++ b/browser/devtools/debugger/panel.js
+@@ -52,16 +52,23 @@ DebuggerPanel.prototype = {
+ 
+     return targetPromise
+       .then(() => this._controller.startupDebugger())
+       .then(() => this._controller.connect())
+       .then(() => {
+         this._toolbox.on("host-changed", this.handleHostChanged);
+         this.target.on("thread-paused", this.highlightWhenPaused);
+         this.target.on("thread-resumed", this.unhighlightWhenResumed);
++        // Add keys from this document's keyset to the toolbox, so they
++        // can work when the split console is focused.
++        let keysToClone = ["resumeKey", "resumeKey2", "stepOverKey", "stepOverKey2",
++                            "stepInKey", "stepInKey2", "stepOutKey", "stepOutKey2"];
++        for (let key of keysToClone) {
++          this._toolbox.useKeyWithSplitConsole(this.panelWin.document.getElementById(key), "jsdebugger");
++        }
+         this.isReady = true;
+         this.emit("ready");
+         return this;
+       })
+       .then(null, function onError(aReason) {
+         DevToolsUtils.reportException("DebuggerPanel.prototype.open", aReason);
+       });
+   },
+diff --git a/browser/devtools/debugger/test/mochitest/browser.ini b/browser/devtools/debugger/test/mochitest/browser.ini
+--- a/browser/devtools/debugger/test/mochitest/browser.ini
++++ b/browser/devtools/debugger/test/mochitest/browser.ini
+@@ -96,16 +96,17 @@ support-files =
+   doc_scope-variable-2.html
+   doc_scope-variable-3.html
+   doc_scope-variable-4.html
+   doc_script-eval.html
+   doc_script-bookmarklet.html
+   doc_script-switching-01.html
+   doc_script-switching-02.html
+   doc_split-console-paused-reload.html
++  doc_step-many-statements.html
+   doc_step-out.html
+   doc_terminate-on-tab-close.html
+   doc_watch-expressions.html
+   doc_watch-expression-button.html
+   doc_with-frame.html
+   doc_WorkerActor.attach-tab1.html
+   doc_WorkerActor.attach-tab2.html
+   doc_WorkerActor.attachThread-tab.html
+@@ -566,8 +567,10 @@ skip-if = e10s && debug
+ [browser_dbg_watch-expressions-01.js]
+ skip-if = e10s && debug
+ [browser_dbg_watch-expressions-02.js]
+ skip-if = e10s && debug
+ [browser_dbg_WorkerActor.attach.js]
+ skip-if = e10s && debug
+ [browser_dbg_WorkerActor.attachThread.js]
+ skip-if = e10s && debug
++[browser_dbg_split-console-keypress.js]
++skip-if = e10s && debug
+diff --git a/browser/devtools/debugger/test/mochitest/browser_dbg_split-console-keypress.js b/browser/devtools/debugger/test/mochitest/browser_dbg_split-console-keypress.js
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/debugger/test/mochitest/browser_dbg_split-console-keypress.js
+@@ -0,0 +1,105 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++/**
++ * When the split console is focused and the debugger is open,
++ * debugger shortcut keys like F11 should work
++ */
++const TAB_URL = EXAMPLE_URL + "doc_step-many-statements.html";
++
++function test() {
++  initDebugger(TAB_URL).then(([aTab,debuggeeWin,aPanel]) => {
++    let dbgWin = aPanel.panelWin; // ChromeWindow object - I think it's the debugger IFRAME's contentWindow
++    let toolbox = gDevTools.getToolbox(aPanel.target);
++    let aThreadClient = dbgWin.DebuggerController.activeThread;
++    waitForSourceShown(aPanel, TAB_URL).then(() => {
++      // We need to open the split console (we use an ESC keypress for that),
++      // then get the script into a paused state by pressing a button in the page,
++      // ensure focus is in the split console,
++      // synthesize a few keys - important ones we share listener for are
++      // "resumeKey", "stepOverKey", "stepInKey", "stepOutKey"
++      // then check that
++      //   * The input cursor remains in the console's input box
++      //   * The paused state is as expected
++      //   * the debugger cursor is where we want it
++      let result = toolbox.once("webconsole-ready", () => {
++        // The console is now open (if not make the test fail already)
++        ok(toolbox.splitConsole, "Split console is shown.");
++        // Add listener that will make the test continue when script is paused
++        aThreadClient.addOneTimeListener("paused", () => {
++          // Information for sub-tests. When 'key' is synthesized 'keyRepeat' times,
++          // cursor should be at 'caretLine' of this test..
++          let allTests = [
++            {key: 'VK_F11', keyRepeat: 1, caretLine: 16},
++            {key: 'VK_F11', keyRepeat: 2, caretLine: 18},
++            {key: 'VK_F11', keyRepeat: 11, caretLine: 29},
++            {key: 'VK_F10', keyRepeat: 1, caretLine: 30},
++            {key: 'VK_F11', keyRepeat: 1, caretLine: 30},
++            {key: 'VK_F11', keyRepeat: 30, caretLine: 40},
++            {key: 'VK_F11', modifier:'Shift', keyRepeat: 1, caretLine: 37},
++            {key: 'VK_F11', modifier:'Shift', keyRepeat: 2, caretLine: 40},
++            {key: 'VK_F11', modifier:'Shift', keyRepeat: 11, caretLine: 21}
++
++          ];
++          var consoleInputLostFocus = false;
++          is(aThreadClient.paused, true,
++            "Should be paused at debugger statement.");
++          // Add another listener to pick up the PAUSED event after a step command
++          aThreadClient.addListener("paused", () => {
++            // First we send another key event if required by the test
++            if(allTests[0] && allTests[0].keyRepeat > 0){
++              allTests[0].keyRepeat --;
++              let keyMods = allTests[0].modifier === 'Shift' ? {shiftKey:true} : {};
++              executeSoon(() => {EventUtils.synthesizeKey(allTests[0].key, keyMods, dbgWin)});
++              //.. and return early
++              return;
++            }
++            // Here are the conditions we're interested in: paused state,
++            // cursor still in console, caret correct in debugger's editor
++            is(aThreadClient.paused, true,
++              "Should still be paused");
++            if(allTests.length > 0){
++              //ok(isCaretPos(aPanel, allTests[0].caretLine),
++              //  "Caret is at line " + allTests[0].caretLine);
++              ok(isDebugPos(aPanel, allTests[0].caretLine),
++                " Current debug position should be at line " + allTests[0].caretLine);
++              // Now we're done with this test, go for the next one
++              allTests.shift();
++              if(allTests[0]){
++                allTests[0].keyRepeat --;
++                let keyMods = allTests[0].modifier === 'Shift' ? {shiftKey:true} : {};
++                executeSoon(() => {EventUtils.synthesizeKey(allTests[0].key, keyMods, dbgWin)});
++              }else{
++                aPanel.target.on("thread-resumed", () => {
++                  info(aThreadClient.state);
++                  is(aThreadClient.paused, false,
++                    "Should not be paused after resume");
++                  // Final test: did we preserve console inputNode focus?
++                  ok(!consoleInputLostFocus, "Console input should not loose focus");
++                  // Done. We don't want the open split console to confuse other tests..
++                  Services.prefs.clearUserPref("devtools.toolbox.splitconsoleEnabled");
++                  closeDebuggerAndFinish(aPanel);
++                });
++                // Last key we test is "resume"
++                executeSoon(() => {EventUtils.synthesizeKey('VK_F8', {}, dbgWin);});
++              }
++            }
++          });
++          // Focus the console
++          let jsterm = toolbox.getPanel("webconsole").hud.jsterm;
++          jsterm.inputNode.focus();
++          jsterm.inputNode.addEventListener('blur', () => {consoleInputLostFocus = true;});
++          // Send key that should trigger step command
++          allTests[0].keyRepeat --;
++          let keyMods = allTests[0].modifier === 'Shift' ? {shiftKey:true} : {};
++          executeSoon(() => {EventUtils.synthesizeKey(allTests[0].key, keyMods, dbgWin);});
++        });
++        // Trigger script that stops at debugger statement
++        generateMouseClickInTab(aTab, "content.document.getElementById('start')");
++      });
++      // This is the ESC key press that triggers the split console
++      EventUtils.synthesizeKey("VK_ESCAPE", {}, dbgWin);
++
++    });
++  });
++}
+diff --git a/browser/devtools/debugger/test/mochitest/doc_step-many-statements.html b/browser/devtools/debugger/test/mochitest/doc_step-many-statements.html
+new file mode 100644
+--- /dev/null
++++ b/browser/devtools/debugger/test/mochitest/doc_step-many-statements.html
+@@ -0,0 +1,50 @@
++<!-- Any copyright is dedicated to the Public Domain.
++     http://creativecommons.org/publicdomain/zero/1.0/ -->
++<!doctype html>
++
++<html>
++  <head>
++    <meta charset="utf-8"/>
++    <title>Debugger test page</title>
++  </head>
++
++  <body>
++    <button id="start">Start!</button>
++
++    <script type="text/javascript">
++      function normal(aArg) {
++        debugger;
++        var r = 10;
++        var a = squareAndOne(r);
++        var b = squareUntil(r, 99999999999); //recurses 3 times, returns on 4th call
++        var c = addUntil(r, 5, 1050); // recurses 208 times and returns on the 209th call
++        return a + b + c;
++
++      }
++
++      function squareAndOne(arg){
++        return (arg * arg) + 1;
++      }
++      function squareUntil(arg, limit){
++        if(arg * arg >= limit){
++          return arg * arg;
++        }else{
++          return squareUntil(arg * arg, limit);
++        }
++      }
++
++      function addUntil(arg1, arg2, limit){
++        if(arg1 + arg2 > limit){
++          return arg1 + arg2;
++        }else{
++          return addUntil(arg1 + arg2, arg2, limit);
++        }
++      }
++
++      var normalBtn = document.getElementById("start");
++      normalBtn.addEventListener("click", normal, false);
++
++    </script>
++  </body>
++
++</html>
+diff --git a/browser/devtools/framework/toolbox.js b/browser/devtools/framework/toolbox.js
+--- a/browser/devtools/framework/toolbox.js
++++ b/browser/devtools/framework/toolbox.js
+@@ -481,16 +481,29 @@ Toolbox.prototype = {
+       // navigation.
+       let jsdebugger = this.getPanel("jsdebugger");
+       if (jsdebugger && jsdebugger.panelWin.gThreadClient.state == "paused") {
+         e.preventDefault();
+       }
+     }
+   },
+ 
++  useKeyWithSplitConsole: function(keyElement, whichTool){
++    let cloned = keyElement.cloneNode();
++    cloned.setAttribute("oncommand", "void(0)");
++    cloned.removeAttribute("command");
++    cloned.addEventListener("command", (e) => {
++      // Only forward the command if the debugger is focused
++      if (this.currentToolId === whichTool) {
++        keyElement.doCommand();
++      }
++    }, true);
++    this.doc.getElementById("toolbox-keyset").appendChild(cloned);
++  },
++
+   _addReloadKeys: function() {
+     [
+       ["toolbox-reload-key", false],
+       ["toolbox-reload-key2", false],
+       ["toolbox-force-reload-key", true],
+       ["toolbox-force-reload-key2", true]
+     ].forEach(([id, force]) => {
+       this.doc.getElementById(id).addEventListener("command", () => {
