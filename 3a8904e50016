@@ -1,3 +1,14 @@
+
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Date 1443108212 25200
+# Node ID 3a8904e50016b81b8e88a71efa377830295d81b2
+# Parent  e9aea2b7d9fd1e4c4507ce2bb8459d306e04b497
+Bug 1034110 - Provide a way to observe mutations for ::before/::after pseudo elements;r=smaug
+
+Adds a new chrome-only MutationObserverInit option called nativeAnonymousChildList
+that will cause a mutation to fire when a native anonymous root is bound or unbound
+
 diff --git a/accessible/generic/DocAccessible.cpp b/accessible/generic/DocAccessible.cpp
 --- a/accessible/generic/DocAccessible.cpp
 +++ b/accessible/generic/DocAccessible.cpp
@@ -25,190 +36,6 @@ diff --git a/accessible/generic/DocAccessible.cpp b/accessible/generic/DocAccess
  {
    NS_ASSERTION(!IsDefunct(),
                 "Attribute changed called on defunct document accessible!");
-diff --git a/devtools/client/markupview/markup-view.js b/devtools/client/markupview/markup-view.js
---- a/devtools/client/markupview/markup-view.js
-+++ b/devtools/client/markupview/markup-view.js
-@@ -825,17 +825,17 @@ MarkupView.prototype = {
-       }
-       if (type === "attributes" || type === "characterData") {
-         container.update();
- 
-         // Auto refresh style properties on selected node when they change.
-         if (type === "attributes" && container.selected) {
-           requiresLayoutChange = true;
-         }
--      } else if (type === "childList") {
-+      } else if (type === "childList" || "nativeAnonymousChildList") {
-         container.childrenDirty = true;
-         // Update the children to take care of changes in the markup view DOM.
-         this._updateChildren(container, {flash: true});
-       } else if (type === "pseudoClassLock") {
-         container.update();
-       }
-     }
- 
-diff --git a/devtools/client/markupview/test/browser_markupview_mutation_01.js b/devtools/client/markupview/test/browser_markupview_mutation_01.js
---- a/devtools/client/markupview/test/browser_markupview_mutation_01.js
-+++ b/devtools/client/markupview/test/browser_markupview_mutation_01.js
-@@ -3,16 +3,17 @@
-  http://creativecommons.org/publicdomain/zero/1.0/ */
- 
- "use strict";
- 
- // Tests that various mutations to the dom update the markup view correctly.
- 
- const TEST_URL = TEST_URL_ROOT + "doc_markup_mutation.html";
- 
-+
- // Mutation tests. Each entry in the array has the following properties:
- // - desc: for logging only
- // - test: a function supposed to mutate the DOM
- // - check: a function supposed to test that the mutation was handled
- const TEST_DATA = [
-   {
-     desc: "Adding an attribute",
-     test: () => {
-@@ -61,16 +62,39 @@ const TEST_DATA = [
-     check: function*(inspector) {
-       let {editor} = yield getContainerForSelector("#node1", inspector);
-       ok([...editor.attrList.querySelectorAll(".attreditor")].some(attr => {
-         return attr.textContent.trim() === "newattr=\"newattrchanged\"";
-       }), "newattr attribute found");
-     }
-   },
-   {
-+    desc: "Adding ::after element",
-+    test: () => {
-+      let node1 = getNode("#node1");
-+      node1.classList.add("pseudo");
-+    },
-+    check: function*(inspector) {
-+      let {children} = yield getContainerForSelector("#node1", inspector);
-+      is(children.childNodes.length, 2,
-+        "Node1 now has 2 children (text child and ::after");
-+    }
-+  },
-+  {
-+    desc: "Removing ::after element",
-+    test: () => {
-+      let node1 = getNode("#node1");
-+      node1.classList.remove("pseudo");
-+    },
-+    check: function*(inspector) {
-+      let container = yield getContainerForSelector("#node1", inspector);
-+      ok(container.singleTextChild, "Has single text child.");
-+    }
-+  },
-+  {
-     desc: "Updating the text-content",
-     test: () => {
-       let node1 = getNode("#node1");
-       node1.textContent = "newtext";
-     },
-     check: function*(inspector) {
-       let container = yield getContainerForSelector("#node1", inspector);
-       ok(container.singleTextChild, "Has single text child.");
-diff --git a/devtools/client/markupview/test/doc_markup_mutation.html b/devtools/client/markupview/test/doc_markup_mutation.html
---- a/devtools/client/markupview/test/doc_markup_mutation.html
-+++ b/devtools/client/markupview/test/doc_markup_mutation.html
-@@ -1,11 +1,16 @@
- <!DOCTYPE html>
- 
- <html class="html">
-+  <style type="text/css">
-+    #node1.pseudo::after {
-+      content: "after";
-+    }
-+  </style>
- 
-   <body class="body">
-     <div class="node0">
-       <div id="node1" class="node1">line1</div>
-       <div id="node2" class="node2">line2</div>
-       <p class="node3">line3</p>
-       <!-- A comment -->
-       <p id="node4" class="node4">line4
-diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspector.js
---- a/devtools/server/actors/inspector.js
-+++ b/devtools/server/actors/inspector.js
-@@ -321,16 +321,17 @@ var NodeActor = exports.NodeActor = prot
-    */
-   watchDocument: function(callback) {
-     let node = this.rawNode;
-     // Create the observer on the node's actor.  The node will make sure
-     // the observer is cleaned up when the actor is released.
-     let observer = new node.defaultView.MutationObserver(callback);
-     observer.mergeAttributeRecords = true;
-     observer.observe(node, {
-+      nativeAnonymousChildList: true,
-       attributes: true,
-       characterData: true,
-       childList: true,
-       subtree: true
-     });
-     this.mutationObserver = observer;
-   },
- 
-@@ -2805,35 +2806,36 @@ var WalkerActor = protocol.ActorClass({
-    */
-   onMutations: function(mutations) {
-     for (let change of mutations) {
-       let targetActor = this._refMap.get(change.target);
-       if (!targetActor) {
-         continue;
-       }
-       let targetNode = change.target;
-+      let type = change.type;
-       let mutation = {
--        type: change.type,
-+        type: type,
-         target: targetActor.actorID,
-       };
- 
--      if (mutation.type === "attributes") {
-+      if (type === "attributes") {
-         mutation.attributeName = change.attributeName;
-         mutation.attributeNamespace = change.attributeNamespace || undefined;
-         mutation.newValue = targetNode.hasAttribute(mutation.attributeName) ?
-                             targetNode.getAttribute(mutation.attributeName)
-                             : null;
--      } else if (mutation.type === "characterData") {
-+      } else if (type === "characterData") {
-         if (targetNode.nodeValue.length > gValueSummaryLength) {
-           mutation.newValue = targetNode.nodeValue.substring(0, gValueSummaryLength);
-           mutation.incompleteValue = true;
-         } else {
-           mutation.newValue = targetNode.nodeValue;
-         }
--      } else if (mutation.type === "childList") {
-+      } else if (type === "childList" || type === "nativeAnonymousChildList") {
-         // Get the list of removed and added actors that the client has seen
-         // so that it can keep its ownership tree up to date.
-         let removedActors = [];
-         let addedActors = [];
-         for (let removed of change.removedNodes) {
-           let removedActor = this._refMap.get(removed);
-           if (!removedActor) {
-             // If the client never encountered this actor we don't need to
-@@ -3325,17 +3327,17 @@ var WalkerFront = exports.WalkerFront = 
- 
-         if (!targetFront) {
-           console.trace("Got a mutation for an unexpected actor: " + targetID + ", please file a bug on bugzilla.mozilla.org!");
-           continue;
-         }
- 
-         let emittedMutation = object.merge(change, { target: targetFront });
- 
--        if (change.type === "childList") {
-+        if (change.type === "childList" || change.type === "nativeAnonymousChildList") {
-           // Update the ownership tree according to the mutation record.
-           let addedFronts = [];
-           let removedFronts = [];
-           for (let removed of change.removed) {
-             let removedFront = this.get(removed);
-             if (!removedFront) {
-               console.error("Got a removal of an actor we didn't know about: " + removed);
-               continue;
 diff --git a/docshell/shistory/nsSHEntryShared.cpp b/docshell/shistory/nsSHEntryShared.cpp
 --- a/docshell/shistory/nsSHEntryShared.cpp
 +++ b/docshell/shistory/nsSHEntryShared.cpp
@@ -280,72 +107,6 @@ diff --git a/dom/base/Element.cpp b/dom/base/Element.cpp
      }
      SetParentIsContent(false);
    }
-diff --git a/dom/base/nsDOMMutationObserver.h b/dom/base/nsDOMMutationObserver.h
---- a/dom/base/nsDOMMutationObserver.h
-+++ b/dom/base/nsDOMMutationObserver.h
-@@ -167,16 +167,26 @@ public:
-     return mParent ? mParent->CharacterDataOldValue() : mCharacterDataOldValue;
-   }
-   void SetCharacterDataOldValue(bool aOldValue)
-   {
-     NS_ASSERTION(!mParent, "Shouldn't have parent");
-     mCharacterDataOldValue = aOldValue;
-   }
- 
-+  bool NativeAnonymousChildList()
-+  {
-+    return mParent ? mParent->NativeAnonymousChildList() : mNativeAnonymousChildList;
-+  }
-+  void SetNativeAnonymousChildList(bool aOldValue)
-+  {
-+    NS_ASSERTION(!mParent, "Shouldn't have parent");
-+    mNativeAnonymousChildList = aOldValue;
-+  }
-+
-   bool Attributes() { return mParent ? mParent->Attributes() : mAttributes; }
-   void SetAttributes(bool aAttributes)
-   {
-     NS_ASSERTION(!mParent, "Shouldn't have parent");
-     mAttributes = aAttributes;
-   }
- 
-   bool AllAttributes()
-@@ -293,16 +303,17 @@ protected:
-   // alive so it doesn't go away and disconnect all its transient receivers.
-   nsCOMPtr<nsINode>                  mKungFuDeathGrip;
-   
- private:
-   bool                               mSubtree;
-   bool                               mChildList;
-   bool                               mCharacterData;
-   bool                               mCharacterDataOldValue;
-+  bool                               mNativeAnonymousChildList;
-   bool                               mAttributes;
-   bool                               mAllAttributes;
-   bool                               mAttributeOldValue;
-   bool                               mAnimations;
-   nsCOMArray<nsIAtom>                mAttributeFilter;
- };
- 
- 
-@@ -357,16 +368,17 @@ public:
-   }
- 
-   void Disconnect(bool aRemoveFromObserver);
- 
-   NS_DECL_AND_IMPL_ZEROING_OPERATOR_NEW
-   NS_DECL_ISUPPORTS
- 
-   NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTEWILLCHANGE
-+  NS_DECL_NSIMUTATIONOBSERVER_NATIVEANONYMOUSCHILDLISTCHANGE
-   NS_DECL_NSIMUTATIONOBSERVER_CHARACTERDATAWILLCHANGE
-   NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
-   NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
-   NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
-   NS_DECL_NSIMUTATIONOBSERVER_NODEWILLBEDESTROYED
- 
-   virtual void AttributeSetToCurrentValue(nsIDocument* aDocument,
-                                           mozilla::dom::Element* aElement,
 diff --git a/dom/base/nsDOMMutationObserver.cpp b/dom/base/nsDOMMutationObserver.cpp
 --- a/dom/base/nsDOMMutationObserver.cpp
 +++ b/dom/base/nsDOMMutationObserver.cpp
@@ -473,6 +234,72 @@ diff --git a/dom/base/nsDOMMutationObserver.cpp b/dom/base/nsDOMMutationObserver
          info.mAttributeFilter.Value();
        for (int32_t j = 0; j < filters.Count(); ++j) {
          if (!filtersAsStrings.AppendElement(nsDependentAtomString(filters[j]),
+diff --git a/dom/base/nsDOMMutationObserver.h b/dom/base/nsDOMMutationObserver.h
+--- a/dom/base/nsDOMMutationObserver.h
++++ b/dom/base/nsDOMMutationObserver.h
+@@ -167,16 +167,26 @@ public:
+     return mParent ? mParent->CharacterDataOldValue() : mCharacterDataOldValue;
+   }
+   void SetCharacterDataOldValue(bool aOldValue)
+   {
+     NS_ASSERTION(!mParent, "Shouldn't have parent");
+     mCharacterDataOldValue = aOldValue;
+   }
+ 
++  bool NativeAnonymousChildList()
++  {
++    return mParent ? mParent->NativeAnonymousChildList() : mNativeAnonymousChildList;
++  }
++  void SetNativeAnonymousChildList(bool aOldValue)
++  {
++    NS_ASSERTION(!mParent, "Shouldn't have parent");
++    mNativeAnonymousChildList = aOldValue;
++  }
++
+   bool Attributes() { return mParent ? mParent->Attributes() : mAttributes; }
+   void SetAttributes(bool aAttributes)
+   {
+     NS_ASSERTION(!mParent, "Shouldn't have parent");
+     mAttributes = aAttributes;
+   }
+ 
+   bool AllAttributes()
+@@ -293,16 +303,17 @@ protected:
+   // alive so it doesn't go away and disconnect all its transient receivers.
+   nsCOMPtr<nsINode>                  mKungFuDeathGrip;
+   
+ private:
+   bool                               mSubtree;
+   bool                               mChildList;
+   bool                               mCharacterData;
+   bool                               mCharacterDataOldValue;
++  bool                               mNativeAnonymousChildList;
+   bool                               mAttributes;
+   bool                               mAllAttributes;
+   bool                               mAttributeOldValue;
+   bool                               mAnimations;
+   nsCOMArray<nsIAtom>                mAttributeFilter;
+ };
+ 
+ 
+@@ -357,16 +368,17 @@ public:
+   }
+ 
+   void Disconnect(bool aRemoveFromObserver);
+ 
+   NS_DECL_AND_IMPL_ZEROING_OPERATOR_NEW
+   NS_DECL_ISUPPORTS
+ 
+   NS_DECL_NSIMUTATIONOBSERVER_ATTRIBUTEWILLCHANGE
++  NS_DECL_NSIMUTATIONOBSERVER_NATIVEANONYMOUSCHILDLISTCHANGE
+   NS_DECL_NSIMUTATIONOBSERVER_CHARACTERDATAWILLCHANGE
+   NS_DECL_NSIMUTATIONOBSERVER_CONTENTAPPENDED
+   NS_DECL_NSIMUTATIONOBSERVER_CONTENTINSERTED
+   NS_DECL_NSIMUTATIONOBSERVER_CONTENTREMOVED
+   NS_DECL_NSIMUTATIONOBSERVER_NODEWILLBEDESTROYED
+ 
+   virtual void AttributeSetToCurrentValue(nsIDocument* aDocument,
+                                           mozilla::dom::Element* aElement,
 diff --git a/dom/base/nsGenericDOMDataNode.cpp b/dom/base/nsGenericDOMDataNode.cpp
 --- a/dom/base/nsGenericDOMDataNode.cpp
 +++ b/dom/base/nsGenericDOMDataNode.cpp
@@ -672,35 +499,6 @@ diff --git a/dom/base/nsIMutationObserver.h b/dom/base/nsIMutationObserver.h
                           const nsAttrValue* aOldValue)                    \
  {                                                                         \
  }                                                                         \
-diff --git a/dom/base/nsNodeUtils.h b/dom/base/nsNodeUtils.h
---- a/dom/base/nsNodeUtils.h
-+++ b/dom/base/nsNodeUtils.h
-@@ -92,16 +92,25 @@ public:
-    * @param aNewIndexInContainer Index of first new child
-    * @see nsIMutationObserver::ContentAppended
-    */
-   static void ContentAppended(nsIContent* aContainer,
-                               nsIContent* aFirstNewContent,
-                               int32_t aNewIndexInContainer);
- 
-   /**
-+   * Send NativeAnonymousChildList notifications to nsIMutationObservers
-+   * @param aContent             Anonymous node that's been added or removed
-+   * @param aIsRemove            True if it's a removal, false if an addition
-+   * @see nsIMutationObserver::NativeAnonymousChildListChange
-+   */
-+  static void NativeAnonymousChildListChange(nsIContent* aContent,
-+                                             bool aIsRemove);
-+
-+  /**
-    * Send ContentInserted notifications to nsIMutationObservers
-    * @param aContainer        Node into which new child was inserted
-    * @param aChild            Newly inserted child
-    * @param aIndexInContainer Index of new child
-    * @see nsIMutationObserver::ContentInserted
-    */
-   static void ContentInserted(nsINode* aContainer,
-                               nsIContent* aChild,
 diff --git a/dom/base/nsNodeUtils.cpp b/dom/base/nsNodeUtils.cpp
 --- a/dom/base/nsNodeUtils.cpp
 +++ b/dom/base/nsNodeUtils.cpp
@@ -730,6 +528,35 @@ diff --git a/dom/base/nsNodeUtils.cpp b/dom/base/nsNodeUtils.cpp
                    aContainer->IsNodeOfType(nsINode::eDOCUMENT),
                    "container must be an nsIContent or an nsIDocument");
    nsIContent* container;
+diff --git a/dom/base/nsNodeUtils.h b/dom/base/nsNodeUtils.h
+--- a/dom/base/nsNodeUtils.h
++++ b/dom/base/nsNodeUtils.h
+@@ -92,16 +92,25 @@ public:
+    * @param aNewIndexInContainer Index of first new child
+    * @see nsIMutationObserver::ContentAppended
+    */
+   static void ContentAppended(nsIContent* aContainer,
+                               nsIContent* aFirstNewContent,
+                               int32_t aNewIndexInContainer);
+ 
+   /**
++   * Send NativeAnonymousChildList notifications to nsIMutationObservers
++   * @param aContent             Anonymous node that's been added or removed
++   * @param aIsRemove            True if it's a removal, false if an addition
++   * @see nsIMutationObserver::NativeAnonymousChildListChange
++   */
++  static void NativeAnonymousChildListChange(nsIContent* aContent,
++                                             bool aIsRemove);
++
++  /**
+    * Send ContentInserted notifications to nsIMutationObservers
+    * @param aContainer        Node into which new child was inserted
+    * @param aChild            Newly inserted child
+    * @param aIndexInContainer Index of new child
+    * @see nsIMutationObserver::ContentInserted
+    */
+   static void ContentInserted(nsINode* aContainer,
+                               nsIContent* aChild,
 diff --git a/dom/base/test/chrome/chrome.ini b/dom/base/test/chrome/chrome.ini
 --- a/dom/base/test/chrome/chrome.ini
 +++ b/dom/base/test/chrome/chrome.ini
@@ -755,7 +582,7 @@ diff --git a/dom/base/test/chrome/test_mutationobserver_anonymous.html b/dom/bas
 new file mode 100644
 --- /dev/null
 +++ b/dom/base/test/chrome/test_mutationobserver_anonymous.html
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,251 @@
 +<!DOCTYPE HTML>
 +<html>
 +<!--
@@ -968,11 +795,15 @@ new file mode 100644
 +  m.observe(document, { nativeAnonymousChildList: true });
 +  parent.style.display = "none";
 +
-+  setTimeout(() => {
++  // Wait for the actual mutation to come through, making sure that
++  // the original observer never fires.
++  var m2 = new MutationObserver(function(records, observer) {
 +    ok(!getFirstChild(parent), "Pseudo element has been removed, but no mutation");
 +    ok(!getLastChild(parent), "Pseudo element has been removed, but no mutation");
++    observer.disconnect();
 +    testSubtree();
-+  }, 0);
++  });
++  m2.observe(parent, { nativeAnonymousChildList: true });
 +}
 +
 +function testSubtree() {
@@ -1110,4 +941,3 @@ diff --git a/widget/cocoa/nsMenuGroupOwnerX.mm b/widget/cocoa/nsMenuGroupOwnerX.
                                           int32_t aModType,
                                           const nsAttrValue* aOldValue)
  {
-
