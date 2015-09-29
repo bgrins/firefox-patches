@@ -1,0 +1,773 @@
+commit 141cb91122728572885eeec0457e56403b495d50
+Author: James Long <longster@gmail.com>
+Date:   Mon Sep 28 21:42:29 2015 -0400
+
+    wip
+
+diff --git a/devtools/client/debugger/debugger-controller.js b/devtools/client/debugger/debugger-controller.js
+index cd1fee1..73c5bb3 100644
+--- a/devtools/client/debugger/debugger-controller.js
++++ b/devtools/client/debugger/debugger-controller.js
+@@ -191,35 +191,39 @@ var DebuggerController = {
+   /**
+    * Initiates remote debugging based on the current target, wiring event
+    * handlers as necessary.
+    *
+    * @return object
+    *         A promise that is resolved when the debugger finishes connecting.
+    */
+   connect: Task.async(function*() {
+-    if (this._connected) {
+-      return;
+-    }
+-
+     let target = this._target;
+-    let { client, form: { chromeDebugger, actor } } = target;
++
++    let { client } = target;
+     target.on("close", this._onTabDetached);
+     target.on("navigate", this._onTabNavigated);
+     target.on("will-navigate", this._onTabNavigated);
+     this.client = client;
++    this.activeThread = this._toolbox.threadClient;
+ 
+-    if (target.isAddon) {
+-      yield this._startAddonDebugging(actor);
+-    } else if (!target.isTabActor) {
+-      // Some actors like AddonActor or RootActor for chrome debugging
+-      // do not support attach/detach and can be used directly
+-      yield this._startChromeDebugging(chromeDebugger);
+-    } else {
+-      yield this._startDebuggingTab();
++    this.Workers.connect();
++    this.ThreadState.connect();
++    this.StackFrames.connect();
++    this.SourceScripts.connect();
++
++    // If the engine is already paused, update the UI to represent the
++    // paused state
++    const pausedPacket = this.activeThread.getLastPausePacket();
++    DebuggerView.Toolbar.toggleResumeButtonState(
++      this.activeThread.state,
++      !!pausedPacket
++    );
++    if(pausedPacket) {
++      this.StackFrames._onPaused("paused", pausedPacket);
+     }
+ 
+     this._hideUnsupportedFeatures();
+   }),
+ 
+   /**
+    * Disconnects the debugger client and removes event handlers as necessary.
+    */
+@@ -292,105 +296,16 @@ var DebuggerController = {
+    */
+   _ensureResumptionOrder: function(aResponse) {
+     if (aResponse.error == "wrongOrder") {
+       DebuggerView.Toolbar.showResumeWarning(aResponse.lastPausedUrl);
+     }
+   },
+ 
+   /**
+-   * Sets up a debugging session.
+-   *
+-   * @return object
+-   *         A promise resolved once the client attaches to the active thread.
+-   */
+-  _startDebuggingTab: function() {
+-    let deferred = promise.defer();
+-    let threadOptions = {
+-      useSourceMaps: Prefs.sourceMapsEnabled,
+-      autoBlackBox: Prefs.autoBlackBox
+-    };
+-
+-    this._target.activeTab.attachThread(threadOptions, (aResponse, aThreadClient) => {
+-      if (!aThreadClient) {
+-        deferred.reject(new Error("Couldn't attach to thread: " + aResponse.error));
+-        return;
+-      }
+-      this.activeThread = aThreadClient;
+-      this.Workers.connect();
+-      this.ThreadState.connect();
+-      this.StackFrames.connect();
+-      this.SourceScripts.connect();
+-
+-      if (aThreadClient.paused) {
+-        aThreadClient.resume(res => {
+-          this._ensureResumptionOrder(res)
+-        });
+-      }
+-
+-      deferred.resolve();
+-    });
+-
+-    return deferred.promise;
+-  },
+-
+-  /**
+-   * Sets up an addon debugging session.
+-   *
+-   * @param object aAddonActor
+-   *        The actor for the addon that is being debugged.
+-   * @return object
+-   *        A promise resolved once the client attaches to the active thread.
+-   */
+-  _startAddonDebugging: function(aAddonActor) {
+-    let deferred = promise.defer();
+-
+-    this.client.attachAddon(aAddonActor, aResponse => {
+-      this._startChromeDebugging(aResponse.threadActor).then(deferred.resolve);
+-    });
+-
+-    return deferred.promise;
+-  },
+-
+-  /**
+-   * Sets up a chrome debugging session.
+-   *
+-   * @param object aChromeDebugger
+-   *        The remote protocol grip of the chrome debugger.
+-   * @return object
+-   *         A promise resolved once the client attaches to the active thread.
+-   */
+-  _startChromeDebugging: function(aChromeDebugger) {
+-    let deferred = promise.defer();
+-    let threadOptions = {
+-      useSourceMaps: Prefs.sourceMapsEnabled,
+-      autoBlackBox: Prefs.autoBlackBox
+-    };
+-
+-    this.client.attachThread(aChromeDebugger, (aResponse, aThreadClient) => {
+-      if (!aThreadClient) {
+-        deferred.reject(new Error("Couldn't attach to thread: " + aResponse.error));
+-        return;
+-      }
+-      this.activeThread = aThreadClient;
+-      this.ThreadState.connect();
+-      this.StackFrames.connect();
+-      this.SourceScripts.connect();
+-
+-      if (aThreadClient.paused) {
+-        aThreadClient.resume(this._ensureResumptionOrder);
+-      }
+-
+-      deferred.resolve();
+-    }, threadOptions);
+-
+-    return deferred.promise;
+-  },
+-
+-  /**
+    * Detach and reattach to the thread actor with useSourceMaps true, blow
+    * away old sources and get them again.
+    */
+   reconfigureThread: function({ useSourceMaps, autoBlackBox }) {
+     this.activeThread.reconfigure({
+       useSourceMaps: useSourceMaps,
+       autoBlackBox: autoBlackBox
+     }, aResponse => {
+@@ -574,20 +489,16 @@ ThreadState.prototype = {
+       }
+     }
+ 
+     this.interruptedByResumeButton = false;
+     DebuggerView.Toolbar.toggleResumeButtonState(
+       this.activeThread.state,
+       aPacket ? aPacket.frame : false
+     );
+-
+-    if (gTarget && (aEvent == "paused" || aEvent == "resumed")) {
+-      gTarget.emit("thread-" + aEvent);
+-    }
+   }
+ };
+ 
+ /**
+  * Keeps the stack frame list up-to-date, using the thread client's
+  * stack frame cache.
+  */
+ function StackFrames() {
+diff --git a/devtools/client/debugger/panel.js b/devtools/client/debugger/panel.js
+index e1cf598..c38c2d4 100644
+--- a/devtools/client/debugger/panel.js
++++ b/devtools/client/debugger/panel.js
+@@ -17,19 +17,16 @@ function DebuggerPanel(iframeWindow, toolbox) {
+ 
+   this._view = this.panelWin.DebuggerView;
+   this._controller = this.panelWin.DebuggerController;
+   this._view._hostType = this._toolbox.hostType;
+   this._controller._target = this.target;
+   this._controller._toolbox = this._toolbox;
+ 
+   this.handleHostChanged = this.handleHostChanged.bind(this);
+-  this.highlightWhenPaused = this.highlightWhenPaused.bind(this);
+-  this.unhighlightWhenResumed = this.unhighlightWhenResumed.bind(this);
+-
+   EventEmitter.decorate(this);
+ }
+ 
+ exports.DebuggerPanel = DebuggerPanel;
+ 
+ DebuggerPanel.prototype = {
+   /**
+    * Open is effectively an asynchronous constructor.
+@@ -50,18 +47,16 @@ DebuggerPanel.prototype = {
+       targetPromise = promise.resolve(this.target);
+     }
+ 
+     return targetPromise
+       .then(() => this._controller.startupDebugger())
+       .then(() => this._controller.connect())
+       .then(() => {
+         this._toolbox.on("host-changed", this.handleHostChanged);
+-        this.target.on("thread-paused", this.highlightWhenPaused);
+-        this.target.on("thread-resumed", this.unhighlightWhenResumed);
+         this.isReady = true;
+         this.emit("ready");
+         return this;
+       })
+       .then(null, function onError(aReason) {
+         DevToolsUtils.reportException("DebuggerPanel.prototype.open", aReason);
+       });
+   },
+@@ -73,19 +68,16 @@ DebuggerPanel.prototype = {
+   },
+ 
+   destroy: function() {
+     // Make sure this panel is not already destroyed.
+     if (this._destroyer) {
+       return this._destroyer;
+     }
+ 
+-    this.target.off("thread-paused", this.highlightWhenPaused);
+-    this.target.off("thread-resumed", this.unhighlightWhenResumed);
+-
+     if (!this.target.isRemote) {
+       this.target.tab.removeEventListener('TabSelect', this);
+     }
+ 
+     return this._destroyer = this._controller.shutdownDebugger().then(() => {
+       this.emit("destroyed");
+     });
+   },
+@@ -99,28 +91,16 @@ DebuggerPanel.prototype = {
+   removeBreakpoint: function(aLocation) {
+     return this._controller.Breakpoints.removeBreakpoint(aLocation);
+   },
+ 
+   handleHostChanged: function() {
+     this._view.handleHostChanged(this._toolbox.hostType);
+   },
+ 
+-  highlightWhenPaused: function() {
+-    this._toolbox.highlightTool("jsdebugger");
+-
+-    // Also raise the toolbox window if it is undocked or select the
+-    // corresponding tab when toolbox is docked.
+-    this._toolbox.raise();
+-  },
+-
+-  unhighlightWhenResumed: function() {
+-    this._toolbox.unhighlightTool("jsdebugger");
+-  },
+-
+   // nsIDOMEventListener API
+ 
+   handleEvent: function(aEvent) {
+     if (aEvent.target == this.target.tab &&
+         this._controller.activeThread.state == "paused") {
+       // Wait a tick for the content focus event to be delivered.
+       DevToolsUtils.executeSoon(() => this._toolbox.focusTool("jsdebugger"));
+     }
+diff --git a/devtools/client/debugger/test/mochitest/browser_dbg_pause-warning.js b/devtools/client/debugger/test/mochitest/browser_dbg_pause-warning.js
+index a195414..c4c3847 100644
+--- a/devtools/client/debugger/test/mochitest/browser_dbg_pause-warning.js
++++ b/devtools/client/debugger/test/mochitest/browser_dbg_pause-warning.js
+@@ -19,18 +19,18 @@ function test() {
+     gToolbox = gPanel._toolbox;
+ 
+     testPause();
+   });
+ }
+ 
+ function testPause() {
+   gDebugger.gThreadClient.addOneTimeListener("paused", () => {
+-    ok(gTarget.isThreadPaused,
+-      "target.isThreadPaused has been updated to true.");
++    ok(gDebugger.gThreadClient.paused,
++      "threadClient.paused has been updated to true.");
+ 
+     gToolbox.once("inspector-selected").then(inspector => {
+       inspector.once("inspector-updated").then(testNotificationIsUp1);
+     });
+     gToolbox.selectTool("inspector");
+   });
+ 
+   EventUtils.sendMouseEvent({ type: "mousedown" },
+@@ -72,18 +72,18 @@ function testNotificationIsUp2() {
+   ok(notification,
+     "Inspector notification is present again (3).");
+ 
+   testResume();
+ }
+ 
+ function testResume() {
+   gDebugger.gThreadClient.addOneTimeListener("resumed", () => {
+-    ok(!gTarget.isThreadPaused,
+-      "target.isThreadPaused has been updated to false.");
++    ok(!gDebugger.gThreadClient.paused,
++      "threadClient.paused has been updated to false.");
+ 
+     let notificationBox = gToolbox.getNotificationBox();
+     let notification = notificationBox.getNotificationWithValue("inspector-script-paused");
+ 
+     ok(!notification,
+       "Inspector notification was removed once debugger resumed.");
+ 
+     closeDebuggerAndFinish(gPanel);
+diff --git a/devtools/client/framework/attach-thread.js b/devtools/client/framework/attach-thread.js
+new file mode 100644
+index 0000000..6be9ecb
+--- /dev/null
++++ b/devtools/client/framework/attach-thread.js
+@@ -0,0 +1,71 @@
++const {Cc, Ci, Cu} = require("chrome");
++const Services = Cu.import("resource://gre/modules/Services.jsm", {}).Services;
++const promise = require("promise");
++
++function handleThreadState(toolbox, event, packet) {
++  toolbox.target.emit("thread-" + event);
++
++  if(event === "paused") {
++    toolbox.highlightTool("jsdebugger");
++
++    if(packet.why.type === 'debuggerStatement' ||
++       packet.why.type === 'breakpoint' ||
++       packet.why.type === 'exception') {
++      toolbox.raise();
++      toolbox.selectTool("jsdebugger");
++    }
++  }
++  else if(event === "resumed") {
++    toolbox.unhighlightTool("jsdebugger");
++  }
++}
++
++function attachThread(toolbox) {
++  let deferred = promise.defer();
++
++  let target = toolbox.target;
++  let { form: { chromeDebugger, actor } } = target;
++  let threadOptions = {
++    useSourceMaps: Services.prefs.getBoolPref("devtools.debugger.source-maps-enabled"),
++    autoBlackBox: Services.prefs.getBoolPref("devtools.debugger.auto-black-box")
++  };
++
++  let handleResponse = (res, threadClient) => {
++    if (res.error) {
++      deferred.reject(new Error("Couldn't attach to thread: " + res.error));
++      return;
++    }
++    threadClient.addListener("paused", handleThreadState.bind(null, toolbox));
++    threadClient.addListener("resumed", handleThreadState.bind(null, toolbox));
++
++    if (!threadClient.paused) {
++      deferred.reject(
++        new Error("Thread in wrong state when starting up, should be paused")
++      );
++    }
++
++    threadClient.resume(res => deferred.resolve(threadClient));
++  }
++
++  if (target.isAddon) {
++    // Attaching an addon
++    target.client.attachAddon(actor, res => {
++      target.client.attachThread(res.threadActor, handleResponse);
++    });
++  } else if (target.isTabActor) {
++    // Attaching a normal thread
++    target.activeTab.attachThread(threadOptions, handleResponse);
++  } else {
++    // Attaching the browser debugger
++    target.client.attachThread(chromeDebugger, handleResponse);
++  }
++
++  return deferred.promise;
++}
++
++function detachThread(threadClient) {
++  threadClient.removeListener("paused");
++  threadClient.removeListener("resumed");
++}
++
++module.exports = { attachThread, detachThread };
+diff --git a/devtools/client/framework/moz.build b/devtools/client/framework/moz.build
+index 5afc896..06e4a47 100644
+--- a/devtools/client/framework/moz.build
++++ b/devtools/client/framework/moz.build
+@@ -2,16 +2,17 @@
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ BROWSER_CHROME_MANIFESTS += ['test/browser.ini']
+ 
+ DevToolsModules(
++    'attach-thread.js',
+     'gDevTools.jsm',
+     'selection.js',
+     'sidebar.js',
+     'target.js',
+     'toolbox-highlighter-utils.js',
+     'toolbox-hosts.js',
+     'toolbox-options.js',
+     'toolbox.js',
+diff --git a/devtools/client/framework/target.js b/devtools/client/framework/target.js
+index 2ffd2f9..8bebd44 100644
+--- a/devtools/client/framework/target.js
++++ b/devtools/client/framework/target.js
+@@ -164,19 +164,16 @@ Object.defineProperty(Target.prototype, "version", {
+ 
+ /**
+  * A TabTarget represents a page living in a browser tab. Generally these will
+  * be web pages served over http(s), but they don't have to be.
+  */
+ function TabTarget(tab) {
+   EventEmitter.decorate(this);
+   this.destroy = this.destroy.bind(this);
+-  this._handleThreadState = this._handleThreadState.bind(this);
+-  this.on("thread-resumed", this._handleThreadState);
+-  this.on("thread-paused", this._handleThreadState);
+   this.activeTab = this.activeConsole = null;
+   // Only real tabs need initialization here. Placeholder objects for remote
+   // targets will be initialized after a makeRemote method call.
+   if (tab && !["client", "form", "chrome"].every(tab.hasOwnProperty, tab)) {
+     this._tab = tab;
+     this._setupListeners();
+   } else {
+     this._form = tab.form;
+@@ -402,20 +399,16 @@ TabTarget.prototype = {
+   get isLocalTab() {
+     return !!this._tab;
+   },
+ 
+   get isMultiProcess() {
+     return !this.window;
+   },
+ 
+-  get isThreadPaused() {
+-    return !!this._isThreadPaused;
+-  },
+-
+   /**
+    * Adds remote protocol capabilities to the target, so that it can be used
+    * for tools that support the Remote Debugging Protocol even for local
+    * connections.
+    */
+   makeRemote: function TabTarget_makeRemote() {
+     if (this._remote) {
+       return this._remote.promise;
+@@ -572,50 +565,36 @@ TabTarget.prototype = {
+           this.emit("visible", event);
+         } else {
+           this.emit("hidden", event);
+         }
+         break;
+     }
+   },
+ 
+-  /**
+-   * Handle script status.
+-   */
+-  _handleThreadState: function(event) {
+-    switch (event) {
+-      case "thread-resumed":
+-        this._isThreadPaused = false;
+-        break;
+-      case "thread-paused":
+-        this._isThreadPaused = true;
+-        break;
+-    }
++  getPausedDetails: function() {
++    return this._pausedPacket;
+   },
+ 
++
+   /**
+    * Target is not alive anymore.
+    */
+   destroy: function() {
+     // If several things call destroy then we give them all the same
+     // destruction promise so we're sure to destroy only once
+     if (this._destroyer) {
+       return this._destroyer.promise;
+     }
+ 
+     this._destroyer = promise.defer();
+ 
+     // Before taking any action, notify listeners that destruction is imminent.
+     this.emit("close");
+ 
+-    // First of all, do cleanup tasks that pertain to both remoted and
+-    // non-remoted targets.
+-    this.off("thread-resumed", this._handleThreadState);
+-    this.off("thread-paused", this._handleThreadState);
+-
+     if (this._tab) {
+       this._teardownListeners();
+     }
+ 
+     let cleanupAndResolve = () => {
+       this._cleanup();
+       this._destroyer.resolve(null);
+     };
+@@ -651,16 +630,17 @@ TabTarget.prototype = {
+    * Clean up references to what this target points to.
+    */
+   _cleanup: function TabTarget__cleanup() {
+     if (this._tab) {
+       targets.delete(this._tab);
+     } else {
+       promiseTargets.delete(this._form);
+     }
++
+     this.activeTab = null;
+     this.activeConsole = null;
+     this._client = null;
+     this._tab = null;
+     this._form = null;
+     this._remote = null;
+   },
+ 
+@@ -773,49 +753,28 @@ WindowTarget.prototype = {
+   get isRemote() {
+     return false;
+   },
+ 
+   get isLocalTab() {
+     return false;
+   },
+ 
+-  get isThreadPaused() {
+-    return !!this._isThreadPaused;
+-  },
+-
+   /**
+    * Listen to the different events.
+    */
+   _setupListeners: function() {
+-    this._handleThreadState = this._handleThreadState.bind(this);
+-    this.on("thread-paused", this._handleThreadState);
+-    this.on("thread-resumed", this._handleThreadState);
+-  },
+-
+-  _handleThreadState: function(event) {
+-    switch (event) {
+-      case "thread-resumed":
+-        this._isThreadPaused = false;
+-        break;
+-      case "thread-paused":
+-        this._isThreadPaused = true;
+-        break;
+-    }
+   },
+ 
+   /**
+    * Target is not alive anymore.
+    */
+   destroy: function() {
+     if (!this._destroyed) {
+       this._destroyed = true;
+-
+-      this.off("thread-paused", this._handleThreadState);
+-      this.off("thread-resumed", this._handleThreadState);
+       this.emit("close");
+ 
+       targets.delete(this._window);
+       this._window = null;
+     }
+ 
+     return promise.resolve(null);
+   },
+diff --git a/devtools/client/framework/toolbox.js b/devtools/client/framework/toolbox.js
+index 7f9c1f7..0fb6202 100644
+--- a/devtools/client/framework/toolbox.js
++++ b/devtools/client/framework/toolbox.js
+@@ -18,16 +18,17 @@ const OS_IS_64_BITS = "DEVTOOLS_OS_IS_64_BITS_PER_USER";
+ const SCREENSIZE_HISTOGRAM = "DEVTOOLS_SCREEN_RESOLUTION_ENUMERATED_PER_USER";
+ 
+ var {Cc, Ci, Cu} = require("chrome");
+ var promise = require("promise");
+ var EventEmitter = require("devtools/shared/event-emitter");
+ var Telemetry = require("devtools/client/shared/telemetry");
+ var HUDService = require("devtools/client/webconsole/hudservice");
+ var sourceUtils = require("devtools/client/shared/source-utils");
++var { attachThread, detachThread } = require("./attach-thread");
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource:///modules/devtools/client/framework/gDevTools.jsm");
+ Cu.import("resource:///modules/devtools/client/scratchpad/scratchpad-manager.jsm");
+ Cu.import("resource:///modules/devtools/client/shared/DOMHelpers.jsm");
+ Cu.import("resource://gre/modules/Task.jsm");
+ 
+ loader.lazyImporter(this, "CommandUtils",
+@@ -248,16 +249,20 @@ Toolbox.prototype = {
+    * Get/alter the target of a Toolbox so we're debugging something different.
+    * See Target.jsm for more details.
+    * TODO: Do we allow |toolbox.target = null;| ?
+    */
+   get target() {
+     return this._target;
+   },
+ 
++  get threadClient() {
++    return this._threadClient;
++  },
++
+   /**
+    * Get/alter the host of a Toolbox, i.e. is it in browser or in a separate
+    * tab. See HostType for more details.
+    */
+   get hostType() {
+     return this._host.type;
+   },
+ 
+@@ -336,16 +341,18 @@ Toolbox.prototype = {
+    */
+   open: function() {
+     return Task.spawn(function*() {
+       let iframe = yield this._host.create();
+       let domReady = promise.defer();
+ 
+       // Load the toolbox-level actor fronts and utilities now
+       yield this._target.makeRemote();
++      this._threadClient = yield attachThread(this);
++
+       iframe.setAttribute("src", this._URL);
+       iframe.setAttribute("aria-label", toolboxStrings("toolbox.label"));
+       let domHelper = new DOMHelpers(iframe.contentWindow);
+       domHelper.onceDOMReady(() => domReady.resolve());
+ 
+       yield domReady.promise;
+ 
+       this.isReady = true;
+@@ -1908,16 +1915,20 @@ Toolbox.prototype = {
+         this._pickerButton.removeEventListener("command", this._togglePicker, false);
+         this._pickerButton = null;
+       }
+     }));
+ 
+     // Destroy the profiler connection
+     outstanding.push(this.destroyPerformance());
+ 
++    // Detach the thread
++    detachThread(this._threadClient);
++    this._threadClient = null;
++
+     // We need to grab a reference to win before this._host is destroyed.
+     let win = this.frame.ownerGlobal;
+ 
+     if (this._requisition) {
+       CommandUtils.destroyRequisition(this._requisition, this.target);
+     }
+     this._telemetry.toolClosed("toolbox");
+     this._telemetry.destroy();
+diff --git a/devtools/client/inspector/inspector-panel.js b/devtools/client/inspector/inspector-panel.js
+index 4584da1..156df80 100644
+--- a/devtools/client/inspector/inspector-panel.js
++++ b/devtools/client/inspector/inspector-panel.js
+@@ -167,27 +167,27 @@ InspectorPanel.prototype = {
+ 
+       // Show a warning when the debugger is paused.
+       // We show the warning only when the inspector
+       // is selected.
+       this.updateDebuggerPausedWarning = () => {
+         let notificationBox = this._toolbox.getNotificationBox();
+         let notification = notificationBox.getNotificationWithValue("inspector-script-paused");
+         if (!notification && this._toolbox.currentToolId == "inspector" &&
+-            this.target.isThreadPaused) {
++            this._toolbox.threadClient.paused) {
+           let message = strings.GetStringFromName("debuggerPausedWarning.message");
+           notificationBox.appendNotification(message,
+             "inspector-script-paused", "", notificationBox.PRIORITY_WARNING_HIGH);
+         }
+ 
+         if (notification && this._toolbox.currentToolId != "inspector") {
+           notificationBox.removeNotification(notification);
+         }
+ 
+-        if (notification && !this.target.isThreadPaused) {
++        if (notification && !this._toolbox.threadClient.paused) {
+           notificationBox.removeNotification(notification);
+         }
+ 
+       };
+       this.target.on("thread-paused", this.updateDebuggerPausedWarning);
+       this.target.on("thread-resumed", this.updateDebuggerPausedWarning);
+       this._toolbox.on("select", this.updateDebuggerPausedWarning);
+       this.updateDebuggerPausedWarning();
+diff --git a/devtools/shared/client/main.js b/devtools/shared/client/main.js
+index 3b75c6a..404fdab 100644
+--- a/devtools/shared/client/main.js
++++ b/devtools/shared/client/main.js
+@@ -79,18 +79,24 @@ function eventSource(aProto) {
+    * @param aListener function
+    *        The callback to remove. If addListener was called multiple
+    *        times, all instances will be removed.
+    */
+   aProto.removeListener = function (aName, aListener) {
+     if (!this._listeners || !this._listeners[aName]) {
+       return;
+     }
+-    this._listeners[aName] =
+-      this._listeners[aName].filter(function (l) { return l != aListener });
++
++    if(!aListener) {
++      this._listeners[aName] = [];
++    }
++    else {
++      this._listeners[aName] =
++        this._listeners[aName].filter(function (l) { return l != aListener });
++    }
+   };
+ 
+   /**
+    * Returns the listeners for the specified event name. If none are defined it
+    * initializes an empty list and returns that.
+    *
+    * @param aName string
+    *        The event name.
+@@ -2093,22 +2099,30 @@ ThreadClient.prototype = {
+   },
+ 
+   /**
+    * Handle thread state change by doing necessary cleanup and notifying all
+    * registered listeners.
+    */
+   _onThreadState: function (aPacket) {
+     this._state = ThreadStateTypes[aPacket.type];
++    // The debugger UI may not be initialized yet so we want to keep
++    // the packet around so it knows what to pause state to display
++    // when it's initialized
++    this._lastPausePacket = aPacket.type === 'resumed' ? null : aPacket;
+     this._clearFrames();
+     this._clearPauseGrips();
+     aPacket.type === ThreadStateTypes.detached && this._clearThreadGrips();
+     this.client._eventsEnabled && this.emit(aPacket.type, aPacket);
+   },
+ 
++  getLastPausePacket: function() {
++    return this._lastPausePacket;
++  },
++
+   /**
+    * Return an EnvironmentClient instance for the given environment actor form.
+    */
+   environment: function (aForm) {
+     return new EnvironmentClient(this.client, aForm);
+   },
+ 
+   /**
