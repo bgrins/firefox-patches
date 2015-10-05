@@ -1,0 +1,132 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  88829b86c9ebc235d719f991352350d845127151
+Bug 1198039 - Don't modify the DOM after dragging an element and putting it back where it started;r=pbrosset
+
+diff --git a/devtools/client/markupview/markup-view.js b/devtools/client/markupview/markup-view.js
+--- a/devtools/client/markupview/markup-view.js
++++ b/devtools/client/markupview/markup-view.js
+@@ -1941,22 +1941,29 @@ MarkupContainer.prototype = {
+     if (!this.isDragging) {
+       return;
+     }
+ 
+     this.cancelDragging();
+ 
+     let dropTargetNodes = this.markup.dropTargetNodes;
+ 
+-    if (!dropTargetNodes) {
++    // debugger;
++    // console.log(this.node._form.attrs[0].value, dropTargetNodes.nextSibling._form.attrs[0].value)
++    
++
++    // file:///Users/bgrinstead/Code/fx-team/devtools/client/markupview/test/doc_markup_dragdrop.html
++    // Don't do a mutation if nothing is going to change.
++    if (!dropTargetNodes){ // || this.node === dropTargetNodes.nextSibling) {
+       return;
+     }
+ 
+     yield this.markup.walker.insertBefore(this.node, dropTargetNodes.parent,
+                                           dropTargetNodes.nextSibling);
++
+     this.markup.emit("drop-completed");
+   }),
+ 
+   /**
+    * On mouse move, move the dragged element if any and indicate the drop target.
+    */
+   _onMouseMove: function(event) {
+     if (!this.isDragging) {
+diff --git a/devtools/client/markupview/test/browser_markupview_dragdrop_reorder.js b/devtools/client/markupview/test/browser_markupview_dragdrop_reorder.js
+--- a/devtools/client/markupview/test/browser_markupview_dragdrop_reorder.js
++++ b/devtools/client/markupview/test/browser_markupview_dragdrop_reorder.js
+@@ -18,16 +18,21 @@ add_task(function*() {
+   let parent = yield getNode("#test");
+   let parentContainer = yield getContainerForNodeFront(parentFront, inspector);
+ 
+   yield inspector.markup.expandNode(parentFront);
+   yield waitForMultipleChildrenUpdates(inspector);
+ 
+   parentContainer.elt.scrollIntoView(true);
+ 
++  info("Testing putting an element back in it's original place");
++  yield dragElementToOriginalLocation("#firstChild", inspector);
++  is(parent.children[0].id, "firstChild", "#firstChild is still the first child of #test");
++  is(parent.children[1].id, "middleChild", "#middleChild is still the second child of #test");
++
+   info("Testing switching elements inside their parent");
+   yield moveElementDown("#firstChild", "#middleChild", inspector);
+ 
+   is(parent.children[0].id, "middleChild", "#firstChild is now the second child of #test");
+   is(parent.children[1].id, "firstChild", "#middleChild is now the first child of #test");
+ 
+   info("Testing switching elements with a last child");
+   yield moveElementDown("#firstChild", "#lastChild", inspector);
+@@ -90,16 +95,36 @@ function* dragContainer(selector, target
+     });
+ 
+     container.markup._onMouseUp();
+   }, GRAB_DELAY+1);
+ 
+   return updated;
+ };
+ 
++function* dragElementToOriginalLocation(selector, inspector) {
++  let el = yield getContainerForSelector(selector, inspector);
++  let height = el.tagLine.getBoundingClientRect().height;
++
++  info("Picking up and putting back down " + selector);
++
++  // Override the function that's used to modify the DOM.
++  // This is just extra checking, the test will fail later on
++  // if it's not 
++  let orig = inspector.markup.walker.insertBefore;
++  inspector.markup.walker.insertBefore = function() {
++    debugger;
++    ok(false, "Should not be attempting to insert any nodes");
++  }
++  yield dragContainer(selector, {x: 0, y: 0}, inspector);
++  inspector.markup.walker.insertBefore = orig;
++
++  yield new Promise(() => {})
++}
++
+ function* moveElementDown(selector, next, inspector) {
+   let onMutated = inspector.once("markupmutation");
+   let uiUpdate = inspector.once("inspector-updated");
+ 
+   let el = yield getContainerForSelector(next, inspector);
+   let height = el.tagLine.getBoundingClientRect().height;
+ 
+   info("Switching " + selector + ' with ' + next);
+diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspector.js
+--- a/devtools/server/actors/inspector.js
++++ b/devtools/server/actors/inspector.js
+@@ -2657,16 +2657,27 @@ var WalkerActor = protocol.ActorClass({
+    */
+   insertBefore: method(function(node, parent, sibling) {
+     if (isNodeDead(node) ||
+         isNodeDead(parent) ||
+         (sibling && isNodeDead(sibling))) {
+       return null;
+     }
+ 
++    let rawNode = node.rawNode;
++    let rawParent = parent.rawNode;
++    let rawSibling = sibling && sibling.rawNode;
++
++    // Don't bother inserting a node if the document position isn't going
++    // to change. This prevents needless iframes reloading and mutations.
++    if (rawNode.parentNode === rawParent &&
++        (rawNode === rawSibling || rawNode.nextSibling === rawSibling)) {
++      return;
++    }
++
+     parent.rawNode.insertBefore(node.rawNode, sibling ? sibling.rawNode : null);
+   }, {
+     request: {
+       node: Arg(0, "domnode"),
+       parent: Arg(1, "domnode"),
+       sibling: Arg(2, "nullable:domnode")
+     },
+     response: {}
