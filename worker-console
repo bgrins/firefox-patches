@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  1831b1955278d055e7b6f3435d5236c0a8adf036
+# Parent  2ebf10394882ffc825ab01d6ff54497d773808ae
 Bug 1209353 - Try to create a console actor in worker
 
 diff --git a/devtools/client/framework/target.js b/devtools/client/framework/target.js
@@ -25,13 +25,13 @@ diff --git a/devtools/client/framework/target.js b/devtools/client/framework/tar
   * Moreover, unlike TabTarget, which is constructed with a placeholder object
   * for remote tabs (from which a TabClient can then be lazily obtained),
   * WorkerTarget is constructed with a WorkerClient directly.
-@@ -851,19 +853,25 @@ WorkerTarget.prototype = {
-   get isRemote() {
+@@ -855,19 +857,25 @@ WorkerTarget.prototype = {
+   get isTabActor() {
      return true;
    },
  
-   get isTabActor() {
-     return true;
+   get url() {
+     return this._workerClient.url;
    },
  
 +  get isWorkerTarget() {
@@ -51,7 +51,7 @@ diff --git a/devtools/client/framework/target.js b/devtools/client/framework/tar
  
    get activeTab() {
      return this._workerClient;
-@@ -878,10 +886,12 @@ WorkerTarget.prototype = {
+@@ -882,10 +890,12 @@ WorkerTarget.prototype = {
    hasActor: function (name) {
      return false;
    },
@@ -276,29 +276,246 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
      if (this._parentIsContentActor) {
        appId = this.parentActor.docShell.appId;
        messageManager = this.parentActor.messageManager;
-@@ -880,16 +873,22 @@ WebConsoleActor.prototype =
-    *
-    * @param object aRequest
-    *        The request message - what input to autocomplete.
+@@ -791,17 +784,17 @@ WebConsoleActor.prototype =
     * @return object
-    *         The response message - matched properties.
+    *         The response packet to send to with the unique id in the
+    *         `resultID` field.
     */
-   onAutocomplete: function WCA_onAutocomplete(aRequest)
+   onEvaluateJSAsync: function WCA_onEvaluateJSAsync(aRequest)
    {
-+    // XXX: early return for easier debugging on execute()
-+    return {
-+      from: this.actorID,
-+      matches: [],
-+      matchProp: "",
-+    };
-     let frameActorId = aRequest.frameActor;
-     let dbgObject = null;
-     let environment = null;
+     // We want to be able to run console commands without waiting
+     // for the first to return (see Bug 1088861).
+-
++    dump("onEvaluateJSAsync" + this.actorID + " " + aRequest.text + "\n\n");
+     // First, send a response packet with the id only.
+     let resultID = Date.now();
+     this.conn.send({
+       from: this.actorID,
+       resultID: resultID
+     });
  
+     // Then, execute the script that may pause.
+@@ -828,47 +821,55 @@ WebConsoleActor.prototype =
+     let timestamp = Date.now();
+ 
+     let evalOptions = {
+       bindObjectActor: aRequest.bindObjectActor,
+       frameActor: aRequest.frameActor,
+       url: aRequest.url,
+       selectedNodeActor: aRequest.selectedNodeActor,
+     };
++    dump("Eval 0\n");
+ 
+     let evalInfo = this.evalWithDebugger(input, evalOptions);
+     let evalResult = evalInfo.result;
+     let helperResult = evalInfo.helperResult;
+ 
++    dump("Eval 1 " + isWorker + "\n");
+     let result, errorMessage, errorGrip = null;
+     if (evalResult) {
+       if ("return" in evalResult) {
+         result = evalResult.return;
+       } else if ("yield" in evalResult) {
+         result = evalResult.yield;
+       } else if ("throw" in evalResult) {
+         let error = evalResult.throw;
+         errorGrip = this.createValueGrip(error);
+-        errorMessage = error && (typeof error === "object")
+-          ? error.unsafeDereference().toString()
++        // XXX: This error seems like an empty object in a worker.
++        // Can test by running '1_1' in a normal console and worker console
++        let unsafeDereference = error && (typeof error === "object") &&
++                                error.unsafeDereference();
++        errorMessage = unsafeDereference && unsafeDereference.toString
++          ? unsafeDereference.toString()
+           : "" + error;
+       }
+     }
++    dump("Eval 2\n");
+ 
+     // If a value is encountered that the debugger server doesn't support yet,
+     // the console should remain functional.
+     let resultGrip;
+     try {
+       resultGrip = this.createValueGrip(result);
+     } catch (e) {
+       errorMessage = e;
+     }
+ 
+     this._lastConsoleInputEvaluation = result;
+ 
++    dump("Eval 3\n");
+     return {
+       from: this.actorID,
+       input: input,
+       result: resultGrip,
+       timestamp: timestamp,
+       exception: errorGrip,
+       exceptionMessage: this._createStringGrip(errorMessage),
+       helperResult: helperResult,
+@@ -892,18 +893,18 @@ WebConsoleActor.prototype =
      // This is the case of the paused debugger
      if (frameActorId) {
        let frameActor = this.conn.getActor(frameActorId);
        if (frameActor) {
+         let frame = frameActor.frame;
+         environment = frame.environment;
+       }
+       else {
+-        Cu.reportError("Web Console Actor: the frame actor was not found: " +
+-                       frameActorId);
++        DevToolsUtils.reportException("onAutocomplete",
++          Error("The frame actor was not found: " + frameActorId));
+       }
+     }
+     // This is the general case (non-paused debugger)
+     else {
+       dbgObject = this.dbg.makeGlobalObjectReference(this.evalWindow);
+     }
+ 
+     let result = JSPropertyProvider(dbgObject, environment, aRequest.text,
+@@ -1021,17 +1022,19 @@ WebConsoleActor.prototype =
+       sandbox: Object.create(null),
+       helperResult: null,
+       consoleActor: this,
+     };
+     addWebConsoleCommands(helpers);
+ 
+     let evalWindow = this.evalWindow;
+     function maybeExport(obj, name) {
+-      if (typeof obj[name] != "function") {
++      // XXX: Don't ever export in worker b/c of Cu.exportFunction
++      if (typeof obj[name] != "function" || isWorker) {
++        dump("Skipping export " + name + "\n\n")
+         return;
+       }
+ 
+       // By default, chrome-implemented functions that are exposed to content
+       // refuse to accept arguments that are cross-origin for the caller. This
+       // is generally the safe thing, but causes problems for certain console
+       // helpers like cd(), where we users sometimes want to pass a cross-origin
+       // window. To circumvent this restriction, we use exportFunction along
+@@ -1121,84 +1124,92 @@ WebConsoleActor.prototype =
+       aString = "help()";
+     }
+ 
+     // Add easter egg for console.mihai().
+     if (trimmedString == "console.mihai()" || trimmedString == "console.mihai();") {
+       aString = "\"http://incompleteness.me/blog/2015/02/09/console-dot-mihai/\"";
+     }
+ 
++    dump("evalWithDebugger 0\n\n");
++
+     // Find the Debugger.Frame of the given FrameActor.
+     let frame = null, frameActor = null;
+     if (aOptions.frameActor) {
+       frameActor = this.conn.getActor(aOptions.frameActor);
+       if (frameActor) {
+         frame = frameActor.frame;
+       }
+       else {
+-        Cu.reportError("Web Console Actor: the frame actor was not found: " +
+-                       aOptions.frameActor);
++        DevToolsUtils.reportException("evalWithDebugger",
++          Error("The frame actor was not found: " + aOptions.frameActor));
+       }
+     }
+ 
++    dump("evalWithDebugger 1" + frameActor + "\n\n");
+     // If we've been given a frame actor in whose scope we should evaluate the
+     // expression, be sure to use that frame's Debugger (that is, the JavaScript
+     // debugger's Debugger) for the whole operation, not the console's Debugger.
+     // (One Debugger will treat a different Debugger's Debugger.Object instances
+     // as ordinary objects, not as references to be followed, so mixing
+     // debuggers causes strange behaviors.)
+     let dbg = frame ? frameActor.threadActor.dbg : this.dbg;
+     let dbgWindow = dbg.makeGlobalObjectReference(this.evalWindow);
+ 
++    dump("evalWithDebugger 2\n\n");
+     // If we have an object to bind to |_self|, create a Debugger.Object
+     // referring to that object, belonging to dbg.
+     let bindSelf = null;
+     if (aOptions.bindObjectActor) {
+       let objActor = this.getActorByID(aOptions.bindObjectActor);
+       if (objActor) {
+         let jsObj = objActor.obj.unsafeDereference();
+         // If we use the makeDebuggeeValue method of jsObj's own global, then
+         // we'll get a D.O that sees jsObj as viewed from its own compartment -
+         // that is, without wrappers. The evalWithBindings call will then wrap
+         // jsObj appropriately for the evaluation compartment.
+         let global = Cu.getGlobalForObject(jsObj);
+         dbgWindow = dbg.makeGlobalObjectReference(global);
+         bindSelf = dbgWindow.makeDebuggeeValue(jsObj);
+       }
+     }
++    dump("evalWithDebugger 4" + aOptions.selectedNodeActor  + "\n\n");
+ 
+     // Get the Web Console commands for the given debugger window.
+     let helpers = this._getWebConsoleCommands(dbgWindow);
+     let bindings = helpers.sandbox;
+     if (bindSelf) {
+       bindings._self = bindSelf;
+     }
+ 
++    dump("evalWithDebugger 4.1\n\n");
+     if (aOptions.selectedNodeActor) {
+       let actor = this.conn.getActor(aOptions.selectedNodeActor);
+       if (actor) {
+         helpers.selectedNode = actor.rawNode;
+       }
+     }
++    dump("evalWithDebugger 5\n\n");
+ 
+     // Check if the Debugger.Frame or Debugger.Object for the global include
+     // $ or $$. We will not overwrite these functions with the Web Console
+     // commands.
+     let found$ = false, found$$ = false;
+     if (frame) {
+       let env = frame.environment;
+       if (env) {
+         found$ = !!env.find("$");
+         found$$ = !!env.find("$$");
+       }
+     }
+     else {
+       found$ = !!dbgWindow.getOwnPropertyDescriptor("$");
+       found$$ = !!dbgWindow.getOwnPropertyDescriptor("$$");
+     }
++    dump("evalWithDebugger 6\n\n");
+ 
+     let $ = null, $$ = null;
+     if (found$) {
+       $ = bindings.$;
+       delete bindings.$;
+     }
+     if (found$$) {
+       $$ = bindings.$$;
+@@ -1208,23 +1219,25 @@ WebConsoleActor.prototype =
+     // Ready to evaluate the string.
+     helpers.evalInput = aString;
+ 
+     let evalOptions;
+     if (typeof aOptions.url == "string") {
+       evalOptions = { url: aOptions.url };
+     }
+ 
++    dump("evalWithDebugger 7" + JSON.stringify(evalOptions) + " \n\n");
+     let result;
+     if (frame) {
+       result = frame.evalWithBindings(aString, bindings, evalOptions);
+     }
+     else {
+       result = dbgWindow.executeInGlobalWithBindings(aString, bindings, evalOptions);
+     }
++    dump("evalWithDebugger 8\n\n");
+ 
+     let helperResult = helpers.helperResult;
+     delete helpers.evalInput;
+     delete helpers.helperResult;
+     delete helpers.selectedNode;
+ 
+     if ($) {
+       bindings.$ = $;
 diff --git a/devtools/server/actors/worker.js b/devtools/server/actors/worker.js
 --- a/devtools/server/actors/worker.js
 +++ b/devtools/server/actors/worker.js
@@ -633,6 +850,58 @@ diff --git a/devtools/shared/client/main.js b/devtools/shared/client/main.js
      this.removeListener("close", this._onClose);
      this.removeListener("freeze", this._onFreeze);
      this.removeListener("thaw", this._onThaw);
+diff --git a/devtools/shared/webconsole/client.js b/devtools/shared/webconsole/client.js
+--- a/devtools/shared/webconsole/client.js
++++ b/devtools/shared/webconsole/client.js
+@@ -276,37 +276,47 @@ WebConsoleClient.prototype = {
+       type: "evaluateJSAsync",
+       text: aString,
+       bindObjectActor: aOptions.bindObjectActor,
+       frameActor: aOptions.frameActor,
+       url: aOptions.url,
+       selectedNodeActor: aOptions.selectedNodeActor,
+     };
+ 
++    dump("this._client.request " + JSON.stringify(packet) + "\n\n");
++
+     this._client.request(packet, response => {
+       // Null check this in case the client has been detached while waiting
+       // for a response.
+       if (this.pendingEvaluationResults) {
+         this.pendingEvaluationResults.set(response.resultID, aOnResponse);
+       }
+     });
+   },
+ 
+   /**
+    * Handler for the actors's unsolicited evaluationResult packet.
+    */
+   onEvaluationResult: function(aNotification, aPacket) {
++    // The evaluation request came from a worker, the main thread's client
++    // receives this callback.
++    // XXX: Eddy, is this expected?
++    if (aPacket.from !== this._actor) {
++      return;
++    }
++
+     // Find the associated callback based on this ID, and fire it.
+     // In a sync evaluation, this would have already been called in
+     // direct response to the client.request function.
+     let onResponse = this.pendingEvaluationResults.get(aPacket.resultID);
+     if (onResponse) {
+       onResponse(aPacket);
+       this.pendingEvaluationResults.delete(aPacket.resultID);
+-    } else {
++    } else if (!isWorker) {
++      debugger;
+       DevToolsUtils.reportException("onEvaluationResult",
+         "No response handler for an evaluateJSAsync result (resultID: " + aPacket.resultID + ")");
+     }
+   },
+ 
+   /**
+    * Autocomplete a JavaScript expression.
+    *
 diff --git a/devtools/shared/webconsole/moz.build b/devtools/shared/webconsole/moz.build
 --- a/devtools/shared/webconsole/moz.build
 +++ b/devtools/shared/webconsole/moz.build
