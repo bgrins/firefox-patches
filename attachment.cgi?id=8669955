@@ -1,0 +1,310 @@
+# HG changeset patch
+# User J. Ryan Stinnett <jryans@gmail.com>
+# Parent  5423ad10d93037a7b1031e2b4958df8c2733a1fa
+Bug 1070719 - Autosave project files before running. r=bgrins
+
+diff --git a/browser/locales/en-US/chrome/browser/devtools/webide.dtd b/browser/locales/en-US/chrome/browser/devtools/webide.dtd
+--- a/browser/locales/en-US/chrome/browser/devtools/webide.dtd
++++ b/browser/locales/en-US/chrome/browser/devtools/webide.dtd
+@@ -132,16 +132,18 @@
+ <!ENTITY prefs_options_detectindentation "Autoindent">
+ <!ENTITY prefs_options_detectindentation_tooltip "Guess indentation based on source content">
+ <!ENTITY prefs_options_autocomplete "Autocomplete">
+ <!ENTITY prefs_options_autocomplete_tooltip "Enable code autocompletion">
+ <!ENTITY prefs_options_autoclosebrackets "Autoclose brackets">
+ <!ENTITY prefs_options_autoclosebrackets_tooltip "Automatically insert closing brackets">
+ <!ENTITY prefs_options_keybindings "Keybindings">
+ <!ENTITY prefs_options_keybindings_default "Default">
++<!ENTITY prefs_options_autosavefiles "Autosave files">
++<!ENTITY prefs_options_autosavefiles_tooltip "Automatically save edited files before running project">
+ 
+ <!-- Permissions Table -->
+ <!ENTITY permissionstable_title "Permissions Table">
+ <!ENTITY permissionstable_name_header "Name">
+ 
+ <!-- Runtime Details -->
+ <!ENTITY runtimedetails_title "Runtime Info">
+ <!ENTITY runtimedetails_adbIsRoot "ADB is root: ">
+diff --git a/devtools/client/projecteditor/lib/projecteditor.js b/devtools/client/projecteditor/lib/projecteditor.js
+--- a/devtools/client/projecteditor/lib/projecteditor.js
++++ b/devtools/client/projecteditor/lib/projecteditor.js
+@@ -14,16 +14,17 @@ const { registeredPlugins } = require("d
+ const { EventTarget } = require("sdk/event/target");
+ const { on, forget } = require("devtools/client/projecteditor/lib/helpers/event");
+ const { emit } = require("sdk/event/core");
+ const { merge } = require("sdk/util/object");
+ const promise = require("promise");
+ const { ViewHelpers } = Cu.import("resource:///modules/devtools/client/shared/widgets/ViewHelpers.jsm", {});
+ const { DOMHelpers } = Cu.import("resource:///modules/devtools/client/shared/DOMHelpers.jsm");
+ const { Services } = Cu.import("resource://gre/modules/Services.jsm", {});
++const { Task } = Cu.import("resource://gre/modules/Task.jsm", {});
+ const ITCHPAD_URL = "chrome://devtools/content/projecteditor/chrome/content/projecteditor.xul";
+ const { confirm } = require("devtools/client/projecteditor/lib/helpers/prompts");
+ const { getLocalizedString } = require("devtools/client/projecteditor/lib/helpers/l10n");
+ 
+ // Enabled Plugins
+ require("devtools/client/projecteditor/lib/plugins/dirty/dirty");
+ require("devtools/client/projecteditor/lib/plugins/delete/delete");
+ require("devtools/client/projecteditor/lib/plugins/new/new");
+@@ -747,26 +748,46 @@ var ProjectEditor = Class({
+   /**
+    * Check with the user about navigating away with unsaved changes.
+    *
+    * @returns Boolean
+    *          True if there are no unsaved changes
+    *          Otherwise, ask the user to confirm and return the outcome.
+    */
+   confirmUnsaved: function() {
+-
+     if (this.hasUnsavedResources) {
+       return confirm(
+         getLocalizedString("projecteditor.confirmUnsavedTitle"),
+         getLocalizedString("projecteditor.confirmUnsavedLabel2")
+       );
+     }
+ 
+     return true;
+-  }
++  },
++
++  /**
++   * Save all the changes in source files.
++   *
++   * @returns Boolean
++   *          True if there were resources to save.
++   */
++  saveAllFiles: Task.async(function*() {
++    if (this.hasUnsavedResources) {
++      for (let resource of this.project.allResources()) {
++        let editor = this.editorFor(resource);
++        if (editor && !editor.isClean()) {
++          yield editor.save(resource);
++        }
++      }
++
++      return true;
++    }
++
++    return false;
++  })
+ 
+ });
+ 
+ 
+ /**
+  * Returns a controller object that can be used for
+  * editor-specific commands such as find, jump to line,
+  * copy/paste, etc.
+diff --git a/devtools/client/projecteditor/lib/stores/resource.js b/devtools/client/projecteditor/lib/stores/resource.js
+--- a/devtools/client/projecteditor/lib/stores/resource.js
++++ b/devtools/client/projecteditor/lib/stores/resource.js
+@@ -343,29 +343,25 @@ var FileResource = Class({
+   /**
+    * Write a string to this file.
+    *
+    * @param string content
+    * @returns Promise
+    *          Resolves once it has been written to disk.
+    *          Rejected if there is an error
+    */
+-  save: function(content) {
++  save: Task.async(function*(content) {
++    // XXX: writeAtomic was losing permissions after saving on OSX
++    // return OS.File.writeAtomic(this.path, buffer, { tmpPath: this.path + ".tmp" });
+     let buffer = gEncoder.encode(content);
+     let path = this.path;
+-
+-    // XXX: writeAtomic was losing permissions after saving on OSX
+-    // return OS.File.writeAtomic(this.path, buffer, { tmpPath: this.path + ".tmp" });
+-
+-    return Task.spawn(function*() {
+-        let pfh = yield OS.File.open(path, {truncate: true});
+-        yield pfh.write(buffer);
+-        yield pfh.close();
+-    });
+-  },
++    let file = yield OS.File.open(path, {truncate: true});
++    yield file.write(buffer);
++    yield file.close();
++  }),
+ 
+   /**
+    * Attempts to get the content type from the file.
+    */
+   get contentType() {
+     if (this._contentType) {
+       return this._contentType;
+     }
+diff --git a/devtools/client/projecteditor/test/browser.ini b/devtools/client/projecteditor/test/browser.ini
+--- a/devtools/client/projecteditor/test/browser.ini
++++ b/devtools/client/projecteditor/test/browser.ini
+@@ -21,11 +21,13 @@ skip-if = buildapp == 'mulet'
+ [browser_projecteditor_editors_image.js]
+ [browser_projecteditor_external_change.js]
+ [browser_projecteditor_immediate_destroy.js]
+ [browser_projecteditor_init.js]
+ [browser_projecteditor_menubar_01.js]
+ [browser_projecteditor_menubar_02.js]
+ skip-if = true # Bug 1173950
+ [browser_projecteditor_new_file.js]
++[browser_projecteditor_saveall.js]
++skip-if = buildapp == 'mulet'
+ [browser_projecteditor_stores.js]
+ [browser_projecteditor_tree_selection_01.js]
+ [browser_projecteditor_tree_selection_02.js]
+diff --git a/devtools/client/projecteditor/test/browser_projecteditor_saveall.js b/devtools/client/projecteditor/test/browser_projecteditor_saveall.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/projecteditor/test/browser_projecteditor_saveall.js
+@@ -0,0 +1,63 @@
++/* vim: set ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++///////////////////
++//
++// Whitelisting this test.
++// As part of bug 1077403, the leaking uncaught rejection should be fixed.
++//
++thisTestLeaksUncaughtRejectionsAndShouldBeFixed("destroy");
++
++loadHelperScript("helper_edits.js");
++
++// Test ProjectEditor basic functionality
++add_task(function*() {
++  let projecteditor = yield addProjectEditorTabForTempDirectory();
++  let TEMP_PATH = projecteditor.project.allPaths()[0];
++
++  is (getTempFile("").path, TEMP_PATH, "Temp path is set correctly.");
++
++  ok (projecteditor.currentEditor, "There is an editor for projecteditor");
++  let resources = projecteditor.project.allResources();
++
++  for (let data of helperEditData) {
++    info ("Processing " + data.path);
++    let resource = resources.filter(r=>r.basename === data.basename)[0];
++    yield selectFile(projecteditor, resource);
++    yield editFile(projecteditor, getTempFile(data.path).path, data.newContent);
++  }
++
++  info ("Saving all resources");
++  yield projecteditor.saveAll();
++  for (let data of helperEditData) {
++    let resource = resources.filter(r=>r.basename === data.basename)[0];
++    yield selectFile(projecteditor, resource);
++    let editor = projecteditor.currentEditor;
++    let resource = projecteditor.resourceFor(editor);
++    let savedData = yield getFileData(filePath);
++    is (savedData, data.newContent, "Data has been correctly saved to disk");
++    info ("Finished checking saving for " + filePath);
++  }
++});
++
++function* editFile(projecteditor, filePath, newData) {
++  info ("Testing file editing for: " + filePath);
++
++  let initialData = yield getFileData(filePath);
++  let editor = projecteditor.currentEditor;
++  let resource = projecteditor.resourceFor(editor);
++  let viewContainer = projecteditor.projectTree.getViewContainer(resource);
++  let originalTreeLabel = viewContainer.label.textContent;
++
++  is (resource.path, filePath, "Resource path is set correctly");
++  is (editor.editor.getText(), initialData, "Editor is loaded with correct file contents");
++
++  info ("Setting text in the editor");
++
++  editor.editor.setText(newData);
++  is (editor.editor.getText(), newData, "Editor has been filled with new data");
++  is (viewContainer.label.textContent, "*" + originalTreeLabel, "Label is marked as changed");
++}
+diff --git a/devtools/client/webide/content/prefs.xhtml b/devtools/client/webide/content/prefs.xhtml
+--- a/devtools/client/webide/content/prefs.xhtml
++++ b/devtools/client/webide/content/prefs.xhtml
+@@ -86,16 +86,22 @@
+       </li>
+       <li>
+         <label title="&prefs_options_autoclosebrackets_tooltip;">
+           <input type="checkbox" data-pref="devtools.editor.autoclosebrackets"/>
+           <span>&prefs_options_autoclosebrackets;</span>
+         </label>
+       </li>
+       <li>
++        <label title="&prefs_options_autosavefiles_tooltip;">
++          <input type="checkbox" data-pref="devtools.webide.autosaveFiles"/>
++          <span>&prefs_options_autosavefiles;</span>
++        </label>
++      </li>
++      <li>
+         <label><span>&prefs_options_keybindings;</span>
+           <select data-pref="devtools.editor.keymap">
+             <option value="default">&prefs_options_keybindings_default;</option>
+             <option value="vim">Vim</option>
+             <option value="emacs">Emacs</option>
+             <option value="sublime">Sublime</option>
+           </select>
+         </label>
+diff --git a/devtools/client/webide/content/webide.js b/devtools/client/webide/content/webide.js
+--- a/devtools/client/webide/content/webide.js
++++ b/devtools/client/webide/content/webide.js
+@@ -1180,20 +1180,25 @@ var Cmds = {
+   showSettings: function() {
+     UI.selectDeckPanel("devicesettings");
+   },
+ 
+   showMonitor: function() {
+     UI.selectDeckPanel("monitor");
+   },
+ 
+-  play: function() {
++  play: Task.async(function*() {
+     let busy;
+     switch(AppManager.selectedProject.type) {
+       case "packaged":
++        let autosave =
++          Services.prefs.getBoolPref("devtools.webide.autosaveFiles");
++        if (autosave && UI.projecteditor) {
++          yield UI.projecteditor.saveAllFiles();
++        }
+         busy = UI.busyWithProgressUntil(AppManager.installAndRunProject(),
+                                         "installing and running app");
+         break;
+       case "hosted":
+         busy = UI.busyUntil(AppManager.installAndRunProject(),
+                             "installing and running app");
+         break;
+       case "runtimeApp":
+@@ -1203,17 +1208,17 @@ var Cmds = {
+         busy = UI.busyUntil(AppManager.reloadTab(), "reloading tab");
+         break;
+     }
+     if (!busy) {
+       return promise.reject();
+     }
+     UI.onAction("play");
+     return busy;
+-  },
++  }),
+ 
+   stop: function() {
+     return UI.busyUntil(AppManager.stopRunningApp(), "stopping app");
+   },
+ 
+   toggleToolbox: function() {
+     UI.onAction("debug");
+     if (UI.toolboxIframe) {
+diff --git a/devtools/client/webide/webide-prefs.js b/devtools/client/webide/webide-prefs.js
+--- a/devtools/client/webide/webide-prefs.js
++++ b/devtools/client/webide/webide-prefs.js
+@@ -28,8 +28,9 @@ pref("devtools.webide.widget.enabled", t
+ pref("devtools.webide.widget.inNavbarByDefault", true);
+ #else
+ pref("devtools.webide.widget.enabled", false);
+ pref("devtools.webide.widget.inNavbarByDefault", false);
+ #endif
+ pref("devtools.webide.zoom", "1");
+ pref("devtools.webide.busyTimeout", 10000);
+ pref("devtools.webide.sidebars", true);
++pref("devtools.webide.autosaveFiles", true);
