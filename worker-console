@@ -6,7 +6,7 @@ Bug 1209353 - Try to create a console actor in worker
 diff --git a/devtools/client/framework/target.js b/devtools/client/framework/target.js
 --- a/devtools/client/framework/target.js
 +++ b/devtools/client/framework/target.js
-@@ -823,16 +823,17 @@ WindowTarget.prototype = {
+@@ -823,16 +823,18 @@ WindowTarget.prototype = {
    toString: function() {
      return 'WindowTarget:' + this.window;
    },
@@ -15,7 +15,8 @@ diff --git a/devtools/client/framework/target.js b/devtools/client/framework/tar
  function WorkerTarget(workerClient) {
    EventEmitter.decorate(this);
    this._workerClient = workerClient;
-+  console.log("WorkerTarget created", workerClient);
++  console.trace();
++  console.log("WorkerTarget created in target.js", this._workerClient);
  }
  
  /**
@@ -24,10 +25,151 @@ diff --git a/devtools/client/framework/target.js b/devtools/client/framework/tar
   * Moreover, unlike TabTarget, which is constructed with a placeholder object
   * for remote tabs (from which a TabClient can then be lazily obtained),
   * WorkerTarget is constructed with a WorkerClient directly.
+@@ -851,19 +853,25 @@ WorkerTarget.prototype = {
+   get isRemote() {
+     return true;
+   },
+ 
+   get isTabActor() {
+     return true;
+   },
+ 
++  get isWorkerTarget() {
++    return true;
++  },
++
+   get form() {
++    console.log("get form()", this._workerClient);
+     return {
+       from: this._workerClient.actor,
++      consoleActor: this._workerClient.webConsoleActor,
+       type: "attached",
+       isFrozen: this._workerClient.isFrozen,
+       url: this._workerClient.url
+     };
+   },
+ 
+   get activeTab() {
+     return this._workerClient;
+@@ -878,10 +886,12 @@ WorkerTarget.prototype = {
+   hasActor: function (name) {
+     return false;
+   },
+ 
+   getTrait: function (name) {
+     return undefined;
+   },
+ 
+-  makeRemote: function () {}
++  makeRemote: function () {
++    console.log("makeRemote()", this);
++  }
+ };
+diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconsole/webconsole.js
+--- a/devtools/client/webconsole/webconsole.js
++++ b/devtools/client/webconsole/webconsole.js
+@@ -5017,23 +5017,27 @@ WebConsoleConnectionProxy.prototype = {
+       this._connectTimer.cancel();
+       this._connectTimer = null;
+     }, () => {
+       this._connectTimer = null;
+     });
+ 
+     let client = this.client = this.target.client;
+ 
+-    client.addListener("logMessage", this._onLogMessage);
+-    client.addListener("pageError", this._onPageError);
+-    client.addListener("consoleAPICall", this._onConsoleAPICall);
+-    client.addListener("fileActivity", this._onFileActivity);
+-    client.addListener("reflowActivity", this._onReflowActivity);
+-    client.addListener("serverLogCall", this._onServerLogCall);
+-    client.addListener("lastPrivateContextExited", this._onLastPrivateContextExited);
++    if (this.target.isWorkerTarget) {
++
++    } else {
++      client.addListener("logMessage", this._onLogMessage);
++      client.addListener("pageError", this._onPageError);
++      client.addListener("consoleAPICall", this._onConsoleAPICall);
++      client.addListener("fileActivity", this._onFileActivity);
++      client.addListener("reflowActivity", this._onReflowActivity);
++      client.addListener("serverLogCall", this._onServerLogCall);
++      client.addListener("lastPrivateContextExited", this._onLastPrivateContextExited);
++    }
+     this.target.on("will-navigate", this._onTabNavigated);
+     this.target.on("navigate", this._onTabNavigated);
+ 
+     this._consoleActor = this.target.form.consoleActor;
+     if (this.target.isTabActor) {
+       let tab = this.target.form;
+       this.owner.onLocationChange(tab.url, tab.title);
+     }
+@@ -5057,16 +5061,17 @@ WebConsoleConnectionProxy.prototype = {
+   },
+ 
+   /**
+    * Attach to the Web Console actor.
+    * @private
+    */
+   _attachConsole: function WCCP__attachConsole()
+   {
++    console.log("Attaching client now " + this._consoleActor);
+     let listeners = ["PageError", "ConsoleAPI", "NetworkActivity",
+                      "FileActivity"];
+     this.client.attachConsole(this._consoleActor, listeners,
+                               this._onAttachConsole);
+   },
+ 
+   /**
+    * The "attachConsole" response handler.
+@@ -5083,16 +5088,17 @@ WebConsoleConnectionProxy.prototype = {
+     if (aResponse.error) {
+       Cu.reportError("attachConsole failed: " + aResponse.error + " " +
+                      aResponse.message);
+       this._connectDefer.reject(aResponse);
+       return;
+     }
+ 
+     this.webConsoleClient = aWebConsoleClient;
++    console.log("frontend _onAttachConsole", aWebConsoleClient)
+ 
+     this._hasNativeConsoleAPI = aResponse.nativeConsoleAPI;
+     this.webConsoleClient.on("networkEvent", this._onNetworkEvent);
+     this.webConsoleClient.on("networkEventUpdate", this._onNetworkEventUpdate);
+ 
+     let msgs = ["PageError", "ConsoleAPI"];
+     this.webConsoleClient.getCachedMessages(msgs, this._onCachedMessages);
+ 
+diff --git a/devtools/server/actors/script.js b/devtools/server/actors/script.js
+--- a/devtools/server/actors/script.js
++++ b/devtools/server/actors/script.js
+@@ -642,16 +642,23 @@ ThreadActor.prototype = {
+     try {
+       // Put ourselves in the paused state.
+       let packet = this._paused();
+       if (!packet) {
+         return { error: "notAttached" };
+       }
+       packet.why = { type: "attached" };
+ 
++      // XXX: this is a hacky way to attach the webconsole and send the actor id.
++      // Seems like this should happen in server/worker.js maybe
++      if (this._webConsoleActor) {
++        var webConsoleActor = this._webConsoleActor;
++        packet.webConsoleActor = webConsoleActor.actorID;
++      }
++
+       this._restoreBreakpoints();
+ 
+       // Send the response to the attach request now (rather than
+       // returning it), because we're going to start a nested event loop
+       // here.
+       this.conn.send(packet);
+ 
+       // Start a nested event loop.
 diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webconsole.js
 --- a/devtools/server/actors/webconsole.js
 +++ b/devtools/server/actors/webconsole.js
-@@ -1,45 +1,28 @@
+@@ -1,55 +1,42 @@
  /* -*- js-indent-level: 2; indent-tabs-mode: nil -*- */
  /* vim: set ts=2 et sw=2 tw=80: */
  /* This Source Code Form is subject to the terms of the Mozilla Public
@@ -79,10 +221,112 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
      get: function(prop) {
        if (prop == "WebConsoleUtils") {
          prop = "Utils";
+       }
+-      return require("devtools/shared/webconsole/utils")[prop];
++      if (isWorker) {
++        return require("devtools/shared/webconsole/worker-utils")[prop];
++      } else {
++        return require("devtools/shared/webconsole/utils")[prop];
++      }
+     }.bind(null, name),
+     configurable: true,
+     enumerable: true
+   });
+ }
+ 
+ /**
+  * The WebConsoleActor implements capabilities needed for the Web Console
+@@ -168,16 +155,17 @@ WebConsoleActor.prototype =
+             this.parentActor instanceof DebuggerServer.ContentActor;
+   },
+ 
+   /**
+    * The window we work with.
+    * @type nsIDOMWindow
+    */
+   get window() {
++    // dump("Fetching parent for console actor " + this.parentActor.window + " " + this.parentActor.actorID + "\n\n");
+     if (this.parentActor.isRootActor) {
+       return this._getWindowForBrowserConsole();
+     }
+     return this.parentActor.window;
+   },
+ 
+   /**
+    * Get a window to use for the browser console.
+@@ -550,16 +538,21 @@ WebConsoleActor.prototype =
+    *
+    * @param object aRequest
+    *        The JSON request object received from the Web Console client.
+    * @return object
+    *         The response object which holds the startedListeners array.
+    */
+   onStartListeners: function WCA_onStartListeners(aRequest)
+   {
++    // XXX
++    if (isWorker) {
++      dump("XXX: Bailing out when adding listeners " + aRequest.listeners.join(",") + "\n");
++       aRequest.listeners = [];
++     }
+     let startedListeners = [];
+     let window = !this.parentActor.isRootActor ? this.window : null;
+     let appId = null;
+     let messageManager = null;
+ 
+     if (this._parentIsContentActor) {
+       appId = this.parentActor.docShell.appId;
+       messageManager = this.parentActor.messageManager;
+@@ -880,16 +873,22 @@ WebConsoleActor.prototype =
+    *
+    * @param object aRequest
+    *        The request message - what input to autocomplete.
+    * @return object
+    *         The response message - matched properties.
+    */
+   onAutocomplete: function WCA_onAutocomplete(aRequest)
+   {
++    // XXX: early return for easier debugging on execute()
++    return {
++      from: this.actorID,
++      matches: [],
++      matchProp: "",
++    };
+     let frameActorId = aRequest.frameActor;
+     let dbgObject = null;
+     let environment = null;
+ 
+     // This is the case of the paused debugger
+     if (frameActorId) {
+       let frameActor = this.conn.getActor(frameActorId);
+       if (frameActor) {
 diff --git a/devtools/server/actors/worker.js b/devtools/server/actors/worker.js
 --- a/devtools/server/actors/worker.js
 +++ b/devtools/server/actors/worker.js
-@@ -52,16 +52,17 @@ WorkerActor.prototype = {
+@@ -34,34 +34,41 @@ function WorkerActor(dbg) {
+   this._isAttached = false;
+   this._threadActor = null;
+   this._transport = null;
+ }
+ 
+ WorkerActor.prototype = {
+   actorPrefix: "worker",
+ 
++  get window() {
++    dump("Fetching window \n\n" + this._dbg.window);
++    return this._dbg.window;
++  },
++
+   form: function () {
+     return {
+       actor: this.actorID,
++      webConsoleActor: this._webConsoleActor,
+       url: this._dbg.url,
+       type: this._dbg.type
+     };
+   },
+ 
+   onAttach: function () {
+     if (this._dbg.isClosed) {
        return { error: "closed" };
      }
  
@@ -100,25 +344,36 @@ diff --git a/devtools/server/actors/worker.js b/devtools/server/actors/worker.js
    },
  
    onDetach: function () {
-@@ -87,16 +88,18 @@ WorkerActor.prototype = {
+@@ -83,23 +90,27 @@ WorkerActor.prototype = {
+       return {
+         type: "connected",
+         threadActor: this._threadActor
+       };
      }
  
      return DebuggerServer.connectToWorker(
        this.conn, this._dbg, this.actorID, request.options
-     ).then(({ threadActor, transport }) => {
+-    ).then(({ threadActor, transport }) => {
++    ).then(({ threadActor, transport, webConsoleActor }) => {
        this._threadActor = threadActor;
        this._transport = transport;
- 
-+      console.log("connectToWorker finished", this);
++      this._webConsoleActor = webConsoleActor;
 +
++      console.log("connectToWorker finished", this, this._webConsoleActor);
+ 
        return {
          type: "connected",
-         threadActor: this._threadActor
+-        threadActor: this._threadActor
++        threadActor: this._threadActor,
++        webConsoleActor: this._webConsoleActor
        };
      }, (error) => {
        return { error: error.toString() };
      });
    },
+ 
+   onClose: function () {
+     if (this._isAttached) {
 diff --git a/devtools/server/main.js b/devtools/server/main.js
 --- a/devtools/server/main.js
 +++ b/devtools/server/main.js
@@ -163,6 +418,42 @@ diff --git a/devtools/server/main.js b/devtools/server/main.js
                return method.apply(undefined, packet.params);
              }).then((value) => {
                aDbg.postMessage(JSON.stringify({
+@@ -847,16 +854,17 @@ var DebuggerServer = {
+             return;
+           }
+ 
+           message = packet.message;
+           if (message.error) {
+             reject(error);
+           }
+ 
++          console.log(message, message.type);
+           if (message.type !== "paused") {
+             return;
+           }
+ 
+           aDbg.removeListener(listener);
+ 
+           // Step 7: Create a transport for the connection to the worker.
+           let transport = new WorkerDebuggerTransport(aDbg, aId);
+@@ -883,16 +891,17 @@ var DebuggerServer = {
+ 
+           // Ensure that any packets received from the client on the main thread
+           // to actors on the worker thread are forwarded to the server on the
+           // worker thread.
+           aConnection.setForwarding(aId, transport);
+ 
+           resolve({
+             threadActor: message.from,
++            webConsoleActor: message.webConsoleActor,
+             transport: transport
+           });
+         }
+       };
+       aDbg.addListener(listener);
+     });
+   },
+ 
 diff --git a/devtools/server/worker.js b/devtools/server/worker.js
 --- a/devtools/server/worker.js
 +++ b/devtools/server/worker.js
@@ -175,7 +466,7 @@ diff --git a/devtools/server/worker.js b/devtools/server/worker.js
  var Promise = worker.require("promise");
  var { ActorPool } = worker.require("devtools/server/actors/common");
  var { ThreadActor } = worker.require("devtools/server/actors/script");
-+// var { WebConsoleActor } = worker.require("devtools/server/actors/webconsole");
++var { WebConsoleActor } = worker.require("devtools/server/actors/webconsole");
  var { TabSources } = worker.require("devtools/server/actors/utils/TabSources");
  var makeDebugger = worker.require("devtools/server/actors/utils/make-debugger");
  var { DebuggerServer } = worker.require("devtools/server/main");
@@ -184,27 +475,209 @@ diff --git a/devtools/server/worker.js b/devtools/server/worker.js
  DebuggerServer.createRootActor = function () {
    throw new Error("Should never get here!");
  };
-@@ -69,16 +70,23 @@ this.addEventListener("message",  functi
+@@ -49,44 +50,83 @@ this.addEventListener("message",  functi
+     };
+ 
+     // Step 4: Create a thread actor for the connection to the parent.
+     let pool = new ActorPool(connection);
+     connection.addActorPool(pool);
+ 
+     let sources = null;
+ 
+-    let actor = new ThreadActor({
++    let parent = {
+       makeDebugger: makeDebugger.bind(null, {
+         findDebuggees: () => {
+           return [this.global];
+         },
+ 
+         shouldAddNewGlobalAsDebuggee: () => {
+           return true;
+         },
+       }),
+ 
+       get sources() {
          if (sources === null) {
            sources = new TabSources(actor);
          }
          return sources;
        }
-     }, global);
+-    }, global);
++    };
++    let actor = new ThreadActor(parent, global);
  
      pool.addActor(actor);
-+    dump("Connecting " + actor.conn + " - " + actor.isRootActor + "\n");
+ 
++    // let seen = [];
++    // let str = JSON.stringify(actor, function(key, val) {
++    //    if (val != null && typeof val == "object") {
++    //         if (seen.indexOf(val) >= 0) {
++    //             return;
++    //         }
++    //         seen.push(val);
++    //     }
++    //     return val;
++    // });
 +
-+    dump("Doing rpc ");
++    // dump("Connecting " + str + "\n");
++
++    let wc = new WebConsoleActor(actor.conn, {
++      makeDebugger: makeDebugger.bind(null, {
++        findDebuggees: () => {
++          return [this.global];
++        },
++
++        shouldAddNewGlobalAsDebuggee: () => {
++          return true;
++        },
++      }),
++      window: global
++    });
++
++    pool.addActor(wc);
++
++    dump("\nwc " + wc.actorID + "\n");
++    dump("\nac " + actor.actorID + "\n");
++
++    actor._webConsoleActor = wc;
++
++    // dump("Doing rpc " + wc + " " + wc.onAttach);
 +    rpc("foo").then((a) => {
 +      dump("Receieved rpc" + JSON.stringify(a));
 +    });
-+    // let wc = new WebConsoleActor(actor.conn, actor);
- 
++
      // Step 5: Attach to the thread actor.
      //
      // This will cause a packet to be sent over the connection to the parent.
      // Because this connection uses WorkerDebuggerTransport internally, this
      // packet will be sent using WorkerDebuggerGlobalScope.postMessage, causing
      // an onMessage event to be fired on the WorkerDebugger in the main thread.
-     actor.onAttach({});
+-    actor.onAttach({});
++    actor.onAttach({ });
+     break;
+ 
+   case "disconnect":
+     connections[packet.id].connection.close();
+     break;
+ 
+   case "rpc":
+     let deferred = rpcDeferreds[packet.id];
+diff --git a/devtools/shared/client/main.js b/devtools/shared/client/main.js
+--- a/devtools/shared/client/main.js
++++ b/devtools/shared/client/main.js
+@@ -499,27 +499,27 @@ DebuggerClient.prototype = {
+    */
+   attachConsole:
+   function (aConsoleActor, aListeners, aOnResponse = noop) {
+     let packet = {
+       to: aConsoleActor,
+       type: "startListeners",
+       listeners: aListeners,
+     };
+-
+     this.request(packet, (aResponse) => {
+       let consoleClient;
+       if (!aResponse.error) {
+         if (this._clients.has(aConsoleActor)) {
+           consoleClient = this._clients.get(aConsoleActor);
+         } else {
+           consoleClient = new WebConsoleClient(this, aResponse);
+           this.registerClient(consoleClient);
+         }
+       }
++console.log("Attached", consoleClient);
+       aOnResponse(aResponse, consoleClient);
+     });
+   },
+ 
+   /**
+    * Attach to a global-scoped thread actor for chrome debugging.
+    *
+    * @param string aThreadActor
+@@ -1346,33 +1346,38 @@ WorkerClient.prototype = {
+       this.client.unregisterClient(this);
+       return aResponse;
+     },
+ 
+     telemetry: "WORKERDETACH"
+   }),
+ 
+   attachThread: function(aOptions = {}, aOnResponse = noop) {
++    console.trace();
+     if (this.thread) {
+       DevToolsUtils.executeSoon(() => aOnResponse({
+         type: "connected",
+         threadActor: this.thread._actor,
++        webConsoleActor: this.webConsoleActor,
+       }, this.thread));
+       return;
+     }
+ 
+     this.request({
+       to: this._actor,
+       type: "connect",
+       options: aOptions,
+     }, (aResponse) => {
++      console.log("attachThread", aResponse)
+       if (!aResponse.error) {
+         this.thread = new ThreadClient(this, aResponse.threadActor);
++        this.webConsoleActor = aResponse.webConsoleActor;
+         this.client.registerClient(this.thread);
+       }
++
+       aOnResponse(aResponse, this.thread);
+     });
+   },
+ 
+   _onClose: function () {
+     this.removeListener("close", this._onClose);
+     this.removeListener("freeze", this._onFreeze);
+     this.removeListener("thaw", this._onThaw);
+diff --git a/devtools/shared/webconsole/moz.build b/devtools/shared/webconsole/moz.build
+--- a/devtools/shared/webconsole/moz.build
++++ b/devtools/shared/webconsole/moz.build
+@@ -10,9 +10,10 @@ if CONFIG['OS_TARGET'] != 'Android':
+ 
+ DevToolsModules(
+     'client.js',
+     'network-helper.js',
+     'network-monitor.js',
+     'server-logger-monitor.js',
+     'server-logger.js',
+     'utils.js',
++    'worker-utils.js',
+ )
+diff --git a/devtools/shared/webconsole/worker-utils.js b/devtools/shared/webconsole/worker-utils.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/shared/webconsole/worker-utils.js
+@@ -0,0 +1,28 @@
++// This file is loaded on the server side for worker debugging.
++// Since the server is running in the worker thread, it doesn't
++// have access to things
++
++exports.Utils = {
++
++  l10n: function() {
++
++  },
++};
++let ConsoleServiceListener = function(window, aListener) {
++
++};
++exports.ConsoleServiceListener = ConsoleServiceListener;
++
++exports.ConsoleAPIListener = function() {
++
++};
++exports.addWebConsoleCommands = function() {
++
++};
++exports.JSPropertyProvider = function() {
++
++};
++exports.ConsoleReflowListener = function() {
++
++};
++exports.CONSOLE_WORKER_IDS = [];
+\ No newline at end of file
