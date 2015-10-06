@@ -1,42 +1,8 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  88829b86c9ebc235d719f991352350d845127151
+# Parent  5423ad10d93037a7b1031e2b4958df8c2733a1fa
 Bug 1198039 - Don't modify the DOM after dragging an element and putting it back where it started;r=pbrosset
 
-diff --git a/devtools/client/markupview/markup-view.js b/devtools/client/markupview/markup-view.js
---- a/devtools/client/markupview/markup-view.js
-+++ b/devtools/client/markupview/markup-view.js
-@@ -1941,22 +1941,29 @@ MarkupContainer.prototype = {
-     if (!this.isDragging) {
-       return;
-     }
- 
-     this.cancelDragging();
- 
-     let dropTargetNodes = this.markup.dropTargetNodes;
- 
--    if (!dropTargetNodes) {
-+    // debugger;
-+    // console.log(this.node._form.attrs[0].value, dropTargetNodes.nextSibling._form.attrs[0].value)
-+    
-+
-+    // file:///Users/bgrinstead/Code/fx-team/devtools/client/markupview/test/doc_markup_dragdrop.html
-+    // Don't do a mutation if nothing is going to change.
-+    if (!dropTargetNodes){ // || this.node === dropTargetNodes.nextSibling) {
-       return;
-     }
- 
-     yield this.markup.walker.insertBefore(this.node, dropTargetNodes.parent,
-                                           dropTargetNodes.nextSibling);
-+
-     this.markup.emit("drop-completed");
-   }),
- 
-   /**
-    * On mouse move, move the dragged element if any and indicate the drop target.
-    */
-   _onMouseMove: function(event) {
-     if (!this.isDragging) {
 diff --git a/devtools/client/markupview/test/browser_markupview_dragdrop_reorder.js b/devtools/client/markupview/test/browser_markupview_dragdrop_reorder.js
 --- a/devtools/client/markupview/test/browser_markupview_dragdrop_reorder.js
 +++ b/devtools/client/markupview/test/browser_markupview_dragdrop_reorder.js
@@ -62,7 +28,7 @@ diff --git a/devtools/client/markupview/test/browser_markupview_dragdrop_reorder
  
    info("Testing switching elements with a last child");
    yield moveElementDown("#firstChild", "#lastChild", inspector);
-@@ -90,16 +95,36 @@ function* dragContainer(selector, target
+@@ -90,22 +95,44 @@ function* dragContainer(selector, target
      });
  
      container.markup._onMouseUp();
@@ -77,18 +43,19 @@ diff --git a/devtools/client/markupview/test/browser_markupview_dragdrop_reorder
 +
 +  info("Picking up and putting back down " + selector);
 +
-+  // Override the function that's used to modify the DOM.
-+  // This is just extra checking, the test will fail later on
-+  // if it's not 
-+  let orig = inspector.markup.walker.insertBefore;
-+  inspector.markup.walker.insertBefore = function() {
-+    debugger;
-+    ok(false, "Should not be attempting to insert any nodes");
++  function onMutation() {
++    ok(false, "Mutation received from dragging a node back to its location");
 +  }
++  inspector.on("markupmutation", onMutation);
 +  yield dragContainer(selector, {x: 0, y: 0}, inspector);
-+  inspector.markup.walker.insertBefore = orig;
 +
-+  yield new Promise(() => {})
++  // Wait a bit to make sure the event never fires.
++  // This doesn't need to catch *all* cases, since the mutation
++  // will cause failure later in the test.
++  yield new Promise(resolve => {
++    setTimeout(resolve, 100);
++  });
++  inspector.off("markupmutation", onMutation);
 +}
 +
  function* moveElementDown(selector, next, inspector) {
@@ -99,10 +66,19 @@ diff --git a/devtools/client/markupview/test/browser_markupview_dragdrop_reorder
    let height = el.tagLine.getBoundingClientRect().height;
  
    info("Switching " + selector + ' with ' + next);
+ 
+   yield dragContainer(selector, {x: 0, y: Math.round(height) + 2}, inspector);
+ 
+-  yield onMutated;
++  let mutations = yield onMutated;
++  is(mutations.length, 2, "2 mutations");
+   yield uiUpdate;
+ };
+\ No newline at end of file
 diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspector.js
 --- a/devtools/server/actors/inspector.js
 +++ b/devtools/server/actors/inspector.js
-@@ -2657,16 +2657,27 @@ var WalkerActor = protocol.ActorClass({
+@@ -2657,17 +2657,33 @@ var WalkerActor = protocol.ActorClass({
     */
    insertBefore: method(function(node, parent, sibling) {
      if (isNodeDead(node) ||
@@ -111,18 +87,24 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
        return null;
      }
  
+-    parent.rawNode.insertBefore(node.rawNode, sibling ? sibling.rawNode : null);
 +    let rawNode = node.rawNode;
 +    let rawParent = parent.rawNode;
-+    let rawSibling = sibling && sibling.rawNode;
++    let rawSibling = sibling ? sibling.rawNode : null;
 +
 +    // Don't bother inserting a node if the document position isn't going
 +    // to change. This prevents needless iframes reloading and mutations.
-+    if (rawNode.parentNode === rawParent &&
-+        (rawNode === rawSibling || rawNode.nextSibling === rawSibling)) {
-+      return;
++    if (rawNode.parentNode === rawParent) {
++      let currentNextSibling = this.nextSibling(node);
++      currentNextSibling = currentNextSibling ? currentNextSibling.rawNode :
++                                                null;
++
++      if (rawNode === rawSibling || currentNextSibling === rawSibling) {
++        return;
++      }
 +    }
 +
-     parent.rawNode.insertBefore(node.rawNode, sibling ? sibling.rawNode : null);
++    rawParent.insertBefore(rawNode, rawSibling);
    }, {
      request: {
        node: Arg(0, "domnode"),
@@ -130,3 +112,120 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
        sibling: Arg(2, "nullable:domnode")
      },
      response: {}
+   }),
+diff --git a/devtools/server/tests/mochitest/test_inspector-insert.html b/devtools/server/tests/mochitest/test_inspector-insert.html
+--- a/devtools/server/tests/mochitest/test_inspector-insert.html
++++ b/devtools/server/tests/mochitest/test_inspector-insert.html
+@@ -34,55 +34,82 @@ addTest(function setup() {
+     promiseDone(inspector.getWalker().then(walker => {
+       ok(walker, "getWalker() should return an actor.");
+       gClient = client;
+       gWalker = walker;
+     }).then(runNextTest));
+   });
+ });
+ 
+-addTest(function testRearrange() {
+-  let longlist = null;
+-  let nodeA = null;
+-  let nextNode = null;
++addAsyncTest(function* testRearrange() {
++  let longlist = yield gWalker.querySelector(gWalker.rootNode, "#longlist");
++  let children = yield gWalker.children(longlist);
++  let nodeA = children.nodes[0];
++  is(nodeA.id, "a", "Got the expected node.");
+ 
+-  promiseDone(gWalker.querySelector(gWalker.rootNode, "#longlist").then(listFront => {
+-    longlist = listFront;
+-  }).then(() => {
+-    return gWalker.children(longlist);
+-  }).then(response => {
+-    nodeA = response.nodes[0];
+-    is(nodeA.id, "a", "Got the expected node.");
+-    // Move nodeA to the end of the list.
+-    return gWalker.insertBefore(nodeA, longlist, null);
+-  }).then(() => {
+-    ok(!gInspectee.querySelector("#a").nextSibling, "a should now be at the end of the list.");
+-    return gWalker.children(longlist);
+-  }).then(response => {
+-    is(nodeA, response.nodes[response.nodes.length - 1], "a should now be the last returned child.");
+-    // Now move it to the middle of the list.
+-    nextNode = response.nodes[13];
+-    return gWalker.insertBefore(nodeA, longlist, nextNode);
+-  }).then(response => {
+-    let sibling = new inspector._documentWalker(gInspectee.querySelector("#a"), window).nextSibling();
+-    is(sibling, nextNode.rawNode(), "Node should match the expected next node.");
+-    return gWalker.children(longlist);
+-  }).then(response => {
+-    is(nodeA, response.nodes[13], "a should be where we expect it.");
+-    is(nextNode, response.nodes[14], "next node should be where we expect it.");
+-  }).then(runNextTest));
++  // Move nodeA to the end of the list.
++  yield gWalker.insertBefore(nodeA, longlist, null);
++  ok(!gInspectee.querySelector("#a").nextSibling, "a should now be at the end of the list.");
++  children = yield gWalker.children(longlist);
++  is(nodeA, children.nodes[children.nodes.length - 1], "a should now be the last returned child.");
++
++  // Now move it to the middle of the list.
++  let nextNode = children.nodes[13];
++  yield gWalker.insertBefore(nodeA, longlist, nextNode);
++  let sibling =
++    new inspector._documentWalker(gInspectee.querySelector("#a"), window).nextSibling();
++  is(sibling, nextNode.rawNode(), "Node should match the expected next node.");
++  children = yield gWalker.children(longlist);
++  is(nodeA, children.nodes[13], "a should be where we expect it.");
++  is(nextNode, children.nodes[14], "next node should be where we expect it.");
++
++  runNextTest();
++});
++
++addAsyncTest(function* testInsertInvalidInput() {
++  let longlist = yield gWalker.querySelector(gWalker.rootNode, "#longlist");
++  let children = yield gWalker.children(longlist);
++  let nodeA = children.nodes[0];
++  let nextSibling = children.nodes[1];
++  // let parentNode = nodeA.rawNode().parentNode;
++
++  // Now move it to the original location and make sure no mutation happens.
++  let hasMutated = false;
++  let observer = new gInspectee.defaultView.MutationObserver(() => {
++    hasMutated = true;
++  });
++  observer.observe(longlist.rawNode(), {
++    childList: true,
++  });
++
++  yield gWalker.insertBefore(nodeA, longlist, nodeA);
++  ok(!hasMutated, "hasn't mutated");
++  hasMutated = false;
++
++  yield gWalker.insertBefore(nodeA, longlist, nextSibling);
++  ok(!hasMutated, "still hasn't mutated after inserting before nextSibling");
++  hasMutated = false;
++
++  yield gWalker.insertBefore(nodeA, longlist);
++  ok(hasMutated, "has mutated after inserting with null sibling");
++  hasMutated = false;
++
++  yield gWalker.insertBefore(nodeA, longlist);
++  ok(!hasMutated, "hasn't mutated after inserting with null sibling again");
++
++  observer.disconnect();
++  runNextTest();
+ });
+ 
+ addTest(function cleanup() {
+   delete gWalker;
+   delete gClient;
+   runNextTest();
+ });
+ 
+-
+   </script>
+ </head>
+ <body>
+ <a target="_blank" href="https://bugzilla.mozilla.org/show_bug.cgi?id=">Mozilla Bug </a>
+ <a id="inspectorContent" target="_blank" href="inspector-traversal-data.html">Test Document</a>
+ <p id="display"></p>
+ <div id="content" style="display: none">
+ 
