@@ -1,0 +1,235 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  ba28fd929617d3673936f8a31ef40e3e6017f3c8
+Bug 1025778 - Save value as global variable in console
+
+diff --git a/devtools/client/webconsole/console-output.js b/devtools/client/webconsole/console-output.js
+--- a/devtools/client/webconsole/console-output.js
++++ b/devtools/client/webconsole/console-output.js
+@@ -2529,16 +2529,26 @@ Widgets.JSObject.prototype = Heritage.ex
+   {
+     this.output.openVariablesView({
+       label: VariablesView.getString(this.objectActor, { concise: true }),
+       objectActor: this.objectActor,
+       autofocus: true,
+     });
+   },
+ 
++  storeObjectInWindow: function()
++  {
++    this.output.webConsoleClient.evaluateJSAsync("this.temp2 = _self; console.log(this)", (response) => {
++      console.log("Done", response);
++    }, {
++      bindObjectActor: this.objectActor.actor,
++      // selectedObjectActor: this.objectActor.actor,
++    });
++  },
++
+   /**
+    * The click event handler for objects shown inline.
+    * @private
+    */
+   _onClick: function()
+   {
+     this.openObjectInVariablesView();
+   },
+@@ -2553,16 +2563,25 @@ Widgets.JSObject.prototype = Heritage.ex
+     let openVarView = this.openObjectInVariablesView.bind(this);
+     openInVarViewCmd.addEventListener("command", openVarView);
+     openInVarViewCmd.removeAttribute("disabled");
+     cmPopup.addEventListener("popuphiding", function onPopupHiding() {
+       cmPopup.removeEventListener("popuphiding", onPopupHiding);
+       openInVarViewCmd.removeEventListener("command", openVarView);
+       openInVarViewCmd.setAttribute("disabled", "true");
+     });
++    let storeObjectInWindow = this.storeObjectInWindow.bind(this);
++    let storeInGlobalCmd = doc.getElementById("menu_storeAsGlobal");
++    storeInGlobalCmd.addEventListener("command", storeObjectInWindow);
++    storeInGlobalCmd.removeAttribute("disabled");
++    cmPopup.addEventListener("popuphiding", function onPopupHiding() {
++      cmPopup.removeEventListener("popuphiding", onPopupHiding);
++      storeInGlobalCmd.removeEventListener("command", storeObjectInWindow);
++      storeInGlobalCmd.setAttribute("disabled", "true");
++    });
+   },
+ 
+   /**
+    * Add a string to the message.
+    *
+    * @private
+    * @param string str
+    *        String to add.
+diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconsole/webconsole.js
+--- a/devtools/client/webconsole/webconsole.js
++++ b/devtools/client/webconsole/webconsole.js
+@@ -2888,16 +2888,32 @@ WebConsoleFrame.prototype = {
+     if (!item || !item.url) {
+       return;
+     }
+ 
+     this.owner.openLink(item.url);
+   },
+ 
+   /**
++   * Open the selected item's URL in a new tab.
++   */
++  storeSelectedItemInGlobal: function WCF_storeSelectedItemInGlobal()
++  {
++    let item = this.output.getSelectedMessages(1)[0] ||
++               this._contextMenuHandler.lastClickedMessage;
++
++    if (!item) {
++      return;
++    }
++
++    console.log(item);
++    // this.owner.openLink(item.url);
++  },
++
++  /**
+    * Destroy the WebConsoleFrame object. Call this method to avoid memory leaks
+    * when the Web Console is closed.
+    *
+    * @return object
+    *         A promise that is resolved when the WebConsoleFrame instance is
+    *         destroyed.
+    */
+   destroy: function WCF_destroy()
+diff --git a/devtools/client/webconsole/webconsole.xul b/devtools/client/webconsole/webconsole.xul
+--- a/devtools/client/webconsole/webconsole.xul
++++ b/devtools/client/webconsole/webconsole.xul
+@@ -73,16 +73,18 @@ function goUpdateConsoleCommands() {
+       <menuitem id="menu_openURL" label="&openURL.label;"
+                 accesskey="&openURL.accesskey;" command="consoleCmd_openURL"
+                 selection="network" selectionType="single"/>
+       <menuitem id="menu_copyURL" label="&copyURLCmd.label;"
+                 accesskey="&copyURLCmd.accesskey;" command="consoleCmd_copyURL"
+                 selection="network" selectionType="single"/>
+       <menuitem id="menu_openInVarView" label="&openInVarViewCmd.label;"
+         accesskey="&openInVarViewCmd.accesskey;" disabled="true"/>
++      <menuitem id="menu_storeAsGlobal" label="Store as global"
++        accesskey=""/>
+       <menuitem id="cMenu_copy"/>
+       <menuitem id="cMenu_selectAll"/>
+     </menupopup>
+   </popupset>
+ 
+   <tooltip id="aHTMLTooltip" page="true"/>
+ 
+   <box class="hud-outer-wrapper devtools-responsive-container theme-body" flex="1">
+diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webconsole.js
+--- a/devtools/server/actors/webconsole.js
++++ b/devtools/server/actors/webconsole.js
+@@ -827,16 +827,17 @@ WebConsoleActor.prototype =
+     let input = aRequest.text;
+     let timestamp = Date.now();
+ 
+     let evalOptions = {
+       bindObjectActor: aRequest.bindObjectActor,
+       frameActor: aRequest.frameActor,
+       url: aRequest.url,
+       selectedNodeActor: aRequest.selectedNodeActor,
++      selectedObjectActor: aRequest.selectedObjectActor,
+     };
+ 
+     let evalInfo = this.evalWithDebugger(input, evalOptions);
+     let evalResult = evalInfo.result;
+     let helperResult = evalInfo.helperResult;
+ 
+     let result, errorMessage, errorGrip = null;
+     if (evalResult) {
+@@ -1146,27 +1147,27 @@ WebConsoleActor.prototype =
+     // as ordinary objects, not as references to be followed, so mixing
+     // debuggers causes strange behaviors.)
+     let dbg = frame ? frameActor.threadActor.dbg : this.dbg;
+     let dbgWindow = dbg.makeGlobalObjectReference(this.evalWindow);
+ 
+     // If we have an object to bind to |_self|, create a Debugger.Object
+     // referring to that object, belonging to dbg.
+     let bindSelf = null;
+-    if (aOptions.bindObjectActor) {
+-      let objActor = this.getActorByID(aOptions.bindObjectActor);
++    if (aOptions.bindObjectActor || aOptions.selectedObjectActor) {
++      let objActor = this.getActorByID(aOptions.bindObjectActor || aOptions.selectedObjectActor);
+       if (objActor) {
+         let jsObj = objActor.obj.unsafeDereference();
+         // If we use the makeDebuggeeValue method of jsObj's own global, then
+         // we'll get a D.O that sees jsObj as viewed from its own compartment -
+         // that is, without wrappers. The evalWithBindings call will then wrap
+         // jsObj appropriately for the evaluation compartment.
+         let global = Cu.getGlobalForObject(jsObj);
+-        dbgWindow = dbg.makeGlobalObjectReference(global);
+-        bindSelf = dbgWindow.makeDebuggeeValue(jsObj);
++        let dbgWindow1 = dbg.makeGlobalObjectReference(global);
++        bindSelf = dbgWindow1.makeDebuggeeValue(jsObj);
+       }
+     }
+ 
+     // Get the Web Console commands for the given debugger window.
+     let helpers = this._getWebConsoleCommands(dbgWindow);
+     let bindings = helpers.sandbox;
+     if (bindSelf) {
+       bindings._self = bindSelf;
+@@ -1174,16 +1175,23 @@ WebConsoleActor.prototype =
+ 
+     if (aOptions.selectedNodeActor) {
+       let actor = this.conn.getActor(aOptions.selectedNodeActor);
+       if (actor) {
+         helpers.selectedNode = actor.rawNode;
+       }
+     }
+ 
++    // if (aOptions.selectedObjectActor) {
++    //   let actor = this.conn.getActor(aOptions.selectedNodeActor);
++    //   if (actor) {
++    //     helpers.selectedObjectActor = actor.rawNode;
++    //   }
++    // }
++
+     // Check if the Debugger.Frame or Debugger.Object for the global include
+     // $ or $$. We will not overwrite these functions with the Web Console
+     // commands.
+     let found$ = false, found$$ = false;
+     if (frame) {
+       let env = frame.environment;
+       if (env) {
+         found$ = !!env.find("$");
+diff --git a/devtools/shared/webconsole/client.js b/devtools/shared/webconsole/client.js
+--- a/devtools/shared/webconsole/client.js
++++ b/devtools/shared/webconsole/client.js
+@@ -250,16 +250,17 @@ WebConsoleClient.prototype = {
+     let packet = {
+       to: this._actor,
+       type: "evaluateJS",
+       text: aString,
+       bindObjectActor: aOptions.bindObjectActor,
+       frameActor: aOptions.frameActor,
+       url: aOptions.url,
+       selectedNodeActor: aOptions.selectedNodeActor,
++      selectedObjectActor: aOptions.selectedObjectActor,
+     };
+     this._client.request(packet, aOnResponse);
+   },
+ 
+   /**
+    * Evaluate a JavaScript expression asynchronously.
+    * See evaluateJS for parameter and response information.
+    */
+@@ -274,16 +275,17 @@ WebConsoleClient.prototype = {
+     let packet = {
+       to: this._actor,
+       type: "evaluateJSAsync",
+       text: aString,
+       bindObjectActor: aOptions.bindObjectActor,
+       frameActor: aOptions.frameActor,
+       url: aOptions.url,
+       selectedNodeActor: aOptions.selectedNodeActor,
++      selectedObjectActor: aOptions.selectedObjectActor,
+     };
+ 
+     this._client.request(packet, response => {
+       // Null check this in case the client has been detached while waiting
+       // for a response.
+       if (this.pendingEvaluationResults) {
+         this.pendingEvaluationResults.set(response.resultID, aOnResponse);
+       }
