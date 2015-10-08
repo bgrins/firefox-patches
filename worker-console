@@ -27,7 +27,7 @@ diff --git a/devtools/client/debugger/test/mochitest/browser_dbg_worker-console.
 new file mode 100644
 --- /dev/null
 +++ b/devtools/client/debugger/test/mochitest/browser_dbg_worker-console.js
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,124 @@
 +// Check to make sure that a worker can be attached to a toolbox
 +// and that the console works.
 +// XXX: The test is in debugger/ since it's easier.. should move this
@@ -61,35 +61,49 @@ new file mode 100644
 +  let debuggerPanel = toolbox.getCurrentPanel();
 +  let gDebugger = debuggerPanel.panelWin;
 +
-+  // Wait for the initial resume...
-+  // panelWin.gClient.addOneTimeListener("resumed", () => {
-+  //   info("Debugger client resumed successfully.");
-+
-+  //   prepareDebugger(debuggerPanel);
-+  //   deferred.resolve([aTab, debuggee, debuggerPanel, aWindow]);
-+  // });
 +  return {client,tab,tabClient,workerClient,toolbox,gDebugger};
 +}
 +
-+add_task(function* () {
++add_task(function* testPaused() {
 +  let {client,tab,tabClient,workerClient,toolbox,gDebugger} = yield initDebuggerForTab(TAB_URL, WORKER_URL);
 +
 +  let gTarget = gDebugger.gTarget;
 +  let gResumeButton = gDebugger.document.getElementById("resume");
 +  let gResumeKey = gDebugger.document.getElementById("resumeKey");
 +
++  // Execute some basic math to make sure evaluations are working.
 +  let jsterm = yield getSplitConsole(toolbox);
 +  let executed = yield jsterm.execute("10000+1");
-+
-+  info(executed.textContent);
 +  ok(executed.textContent.includes("10001"), "Text for message appeared correct");
 +
++  // Pause the worker by waiting for next execution and then sending a message to
++  // it from the main thread.
 +  let oncePaused = gTarget.once("thread-paused");
 +  EventUtils.sendMouseEvent({ type: "mousedown" }, gResumeButton, gDebugger);
-+  executed = yield jsterm.execute("1+1");
++  yield evalInTab(tab, `
++    worker.postMessage('ping');
++  `);
 +  yield oncePaused;
 +
-+  ok(true, "Paused");
++  // EDDY: here is the bug I was discussing.
++  // Try a couple more commands.  There is a bug here where the command doesn't
++  // finish executing until after we resume the debugger.
++  // In the main thread we could usually yield on this line but for some reason
++  // the result doesn't actually return until *after* the thread resumes
++  let command1 = jsterm.execute("10000+2");
++  let command2 = jsterm.execute("10000+3");
++
++  // We shouldn't have to do this..
++  EventUtils.sendMouseEvent({ type: "mousedown" }, gResumeButton, gDebugger);
++
++  executed = yield command2;
++  ok(executed.textContent.includes("10003"),
++      "NOTE THAT WE SHOULD ALSO BE ABLE TO GET ACCESS TO command1 result");
++
++  info ("Trying to get the result of command1")
++  executed = yield command1;
++  ok(executed.textContent.includes("10002"),
++      "THIS NEVER FIRES");
 +
 +  yield new Promise(() => {});
 +
@@ -98,6 +112,31 @@ new file mode 100644
 +  yield waitForWorkerClose(workerClient);
 +  yield close(client);
 +});
++
++// Test to see if creating the pause from the console works.
++// Pretty similar issue as before, commenting out for simplicity
++// add_task(function testPauseByConsole* () {
++//   let {client,tab,tabClient,workerClient,toolbox,gDebugger} = yield initDebuggerForTab(TAB_URL, WORKER_URL);
++
++//   let gTarget = gDebugger.gTarget;
++//   let gResumeButton = gDebugger.document.getElementById("resume");
++//   let gResumeKey = gDebugger.document.getElementById("resumeKey");
++
++//   let jsterm = yield getSplitConsole(toolbox);
++//   let executed = yield jsterm.execute("10000+1");
++
++//   ok(executed.textContent.includes("10001"), "Text for message appeared correct");
++
++//   let oncePaused = gTarget.once("thread-paused");
++//   EventUtils.sendMouseEvent({ type: "mousedown" }, gResumeButton, gDebugger);
++//   executed = yield jsterm.execute("1+1");
++//   yield oncePaused;
++
++//   yield gDevTools.closeToolbox(TargetFactory.forWorker(workerClient));
++//   terminateWorkerInTab(tab, WORKER_URL);
++//   yield waitForWorkerClose(workerClient);
++//   yield close(client);
++// });
 +
 +function getSplitConsole(toolbox) {
 +  return new Promise(resolve => {
@@ -113,6 +152,27 @@ new file mode 100644
 +registerCleanupFunction(() => {
 +  Services.prefs.clearUserPref("devtools.toolbox.splitconsoleEnabled");
 +});
+diff --git a/devtools/client/debugger/test/mochitest/code_frame-script.js b/devtools/client/debugger/test/mochitest/code_frame-script.js
+--- a/devtools/client/debugger/test/mochitest/code_frame-script.js
++++ b/devtools/client/debugger/test/mochitest/code_frame-script.js
+@@ -32,16 +32,17 @@ this.generateMouseClick = function (path
+                                      target.ownerDocument.defaultView);
+ };
+ 
+ this.createWorker = function (url) {
+   dump("Creating worker with url '" + url + "'.\n");
+ 
+   return new Promise(function (resolve, reject) {
+     let worker = new content.Worker(url);
++    XPCNativeWrapper.unwrap(content).worker = worker;
+     worker.addEventListener("message", function listener() {
+       worker.removeEventListener("message", listener);
+       workers[url] = worker;
+       resolve();
+     });
+   });
+ };
+ 
 diff --git a/devtools/client/framework/target.js b/devtools/client/framework/target.js
 --- a/devtools/client/framework/target.js
 +++ b/devtools/client/framework/target.js
