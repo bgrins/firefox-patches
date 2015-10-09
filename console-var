@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  ba28fd929617d3673936f8a31ef40e3e6017f3c8
+# Parent  20bb8fec6bad03a2c512bc6132533484f71abcca
 Bug 1025778 - Save value as global variable in console
 
 diff --git a/devtools/client/webconsole/console-output.js b/devtools/client/webconsole/console-output.js
@@ -25,7 +25,7 @@ diff --git a/devtools/client/webconsole/console-output.js b/devtools/client/webc
 +      "temp" + i;
 +    }`;
 +    let options = {
-+      bindObjectActor: this.objectActor.actor,
++      selectedObjectActor: this.objectActor.actor,
 +    };
 +
 +    this.output.owner.jsterm.requestEvaluation(evalString, options).then((res) => {
@@ -98,40 +98,7 @@ diff --git a/devtools/client/webconsole/panel.js b/devtools/client/webconsole/pa
 diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconsole/webconsole.js
 --- a/devtools/client/webconsole/webconsole.js
 +++ b/devtools/client/webconsole/webconsole.js
-@@ -2888,16 +2888,32 @@ WebConsoleFrame.prototype = {
-     if (!item || !item.url) {
-       return;
-     }
- 
-     this.owner.openLink(item.url);
-   },
- 
-   /**
-+   * Open the selected item's URL in a new tab.
-+   */
-+  storeSelectedItemInGlobal: function WCF_storeSelectedItemInGlobal()
-+  {
-+    let item = this.output.getSelectedMessages(1)[0] ||
-+               this._contextMenuHandler.lastClickedMessage;
-+
-+    if (!item) {
-+      return;
-+    }
-+
-+    console.log(item);
-+    // this.owner.openLink(item.url);
-+  },
-+
-+  /**
-    * Destroy the WebConsoleFrame object. Call this method to avoid memory leaks
-    * when the Web Console is closed.
-    *
-    * @return object
-    *         A promise that is resolved when the WebConsoleFrame instance is
-    *         destroyed.
-    */
-   destroy: function WCF_destroy()
-@@ -3223,16 +3239,23 @@ JSTerm.prototype = {
+@@ -3223,16 +3223,23 @@ JSTerm.prototype = {
        this.inputNode.addEventListener("keyup", this._inputEventHandler, false);
        this.inputNode.addEventListener("focus", this._focusEventHandler, false);
      }
@@ -155,6 +122,24 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
     *        Optional message after which the evaluation result will be
     *        inserted.
     * @param function [aCallback]
+@@ -3437,16 +3444,17 @@ JSTerm.prototype = {
+     if ("frame" in aOptions) {
+       frameActor = this.getFrameActor(aOptions.frame);
+     }
+ 
+     let evalOptions = {
+       bindObjectActor: aOptions.bindObjectActor,
+       frameActor: frameActor,
+       selectedNodeActor: aOptions.selectedNodeActor,
++      selectedObjectActor: aOptions.selectedObjectActor,
+     };
+ 
+     this.webConsoleClient.evaluateJSAsync(aString, onResult, evalOptions);
+     return deferred.promise;
+   },
+ 
+   /**
+    * Retrieve the FrameActor ID given a frame depth.
 diff --git a/devtools/client/webconsole/webconsole.xul b/devtools/client/webconsole/webconsole.xul
 --- a/devtools/client/webconsole/webconsole.xul
 +++ b/devtools/client/webconsole/webconsole.xul
@@ -177,3 +162,117 @@ diff --git a/devtools/client/webconsole/webconsole.xul b/devtools/client/webcons
    <tooltip id="aHTMLTooltip" page="true"/>
  
    <box class="hud-outer-wrapper devtools-responsive-container theme-body" flex="1">
+diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webconsole.js
+--- a/devtools/server/actors/webconsole.js
++++ b/devtools/server/actors/webconsole.js
+@@ -827,16 +827,17 @@ WebConsoleActor.prototype =
+     let input = aRequest.text;
+     let timestamp = Date.now();
+ 
+     let evalOptions = {
+       bindObjectActor: aRequest.bindObjectActor,
+       frameActor: aRequest.frameActor,
+       url: aRequest.url,
+       selectedNodeActor: aRequest.selectedNodeActor,
++      selectedObjectActor: aRequest.selectedObjectActor,
+     };
+ 
+     let evalInfo = this.evalWithDebugger(input, evalOptions);
+     let evalResult = evalInfo.result;
+     let helperResult = evalInfo.helperResult;
+ 
+     let result, errorMessage, errorGrip = null;
+     if (evalResult) {
+@@ -1090,16 +1091,17 @@ WebConsoleActor.prototype =
+    * @param string aString
+    *        String to evaluate.
+    * @param object [aOptions]
+    *        Options for evaluation:
+    *        - bindObjectActor: the ObjectActor ID to use for evaluation.
+    *          |evalWithBindings()| will be called with one additional binding:
+    *          |_self| which will point to the Debugger.Object of the given
+    *          ObjectActor.
++   *        - selectedObjectActor: Like bindObjectActor, but XXX.
+    *        - frameActor: the FrameActor ID to use for evaluation. The given
+    *        debugger frame is used for evaluation, instead of the global window.
+    *        - selectedNodeActor: the NodeActor ID of the currently selected node
+    *        in the Inspector (or null, if there is no selection). This is used
+    *        for helper functions that make reference to the currently selected
+    *        node, like $0.
+    * @return object
+    *         An object that holds the following properties:
+@@ -1146,27 +1148,32 @@ WebConsoleActor.prototype =
+     // as ordinary objects, not as references to be followed, so mixing
+     // debuggers causes strange behaviors.)
+     let dbg = frame ? frameActor.threadActor.dbg : this.dbg;
+     let dbgWindow = dbg.makeGlobalObjectReference(this.evalWindow);
+ 
+     // If we have an object to bind to |_self|, create a Debugger.Object
+     // referring to that object, belonging to dbg.
+     let bindSelf = null;
+-    if (aOptions.bindObjectActor) {
+-      let objActor = this.getActorByID(aOptions.bindObjectActor);
++    if (aOptions.bindObjectActor || aOptions.selectedObjectActor) {
++      let objActor = this.getActorByID(aOptions.bindObjectActor ||
++                                       aOptions.selectedObjectActor);
+       if (objActor) {
+         let jsObj = objActor.obj.unsafeDereference();
+         // If we use the makeDebuggeeValue method of jsObj's own global, then
+         // we'll get a D.O that sees jsObj as viewed from its own compartment -
+         // that is, without wrappers. The evalWithBindings call will then wrap
+         // jsObj appropriately for the evaluation compartment.
+         let global = Cu.getGlobalForObject(jsObj);
+-        dbgWindow = dbg.makeGlobalObjectReference(global);
++        let _dbgWindow = dbg.makeGlobalObjectReference(global);
+         bindSelf = dbgWindow.makeDebuggeeValue(jsObj);
++
++        if (aOptions.bindObjectActor) {
++          dbgWindow = _dbgWindow;
++        }
+       }
+     }
+ 
+     // Get the Web Console commands for the given debugger window.
+     let helpers = this._getWebConsoleCommands(dbgWindow);
+     let bindings = helpers.sandbox;
+     if (bindSelf) {
+       bindings._self = bindSelf;
+diff --git a/devtools/shared/webconsole/client.js b/devtools/shared/webconsole/client.js
+--- a/devtools/shared/webconsole/client.js
++++ b/devtools/shared/webconsole/client.js
+@@ -250,16 +250,17 @@ WebConsoleClient.prototype = {
+     let packet = {
+       to: this._actor,
+       type: "evaluateJS",
+       text: aString,
+       bindObjectActor: aOptions.bindObjectActor,
+       frameActor: aOptions.frameActor,
+       url: aOptions.url,
+       selectedNodeActor: aOptions.selectedNodeActor,
++      selectedObjectActor: aOptions.selectedObjectActor,
+     };
+     this._client.request(packet, aOnResponse);
+   },
+ 
+   /**
+    * Evaluate a JavaScript expression asynchronously.
+    * See evaluateJS for parameter and response information.
+    */
+@@ -274,16 +275,17 @@ WebConsoleClient.prototype = {
+     let packet = {
+       to: this._actor,
+       type: "evaluateJSAsync",
+       text: aString,
+       bindObjectActor: aOptions.bindObjectActor,
+       frameActor: aOptions.frameActor,
+       url: aOptions.url,
+       selectedNodeActor: aOptions.selectedNodeActor,
++      selectedObjectActor: aOptions.selectedObjectActor,
+     };
+ 
+     this._client.request(packet, response => {
+       // Null check this in case the client has been detached while waiting
+       // for a response.
+       if (this.pendingEvaluationResults) {
+         this.pendingEvaluationResults.set(response.resultID, aOnResponse);
+       }
