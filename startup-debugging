@@ -1,0 +1,171 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  1c5a319734c9a282dd1611944b0a99af8320d079
+
+diff --git a/devtools/server/main.js b/devtools/server/main.js
+--- a/devtools/server/main.js
++++ b/devtools/server/main.js
+@@ -785,16 +785,17 @@ var DebuggerServer = {
+         // for each connection.
+         let listener = {
+           onClose: () => {
+             aDbg.removeListener(listener);
+           },
+ 
+           onMessage: (message) => {
+             let packet = JSON.parse(message);
++
+             if (packet.type !== "rpc") {
+               return;
+             }
+ 
+             Promise.resolve().then(() => {
+               let method = {
+                 "fetch": DevToolsUtils.fetch,
+               }[packet.method];
+@@ -826,45 +827,54 @@ var DebuggerServer = {
+ 
+       // Step 2: Send a connect request to the worker debugger.
+       aDbg.postMessage(JSON.stringify({
+         type: "connect",
+         id: aId,
+         options: aOptions
+       }));
+ 
+-      // Steps 3-5 are performed on the worker thread (see worker.js).
+       let threadActor;
+       let webConsoleActor;
++      // Steps 3-5 are performed on the worker thread (see worker.js).
+ 
+       // Step 6: Wait for a response from the worker debugger.
+       let listener = {
+         onClose: () => {
+           aDbg.removeListener(listener);
+ 
+           reject("closed");
+         },
+ 
+         onMessage: (message) => {
+           let packet = JSON.parse(message);
++          // Step 7: Assign the actors that we created in the worker thread.
++          dump("PACKET RECEIVED " + packet.type + " " + packet.threadActor + "\n");
++          if (packet.type === "connected") {
++            threadActor = packet.threadActor;
++            webConsoleActor = packet.webConsoleActor;
++            // console.log(aDbg, aConnection);
++            // aConnection.send({})
++            //{ to: aResponse.threadActor, type: "attach" }
++            aDbg.postMessage(JSON.stringify({
++              type: "attach",
++              id: aId,
++            }));
++          }
++
++          dump("onMessage " + message + "\n\n");
+           if (packet.type !== "message" || packet.id !== aId) {
+             return;
+           }
+ 
+           message = packet.message;
+           if (message.error) {
+             reject(error);
+           }
+ 
+-          // Step 7: Assign the actors that we created in the worker thread.
+-          if (message.type === "actors-created") {
+-            threadActor = message.threadActor;
+-            webConsoleActor = message.webConsoleActor;
+-          }
+-
+           if (message.type !== "paused") {
+             return;
+           }
+ 
+           aDbg.removeListener(listener);
+ 
+           // Step 8: Create a transport for the connection to the worker.
+           let transport = new WorkerDebuggerTransport(aDbg, aId);
+diff --git a/devtools/server/worker.js b/devtools/server/worker.js
+--- a/devtools/server/worker.js
++++ b/devtools/server/worker.js
+@@ -36,23 +36,21 @@ DebuggerServer.createRootActor = functio
+ 
+ var connections = Object.create(null);
+ var nextId = 0;
+ var rpcDeferreds = [];
+ 
+ this.addEventListener("message",  function (event) {
+   let packet = JSON.parse(event.data);
+   switch (packet.type) {
++  case "attach":
++    connections[packet.id].threadActor.onAttach({});
+   case "connect":
+     // Step 3: Create a connection to the parent.
+     let connection = DebuggerServer.connectToParent(packet.id, this);
+-    connections[packet.id] = {
+-      connection : connection,
+-      rpcs: []
+-    };
+ 
+     // Step 4: Create a thread actor for the connection to the parent.
+     let pool = new ActorPool(connection);
+     connection.addActorPool(pool);
+ 
+     let sources = null;
+ 
+     let parent = {
+@@ -77,36 +75,45 @@ this.addEventListener("message",  functi
+     };
+ 
+     let threadActor = new ThreadActor(parent, global);
+     pool.addActor(threadActor);
+ 
+     let webConsoleActor = new WebConsoleActor(connection, parent);
+     pool.addActor(webConsoleActor);
+ 
++    connections[packet.id] = {
++      connection: connection,
++      threadActor: threadActor,
++      webConsoleActor: webConsoleActor,
++      rpcs: []
++    };
++
+     // XXX: USE POST MESSAGE FOR THIS
+ 
+-    // postMessage({
+-    //   type: "connected",
+-
+-
+-    
+-    connection.send({
+-      type: "actors-created",
++    postMessage(JSON.stringify({
++      type: "connected",
+       threadActor: threadActor.actorID,
+       webConsoleActor: webConsoleActor.actorID,
+-    });
++    }));
++
++
++    // connection.send({
++    //   type: "actors-created",
++    //   threadActor: threadActor.actorID,
++    //   webConsoleActor: webConsoleActor.actorID,
++    // });
+ 
+     // Step 5: Attach to the thread actor.
+     //
+     // This will cause a packet to be sent over the connection to the parent.
+     // Because this connection uses WorkerDebuggerTransport internally, this
+     // packet will be sent using WorkerDebuggerGlobalScope.postMessage, causing
+     // an onMessage event to be fired on the WorkerDebugger in the main thread.
+-    threadActor.onAttach({});
++    // threadActor.onAttach({});
+     break;
+ 
+   case "disconnect":
+     connections[packet.id].connection.close();
+     break;
+ 
+   case "rpc":
+     let deferred = rpcDeferreds[packet.id];
