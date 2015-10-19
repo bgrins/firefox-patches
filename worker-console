@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  3d25ac75fc4b43b8fe76f4eab280939c33a58931
+# Parent  f3eba94017f7d368634aa05393de51d58abaaed5
 Bug 1215117 - Make console input field work inside a worker toolbox;r=ejpbruel
 
 diff --git a/devtools/client/debugger/test/mochitest/browser.ini b/devtools/client/debugger/test/mochitest/browser.ini
@@ -617,22 +617,17 @@ diff --git a/devtools/server/actors/worker.js b/devtools/server/actors/worker.js
 diff --git a/devtools/server/main.js b/devtools/server/main.js
 --- a/devtools/server/main.js
 +++ b/devtools/server/main.js
-@@ -826,44 +826,53 @@ var DebuggerServer = {
- 
-       // Step 2: Send a connect request to the worker debugger.
+@@ -828,42 +828,35 @@ var DebuggerServer = {
        aDbg.postMessage(JSON.stringify({
          type: "connect",
          id: aId,
          options: aOptions
        }));
  
--      // Steps 3-5 are performed on the worker thread (see worker.js).
-+      // Steps 3-6 are performed on the worker thread (see worker.js).
-+      let threadActor;
-+      let webConsoleActor;
+       // Steps 3-5 are performed on the worker thread (see worker.js).
  
 -      // Step 6: Wait for a response from the worker debugger.
-+      // Step 7: Wait for a response from the worker debugger.
++      // Step 6: Wait for a connection response from the worker debugger.
        let listener = {
          onClose: () => {
            aDbg.removeListener(listener);
@@ -642,30 +637,26 @@ diff --git a/devtools/server/main.js b/devtools/server/main.js
  
          onMessage: (message) => {
            let packet = JSON.parse(message);
-+
-+          // Step 8: Assign the actors that we created in the worker thread.
-+          if (packet.type === "connected" && packet.id === aId) {
-+            threadActor = packet.threadActor;
-+            webConsoleActor = packet.webConsoleActor;
-+          }
-+
-           if (packet.type !== "message" || packet.id !== aId) {
+-          if (packet.type !== "message" || packet.id !== aId) {
++          if (packet.type !== "connected" || packet.id !== aId) {
              return;
            }
  
-           message = packet.message;
-           if (message.error) {
-             reject(error);
-           }
- 
-           if (message.type !== "paused") {
-             return;
-           }
- 
+-          message = packet.message;
+-          if (message.error) {
+-            reject(error);
+-          }
+-
+-          if (message.type !== "paused") {
+-            return;
+-          }
+-
++          // Step 7: The initial connection packet has been received, remove
++          // this listener.
            aDbg.removeListener(listener);
  
 -          // Step 7: Create a transport for the connection to the worker.
-+          // Step 9: Create a transport for the connection to the worker.
++          // Step 8: Create a transport for the connection to the worker.
            let transport = new WorkerDebuggerTransport(aDbg, aId);
            transport.ready();
            transport.hooks = {
@@ -674,7 +665,7 @@ diff --git a/devtools/server/main.js b/devtools/server/main.js
                  aDbg.postMessage(JSON.stringify({
                    type: "disconnect",
                    id: aId
-@@ -882,17 +891,18 @@ var DebuggerServer = {
+@@ -882,17 +875,18 @@ var DebuggerServer = {
            };
  
            // Ensure that any packets received from the client on the main thread
@@ -684,8 +675,8 @@ diff --git a/devtools/server/main.js b/devtools/server/main.js
  
            resolve({
 -            threadActor: message.from,
-+            threadActor: threadActor,
-+            webConsoleActor: webConsoleActor,
++            threadActor: packet.threadActor,
++            webConsoleActor: packet.webConsoleActor,
              transport: transport
            });
          }
@@ -715,7 +706,7 @@ diff --git a/devtools/server/worker.js b/devtools/server/worker.js
  DebuggerServer.createRootActor = function () {
    throw new Error("Should never get here!");
  };
-@@ -49,44 +50,59 @@ this.addEventListener("message",  functi
+@@ -49,44 +50,51 @@ this.addEventListener("message",  functi
      };
  
      // Step 4: Create a thread actor for the connection to the parent.
@@ -751,6 +742,12 @@ diff --git a/devtools/server/worker.js b/devtools/server/worker.js
 +    };
  
 -    // Step 5: Attach to the thread actor.
+-    //
+-    // This will cause a packet to be sent over the connection to the parent.
+-    // Because this connection uses WorkerDebuggerTransport internally, this
+-    // packet will be sent using WorkerDebuggerGlobalScope.postMessage, causing
+-    // an onMessage event to be fired on the WorkerDebugger in the main thread.
+-    actor.onAttach({});
 +    let threadActor = new ThreadActor(parent, global);
 +    pool.addActor(threadActor);
 +
@@ -765,15 +762,6 @@ diff --git a/devtools/server/worker.js b/devtools/server/worker.js
 +      threadActor: threadActor.actorID,
 +      webConsoleActor: webConsoleActor.actorID,
 +    }));
-+
-+    // Step 6: Attach to the thread actor.
-     //
-     // This will cause a packet to be sent over the connection to the parent.
-     // Because this connection uses WorkerDebuggerTransport internally, this
-     // packet will be sent using WorkerDebuggerGlobalScope.postMessage, causing
-     // an onMessage event to be fired on the WorkerDebugger in the main thread.
--    actor.onAttach({});
-+    threadActor.onAttach({});
      break;
  
    case "disconnect":
@@ -785,7 +773,7 @@ diff --git a/devtools/server/worker.js b/devtools/server/worker.js
 diff --git a/devtools/shared/client/main.js b/devtools/shared/client/main.js
 --- a/devtools/shared/client/main.js
 +++ b/devtools/shared/client/main.js
-@@ -1340,27 +1340,29 @@ WorkerClient.prototype = {
+@@ -1340,30 +1340,46 @@ WorkerClient.prototype = {
      telemetry: "WORKERDETACH"
    }),
  
@@ -799,22 +787,44 @@ diff --git a/devtools/shared/client/main.js b/devtools/shared/client/main.js
        return;
      }
  
++    // The connect call does not also attach the thread, as of 44.
      this.request({
        to: this._actor,
        type: "connect",
        options: aOptions,
-     }, (aResponse) => {
-       if (!aResponse.error) {
-         this.thread = new ThreadClient(this, aResponse.threadActor);
-+        this.webConsoleActor = aResponse.webConsoleActor;
+-    }, (aResponse) => {
+-      if (!aResponse.error) {
+-        this.thread = new ThreadClient(this, aResponse.threadActor);
++    }, (connectReponse) => {
++      if (connectReponse.error) {
++        aOnResponse(connectReponse, null);
++        return;
++      }
++
++      this.request({
++        to: connectReponse.threadActor,
++        type: "attach"
++      }, (attachResponse) => {
++        if (attachResponse.error) {
++          aOnResponse(attachResponse, null);
++        }
++
++        this.thread = new ThreadClient(this, connectReponse.threadActor);
++        this.webConsoleActor = connectReponse.webConsoleActor;
          this.client.registerClient(this.thread);
-       }
-       aOnResponse(aResponse, this.thread);
+-      }
+-      aOnResponse(aResponse, this.thread);
++
++        aOnResponse(connectReponse, this.thread);
++      });
      });
    },
  
    _onClose: function () {
      this.removeListener("close", this._onClose);
+ 
+     this.client.unregisterClient(this);
+     this._isClosed = true;
 diff --git a/devtools/shared/webconsole/client.js b/devtools/shared/webconsole/client.js
 --- a/devtools/shared/webconsole/client.js
 +++ b/devtools/shared/webconsole/client.js
