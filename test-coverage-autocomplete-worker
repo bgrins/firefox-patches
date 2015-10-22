@@ -1,0 +1,379 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  489dc845fdc6bde766359b983b4ccba33fe7d8cc
+Bug 1217591 - Run autocomplete tests in worker console;r=ejpbruel
+
+diff --git a/devtools/shared/client/main.js b/devtools/shared/client/main.js
+--- a/devtools/shared/client/main.js
++++ b/devtools/shared/client/main.js
+@@ -445,16 +445,17 @@ DebuggerClient.prototype = {
+         this.registerClient(tabClient);
+       }
+       aOnResponse(aResponse, tabClient);
+     });
+   },
+ 
+   attachWorker: function DC_attachWorker(aWorkerActor, aOnResponse = noop) {
+     let workerClient = this._clients.get(aWorkerActor);
++    dump("attachWorker: " + aWorkerActor + " " + workerClient + "\n");
+     if (workerClient !== undefined) {
+       DevToolsUtils.executeSoon(() => aOnResponse({
+         from: workerClient.actor,
+         type: "attached",
+         url: workerClient.url
+       }, workerClient));
+       return;
+     }
+diff --git a/devtools/shared/webconsole/test/chrome.ini b/devtools/shared/webconsole/test/chrome.ini
+--- a/devtools/shared/webconsole/test/chrome.ini
++++ b/devtools/shared/webconsole/test/chrome.ini
+@@ -2,28 +2,30 @@
+ tags = devtools
+ skip-if = buildapp == 'b2g'
+ support-files =
+   common.js
+   data.json
+   data.json^headers^
+   network_requests_iframe.html
+   sandboxed_iframe.html
++  worker.js
+ 
+ [test_basics.html]
+ [test_bug819670_getter_throws.html]
+ [test_cached_messages.html]
+ [test_commands_other.html]
+ [test_commands_registration.html]
+ [test_consoleapi.html]
+ [test_consoleapi_innerID.html]
+ [test_console_styling.html]
+ [test_file_uri.html]
+ [test_reflow.html]
+ [test_jsterm.html]
++[test_jsterm_autocomplete.html]
+ [test_jsterm_cd_iframe.html]
+ [test_jsterm_last_result.html]
+ [test_jsterm_queryselector.html]
+ [test_network_get.html]
+ [test_network_longstring.html]
+ [test_network_post.html]
+ [test_network_security-hpkp.html]
+ [test_network_security-hsts.html]
+diff --git a/devtools/shared/webconsole/test/common.js b/devtools/shared/webconsole/test/common.js
+--- a/devtools/shared/webconsole/test/common.js
++++ b/devtools/shared/webconsole/test/common.js
+@@ -18,16 +18,18 @@ var WebConsoleUtils = require("devtools/
+ 
+ var ConsoleAPIStorage = Cc["@mozilla.org/consoleAPI-storage;1"]
+                           .getService(Ci.nsIConsoleAPIStorage);
+ var {DebuggerServer} = require("devtools/server/main");
+ var {DebuggerClient, ObjectClient} = require("devtools/shared/client/main");
+ 
+ var {ConsoleServiceListener, ConsoleAPIListener} =
+   require("devtools/shared/webconsole/utils");
++var { TargetFactory } = require("devtools/client/framework/target");
++const {gDevTools} = Cu.import("resource://devtools/client/framework/gDevTools.jsm", {});
+ 
+ function initCommon()
+ {
+   //Services.prefs.setBoolPref("devtools.debugger.log", true);
+ }
+ 
+ function initDebuggerServer()
+ {
+@@ -45,17 +47,28 @@ function connectToDebugger(aCallback)
+ 
+   let transport = DebuggerServer.connectPipe();
+   let client = new DebuggerClient(transport);
+ 
+   let dbgState = { dbgClient: client };
+   client.connect(aCallback.bind(null, dbgState));
+ }
+ 
+-function attachConsole(aListeners, aCallback, aAttachToTab)
++function attachConsoleToTab(aListeners) {
++  return new Promise(resolve => {
++    attachConsole(aListeners, resolve, true);
++  });
++}
++function attachConsoleToWorker(aListeners) {
++  return new Promise(resolve => {
++    attachConsole(aListeners, resolve, true, true);
++  });
++}
++
++function attachConsole(aListeners, aCallback, aAttachToTab, aAttachToWorker)
+ {
+   function _onAttachConsole(aState, aResponse, aWebConsoleClient)
+   {
+     if (aResponse.error) {
+       Cu.reportError("attachConsole failed: " + aResponse.error + " " +
+                      aResponse.message);
+     }
+ 
+@@ -77,20 +90,46 @@ function attachConsole(aListeners, aCall
+         if (aResponse.error) {
+           Cu.reportError("listTabs failed: " + aResponse.error + " " +
+                          aResponse.message);
+           aCallback(aState, aResponse);
+           return;
+         }
+         let tab = aResponse.tabs[aResponse.selected];
+         let consoleActor = tab.consoleActor;
+-        aState.dbgClient.attachTab(tab.actor, function () {
++        aState.dbgClient.attachTab(tab.actor, function (response, tabClient) {
+           aState.actor = consoleActor;
+-          aState.dbgClient.attachConsole(consoleActor, aListeners,
+-                                         _onAttachConsole.bind(null, aState));
++
++          if (aAttachToWorker) {
++            var worker = new Worker("worker.js");
++            worker.addEventListener("message", function listener() {
++              worker.removeEventListener("message", listener);
++
++              console.log("LISTING WORKERS", tabClient, worker);
++              tabClient.listWorkers(function (response) {
++
++                console.log(response, response.workers, response.workers[0]);
++                tabClient.attachWorker(response.workers[0].actor, function (response, workerClient) {
++                  workerClient.attachThread({}, function(aResponse) {
++                    aState.actor = workerClient.consoleActor;
++                    aState.dbgClient.attachConsole(consoleActor, aListeners,
++                                                   _onAttachConsole.bind(null, aState));
++                  //   _onAttachConsole(aResponse, aState);
++                  // console.log('a', workerClient.consoleActor , response);
++                  });
++
++                });
++              });
++            });
++
++
++          } else {
++            aState.dbgClient.attachConsole(consoleActor, aListeners,
++                                           _onAttachConsole.bind(null, aState));
++          }
+         });
+       });
+     } else {
+       aState.dbgClient.getProcess().then(response => {
+         aState.dbgClient.attachTab(response.form.actor, function () {
+           let consoleActor = response.form.consoleActor;
+           aState.actor = consoleActor;
+           aState.dbgClient.attachConsole(consoleActor, aListeners,
+diff --git a/devtools/shared/webconsole/test/test_jsterm_autocomplete.html b/devtools/shared/webconsole/test/test_jsterm_autocomplete.html
+new file mode 100644
+--- /dev/null
++++ b/devtools/shared/webconsole/test/test_jsterm_autocomplete.html
+@@ -0,0 +1,191 @@
++<!DOCTYPE HTML>
++<html lang="en">
++<head>
++  <meta charset="utf8">
++  <title>Test for JavaScript terminal functionality</title>
++  <script type="text/javascript" src="chrome://mochikit/content/tests/SimpleTest/SimpleTest.js"></script>
++  <script type="text/javascript;version=1.8" src="common.js"></script>
++  <!-- Any copyright is dedicated to the Public Domain.
++     - http://creativecommons.org/publicdomain/zero/1.0/ -->
++</head>
++<body>
++<p>Test for JavaScript terminal functionality</p>
++
++<script class="testbody" type="text/javascript;version=1.8">
++SimpleTest.waitForExplicitFinish();
++
++let gState;
++let {MAX_AUTOCOMPLETE_ATTEMPTS,MAX_AUTOCOMPLETIONS} = require("devtools/shared/webconsole/js-property-provider");
++
++// This test runs all of its assertions twice - once with
++// the tab as a target and once with a worker
++let runningInTab = true;
++
++function startTest({ worker })
++{
++
++  removeEventListener("load", startTest);
++
++    console.log("Attaching");
++
++  // attachConsole([], onAttach, true, true);
++
++  attachConsole(["PageError"], onAttach, true);
++}
++
++function onAttach(aState, aResponse)
++{
++  top.foobarObject = Object.create(null);
++  top.foobarObject.foo = 1;
++  top.foobarObject.foobar = 2;
++  top.foobarObject.foobaz = 3;
++  top.foobarObject.omg = 4;
++  top.foobarObject.omgfoo = 5;
++  top.foobarObject.strfoo = "foobarz";
++  top.foobarObject.omgstr = "foobarz" +
++    (new Array(DebuggerServer.LONG_STRING_LENGTH * 2)).join("abb");
++
++  top.largeObject1 = Object.create(null);
++  for (let i = 0; i < MAX_AUTOCOMPLETE_ATTEMPTS + 1; i++) {
++    top.largeObject1['a' + i] = i;
++  }
++
++  top.largeObject2 = Object.create(null);
++  for (let i = 0; i < MAX_AUTOCOMPLETIONS * 2; i++) {
++    top.largeObject2['a' + i] = i;
++  }
++
++  gState = aState;
++
++  let tests = [doAutocomplete1, doAutocomplete2, doAutocomplete3,
++               doAutocomplete4, doAutocompleteLarge1, doAutocompleteLarge2];
++  runTests(tests, testEnd);
++}
++
++function doAutocomplete1()
++{
++  info("test autocomplete for 'window.foo'");
++  gState.client.autocomplete("window.foo", 10, onAutocomplete1);
++}
++
++function onAutocomplete1(aResponse)
++{
++  let matches = aResponse.matches;
++
++  is(aResponse.matchProp, "foo", "matchProp");
++  is(matches.length, 1, "matches.length");
++  is(matches[0], "foobarObject", "matches[0]");
++
++  nextTest();
++}
++
++function doAutocomplete2()
++{
++  info("test autocomplete for 'window.foobarObject.'");
++  gState.client.autocomplete("window.foobarObject.", 20, onAutocomplete2);
++}
++
++function onAutocomplete2(aResponse)
++{
++  let matches = aResponse.matches;
++
++  ok(!aResponse.matchProp, "matchProp");
++  is(matches.length, 7, "matches.length");
++  checkObject(matches,
++    ["foo", "foobar", "foobaz", "omg", "omgfoo", "omgstr", "strfoo"]);
++
++  nextTest();
++}
++
++function doAutocomplete3()
++{
++  // Check that completion suggestions are offered inside the string.
++  info("test autocomplete for 'dump(window.foobarObject.)'");
++  gState.client.autocomplete("dump(window.foobarObject.)", 25, onAutocomplete3);
++}
++
++function onAutocomplete3(aResponse)
++{
++  let matches = aResponse.matches;
++
++  ok(!aResponse.matchProp, "matchProp");
++  is(matches.length, 7, "matches.length");
++  checkObject(matches,
++    ["foo", "foobar", "foobaz", "omg", "omgfoo", "omgstr", "strfoo"]);
++
++  nextTest();
++}
++
++function doAutocomplete4()
++{
++  // Check that completion requests can have no suggestions.
++  info("test autocomplete for 'dump(window.foobarObject.)'");
++  gState.client.autocomplete("dump(window.foobarObject.)", 26, onAutocomplete4);
++}
++
++function onAutocomplete4(aResponse)
++{
++  ok(!aResponse.matchProp, "matchProp");
++  is(aResponse.matches.length, 0, "matches.length");
++
++  nextTest();
++}
++
++function doAutocompleteLarge1()
++{
++  // Check that completion requests with too large objects will
++  // have no suggestions.
++  info("test autocomplete for 'window.largeObject1.'");
++  gState.client.autocomplete("window.largeObject1.", 20, onAutocompleteLarge1);
++}
++
++function onAutocompleteLarge1(aResponse)
++{
++  ok(!aResponse.matchProp, "matchProp");
++  info (aResponse.matches.join("|"));
++  is(aResponse.matches.length, 0, "Bailed out with too many properties");
++
++  nextTest();
++}
++
++function doAutocompleteLarge2()
++{
++  // Check that completion requests with pretty large objects will
++  // have MAX_AUTOCOMPLETIONS suggestions
++  info("test autocomplete for 'window.largeObject2.'");
++  gState.client.autocomplete("window.largeObject2.", 20, onAutocompleteLarge2);
++}
++
++function onAutocompleteLarge2(aResponse)
++{
++  ok(!aResponse.matchProp, "matchProp");
++  is(aResponse.matches.length, MAX_AUTOCOMPLETIONS, "matches.length is MAX_AUTOCOMPLETIONS");
++
++  nextTest();
++}
++
++function testEnd()
++{
++  // If this is the first run, reload the page and do it again.
++  // Otherwise, end the test.
++  closeDebugger(gState, function() {
++    gState = null;
++    if (runningInTab) {
++      runningInTab = false;
++      startTest({
++        worker: true
++      });
++    } else {
++      SimpleTest.finish();
++    }
++  });
++}
++
++addEventListener("load", () => {
++  startTest({
++    worker: false
++  });
++});
++</script>
++</body>
++</html>
+diff --git a/devtools/shared/webconsole/test/worker.js b/devtools/shared/webconsole/test/worker.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/shared/webconsole/test/worker.js
+@@ -0,0 +1,16 @@
++"use strict";
++
++function f() {
++  var a = 1;
++  var b = 2;
++  var c = 3;
++}
++
++self.onmessage = function (event) {
++  if (event.data == "ping") {
++    f()
++    postMessage("pong");
++  }
++};
++
++postMessage("load");
