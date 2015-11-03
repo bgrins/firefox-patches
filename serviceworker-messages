@@ -43,6 +43,29 @@ diff --git a/devtools/client/shared/frame-script-utils.js b/devtools/client/shar
   *        { method: the request method (default: "GET"),
   *          url: the url to request (default: content.location.href),
   *          body: the request body to send (default: ""),
+diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webconsole.js
+--- a/devtools/server/actors/webconsole.js
++++ b/devtools/server/actors/webconsole.js
+@@ -1529,18 +1529,17 @@ WebConsoleActor.prototype =
+    * @return object
+    *         The object that can be sent to the remote client.
+    */
+   prepareConsoleMessageForRemote:
+   function WCA_prepareConsoleMessageForRemote(aMessage, aUseObjectGlobal = true)
+   {
+     let result = WebConsoleUtils.cloneObject(aMessage);
+ 
+-    result.workerType = CONSOLE_WORKER_IDS.indexOf(result.innerID) == -1
+-                          ? 'none' : result.innerID;
++    result.workerType = WebConsoleUtils.getWorkerType(result) || "none";
+ 
+     delete result.wrappedJSObject;
+     delete result.ID;
+     delete result.innerID;
+     delete result.consoleID;
+ 
+     result.arguments = Array.map(aMessage.arguments || [], (aObj) => {
+       let dbgObj = this.makeDebuggeeValue(aObj, aUseObjectGlobal);
 diff --git a/devtools/shared/webconsole/test/chrome.ini b/devtools/shared/webconsole/test/chrome.ini
 --- a/devtools/shared/webconsole/test/chrome.ini
 +++ b/devtools/shared/webconsole/test/chrome.ini
@@ -137,7 +160,35 @@ diff --git a/devtools/shared/webconsole/test/test_consoleapi_innerID.html b/devt
 diff --git a/devtools/shared/webconsole/utils.js b/devtools/shared/webconsole/utils.js
 --- a/devtools/shared/webconsole/utils.js
 +++ b/devtools/shared/webconsole/utils.js
-@@ -111,16 +111,43 @@ var WebConsoleUtils = {
+@@ -46,16 +46,26 @@ var WebConsoleUtils = {
+   supportsString: function WCU_supportsString(aString)
+   {
+     let str = Cc["@mozilla.org/supports-string;1"].
+               createInstance(Ci.nsISupportsString);
+     str.data = aString;
+     return str;
+   },
+ 
++  getWorkerType: function(message) {
++    let id = "" + (message ? message.innerID : "");
++    for (let w of CONSOLE_WORKER_IDS) {
++      if (id.startsWith(w)) {
++        return w;
++      }
++    }
++    return null;
++  },
++
+   /**
+    * Clone an object.
+    *
+    * @param object aObject
+    *        The object you want cloned.
+    * @param boolean aRecursive
+    *        Tells if you want to dig deeper into the object, to clone
+    *        recursively.
+@@ -110,16 +120,44 @@ var WebConsoleUtils = {
+     let win = aFrom.ownerDocument.defaultView;
      let style = win.getComputedStyle(aFrom);
      aTo.style.fontFamily = style.getPropertyCSSValue("font-family").cssText;
      aTo.style.fontSize = style.getPropertyCSSValue("font-size").cssText;
@@ -145,34 +196,35 @@ diff --git a/devtools/shared/webconsole/utils.js b/devtools/shared/webconsole/ut
      aTo.style.fontStyle = style.getPropertyCSSValue("font-style").cssText;
    },
  
-   /**
-+   */
-+  getServiceWorkerScriptURL: function(aWindow)
++  getLocation: function(aWindow)
 +  {
-+    let swController = aWindow && aWindow.window.navigator.serviceWorker.controller;
-+    return swController && swController.scriptURL;
++    return aWindow && aWindow.location.toString();
 +  },
 +
-+
 +  /**
++   * Recursively gather a list of window locations given
++   * a top level window.
 +   *
++   * @param nsIDOMWindow aWindow
++   * @return Array
++   *         list of window locations as strings
 +   */
-+  getServiceWorkerScriptURLForFrames: function(aWindow)
++  getLocationsForFrames: function(aWindow)
 +  {
-+    let innerWindowID = this.getServiceWorkerScriptURL(aWindow);
-+    let ids = [innerWindowID];
++    let location = aWindow.location.toString();
++    let locations = [location];
 +
 +    if (aWindow.frames) {
 +      for (let i = 0; i < aWindow.frames.length; i++) {
 +        let frame = aWindow.frames[i];
-+        ids = ids.concat(this.getServiceWorkerScriptURLForFrames(frame));
++        locations = locations.concat(this.getLocationsForFrames(frame));
 +      }
 +    }
 +
-+    return ids;
++    return locations;
 +  },
 +
-+  /**
+   /**
     * Gets the ID of the inner window of this DOM window.
     *
     * @param nsIDOMWindow aWindow
@@ -180,8 +232,7 @@ diff --git a/devtools/shared/webconsole/utils.js b/devtools/shared/webconsole/ut
     *         Inner ID for the given aWindow.
     */
    getInnerWindowId: function WCU_getInnerWindowId(aWindow)
-   {
-@@ -930,31 +957,60 @@ ConsoleAPIListener.prototype =
+@@ -930,31 +968,67 @@ ConsoleAPIListener.prototype =
      if (!this.owner) {
        return;
      }
@@ -216,17 +267,24 @@ diff --git a/devtools/shared/webconsole/utils.js b/devtools/shared/webconsole/ut
 +   *         Do we care about this message?
 +   */
 +  isMessageRelevant: function(message) {
-+    // For messages from Service Workers, message.ID is the
-+    // script URL for the worker.
-+    if (message.innerID === "ServiceWorker" && this.window) {
-+      let scriptUrls = WebConsoleUtils.getServiceWorkerScriptURLForFrames(this.window);
-+      console.log(scriptUrls, message.ID, message.innerID, message);
-+      if (scriptUrls.indexOf(message.ID) === -1) {
-+        return false;
++    let workerType = WebConsoleUtils.getWorkerType(message);
++
++    if (this.window && workerType === "ServiceWorker") {
++      // For messages from Service Workers, message.ID is the
++      // script URL for the worker and innerID includes the scope,
++      // which can be used to determine whether it's controlling
++      // a window.
++      let scope = message.innerID.split("ServiceWorker:")[1];
++      let locations = WebConsoleUtils.getLocationsForFrames(this.window);
++
++      for (let location of locations) {
++        if (!location.startsWith(scope)) {
++          return false;
++        }
 +      }
 +    }
 +
-+    if (this.window && CONSOLE_WORKER_IDS.indexOf(message.innerID) === -1) {
++    if (this.window && !workerType) {
 +      let msgWindow = Services.wm.getCurrentInnerWindowWithId(message.innerID);
 +      if (!msgWindow || !isWindowIncluded(this.window, msgWindow)) {
 +        // Not the same window!
@@ -250,7 +308,7 @@ diff --git a/devtools/shared/webconsole/utils.js b/devtools/shared/webconsole/ut
     * @return array
     *         The array of cached messages.
     */
-@@ -974,19 +1030,19 @@ ConsoleAPIListener.prototype =
+@@ -974,19 +1048,19 @@ ConsoleAPIListener.prototype =
          messages = messages.concat(ConsoleAPIStorage.getEvents(id));
        });
      }
@@ -273,3 +331,26 @@ diff --git a/devtools/shared/webconsole/utils.js b/devtools/shared/webconsole/ut
      return messages.filter((m) => !m.private);
    },
  
+diff --git a/dom/base/Console.cpp b/dom/base/Console.cpp
+--- a/dom/base/Console.cpp
++++ b/dom/base/Console.cpp
+@@ -497,17 +497,18 @@ private:
+       if (mCallData->mTopStackFrame) {
+         frame = *mCallData->mTopStackFrame;
+       }
+ 
+       nsString id;
+       if (mWorkerPrivate->IsSharedWorker()) {
+         id = NS_LITERAL_STRING("SharedWorker");
+       } else if (mWorkerPrivate->IsServiceWorker()) {
+-        id = NS_LITERAL_STRING("ServiceWorker");
++        id = NS_LITERAL_STRING("ServiceWorker:");
++        AppendASCIItoUTF16(mWorkerPrivate->WorkerName(), id);
+       } else {
+         id = NS_LITERAL_STRING("Worker");
+       }
+ 
+       mCallData->SetIDs(frame.mFilename, id);
+     }
+ 
+     // Now we could have the correct window (if we are not window-less).
