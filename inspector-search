@@ -1,12 +1,12 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  2bfe5435c1d1e2784af3b225d629a210023daecd
+# Parent  1ed402253ec6c0855605284c7e5ebece4acd3579
 Bug 835896 - Inspector searchbox should also provide a way to search plain text on the page;r=pbrosset
 
 diff --git a/devtools/client/framework/selection.js b/devtools/client/framework/selection.js
 --- a/devtools/client/framework/selection.js
 +++ b/devtools/client/framework/selection.js
-@@ -157,16 +157,21 @@ Selection.prototype = {
+@@ -157,16 +157,22 @@ Selection.prototype = {
        return this.node.ownerDocument;
      }
      return null;
@@ -16,8 +16,9 @@ diff --git a/devtools/client/framework/selection.js b/devtools/client/framework/
      this.reason = reason;
  
 +    // If a singleTextChild text node is being set, then set it's parent instead.
-+    if (value && value._parent && value._parent.singleTextChild == value) {
-+      value = value._parent;
++    let parentNode = value && value.parentNode();
++    if (value && parentNode && parentNode.singleTextChild === value) {
++      value = parentNode;
 +    }
 +
      // We used to return here if the node had not changed but we now need to
@@ -31,7 +32,99 @@ diff --git a/devtools/client/framework/selection.js b/devtools/client/framework/
 diff --git a/devtools/client/inspector/inspector-panel.js b/devtools/client/inspector/inspector-panel.js
 --- a/devtools/client/inspector/inspector-panel.js
 +++ b/devtools/client/inspector/inspector-panel.js
-@@ -303,23 +303,44 @@ InspectorPanel.prototype = {
+@@ -11,17 +11,17 @@ Cu.import("resource://gre/modules/Servic
+ var promise = require("promise");
+ var EventEmitter = require("devtools/shared/event-emitter");
+ var clipboard = require("sdk/clipboard");
+ var {HostType} = require("devtools/client/framework/toolbox").Toolbox;
+ 
+ loader.lazyGetter(this, "MarkupView", () => require("devtools/client/markupview/markup-view").MarkupView);
+ loader.lazyGetter(this, "HTMLBreadcrumbs", () => require("devtools/client/inspector/breadcrumbs").HTMLBreadcrumbs);
+ loader.lazyGetter(this, "ToolSidebar", () => require("devtools/client/framework/sidebar").ToolSidebar);
+-loader.lazyGetter(this, "SelectorSearch", () => require("devtools/client/inspector/selector-search").SelectorSearch);
++loader.lazyGetter(this, "InspectorSearch", () => require("devtools/client/inspector/inspector-search").InspectorSearch);
+ 
+ loader.lazyGetter(this, "strings", () => {
+   return Services.strings.createBundle("chrome://devtools/locale/inspector.properties");
+ });
+ loader.lazyGetter(this, "toolboxStrings", () => {
+   return Services.strings.createBundle("chrome://devtools/locale/toolbox.properties");
+ });
+ loader.lazyGetter(this, "clipboardHelper", () => {
+@@ -73,17 +73,30 @@ const LAYOUT_CHANGE_TIMER = 250;
+ function InspectorPanel(iframeWindow, toolbox) {
+   this._toolbox = toolbox;
+   this._target = toolbox._target;
+   this.panelDoc = iframeWindow.document;
+   this.panelWin = iframeWindow;
+   this.panelWin.inspector = this;
+ 
+   this.nodeMenuTriggerInfo = null;
++
+   this._onBeforeNavigate = this._onBeforeNavigate.bind(this);
++  this.onNewRoot = this.onNewRoot.bind(this);
++  this._setupNodeMenu = this._setupNodeMenu.bind(this);
++  this._resetNodeMenu = this._resetNodeMenu.bind(this);
++  this._updateSearchLabel = this._updateSearchLabel.bind(this);
++  this.onNewSelection = this.onNewSelection.bind(this);
++  this.onBeforeNewSelection = this.onBeforeNewSelection.bind(this);
++  this.onDetached = this.onDetached.bind(this);
++  this.onToolboxHostChanged = this.onToolboxHostChanged.bind(this);
++  this.scheduleLayoutChange = this.scheduleLayoutChange.bind(this);
++  this.onPaneToggleButtonClicked = this.onPaneToggleButtonClicked.bind(this);
++  this._onMarkupFrameLoad = this._onMarkupFrameLoad.bind(this);
++
+   this._target.on("will-navigate", this._onBeforeNavigate);
+ 
+   EventEmitter.decorate(this);
+ }
+ 
+ exports.InspectorPanel = InspectorPanel;
+ 
+ InspectorPanel.prototype = {
+@@ -134,41 +147,33 @@ InspectorPanel.prototype = {
+ 
+   get canPasteInnerOrAdjacentHTML() {
+     return this._target.client.traits.pasteHTML;
+   },
+ 
+   _deferredOpen: function(defaultSelection) {
+     let deferred = promise.defer();
+ 
+-    this.onNewRoot = this.onNewRoot.bind(this);
+     this.walker.on("new-root", this.onNewRoot);
+ 
+     this.nodemenu = this.panelDoc.getElementById("inspector-node-popup");
+     this.lastNodemenuItem = this.nodemenu.lastChild;
+-    this._setupNodeMenu = this._setupNodeMenu.bind(this);
+-    this._resetNodeMenu = this._resetNodeMenu.bind(this);
+     this.nodemenu.addEventListener("popupshowing", this._setupNodeMenu, true);
+     this.nodemenu.addEventListener("popuphiding", this._resetNodeMenu, true);
+ 
+-    this.onNewSelection = this.onNewSelection.bind(this);
+     this.selection.on("new-node-front", this.onNewSelection);
+-    this.onBeforeNewSelection = this.onBeforeNewSelection.bind(this);
+     this.selection.on("before-new-node-front", this.onBeforeNewSelection);
+-    this.onDetached = this.onDetached.bind(this);
+     this.selection.on("detached-front", this.onDetached);
+ 
+     this.breadcrumbs = new HTMLBreadcrumbs(this);
+ 
+-    this.onToolboxHostChanged = this.onToolboxHostChanged.bind(this);
+     this._toolbox.on("host-changed", this.onToolboxHostChanged);
+ 
+     if (this.target.isLocalTab) {
+       this.browser = this.target.tab.linkedBrowser;
+-      this.scheduleLayoutChange = this.scheduleLayoutChange.bind(this);
+       this.browser.addEventListener("resize", this.scheduleLayoutChange, true);
+ 
+       // Show a warning when the debugger is paused.
+       // We show the warning only when the inspector
+       // is selected.
+       this.updateDebuggerPausedWarning = () => {
+         let notificationBox = this._toolbox.getNotificationBox();
+         let notification = notificationBox.getNotificationWithValue("inspector-script-paused");
+@@ -304,23 +309,42 @@ InspectorPanel.prototype = {
    markDirty: function() {
      this.isDirty = true;
    },
@@ -45,11 +138,9 @@ diff --git a/devtools/client/inspector/inspector-panel.js b/devtools/client/insp
 -      this.searchSuggestions.destroy();
 -      this.searchSuggestions = null;
 +    this.searchBox = this.panelDoc.getElementById("inspector-searchbox");
-+    this.search = new SelectorSearch(this, this.searchBox);
-+    this.searchLabel = this.searchBox.ownerDocument.createElement("box");
-+    this.searchBox.parentNode.insertBefore(this.searchLabel, this.searchBox);
++    this.searchLabel = this.panelDoc.getElementById("inspector-searchlabel");
 +
-+    this._updateSearchLabel = this._updateSearchLabel.bind(this);
++    this.search = new InspectorSearch(this, this.searchBox);
 +    this.search.on("search-cleared", this._updateSearchLabel);
 +    this.search.on("search-no-result", this._updateSearchLabel);
 +    this.search.on("search-result", this._updateSearchLabel);
@@ -82,7 +173,25 @@ diff --git a/devtools/client/inspector/inspector-panel.js b/devtools/client/insp
    setupSidebar: function() {
      let tabbox = this.panelDoc.querySelector("#inspector-sidebar");
      this.sidebar = new ToolSidebar(tabbox, this, "inspector", {
-@@ -393,17 +414,16 @@ InspectorPanel.prototype = {
+@@ -364,17 +388,16 @@ InspectorPanel.prototype = {
+     this.setupSidebarToggle();
+   },
+ 
+   /**
+    * Add the expand/collapse behavior for the sidebar panel.
+    */
+   setupSidebarToggle: function() {
+     this._paneToggleButton = this.panelDoc.getElementById("inspector-pane-toggle");
+-    this.onPaneToggleButtonClicked = this.onPaneToggleButtonClicked.bind(this);
+     this._paneToggleButton.addEventListener("mousedown",
+       this.onPaneToggleButtonClicked);
+     this.updatePaneToggleButton();
+   },
+ 
+   /**
+    * Reset the inspector on new root mutation.
+    */
+@@ -394,17 +417,16 @@ InspectorPanel.prototype = {
        this.selection.setNodeFront(defaultNode, "navigateaway");
  
        this._initMarkup();
@@ -100,7 +209,7 @@ diff --git a/devtools/client/inspector/inspector-panel.js b/devtools/client/insp
    },
  
    _selectionCssSelector: null,
-@@ -584,32 +604,32 @@ InspectorPanel.prototype = {
+@@ -585,32 +607,32 @@ InspectorPanel.prototype = {
      this.sidebar = null;
  
      this.nodemenu.removeEventListener("popupshowing", this._setupNodeMenu, true);
@@ -136,32 +245,62 @@ diff --git a/devtools/client/inspector/inspector-panel.js b/devtools/client/insp
  
      return this._panelDestroyer;
    },
-diff --git a/devtools/client/inspector/inspector.xul b/devtools/client/inspector/inspector.xul
---- a/devtools/client/inspector/inspector.xul
-+++ b/devtools/client/inspector/inspector.xul
-@@ -133,17 +133,17 @@
-         <arrowscrollbox id="inspector-breadcrumbs"
-           class="breadcrumbs-widget-container"
-           flex="1" orient="horizontal"
-           clicktoscroll="true"/>
-         <textbox id="inspector-searchbox"
-           type="search"
-           timeout="50"
-           class="devtools-searchinput"
--          placeholder="&inspectorSearchHTML.label2;"/>
-+          placeholder="&inspectorSearchHTML.label3;"/>
-         <toolbarbutton id="inspector-pane-toggle"
-           class="devtools-toolbarbutton"
-           tabindex="0" />
-       </toolbar>
-       <vbox flex="1" id="markup-box">
-       </vbox>
-     </vbox>
-     <splitter class="devtools-side-splitter"/>
-diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/inspector/selector-search.js
+@@ -909,46 +931,41 @@ InspectorPanel.prototype = {
+ 
+     // create tool iframe
+     this._markupFrame = doc.createElement("iframe");
+     this._markupFrame.setAttribute("flex", "1");
+     this._markupFrame.setAttribute("tooltip", "aHTMLTooltip");
+     this._markupFrame.setAttribute("context", "inspector-node-popup");
+ 
+     // This is needed to enable tooltips inside the iframe document.
+-    this._boundMarkupFrameLoad = this._onMarkupFrameLoad.bind(this);
+-    this._markupFrame.addEventListener("load", this._boundMarkupFrameLoad, true);
++    this._markupFrame.addEventListener("load", this._onMarkupFrameLoad, true);
+ 
+     this._markupBox.setAttribute("collapsed", true);
+     this._markupBox.appendChild(this._markupFrame);
+     this._markupFrame.setAttribute("src", "chrome://devtools/content/markupview/markup-view.xhtml");
+     this._markupFrame.setAttribute("aria-label", strings.GetStringFromName("inspector.panelLabel.markupView"));
+   },
+ 
+   _onMarkupFrameLoad: function() {
+-    this._markupFrame.removeEventListener("load", this._boundMarkupFrameLoad, true);
+-    delete this._boundMarkupFrameLoad;
++    this._markupFrame.removeEventListener("load", this._onMarkupFrameLoad, true);
+ 
+     this._markupFrame.contentWindow.focus();
+ 
+     this._markupBox.removeAttribute("collapsed");
+ 
+     let controllerWindow = this._toolbox.doc.defaultView;
+     this.markup = new MarkupView(this, this._markupFrame, controllerWindow);
+ 
+     this.emit("markuploaded");
+   },
+ 
+   _destroyMarkup: function() {
+     let destroyPromise;
+ 
+-    if (this._boundMarkupFrameLoad) {
+-      this._markupFrame.removeEventListener("load", this._boundMarkupFrameLoad, true);
+-      this._boundMarkupFrameLoad = null;
+-    }
++    this._markupFrame.removeEventListener("load", this._onMarkupFrameLoad, true);
+ 
+     if (this.markup) {
+       destroyPromise = this.markup.destroy();
+       this.markup = null;
+     } else {
+       destroyPromise = promise.resolve();
+     }
+ 
+diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/inspector/inspector-search.js
+rename from devtools/client/inspector/selector-search.js
+rename to devtools/client/inspector/inspector-search.js
 --- a/devtools/client/inspector/selector-search.js
-+++ b/devtools/client/inspector/selector-search.js
-@@ -1,54 +1,144 @@
++++ b/devtools/client/inspector/inspector-search.js
+@@ -1,54 +1,145 @@
  /* This Source Code Form is subject to the terms of the Mozilla Public
   * License, v. 2.0. If a copy of the MPL was not distributed with this
   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -192,7 +331,7 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
 + * - search-no-result: when a search is made that yields no result
 + * - search-result: when a search is made and a result is selected
 + */
-+function SelectorSearch(inspector, input) {
++function InspectorSearch(inspector, input) {
 +  this.inspector = inspector;
 +  this.searchBox = input;
 +  this._lastSearched = null;
@@ -210,9 +349,9 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
 +  EventEmitter.decorate(this);
 +}
 +
-+exports.SelectorSearch = SelectorSearch;
++exports.InspectorSearch = InspectorSearch;
 +
-+SelectorSearch.prototype = {
++InspectorSearch.prototype = {
 +  get walker() this.inspector.walker,
 +
 +  destroy: function() {
@@ -223,7 +362,8 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
 +  },
 +
 +  _onSearch: Task.async(function*(reverse = false) {
-+    this._lastQuery = this.doFullTextSearch(this.searchBox.value, reverse);
++    this._lastQuery = this.doFullTextSearch(this.searchBox.value, reverse).
++                           catch(e => console.error(e));
 +  }),
 +
 +  doFullTextSearch: Task.async(function*(query, reverse) {
@@ -231,7 +371,6 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
 +    this._lastSearched = query;
 +
 +    if (query.length === 0) {
-+      this.searchBox.removeAttribute("filled");
 +      this.searchBox.classList.remove("devtools-no-search-result");
 +      if (!lastSearched || lastSearched.length > 0) {
 +        this.emit("search-cleared");
@@ -239,11 +378,7 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
 +      return;
 +    }
 +
-+    this.searchBox.setAttribute("filled", true);
-+
-+    let res = yield this.walker.search(query, {
-+      reverse: reverse
-+    });
++    let res = yield this.walker.search(query, { reverse });
 +
 +    // Value has changed since we started this request, we're done.
 +    if (query != this.searchBox.value) {
@@ -251,7 +386,7 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
 +    }
 +
 +    if (res) {
-+      this.inspector.selection.setNodeFront(res.node, "selectorsearch");
++      this.inspector.selection.setNodeFront(res.node, "inspectorsearch");
 +      this.searchBox.classList.remove("devtools-no-search-result");
 +
 +      res.query = query;
@@ -269,6 +404,11 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
 +  },
 +
 +  _onKeyDown: function(event) {
++    if (this.searchBox.value.length === 0) {
++      this.searchBox.removeAttribute("filled");
++    } else {
++      this.searchBox.setAttribute("filled", true);
++    }
 +    if (event.keyCode === event.DOM_VK_RETURN) {
 +      this._onSearch();
 +    } if (event.keyCode === Ci.nsIDOMKeyEvent.DOM_VK_G && event.metaKey) {
@@ -286,17 +426,21 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
   * search or not.
   *
   * @constructor
-  * @param InspectorPanel aInspector
+- * @param InspectorPanel aInspector
++ * @param InspectorPanel inspector
   *        The InspectorPanel whose `walker` attribute should be used for
   *        document traversal.
-  * @param nsiInputElement aInputNode
+- * @param nsiInputElement aInputNode
++ * @param nsiInputElement inputNode
   *        The input element to which the panel will be attached and from where
   *        search input will be taken.
   */
 -function SelectorSearch(aInspector, aInputNode) {
-+function SelectorAutocompleter(aInspector, aInputNode) {
-   this.inspector = aInspector;
-   this.searchBox = aInputNode;
+-  this.inspector = aInspector;
+-  this.searchBox = aInputNode;
++function SelectorAutocompleter(inspector, inputNode) {
++  this.inspector = inspector;
++  this.searchBox = inputNode;
    this.panelDoc = this.searchBox.ownerDocument;
  
 -  // initialize variables.
@@ -319,7 +463,7 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
    let options = {
      panelId: "inspector-searchbox-panel",
      listBoxId: "searchbox-panel-listbox",
-@@ -56,30 +146,29 @@ function SelectorSearch(aInspector, aInp
+@@ -56,30 +147,29 @@ function SelectorSearch(aInspector, aInp
      position: "before_start",
      direction: "ltr",
      theme: "auto",
@@ -353,7 +497,7 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
    States: {
      CLASS: "class",
      ID: "id",
-@@ -164,226 +253,86 @@ SelectorSearch.prototype = {
+@@ -164,268 +254,123 @@ SelectorSearch.prototype = {
      }
      return this._state;
    },
@@ -485,17 +629,20 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
    /**
     * Handles keypresses inside the input box.
     */
-   _onSearchKeypress: function(aEvent) {
+-  _onSearchKeypress: function(aEvent) {
++  _onSearchKeypress: function(event) {
      let query = this.searchBox.value;
-     switch(aEvent.keyCode) {
-       case aEvent.DOM_VK_RETURN:
+-    switch(aEvent.keyCode) {
+-      case aEvent.DOM_VK_RETURN:
 -        if (query == this._lastSearched && this._searchResults) {
 -          this._searchIndex = (this._searchIndex + 1) % this._searchResults.length;
 -        }
 -        else {
 -          this._onHTMLSearch();
 -          return;
-+      case aEvent.DOM_VK_TAB:
++    switch(event.keyCode) {
++      case event.DOM_VK_RETURN:
++      case event.DOM_VK_TAB:
 +        if (this.searchPopup.isOpen &&
 +            this.searchPopup.getItemAtIndex(this.searchPopup.itemCount - 1)
 +                .preLabel == query) {
@@ -505,7 +652,8 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
          }
          break;
  
-       case aEvent.DOM_VK_UP:
+-      case aEvent.DOM_VK_UP:
++      case event.DOM_VK_UP:
          if (this.searchPopup.isOpen && this.searchPopup.itemCount > 0) {
            this.searchPopup.focus();
            if (this.searchPopup.selectedIndex == this.searchPopup.itemCount - 1) {
@@ -522,7 +670,8 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
 -        }
          break;
  
-       case aEvent.DOM_VK_DOWN:
+-      case aEvent.DOM_VK_DOWN:
++      case event.DOM_VK_DOWN:
          if (this.searchPopup.isOpen && this.searchPopup.itemCount > 0) {
            this.searchPopup.focus();
            this.searchPopup.selectedIndex = 0;
@@ -557,43 +706,79 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
          return;
      }
  
-     aEvent.preventDefault();
-     aEvent.stopPropagation();
+-    aEvent.preventDefault();
+-    aEvent.stopPropagation();
 -    if (this._searchResults && this._searchResults.length > 0) {
 -      this._lastQuery = this._selectResult(this._searchIndex).then(() => this.emit("processing-done"));
 -    }
 -    else {
 -      this.emit("processing-done");
 -    }
++    event.preventDefault();
++    event.stopPropagation();
 +    this.emit("processing-done");
    },
  
    /**
     * Handles keypress and mouse click on the suggestions richlistbox.
     */
-   _onListBoxKeypress: function(aEvent) {
-     switch(aEvent.keyCode || aEvent.button) {
-       case aEvent.DOM_VK_RETURN:
-       case aEvent.DOM_VK_TAB:
+-  _onListBoxKeypress: function(aEvent) {
+-    switch(aEvent.keyCode || aEvent.button) {
+-      case aEvent.DOM_VK_RETURN:
+-      case aEvent.DOM_VK_TAB:
++  _onListBoxKeypress: function(event) {
++    switch(event.keyCode || event.button) {
++      case event.DOM_VK_RETURN:
++      case event.DOM_VK_TAB:
        case 0: // left mouse button
-         aEvent.stopPropagation();
-         aEvent.preventDefault();
+-        aEvent.stopPropagation();
+-        aEvent.preventDefault();
++        event.stopPropagation();
++        event.preventDefault();
          this.searchBox.value = this.searchPopup.selectedItem.label;
          this.searchBox.focus();
 -        this._onHTMLSearch();
 +        this.hidePopup();
          break;
  
-       case aEvent.DOM_VK_UP:
+-      case aEvent.DOM_VK_UP:
++      case event.DOM_VK_UP:
          if (this.searchPopup.selectedIndex == 0) {
            this.searchPopup.selectedIndex = -1;
-           aEvent.stopPropagation();
-           aEvent.preventDefault();
+-          aEvent.stopPropagation();
+-          aEvent.preventDefault();
++          event.stopPropagation();
++          event.preventDefault();
            this.searchBox.focus();
-@@ -410,22 +359,17 @@ SelectorSearch.prototype = {
-       case aEvent.DOM_VK_BACK_SPACE:
-         aEvent.stopPropagation();
-         aEvent.preventDefault();
+         }
+         else {
+           let index = this.searchPopup.selectedIndex;
+           this.searchBox.value = this.searchPopup.getItemAtIndex(index - 1).label;
+         }
+         break;
+ 
+-      case aEvent.DOM_VK_DOWN:
++      case event.DOM_VK_DOWN:
+         if (this.searchPopup.selectedIndex == this.searchPopup.itemCount - 1) {
+           this.searchPopup.selectedIndex = -1;
+-          aEvent.stopPropagation();
+-          aEvent.preventDefault();
++          event.stopPropagation();
++          event.preventDefault();
+           this.searchBox.focus();
+         }
+         else {
+           let index = this.searchPopup.selectedIndex;
+           this.searchBox.value = this.searchPopup.getItemAtIndex(index + 1).label;
+         }
+         break;
+ 
+-      case aEvent.DOM_VK_BACK_SPACE:
+-        aEvent.stopPropagation();
+-        aEvent.preventDefault();
++      case event.DOM_VK_BACK_SPACE:
++        event.stopPropagation();
++        event.preventDefault();
          this.searchBox.focus();
          if (this.searchBox.selectionStart > 0) {
            this.searchBox.value =
@@ -614,17 +799,23 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
    /**
     * Reset previous search results on markup-mutations to make sure we search
     * again after nodes have been added/removed/changed.
-@@ -438,17 +382,17 @@ SelectorSearch.prototype = {
+@@ -433,22 +378,22 @@ SelectorSearch.prototype = {
+   _onMarkupMutation: function() {
+     this._searchResults = null;
+     this._lastSearched = null;
+   },
+ 
    /**
     * Populates the suggestions list and show the suggestion popup.
     */
-   _showPopup: function(aList, aFirstPart, aState) {
+-  _showPopup: function(aList, aFirstPart, aState) {
++  _showPopup: function(list, firstPart, state) {
      let total = 0;
      let query = this.searchBox.value;
      let items = [];
  
 -    for (let [value, count, state] of aList) {
-+    for (let [value, /*count*/, state] of aList) {
++    for (let [value, /*count*/, state] of list) {
        // for cases like 'div ' or 'div >' or 'div+'
        if (query.match(/[\s>+]$/)) {
          value = query + value;
@@ -633,7 +824,7 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
        else if (query.match(/[\s>+][\.#a-zA-Z][^\s>+\.#]*$/)) {
          let lastPart = query.match(/[\s>+][\.#a-zA-Z][^>\s+\.#]*$/)[0];
          value = query.slice(0, -1 * lastPart.length + 1) + value;
-@@ -456,18 +400,17 @@ SelectorSearch.prototype = {
+@@ -456,44 +401,53 @@ SelectorSearch.prototype = {
        // for cases like 'div.class' or '#foo.bar' and likewise
        else if (query.match(/[a-zA-Z][#\.][^#\.\s+>]*$/)) {
          let lastPart = query.match(/[a-zA-Z][#\.][^#\.\s>+]*$/)[0];
@@ -653,7 +844,18 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
        }
  
        // In case the query's state is tag and the item's state is id or class
-@@ -484,16 +427,26 @@ SelectorSearch.prototype = {
+       // adjust the preLabel
+-      if (aState === this.States.TAG && state === this.States.CLASS) {
++      if (state === this.States.TAG && state === this.States.CLASS) {
+         item.preLabel = "." + item.preLabel;
+       }
+-      if (aState === this.States.TAG && state === this.States.ID) {
++      if (state === this.States.TAG && state === this.States.ID) {
+         item.preLabel = "#" + item.preLabel;
+       }
+ 
+       items.unshift(item);
+       if (++total > MAX_SUGGESTIONS - 1) {
          break;
        }
      }
@@ -680,7 +882,7 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
     * Suggests classes,ids and tags based on the user input as user types in the
     * searchbox.
     */
-@@ -520,27 +473,28 @@ SelectorSearch.prototype = {
+@@ -520,27 +474,28 @@ SelectorSearch.prototype = {
      }
      // TODO: implement some caching so that over the wire request is not made
      // everytime.
@@ -712,10 +914,78 @@ diff --git a/devtools/client/inspector/selector-search.js b/devtools/client/insp
 +    return this._lastQuery;
    }
  };
+diff --git a/devtools/client/inspector/inspector.xul b/devtools/client/inspector/inspector.xul
+--- a/devtools/client/inspector/inspector.xul
++++ b/devtools/client/inspector/inspector.xul
+@@ -149,21 +149,22 @@
+     <vbox flex="1" class="devtools-main-content">
+       <toolbar id="inspector-toolbar"
+         class="devtools-toolbar"
+         nowindowdrag="true">
+         <arrowscrollbox id="inspector-breadcrumbs"
+           class="breadcrumbs-widget-container"
+           flex="1" orient="horizontal"
+           clicktoscroll="true"/>
++        <box id="inspector-searchlabel" />
+         <textbox id="inspector-searchbox"
+           type="search"
+           timeout="50"
+           class="devtools-searchinput"
+-          placeholder="&inspectorSearchHTML.label2;"/>
++          placeholder="&inspectorSearchHTML.label3;"/>
+         <toolbarbutton id="inspector-pane-toggle"
+           class="devtools-toolbarbutton"
+           tabindex="0" />
+       </toolbar>
+       <vbox flex="1" id="markup-box">
+       </vbox>
+     </vbox>
+     <splitter class="devtools-side-splitter"/>
+diff --git a/devtools/client/inspector/moz.build b/devtools/client/inspector/moz.build
+--- a/devtools/client/inspector/moz.build
++++ b/devtools/client/inspector/moz.build
+@@ -1,12 +1,12 @@
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ DevToolsModules(
+     'breadcrumbs.js',
+     'inspector-commands.js',
+     'inspector-panel.js',
+-    'selector-search.js'
++    'inspector-search.js'
+ )
+ 
+ BROWSER_CHROME_MANIFESTS += ['test/browser.ini']
+diff --git a/devtools/client/themes/inspector.css b/devtools/client/themes/inspector.css
+--- a/devtools/client/themes/inspector.css
++++ b/devtools/client/themes/inspector.css
+@@ -10,16 +10,20 @@
+ }
+ 
+ #inspector-toolbar:-moz-locale-dir(rtl) {
+   padding-left: 4px;
+ }
+ 
+ %endif
+ 
++#inspector-searchlabel {
++  overflow: hidden;
++}
++
+ #inspector-searchbox {
+   transition-property: max-width, -moz-padding-end, -moz-padding-start;
+   transition-duration: 250ms;
+   transition-timing-function: ease;
+ }
+ 
+ #inspector-searchbox:not([focused]):not([filled]) > .textbox-input-box {
+   overflow: hidden;
 diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspector.js
 --- a/devtools/server/actors/inspector.js
 +++ b/devtools/server/actors/inspector.js
-@@ -57,16 +57,17 @@ const protocol = require("devtools/serve
+@@ -56,16 +56,17 @@ const protocol = require("devtools/serve
  const {Arg, Option, method, RetVal, types} = protocol;
  const {LongStringActor, ShortLongString} = require("devtools/server/actors/string");
  const promise = require("promise");
@@ -733,7 +1003,7 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
  } = require("devtools/server/actors/highlighters");
  const {
    isAnonymous,
-@@ -1114,16 +1115,26 @@ types.addDictType("disconnectedNodeArray
+@@ -1117,16 +1118,23 @@ types.addDictType("disconnectedNodeArray
    nodes: "array:domnode",
  
    // Nodes that are needed to connect those nodes to the root.
@@ -744,11 +1014,8 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
  
 +types.addDictType("searchresult", {
 +  list: "domnodelist",
-+  // XXX: Maybe we don't actually need to pass any of this metadata
-+  // to the client, but I'm imagining we might need it to highlight
-+  // multiple results within a single element.
-+  // If we can modify this type later in a backwards compatible way
-+  // then we can drop the metadata object for now.
++  // Right now there is isn't anything required for metadata,
++  // but it's json so it can be extended with extra data.
 +  metadata: "array:json"
 +});
 +
@@ -760,7 +1027,7 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
  
    initialize: function(walker, nodeList) {
      protocol.Actor.prototype.initialize.call(this);
-@@ -1291,16 +1302,18 @@ var WalkerActor = protocol.ActorClass({
+@@ -1294,16 +1302,18 @@ var WalkerActor = protocol.ActorClass({
      this.tabActor = tabActor;
      this.rootWin = tabActor.window;
      this.rootDoc = this.rootWin.document;
@@ -779,7 +1046,7 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
      // The client can tell the walker that it is interested in a node
      // even when it is orphaned with the `retainNode` method.  This
      // list contains orphaned nodes that were so retained.
-@@ -1326,17 +1339,23 @@ var WalkerActor = protocol.ActorClass({
+@@ -1329,17 +1339,23 @@ var WalkerActor = protocol.ActorClass({
    form: function() {
      return {
        actor: this.actorID,
@@ -804,7 +1071,7 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
      return "[WalkerActor " + this.actorID + "]";
    },
  
-@@ -1368,16 +1387,17 @@ var WalkerActor = protocol.ActorClass({
+@@ -1371,16 +1387,17 @@ var WalkerActor = protocol.ActorClass({
        this._refMap = null;
  
        events.off(this.tabActor, "will-navigate", this.onFrameUnload);
@@ -822,7 +1089,7 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
        this.onMutations = null;
  
        this.tabActor = null;
-@@ -2041,16 +2061,47 @@ var WalkerActor = protocol.ActorClass({
+@@ -2044,16 +2061,43 @@ var WalkerActor = protocol.ActorClass({
        selector: Arg(0)
      },
      response: {
@@ -842,15 +1109,11 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
 +   */
 +  search: method(function(query) {
 +    let results = this.walkerSearch.search(query);
-+    let nodeList = new NodeListActor(this, results.map(r=>r.node));
-+    let nodeMetadata = results.map(result => {
-+      return  {
-+        type: result.type
-+      }
-+    });
++    let nodeList = new NodeListActor(this, results.map(r => r.node));
 +
 +    return {
-+      list: nodeList
++      list: nodeList,
++      metadata: []
 +    }
 +  }, {
 +    request: {
@@ -870,7 +1133,7 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
     *        The exact token being completed out of the query
     * @param string selectorState
     *        One of "pseudo", "id", "tag", "class", "null"
-@@ -2799,16 +2850,21 @@ var WalkerActor = protocol.ActorClass({
+@@ -2833,16 +2877,21 @@ var WalkerActor = protocol.ActorClass({
  
    /**
     * Handles mutations from the DOM mutation observer API.
@@ -890,9 +1153,9 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
          continue;
        }
        let targetNode = change.target;
+       let type = change.type;
        let mutation = {
-         type: change.type,
-@@ -3275,16 +3331,87 @@ var WalkerFront = exports.WalkerFront = 
+@@ -3310,16 +3359,85 @@ var WalkerFront = exports.WalkerFront = 
    getNodeFromActor: protocol.custom(function(actorID, path) {
      return this._getNodeFromActor(actorID, path).then(response => {
        return response ? response.node : null;
@@ -916,7 +1179,6 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
 +   */
 +  search: protocol.custom(Task.async(function*(query, options = { }) {
 +    let nodeList;
-+    let metaData = { };
 +    let searchType;
 +    let searchData = this.searchData = this.searchData || { };
 +    let selectorOnly = !!options.selectorOnly;
@@ -935,7 +1197,6 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
 +      searchType = "search";
 +      let result = yield this._search(query, options);
 +      nodeList = result.list;
-+      metaData = result.metadata;
 +    }
 +
 +    // If this is a new search, start at the beginning.
@@ -980,7 +1241,7 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
      }
  
      if (node.retained) {
-@@ -3835,16 +3962,29 @@ DocumentWalker.prototype = {
+@@ -3870,33 +3988,49 @@ DocumentWalker.prototype = {
    set currentNode(aVal) {
      this.walker.currentNode = aVal;
    },
@@ -991,8 +1252,9 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
  
 +  nextNode: function() {
 +    let node = this.walker.currentNode;
-+    if (!node)
++    if (!node) {
 +      return null;
++    }
 +
 +    let nextNode = this.walker.nextNode();
 +    while (nextNode && this.filter(nextNode) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
@@ -1004,12 +1266,33 @@ diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspec
 +
    firstChild: function() {
      let node = this.walker.currentNode;
-     if (!node)
+-    if (!node)
++    if (!node) {
        return null;
++    }
  
      let firstChild = this.walker.firstChild();
      while (firstChild && this.filter(firstChild) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
        firstChild = this.walker.nextSibling();
+     }
+ 
+     return firstChild;
+   },
+ 
+   lastChild: function() {
+     let node = this.walker.currentNode;
+-    if (!node)
++    if (!node) {
+       return null;
++    }
+ 
+     let lastChild = this.walker.lastChild();
+     while (lastChild && this.filter(lastChild) === Ci.nsIDOMNodeFilter.FILTER_SKIP) {
+       lastChild = this.walker.previousSibling();
+     }
+ 
+     return lastChild;
+   },
 diff --git a/devtools/server/actors/utils/moz.build b/devtools/server/actors/utils/moz.build
 --- a/devtools/server/actors/utils/moz.build
 +++ b/devtools/server/actors/utils/moz.build
@@ -1030,7 +1313,7 @@ diff --git a/devtools/server/actors/utils/walker-search.js b/devtools/server/act
 new file mode 100644
 --- /dev/null
 +++ b/devtools/server/actors/utils/walker-search.js
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,259 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1048,14 +1331,11 @@ new file mode 100644
 +const {Ci, Cu} = require("chrome");
 +
 +/**
-+ * The WalkerIndex class indexes the given document (and all subdocuments).
++ * The WalkerIndex class indexes the document (and all subdocs) from
++ * a given walker.
++ *
 + * It is only indexed the first time the data is accessed and will be
 + * re-indexed if a mutation happens between requests.
-+ *
-+ * Usage example:
-+ * let index = new WalkerIndex(doc);
-+ * index.data; // returns the indexed data as a Map of with strings as keys
-+ * index.destroy();
 + *
 + * @param {Walker} walker The walker to be indexed
 + */
@@ -1087,6 +1367,11 @@ new file mode 100644
 +   * Get the indexed data
 +   * This getter also indexes if it hasn't been done yet or if the state is
 +   * dirty
++   *
++   * @returns Map<String, Array<{type:String, node:DOMNode}>>
++   *          A Map keyed on the searchable value, containing an array with
++   *          objects containing the 'type' (one of ALL_RESULTS_TYPES), and
++   *          the DOM Node.
 +   */
 +  get data() {
 +    if (!this._data) {
@@ -1189,23 +1474,22 @@ new file mode 100644
 +    }
 +
 +    if (!isKnown) {
-+      matches.push({
-+        type: type
-+      });
++      matches.push({type});
 +    }
 +  },
 +
 +  _searchIndex: function(query, options, results) {
 +    for (let [matched, res] of this.index.data) {
-+      if (options.searchMethod(query, matched)) {
-+        // Filtering out all unwanted types
-+        res = res.filter(entry => options.types.indexOf(entry.type) !== -1);
-+        if (res.length) {
-+          res.forEach(({node, type}) => {
-+            this._addResult(node, type, results);
-+          });
-+        }
++      if (!options.searchMethod(query, matched)) {
++        continue;
 +      }
++
++      // Add any relevant results (skipping non-requested options).
++      res.filter(entry => {
++        return options.types.indexOf(entry.type) !== -1;
++      }).forEach(({node, type}) => {
++        this._addResult(node, type, results);
++      });
 +    }
 +  },
 +
@@ -1310,7 +1594,7 @@ diff --git a/devtools/server/tests/mochitest/chrome.ini b/devtools/server/tests/
    memprof-helpers.js
    nonchrome_unsafeDereference.html
    small-image.gif
-@@ -71,16 +72,17 @@ skip-if = buildapp == 'mulet'
+@@ -72,16 +73,18 @@ skip-if = buildapp == 'mulet'
  [test_inspector-mutations-frameload.html]
  [test_inspector-mutations-value.html]
  [test_inspector-pseudoclass-lock.html]
@@ -1320,6 +1604,7 @@ diff --git a/devtools/server/tests/mochitest/chrome.ini b/devtools/server/tests/
  [test_inspector-resolve-url.html]
  [test_inspector-retain.html]
 +[test_inspector-search.html]
++[test_inspector-search-front.html]
  [test_inspector-scroll-into-view.html]
  [test_inspector-traversal.html]
  [test_makeGlobalObjectReference.html]
@@ -1386,11 +1671,11 @@ new file mode 100644
 +</body>
 +</html>
 \ No newline at end of file
-diff --git a/devtools/server/tests/mochitest/test_inspector-search.html b/devtools/server/tests/mochitest/test_inspector-search.html
+diff --git a/devtools/server/tests/mochitest/test_inspector-search-front.html b/devtools/server/tests/mochitest/test_inspector-search-front.html
 new file mode 100644
 --- /dev/null
-+++ b/devtools/server/tests/mochitest/test_inspector-search.html
-@@ -0,0 +1,455 @@
++++ b/devtools/server/tests/mochitest/test_inspector-search-front.html
+@@ -0,0 +1,220 @@
 +<!DOCTYPE HTML>
 +<html>
 +<!--
@@ -1410,281 +1695,46 @@ new file mode 100644
 +    Cu.import("resource://gre/modules/Promise.jsm", {});
 +  const {InspectorFront} =
 +    devtools.require("devtools/server/actors/inspector");
-+  const {WalkerSearch, WalkerIndex} =
-+    devtools.require("devtools/server/actors/utils/walker-search");
 +  const {console} =
 +    Cu.import("resource://gre/modules/devtools/shared/Console.jsm", {});
 +
 +  SimpleTest.waitForExplicitFinish();
 +
 +  let walkerFront = null;
-+  let walkerActor = null;
-+  let walkerSearch = null;
-+  let client = null;
 +  let inspectee = null;
 +  let inspector = null;
++
++  // WalkerFront specific tests.  These aren't to excercise search
++  // edge cases so much as to test the state the Front maintains between
++  // searches.
++  // See also test_inspector-search.html
 +
 +  addAsyncTest(function* setup() {
 +    info ("Setting up inspector and walker actors.");
 +
 +    let url = document.getElementById("inspectorContent").href;
-+    let urlAttached = promise.defer();
 +
-+    attachURL(url, function(err, client, tab, doc) {
-+      inspectee = doc;
-+      inspector = InspectorFront(client, tab);
-+      urlAttached.resolve();
++    yield new Promise(resolve => {
++      attachURL(url, function(err, client, tab, doc) {
++        inspectee = doc;
++        inspector = InspectorFront(client, tab);
++        resolve();
++      });
 +    });
-+
-+    yield urlAttached.promise;
 +
 +    walkerFront = yield inspector.getWalker();
 +    ok(walkerFront, "getWalker() should return an actor.");
 +
-+    let serverConnection = walkerFront.conn._transport._serverConnection;
-+    walkerActor = serverConnection.getActor(walkerFront.actorID);
-+    ok(walkerActor,
-+      "Got a reference to the walker actor (" + walkerFront.actorID + ")");
-+
-+    walkerSearch = walkerActor.walkerSearch;
-+
 +    runNextTest();
 +  });
-+
-+  addAsyncTest(function* testIndexExists() {
-+    info ("Testing basic index APIs exist.");
-+
-+    let index = new WalkerIndex(walkerActor);
-+    ok(index.data.size > 0, "public index is filled after getting");
-+
-+    index.clearIndex();
-+    ok(!index._data, "private index is empty after clearing");
-+    ok(index.data.size > 0, "public index is filled after getting");
-+
-+    index.destroy();
-+    runNextTest();
-+  });
-+
-+  addAsyncTest(function* testSearchExists() {
-+    info ("Testing basic search APIs exist.");
-+
-+    ok(walkerSearch, "walker search is exists on the WalkerActor");
-+    ok(walkerSearch.search, "walker search has `search` method");
-+    ok(walkerSearch.index, "walker search has `index` property");
-+    is(walkerSearch.walker, walkerActor, "referencing the correct WalkerActor");
-+
-+    let search = new WalkerSearch(walkerActor);
-+    ok(search, "a new search instance can be created");
-+    ok(search.search, "new search instance has `search` method");
-+    ok(search.index, "new search instance has `index` property");
-+    isnot(search, walkerSearch, "new search instance differs from the WalkerActor's");
-+
-+    search.destroy();
-+    runNextTest();
-+  });
-+
-+  addAsyncTest(function* testEmptySearch() {
-+    info ("Testing search with an empty query.");
-+    results = walkerSearch.search("");
-+    is(results.length, 0, "No results for an empty search");
-+
-+    results = walkerSearch.search(null);
-+    is(results.length, 0, "No results for an empty search");
-+
-+    results = walkerSearch.search(undefined);
-+    is(results.length, 0, "No results for an empty search");
-+
-+    results = walkerSearch.search(10);
-+    is(results.length, 0, "No results for an empty search");
-+
-+    let frontResult = yield walkerFront.search("");
-+    ok(!frontResult, "Null result on front for empty search");
-+
-+    runNextTest();
-+  });
-+
-+  addAsyncTest(function* testSearchTag() {
-+    info ("Testing search for tag with one result.");
-+    let expected = [
-+      {node: inspectee.body, type: "tag"}
-+    ];
-+
-+    let results = walkerSearch.search("body");
-+    isDeeply(results, expected, "Search works with tag result");
-+
-+    results = walkerSearch.search("body");
-+    isDeeply(results, expected, "Search works with tag result");
-+
-+    runNextTest();
-+  });
-+
-+  addAsyncTest(function* testSearchTags() {
-+    info ("Testing search for tag with multiple results.");
-+    let expected = [
-+      {node: inspectee.querySelectorAll("h2")[0], type: "tag"},
-+      {node: inspectee.querySelectorAll("h2")[1], type: "tag"},
-+      {node: inspectee.querySelectorAll("h2")[2], type: "tag"},
-+    ];
-+
-+    let results = walkerSearch.search("h2");
-+    isDeeply(results, expected, "Search works with tag results");
-+
-+    runNextTest();
-+  });
-+
-+  addAsyncTest(function* testSearchSelector() {
-+    info ("Testing search for a selector with multiple results.");
-+    let expected = [
-+      {node: inspectee.querySelectorAll("h2")[0], type: "selector"},
-+      {node: inspectee.querySelectorAll("h2")[1], type: "selector"},
-+      {node: inspectee.querySelectorAll("h2")[2], type: "selector"},
-+    ];
-+
-+    let results = walkerSearch.search("body > h2");
-+    isDeeply(results, expected, "Search works with selector results");
-+
-+    results = walkerSearch.search(":root h2");
-+    isDeeply(results, expected, "Search works with selector results");
-+
-+    results = walkerSearch.search("* h2");
-+    isDeeply(results, expected, "Search works with selector results");
-+
-+    runNextTest();
-+  });
-+
-+  addAsyncTest(function* testSingleResultMultipleMatches() {
-+    info ("Testing multiple matches in a single tag expecting a single result");
-+    let expected = [
-+      {node: inspectee.getElementById("💩"), type: "attributeName"}
-+    ];
-+
-+    let results = walkerSearch.search("💩");
-+    isDeeply(results, expected, "Search works with single node / many matches");
-+
-+    runNextTest();
-+  });
-+
-+  addAsyncTest(function* testSearchMixed() {
-+    info ("Testing search that has tag and text results.");
-+    let expected = [
-+      {node: inspectee.querySelector("h1"), type: "tag"},
-+      {node: inspectee.querySelector("h1 + p").childNodes[0], type: "text"},
-+      {node: inspectee.querySelector("h1 + p > strong").childNodes[0], type: "text"},
-+    ];
-+
-+    let results = walkerSearch.search("h1");
-+    isDeeply(results, expected, "Mixed search results work");
-+
-+    runNextTest();
-+  });
-+
-+  addAsyncTest(function* testPseudoElements() {
-+    info ("Testing ::before and ::after element matching");
-+
-+    let beforeElt = new _documentWalker(inspectee.querySelector("#pseudo"),
-+                                        inspectee.defaultView).firstChild();
-+    let afterElt = new _documentWalker(inspectee.querySelector("#pseudo"),
-+                                       inspectee.defaultView).lastChild();
-+    let styleText = inspectee.querySelector("style").childNodes[0];
-+
-+    // ::before
-+    let results = walkerSearch.search("::before");
-+    isDeeply(results, [ {node: beforeElt, type: "tag"} ],
-+             "Tag search works for pseudo element");
-+
-+    results = walkerSearch.search("_moz_generated_content_before");
-+    is(results.length, 0, "No results for anon tag name");
-+
-+    results = walkerSearch.search("before element");
-+    isDeeply(results, [
-+      {node: styleText, type: "text"},
-+      {node: beforeElt, type: "text"}
-+    ], "Text search works for pseudo element");
-+
-+    // ::after
-+    results = walkerSearch.search("::after");
-+    isDeeply(results, [ {node: afterElt, type: "tag"} ],
-+             "Tag search works for pseudo element");
-+
-+    results = walkerSearch.search("_moz_generated_content_after");
-+    is(results.length, 0, "No results for anon tag name");
-+
-+    results = walkerSearch.search("after element");
-+    isDeeply(results, [
-+      {node: styleText, type: "text"},
-+      {node: afterElt, type: "text"}
-+    ], "Text search works for pseudo element");
-+
-+    runNextTest();
-+  });
-+
-+  addAsyncTest(function* testSearchMutationChangeResults() {
-+    info ("Testing search before and after a mutation.");
-+    let expected = [
-+      {node: inspectee.querySelectorAll("h3")[0], type: "tag"},
-+      {node: inspectee.querySelectorAll("h3")[1], type: "tag"},
-+      {node: inspectee.querySelectorAll("h3")[2], type: "tag"},
-+    ];
-+
-+    let results = walkerSearch.search("h3");
-+    isDeeply(results, expected, "Search works with tag results");
-+
-+    yield new Promise(resolve => {
-+      info("Waiting for a mutation to happen");
-+      let observer = new inspectee.defaultView.MutationObserver(() => {
-+        resolve();
-+      });
-+      observer.observe(inspectee, {childList: true, subtree: true});
-+      expected[0].node.remove();
-+    });
-+
-+    results = walkerSearch.search("h3");
-+    isDeeply(results, [
-+      expected[1],
-+      expected[2]
-+    ], "Results are updated after removal");
-+
-+    yield new Promise(resolve => {
-+      info("Waiting for a mutation to happen");
-+      let observer = new inspectee.defaultView.MutationObserver(() => {
-+        resolve();
-+      });
-+      observer.observe(inspectee, {attributes: true, subtree: true});
-+      inspectee.body.setAttribute("h3", "true");
-+    });
-+
-+    results = walkerSearch.search("h3");
-+    isDeeply(results, [
-+      {node: inspectee.body, type: "attributeName"},
-+      expected[1],
-+      expected[2]
-+    ], "Results are updated after addition");
-+
-+    yield new Promise(resolve => {
-+      info("Waiting for a mutation to happen");
-+      let observer = new inspectee.defaultView.MutationObserver(() => {
-+        resolve();
-+      });
-+      observer.observe(inspectee, {attributes: true, childList: true, subtree: true});
-+      inspectee.body.removeAttribute("h3");
-+      expected[1].node.remove();
-+      expected[2].node.remove();
-+    });
-+
-+    results = walkerSearch.search("h3");
-+    is(results.length, 0, "Results are updated after removal");
-+
-+    runNextTest();
-+  });
-+
-+  // Now for WalkerFront specific tests.  These aren't to excercise search
-+  // edge cases so much as to test the state the Front maintains between
-+  // searches.
 +
 +  addAsyncTest(function* testWalkerFrontDefaults() {
 +    info ("Testing search API using WalkerFront.");
 +    let nodes = yield walkerFront.querySelectorAll(walkerFront.rootNode, "h2");
 +    let fronts = yield nodes.items();
++
++    let frontResult = yield walkerFront.search("");
++    ok(!frontResult, "Null result on front when searching for ''");
 +
 +    let results = yield walkerFront.search("h2");
 +    isDeeply(results, {
@@ -1833,6 +1883,311 @@ new file mode 100644
 +  });
 +
 +  runNextTest();
++};
++  </script>
++</head>
++<body>
++<a id="inspectorContent" target="_blank" href="inspector-search-data.html">Test Document</a>
++<p id="display"></p>
++<div id="content" style="display: none">
++
++</div>
++<pre id="test">
++</pre>
++</body>
++</html>
+diff --git a/devtools/server/tests/mochitest/test_inspector-search.html b/devtools/server/tests/mochitest/test_inspector-search.html
+new file mode 100644
+--- /dev/null
++++ b/devtools/server/tests/mochitest/test_inspector-search.html
+@@ -0,0 +1,300 @@
++<!DOCTYPE HTML>
++<html>
++<!--
++https://bugzilla.mozilla.org/show_bug.cgi?id=835896
++-->
++<head>
++  <meta charset="utf-8">
++  <title>Test for Bug 835896</title>
++  <script type="application/javascript" src="chrome://mochikit/content/tests/SimpleTest/SimpleTest.js"></script>
++  <link rel="stylesheet" type="text/css" href="chrome://mochikit/content/tests/SimpleTest/test.css">
++  <script type="application/javascript;version=1.8" src="inspector-helpers.js"></script>
++  <script type="application/javascript;version=1.8">
++window.onload = function() {
++  const Cu = Components.utils;
++  Cu.import("resource://gre/modules/devtools/Loader.jsm");
++  const {Promise: promise} =
++    Cu.import("resource://gre/modules/Promise.jsm", {});
++  const {InspectorFront} =
++    devtools.require("devtools/server/actors/inspector");
++  const {WalkerSearch, WalkerIndex} =
++    devtools.require("devtools/server/actors/utils/walker-search");
++  const {console} =
++    Cu.import("resource://gre/modules/devtools/shared/Console.jsm", {});
++
++  SimpleTest.waitForExplicitFinish();
++
++  let walkerActor = null;
++  let walkerSearch = null;
++  let inspectee = null;
++  let inspector = null;
++
++  // WalkerSearch specific tests.  This is to make sure search results are
++  // coming back as expected.
++  // See also test_inspector-search-front.html.
++
++  addAsyncTest(function* setup() {
++    info ("Setting up inspector and walker actors.");
++
++    let url = document.getElementById("inspectorContent").href;
++
++    yield new Promise(resolve => {
++      attachURL(url, function(err, client, tab, doc) {
++        inspectee = doc;
++        inspector = InspectorFront(client, tab);
++        resolve();
++      });
++    });
++
++    let walkerFront = yield inspector.getWalker();
++    ok(walkerFront, "getWalker() should return an actor.");
++
++    let serverConnection = walkerFront.conn._transport._serverConnection;
++    walkerActor = serverConnection.getActor(walkerFront.actorID);
++    ok(walkerActor,
++      "Got a reference to the walker actor (" + walkerFront.actorID + ")");
++
++    walkerSearch = walkerActor.walkerSearch;
++
++    runNextTest();
++  });
++
++  addAsyncTest(function* testIndexExists() {
++    info ("Testing basic index APIs exist.");
++
++    let index = new WalkerIndex(walkerActor);
++    ok(index.data.size > 0, "public index is filled after getting");
++
++    index.clearIndex();
++    ok(!index._data, "private index is empty after clearing");
++    ok(index.data.size > 0, "public index is filled after getting");
++
++    index.destroy();
++    runNextTest();
++  });
++
++  addAsyncTest(function* testSearchExists() {
++    info ("Testing basic search APIs exist.");
++
++    ok(walkerSearch, "walker search exists on the WalkerActor");
++    ok(walkerSearch.search, "walker search has `search` method");
++    ok(walkerSearch.index, "walker search has `index` property");
++    is(walkerSearch.walker, walkerActor, "referencing the correct WalkerActor");
++
++    let search = new WalkerSearch(walkerActor);
++    ok(search, "a new search instance can be created");
++    ok(search.search, "new search instance has `search` method");
++    ok(search.index, "new search instance has `index` property");
++    isnot(search, walkerSearch, "new search instance differs from the WalkerActor's");
++
++    search.destroy();
++    runNextTest();
++  });
++
++  addAsyncTest(function* testEmptySearch() {
++    info ("Testing search with an empty query.");
++    results = walkerSearch.search("");
++    is(results.length, 0, "No results when searching for ''");
++
++    results = walkerSearch.search(null);
++    is(results.length, 0, "No results when searching for null");
++
++    results = walkerSearch.search(undefined);
++    is(results.length, 0, "No results when searching for undefined");
++
++    results = walkerSearch.search(10);
++    is(results.length, 0, "No results when searching for 10");
++
++    runNextTest();
++  });
++
++  addAsyncTest(function* testBasicSearchData() {
++    let testData = [
++    {
++      desc: "Search for tag with one result.",
++      search: "body",
++      expected: [
++        {node: inspectee.body, type: "tag"}
++      ]
++    },
++    {
++      desc: "Search for tag with multiple results",
++      search: "h2",
++      expected: [
++        {node: inspectee.querySelectorAll("h2")[0], type: "tag"},
++        {node: inspectee.querySelectorAll("h2")[1], type: "tag"},
++        {node: inspectee.querySelectorAll("h2")[2], type: "tag"},
++      ]
++    },
++    {
++      desc: "Search for selector with multiple results",
++      search: "body > h2",
++      expected: [
++        {node: inspectee.querySelectorAll("h2")[0], type: "selector"},
++        {node: inspectee.querySelectorAll("h2")[1], type: "selector"},
++        {node: inspectee.querySelectorAll("h2")[2], type: "selector"},
++      ]
++    },
++    {
++      desc: "Search for selector with multiple results",
++      search: ":root h2",
++      expected: [
++        {node: inspectee.querySelectorAll("h2")[0], type: "selector"},
++        {node: inspectee.querySelectorAll("h2")[1], type: "selector"},
++        {node: inspectee.querySelectorAll("h2")[2], type: "selector"},
++      ]
++    },
++    {
++      desc: "Search for selector with multiple results",
++      search: "* h2",
++      expected: [
++        {node: inspectee.querySelectorAll("h2")[0], type: "selector"},
++        {node: inspectee.querySelectorAll("h2")[1], type: "selector"},
++        {node: inspectee.querySelectorAll("h2")[2], type: "selector"},
++      ]
++    },
++    {
++      desc: "Search with multiple matches in a single tag expecting a single result",
++      search: "💩",
++      expected: [
++        {node: inspectee.getElementById("💩"), type: "attributeName"}
++      ]
++    },
++    {
++      desc: "Search that has tag and text results",
++      search: "h1",
++      expected: [
++        {node: inspectee.querySelector("h1"), type: "tag"},
++        {node: inspectee.querySelector("h1 + p").childNodes[0], type: "text"},
++        {node: inspectee.querySelector("h1 + p > strong").childNodes[0], type: "text"},
++      ]
++    },
++    ]
++
++    for (let {desc, search, expected} of testData) {
++      info("Running test: " + desc);
++      let results = walkerSearch.search(search);
++      isDeeply(results, expected,
++        "Search returns correct results with '" + search + "'");
++    }
++
++    runNextTest();
++  });
++
++  addAsyncTest(function* testPseudoElements() {
++    info ("Testing ::before and ::after element matching");
++
++    let beforeElt = new _documentWalker(inspectee.querySelector("#pseudo"),
++                                        inspectee.defaultView).firstChild();
++    let afterElt = new _documentWalker(inspectee.querySelector("#pseudo"),
++                                       inspectee.defaultView).lastChild();
++    let styleText = inspectee.querySelector("style").childNodes[0];
++
++    // ::before
++    let results = walkerSearch.search("::before");
++    isDeeply(results, [ {node: beforeElt, type: "tag"} ],
++             "Tag search works for pseudo element");
++
++    results = walkerSearch.search("_moz_generated_content_before");
++    is(results.length, 0, "No results for anon tag name");
++
++    results = walkerSearch.search("before element");
++    isDeeply(results, [
++      {node: styleText, type: "text"},
++      {node: beforeElt, type: "text"}
++    ], "Text search works for pseudo element");
++
++    // ::after
++    results = walkerSearch.search("::after");
++    isDeeply(results, [ {node: afterElt, type: "tag"} ],
++             "Tag search works for pseudo element");
++
++    results = walkerSearch.search("_moz_generated_content_after");
++    is(results.length, 0, "No results for anon tag name");
++
++    results = walkerSearch.search("after element");
++    isDeeply(results, [
++      {node: styleText, type: "text"},
++      {node: afterElt, type: "text"}
++    ], "Text search works for pseudo element");
++
++    runNextTest();
++  });
++
++  addAsyncTest(function* testSearchMutationChangeResults() {
++    info ("Testing search before and after a mutation.");
++    let expected = [
++      {node: inspectee.querySelectorAll("h3")[0], type: "tag"},
++      {node: inspectee.querySelectorAll("h3")[1], type: "tag"},
++      {node: inspectee.querySelectorAll("h3")[2], type: "tag"},
++    ];
++
++    let results = walkerSearch.search("h3");
++    isDeeply(results, expected, "Search works with tag results");
++
++    yield mutateDocumentAndWaitForMutation(() => {
++      expected[0].node.remove();
++    });
++
++    results = walkerSearch.search("h3");
++    isDeeply(results, [
++      expected[1],
++      expected[2]
++    ], "Results are updated after removal");
++
++    yield new Promise(resolve => {
++      info("Waiting for a mutation to happen");
++      let observer = new inspectee.defaultView.MutationObserver(() => {
++        resolve();
++      });
++      observer.observe(inspectee, {attributes: true, subtree: true});
++      inspectee.body.setAttribute("h3", "true");
++    });
++
++    results = walkerSearch.search("h3");
++    isDeeply(results, [
++      {node: inspectee.body, type: "attributeName"},
++      expected[1],
++      expected[2]
++    ], "Results are updated after addition");
++
++    yield new Promise(resolve => {
++      info("Waiting for a mutation to happen");
++      let observer = new inspectee.defaultView.MutationObserver(() => {
++        resolve();
++      });
++      observer.observe(inspectee, {attributes: true, childList: true, subtree: true});
++      inspectee.body.removeAttribute("h3");
++      expected[1].node.remove();
++      expected[2].node.remove();
++    });
++
++    results = walkerSearch.search("h3");
++    is(results.length, 0, "Results are updated after removal");
++
++    runNextTest();
++  });
++
++  runNextTest();
++
++  function mutateDocumentAndWaitForMutation(mutationFn) {
++    return new Promise(resolve => {
++      info("Listening to markup mutation on the inspectee");
++      let observer = new inspectee.defaultView.MutationObserver(resolve);
++      observer.observe(inspectee, {childList: true, subtree: true});
++      mutationFn();
++    });
++  }
 +};
 +  </script>
 +</head>
