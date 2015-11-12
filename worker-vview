@@ -1,0 +1,98 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  3db2048eaa97ec1256621fc950f1e01704ffa5e5
+Get variables view working better in worker
+
+diff --git a/devtools/server/actors/object.js b/devtools/server/actors/object.js
+--- a/devtools/server/actors/object.js
++++ b/devtools/server/actors/object.js
+@@ -1005,19 +1005,20 @@ DebuggerServer.ObjectActorPreviewers = {
+ 
+     for (let i = 0; i < length; ++i) {
+       // Array Xrays filter out various possibly-unsafe properties (like
+       // functions, and claim that the value is undefined instead. This
+       // is generally the right thing for privileged code accessing untrusted
+       // objects, but quite confusing for Object previews. So we manually
+       // override this protection by waiving Xrays on the array, and re-applying
+       // Xrays on any indexed value props that we pull off of it.
+-      let desc = Object.getOwnPropertyDescriptor(Cu.waiveXrays(raw), i);
++      let waived = isWorker ? raw : Cu.waiveXrays(raw);
++      let desc = Object.getOwnPropertyDescriptor(waived, i);
+       if (desc && !desc.get && !desc.set) {
+-        let value = Cu.unwaiveXrays(desc.value);
++        let value = isWorker ? desc.value : Cu.unwaiveXrays(desc.value);
+         value = makeDebuggeeValueIfNeeded(obj, value);
+         items.push(hooks.createValueGrip(value));
+       } else {
+         items.push(null);
+       }
+ 
+       if (items.length == OBJECT_PREVIEW_MAX_ITEMS) {
+         break;
+diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webconsole.js
+--- a/devtools/server/actors/webconsole.js
++++ b/devtools/server/actors/webconsole.js
+@@ -1160,17 +1160,17 @@ WebConsoleActor.prototype =
+       let objActor = this.getActorByID(aOptions.bindObjectActor ||
+                                        aOptions.selectedObjectActor);
+       if (objActor) {
+         let jsObj = objActor.obj.unsafeDereference();
+         // If we use the makeDebuggeeValue method of jsObj's own global, then
+         // we'll get a D.O that sees jsObj as viewed from its own compartment -
+         // that is, without wrappers. The evalWithBindings call will then wrap
+         // jsObj appropriately for the evaluation compartment.
+-        let global = Cu.getGlobalForObject(jsObj);
++        let global = isWorker ? this.evalWindow : Cu.getGlobalForObject(jsObj);
+         let _dbgWindow = dbg.makeGlobalObjectReference(global);
+         bindSelf = dbgWindow.makeDebuggeeValue(jsObj);
+ 
+         if (aOptions.bindObjectActor) {
+           dbgWindow = _dbgWindow;
+         }
+       }
+     }
+diff --git a/devtools/server/worker.js b/devtools/server/worker.js
+--- a/devtools/server/worker.js
++++ b/devtools/server/worker.js
+@@ -73,16 +73,17 @@ this.addEventListener("message",  functi
+         return sources;
+       },
+ 
+       window: this
+     };
+ 
+     let threadActor = new ThreadActor(parent, this);
+     pool.addActor(threadActor);
++    parent.threadActor = this;
+ 
+     let consoleActor = new WebConsoleActor(connection, parent);
+     pool.addActor(consoleActor);
+ 
+     // Step 5: Send a response packet to the parent to notify
+     // it that a connection has been established.
+     postMessage(JSON.stringify({
+       type: "connected",
+diff --git a/devtools/shared/DevToolsUtils.js b/devtools/shared/DevToolsUtils.js
+--- a/devtools/shared/DevToolsUtils.js
++++ b/devtools/shared/DevToolsUtils.js
+@@ -320,17 +320,19 @@ exports.getProperty = function getProper
+  * @param Object aDesc
+  *        The descriptor to check for a safe getter.
+  * @return Boolean
+  *         Whether a safe getter was found.
+  */
+ exports.hasSafeGetter = function hasSafeGetter(aDesc) {
+   // Scripted functions that are CCWs will not appear scripted until after
+   // unwrapping.
+-  let fn = aDesc.get.unwrap();
++  // XXX: Why doesn't this work in a worker?
++  //   "object in compartment marked as invisible to Debugger"
++  let fn = isWorker ? aDesc.get : aDesc.get.unwrap();
+   return fn && fn.callable && fn.class == "Function" && fn.script === undefined;
+ };
+ 
+ /**
+  * Check if it is safe to read properties and execute methods from the given JS
+  * object. Safety is defined as being protected from unintended code execution
+  * from content scripts (or cross-compartment code).
+  *
