@@ -1,0 +1,203 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  8bf46ba0297dfecfdbae08edc1166d8a10bbadf8
+Simulating messages from worker
+
+diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webconsole.js
+--- a/devtools/server/actors/webconsole.js
++++ b/devtools/server/actors/webconsole.js
+@@ -424,21 +424,24 @@ WebConsoleActor.prototype =
+   makeDebuggeeValue: function WCA_makeDebuggeeValue(aValue, aUseObjectGlobal)
+   {
+     let global = this.window;
+     if (aUseObjectGlobal && typeof aValue == "object") {
+       try {
+         global = Cu.getGlobalForObject(aValue);
+       }
+       catch (ex) {
++        dump("Expection " + ex + "\n")
+         // The above can throw an exception if aValue is not an actual object.
+       }
+     }
+-    let dbgGlobal = this.dbg.makeGlobalObjectReference(global);
+-    return dbgGlobal.makeDebuggeeValue(aValue);
++    try {
++      let dbgGlobal = this.dbg.makeGlobalObjectReference(global);
++      return dbgGlobal.makeDebuggeeValue(aValue);
++    }catch(e) { return {}}
+   },
+ 
+   /**
+    * Create a grip for the given object.
+    *
+    * @param object aObject
+    *        The object you want.
+    * @param object aPool
+@@ -541,17 +544,17 @@ WebConsoleActor.prototype =
+    *        The JSON request object received from the Web Console client.
+    * @return object
+    *         The response object which holds the startedListeners array.
+    */
+   onStartListeners: function WCA_onStartListeners(aRequest)
+   {
+     // XXXworkers: Not handling the Console API yet for workers (Bug 1209353).
+     if (isWorker) {
+-       aRequest.listeners = [];
++       aRequest.listeners = ["ConsoleAPI"];
+     }
+ 
+     let startedListeners = [];
+     let window = !this.parentActor.isRootActor ? this.window : null;
+     let appId = null;
+     let messageManager = null;
+ 
+     if (this._parentIsContentActor) {
+@@ -1346,16 +1349,17 @@ WebConsoleActor.prototype =
+    */
+   onConsoleAPICall: function WCA_onConsoleAPICall(aMessage)
+   {
+     let packet = {
+       from: this.actorID,
+       type: "consoleAPICall",
+       message: this.prepareConsoleMessageForRemote(aMessage),
+     };
++    dump(JSON.stringify(packet) + "\n\n");
+     this.conn.send(packet);
+   },
+ 
+   /**
+    * Handler for network events. This method is invoked when a new network event
+    * is about to be recorded.
+    *
+    * @see NetworkEventActor
+@@ -1527,16 +1531,19 @@ WebConsoleActor.prototype =
+    *        If |true| the object global is determined and added as a debuggee,
+    *        otherwise |this.window| is used when makeDebuggeeValue() is invoked.
+    * @return object
+    *         The object that can be sent to the remote client.
+    */
+   prepareConsoleMessageForRemote:
+   function WCA_prepareConsoleMessageForRemote(aMessage, aUseObjectGlobal = true)
+   {
++    if (aMessage.fake == true) {
++      return aMessage;
++    }
+     let result = WebConsoleUtils.cloneObject(aMessage);
+ 
+     result.workerType = WebConsoleUtils.getWorkerType(result) || "none";
+ 
+     delete result.wrappedJSObject;
+     delete result.ID;
+     delete result.innerID;
+     delete result.consoleID;
+diff --git a/devtools/shared/webconsole/worker-utils.js b/devtools/shared/webconsole/worker-utils.js
+--- a/devtools/shared/webconsole/worker-utils.js
++++ b/devtools/shared/webconsole/worker-utils.js
+@@ -1,12 +1,67 @@
+ // XXXworkers This file is loaded on the server side for worker debugging.
+ // Since the server is running in the worker thread, it doesn't
+ // have access to Services / Components.  This functionality
+ // is stubbed out to prevent errors, and will need to implemented
+ // for Bug 1209353.
+ 
+ exports.Utils = { l10n: function() {} };
+ exports.ConsoleServiceListener = function() {};
+-exports.ConsoleAPIListener = function() {};
++
++function ConsoleAPIListener(aWindow, aOwner, aConsoleID)
++{
++  this.window = aWindow;
++  this.owner = aOwner;
++  this.consoleID = aConsoleID;
++  dump("ConsoleAPIListener MADE " + isWorker + " test\n\n");
++}
++ConsoleAPIListener.prototype.init = function() { }
++ConsoleAPIListener.prototype.getCachedMessages = function() {
++
++  // setImmediate(() => {
++    // let packet = {
++    //   from: this.owner.actorID,
++    //   type: "consoleAPICall",
++    //   message: {
++    //     "arguments":["heyo"],
++    //     "columnNumber":1,
++    //     "counter":null,
++    //     "filename":"data:text/html,<script>console.log(\"heyo\")</script>",
++    //     "functionName":"",
++    //     "groupName":"",
++    //     "level":"log",
++    //     "lineNumber":1,
++    //     "private":false,
++    //     "styles":[],
++    //     "timeStamp":1447286288841,
++    //     "timer":null,
++    //     "workerType":"none",
++    //     "category":"webdev"
++    //   }
++    // };
++
++    // this.owner.conn.send(packet);
++  // });
++  return [
++  {
++        "arguments":["heyo"],
++        "columnNumber":1,
++        "counter":null,
++        "filename":"data:text/html,<script>console.log(\"heyo\")</script>",
++        "functionName":"",
++        "groupName":"",
++        "level":"log",
++        "lineNumber":1,
++        "private":false,
++        "styles":[],
++        "timeStamp":1447286288841,
++        "timer":null,
++        "workerType":"none",
++        "category":"webdev",
++        "fake": true
++      }
++  ];
++}
++exports.ConsoleAPIListener = ConsoleAPIListener;
+ exports.addWebConsoleCommands = function() {};
+ exports.ConsoleReflowListener = function() {};
+ exports.CONSOLE_WORKER_IDS = [];
+diff --git a/devtools/shared/worker/loader.js b/devtools/shared/worker/loader.js
+--- a/devtools/shared/worker/loader.js
++++ b/devtools/shared/worker/loader.js
+@@ -466,33 +466,33 @@ var {
+     return {
+       Debugger: this.Debugger,
+       createSandbox: this.createSandbox,
+       dump: this.dump,
+       rpc: this.rpc,
+       loadSubScript: this.loadSubScript,
+       reportError: this.reportError,
+       setImmediate: this.setImmediate,
+-      xpcInspector: xpcInspector
++      xpcInspector: xpcInspector,
+     };
+   }
+ }).call(this);
+ 
+ // Create the default instance of the worker loader, using the APIs we defined
+ // above.
+ 
+ this.worker = new WorkerDebuggerLoader({
+   createSandbox: createSandbox,
+   globals: {
+     "isWorker": true,
+     "dump": dump,
+     "loader": loader,
+     "reportError": reportError,
+     "rpc": rpc,
+-    "setImmediate": setImmediate
++    "setImmediate": setImmediate,
+   },
+   loadSubScript: loadSubScript,
+   modules: {
+     "Debugger": Debugger,
+     "PromiseDebugging": PromiseDebugging,
+     "Services": Object.create(null),
+     "chrome": chrome,
+     "xpcInspector": xpcInspector
