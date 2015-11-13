@@ -3,6 +3,668 @@
 # Parent  0c648a1efbe06b5ec866ba058d18256b80808b46
 Bug XXX: Use codemirror in console
 
+diff --git a/devtools/client/shared/autocomplete-popup.js b/devtools/client/shared/autocomplete-popup.js
+--- a/devtools/client/shared/autocomplete-popup.js
++++ b/devtools/client/shared/autocomplete-popup.js
+@@ -28,16 +28,17 @@ const events  = require("devtools/shared
+  *                     panel to be automatically selected when the popup shows.
+  *        - direction {String} The direction of the text in the panel. rtl or ltr
+  *        - onSelect {String} The select event handler for the richlistbox
+  *        - onClick {String} The click event handler for the richlistbox.
+  *        - onKeypress {String} The keypress event handler for the richlistitems.
+  */
+ function AutocompletePopup(aDocument, aOptions = {})
+ {
++  console.log("AutocompletePopup", aDocument, aOptions);
+   this._document = aDocument;
+ 
+   this.autoSelect = aOptions.autoSelect || false;
+   this.position = aOptions.position || "after_start";
+   this.direction = aOptions.direction || "ltr";
+ 
+   this.onSelect = aOptions.onSelect;
+   this.onClick = aOptions.onClick;
+@@ -133,20 +134,27 @@ AutocompletePopup.prototype = {
+    *        Optional node to anchor the panel to.
+    * @param Number aXOffset
+    *        Horizontal offset in pixels from the left of the node to the left
+    *        of the popup.
+    * @param Number aYOffset
+    *        Vertical offset in pixels from the top of the node to the starting
+    *        of the popup.
+    */
+-  openPopup: function AP_openPopup(aAnchor, aXOffset = 0, aYOffset = 0)
++  openPopup: function AP_openPopup(aAnchor, aXOffset = 0, aYOffset = 0, dimmed = false)
+   {
+     this.__maxLabelLength = -1;
+     this._updateSize();
++
++    if (dimmed) {
++      this.dimPopup();
++    } else {
++      this.unDimPopup();
++    }
++
+     this._panel.openPopup(aAnchor, this.position, aXOffset, aYOffset);
+ 
+     if (this.autoSelect) {
+       this.selectFirstItem();
+     }
+ 
+     this.emit("popup-opened");
+   },
+@@ -154,16 +162,37 @@ AutocompletePopup.prototype = {
+   /**
+    * Hide the autocomplete popup panel.
+    */
+   hidePopup: function AP_hidePopup()
+   {
+     // Return accessibility focus to the input.
+     this._document.activeElement.removeAttribute("aria-activedescendant");
+     this._panel.hidePopup();
++    this.unDimPopup();
++  },
++
++  /**
++   * "Dim" the autocomplete popup panel, meaning that it's still open
++   * but not visible.
++   */
++  dimPopup: function AP_dimPopup()
++  {
++    this._panel.style.opacity = 0;
++    this._panel.style.pointerEvents = "none";
++  },
++
++  /**
++   * "Dim" the autocomplete popup panel, meaning that it's still open
++   * but not visible.
++   */
++  unDimPopup: function AP_dimPopup()
++  {
++    this._panel.style.opacity = 1;
++    this._panel.style.pointerEvents = "auto";
+   },
+ 
+   /**
+    * Check if the autocomplete popup is open.
+    */
+   get isOpen() {
+     return this._panel &&
+            (this._panel.state == "open" || this._panel.state == "showing");
+diff --git a/devtools/client/sourceeditor/autocomplete.js b/devtools/client/sourceeditor/autocomplete.js
+--- a/devtools/client/sourceeditor/autocomplete.js
++++ b/devtools/client/sourceeditor/autocomplete.js
+@@ -1,40 +1,48 @@
+ /* vim:set ts=2 sw=2 sts=2 et tw=80:
+  * This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ const { Cu } = require("chrome");
+ const cssAutoCompleter = require("devtools/client/sourceeditor/css-autocompleter");
++const consoleAutoCompleter = require("devtools/client/sourceeditor/console-autocompleter");
+ const { AutocompletePopup } = require("devtools/client/shared/autocomplete-popup");
+ 
+ const CM_TERN_SCRIPTS = [
+   "chrome://devtools/content/sourceeditor/codemirror/tern/tern.js",
+   "chrome://devtools/content/sourceeditor/codemirror/hint/show-hint.js"
+ ];
+ 
+ const autocompleteMap = new WeakMap();
+ 
++let WEBCONSOLE_MODE = true;
++
+ /**
+  * Prepares an editor instance for autocompletion.
+  */
+ function initializeAutoCompletion(ctx, options = {}) {
+   let { cm, ed, Editor } = ctx;
+   if (autocompleteMap.has(ed)) {
+     return;
+   }
+ 
+   let win = ed.container.contentWindow.wrappedJSObject;
+   let { CodeMirror, document } = win;
+ 
+   let completer = null;
+   let autocompleteKey = "Ctrl-" +
+                         Editor.keyFor("autocompletion", { noaccel: true });
+-  if (ed.config.mode == Editor.modes.js) {
++  if (options.getWebConsoleClient) {
++    completer = new consoleAutoCompleter({
++      getWebConsoleClient: options.getWebConsoleClient,
++      getFrameActor: options.getFrameActor,
++    });
++  } else if (ed.config.mode == Editor.modes.js) {
+     let defs = [
+       "./tern/browser",
+       "./tern/ecma5",
+     ].map(require);
+ 
+     CM_TERN_SCRIPTS.forEach(ed.loadScript, ed);
+     win.tern = require("./tern/tern");
+     cm.tern = new CodeMirror.TernServer({
+@@ -100,27 +108,27 @@ function initializeAutoCompletion(ctx, o
+ 
+     // TODO: Integrate tern autocompletion with this autocomplete API.
+     return;
+   } else if (ed.config.mode == Editor.modes.css) {
+     completer = new cssAutoCompleter({walker: options.walker});
+   }
+ 
+   function insertSelectedPopupItem() {
+-    let autocompleteState = autocompleteMap.get(ed);
+-    if (!popup || !popup.isOpen || !autocompleteState) {
++    let private = autocompleteMap.get(ed);
++    if (!private || !private.popup || !private.popup.isOpen) {
+       return;
+     }
+ 
+-    if (!autocompleteState.suggestionInsertedOnce && popup.selectedItem) {
+-      autocompleteMap.get(ed).insertingSuggestion = true;
+-      insertPopupItem(ed, popup.selectedItem);
++    if (!private.suggestionInsertedOnce && private.popup.selectedItem) {
++      private.insertingSuggestion = true;
++      insertPopupItem(ed, private.popup.selectedItem);
+     }
+ 
+-    popup.hidePopup();
++    private.hidePopup();
+     ed.emit("popup-hidden"); // This event is used in tests.
+     return true;
+   }
+ 
+   let popup = new AutocompletePopup(win.parent.document, {
+     position: "after_start",
+     fixedWidth: true,
+     theme: "auto",
+@@ -133,19 +141,40 @@ function initializeAutoCompletion(ctx, o
+       cycleSuggestions(ed, reverse == true);
+       return;
+     }
+ 
+     return CodeMirror.Pass;
+   };
+ 
+   let keyMap = {
+-    "Tab": cycle,
++    "Tab": () => {
++      if (WEBCONSOLE_MODE) {
++        let wasHandled = insertSelectedPopupItem();
++        return wasHandled ? true : CodeMirror.Pass;
++      } else {
++        cycle();
++      }
++    },
++    "Right": () => {
++      if (WEBCONSOLE_MODE) {
++        let wasHandled = insertSelectedPopupItem();
++        return wasHandled ? true : CodeMirror.Pass;
++      }
++      return CodeMirror.Pass;
++    },
+     "Down": cycle,
+-    "Shift-Tab": cycle.bind(null, true),
++    "Shift-Tab": () => {
++      if (WEBCONSOLE_MODE) {
++        let wasHandled = insertSelectedPopupItem();
++        return wasHandled ? true : CodeMirror.Pass;
++      } else {
++        cycle();
++      }
++    },
+     "Up": cycle.bind(null, true),
+     "Enter": () => {
+       let wasHandled = insertSelectedPopupItem();
+       return wasHandled ? true : CodeMirror.Pass;
+     }
+   };
+   let autoCompleteCallback = autoComplete.bind(null, ctx);
+   let keypressCallback = onEditorKeypress.bind(null, ctx);
+@@ -164,16 +193,23 @@ function initializeAutoCompletion(ctx, o
+     popup.destroy();
+     keyMap = popup = completer = null;
+     autocompleteMap.delete(ed);
+   }
+ 
+   autocompleteMap.set(ed, {
+     popup: popup,
+     completer: completer,
++    hidePopup: function() {
++      // XXX: Instead should bind to popuphide event and clear widget there..
++      this.popup.hidePopup();
++      if (this.widget) {
++        this.widget.clear();
++      }
++    },
+     keyMap: keyMap,
+     destroy: destroy,
+     insertingSuggestion: false,
+     suggestionInsertedOnce: false
+   });
+ }
+ 
+ /**
+@@ -194,36 +230,46 @@ function destroyAutoCompletion(ctx) {
+  */
+ function autoComplete({ ed, cm }) {
+   let private = autocompleteMap.get(ed);
+   let { completer, popup } = private;
+   if (!completer || private.insertingSuggestion || private.doNotAutocomplete) {
+     private.insertingSuggestion = false;
+     return;
+   }
++  if (WEBCONSOLE_MODE && ed.somethingSelected()) {
++    return;
++  }
+   let cur = ed.getCursor();
+   completer.complete(cm.getRange({line: 0, ch: 0}, cur), cur)
+     .then(suggestions => {
+     if (!suggestions || !suggestions.length || suggestions[0].preLabel == null) {
+       private.suggestionInsertedOnce = false;
+-      popup.hidePopup();
++      private.hidePopup();
+       ed.emit("after-suggest");
+       return;
+     }
+     // The cursor is at the end of the currently entered part of the token, like
+     // "backgr|" but we need to open the popup at the beginning of the character
+     // "b". Thus we need to calculate the width of the entered part of the token
+     // ("backgr" here). 4 comes from the popup's left padding.
+ 
+     let cursorElement = cm.display.cursorDiv.querySelector(".CodeMirror-cursor");
+     let left = suggestions[0].preLabel.length * cm.defaultCharWidth() + 4;
+-    popup.hidePopup();
++    private.hidePopup();
+     popup.setItems(suggestions);
+-    popup.openPopup(cursorElement, -1 * left, 0);
++
++    let dimmed = WEBCONSOLE_MODE && suggestions.length === 1;
++    popup.openPopup(cursorElement, -1 * left, 0, dimmed);
+     private.suggestionInsertedOnce = false;
++
++    if (WEBCONSOLE_MODE) {
++      private.widget = ed.addWidget(cur, popup.selectedItem.label.slice(popup.selectedItem.preLabel.length));
++    }
++
+     // This event is used in tests.
+     ed.emit("after-suggest");
+   }).then(null, Cu.reportError);
+ }
+ 
+ /**
+  * Inserts a popup item into the current cursor location
+  * in the editor.
+@@ -241,106 +287,120 @@ function insertPopupItem(ed, popupItem) 
+   // then the final text needs to the end up as '#about'.
+   if (backwardsPreLabel.indexOf(backwardsTextBeforeCursor) === 0) {
+     ed.replaceText(text, {line: cur.line, ch: 0}, cur);
+   } else {
+     ed.replaceText(text.slice(preLabel.length), cur, cur);
+   }
+ }
+ 
++
+ /**
+  * Cycles through provided suggestions by the popup in a top to bottom manner
+  * when `reverse` is not true. Opposite otherwise.
+  */
+ function cycleSuggestions(ed, reverse) {
+   let private = autocompleteMap.get(ed);
+   let { popup, completer } = private;
+   let cur = ed.getCursor();
+   private.insertingSuggestion = true;
+-  if (!private.suggestionInsertedOnce) {
++  if (!private.suggestionInsertedOnce && !WEBCONSOLE_MODE) {
+     private.suggestionInsertedOnce = true;
+     let firstItem;
+     if (reverse) {
+       firstItem = popup.getItemAtIndex(popup.itemCount - 1);
+       popup.selectPreviousItem();
+     } else {
+       firstItem = popup.getItemAtIndex(0);
+       if (firstItem.label == firstItem.preLabel && popup.itemCount > 1) {
+         firstItem = popup.getItemAtIndex(1);
+         popup.selectNextItem();
+       }
+     }
+     if (popup.itemCount == 1)
+-      popup.hidePopup();
++      private.hidePopup();
+     insertPopupItem(ed, firstItem);
+   } else {
+     let fromCur = {
+       line: cur.line,
+       ch  : cur.ch - popup.selectedItem.text.length
+     };
+     if (reverse)
+       popup.selectPreviousItem();
+     else
+       popup.selectNextItem();
+-    ed.replaceText(popup.selectedItem.text, fromCur, cur);
++
++    if (WEBCONSOLE_MODE) {
++      console.log(popup.selectedItem.preLabel, popup.selectedItem.label)
++      private.widget = ed.addWidget(cur, popup.selectedItem.label.slice(popup.selectedItem.preLabel.length));
++    } else {
++      ed.replaceText(popup.selectedItem.text, fromCur, cur);
++    }
+   }
+   // This event is used in tests.
+   ed.emit("suggestion-entered");
+ }
+ 
+ /**
+  * onkeydown handler for the editor instance to prevent autocompleting on some
+  * keypresses.
+  */
+ function onEditorKeypress({ ed, Editor }, cm, event) {
+   let private = autocompleteMap.get(ed);
+ 
+   // Do not try to autocomplete with multiple selections.
+   if (ed.hasMultipleSelections()) {
+     private.doNotAutocomplete = true;
+-    private.popup.hidePopup();
++    private.hidePopup();
+     return;
+   }
+ 
+   if ((event.ctrlKey || event.metaKey) && event.keyCode == event.DOM_VK_SPACE) {
+     // When Ctrl/Cmd + Space is pressed, two simultaneous keypresses are emitted
+     // first one for just the Ctrl/Cmd and second one for combo. The first one
+     // leave the private.doNotAutocomplete as true, so we have to make it false
+     private.doNotAutocomplete = false;
+     return;
+   }
+ 
+   if (event.ctrlKey || event.metaKey || event.altKey) {
+     private.doNotAutocomplete = true;
+-    private.popup.hidePopup();
++    if (!WEBCONSOLE_MODE) {
++      private.hidePopup();
++    }
+     return;
+   }
+ 
+   switch (event.keyCode) {
+     case event.DOM_VK_RETURN:
+       private.doNotAutocomplete = true;
+       break;
+ 
+     case event.DOM_VK_ESCAPE:
+       if (private.popup.isOpen)
+         event.preventDefault();
+     case event.DOM_VK_LEFT:
+     case event.DOM_VK_RIGHT:
+     case event.DOM_VK_HOME:
+     case event.DOM_VK_END:
++      // TODO: Handle rtl text
++      if (event.keyCode === event.DOM_VK_RIGHT && WEBCONSOLE_MODE) {
++        private.doNotAutocomplete = false;
++        break;
++      }
+       private.doNotAutocomplete = true;
+-      private.popup.hidePopup();
++      private.hidePopup();
+       break;
+ 
+     case event.DOM_VK_BACK_SPACE:
+     case event.DOM_VK_DELETE:
+       if (ed.config.mode == Editor.modes.css)
+         private.completer.invalidateCache(ed.getCursor().line)
+       private.doNotAutocomplete = true;
+-      private.popup.hidePopup();
++      private.hidePopup();
+       break;
+ 
+     default:
+       private.doNotAutocomplete = false;
+   }
+ }
+ 
+ /**
+diff --git a/devtools/client/sourceeditor/console-autocompleter.js b/devtools/client/sourceeditor/console-autocompleter.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/sourceeditor/console-autocompleter.js
+@@ -0,0 +1,89 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++const { Cc, Ci, Cu } = require('chrome');
++
++/**
++ */
++
++/**
++ * Constructor for the autocompletion object.
++ */
++function ConsoleCompleter(options = {}) {
++  this.maxEntries = options.maxEntries || 15;
++  this.getFrameActor = options.getFrameActor;
++  this.getWebConsoleClient = options.getWebConsoleClient;
++}
++
++ConsoleCompleter.prototype = {
++
++  /**
++   * Returns a list of suggestions based on the caret position.
++   *
++   * @param source {String} String of the source code.
++   * @param caret {Object} Cursor location with line and ch properties.
++   *
++   * @returns [{object}] A sorted list of objects containing the following
++   *          peroperties:
++   *          - label {String} Full keyword for the suggestion
++   *          - preLabel {String} Already entered part of the label
++   */
++  complete: function(source, caret) {
++    console.log("Completion request received", source, caret);
++    let webConsoleClient = this.getWebConsoleClient();
++
++    if (!webConsoleClient) {
++      return Promise.resolve([]);
++    }
++
++    // Convert the editor caret format into the form webconsole expects
++    let start = caret.ch;
++    if (caret.line > 0) {
++      let lines = source.split("\n");
++      for (let i = 0; i < caret.line; i++) {
++        start += source[i].length + 1;
++      }
++    }
++
++    console.log(source, caret);
++
++    return new Promise((resolve, reject) => {
++      let frameActor = this.getFrameActor();
++      let onAutocomplete = (message) => {
++        console.log("HERE", message);
++        let lastPart = message.matchProp;
++        let matches = message.matches.map(function(aMatch) {
++          return {
++            preLabel: lastPart,
++            label: aMatch,
++            text: aMatch,
++          };
++        });
++        console.log("Got matches", matches)
++        resolve(matches);
++      };
++      webConsoleClient.autocomplete(source, start, onAutocomplete, frameActor);
++    });
++
++
++
++
++
++    // Getting the context from the caret position.
++    // if (!this.resolveState(source, caret)) {
++    //   // We couldn't resolve the context, we won't be able to complete.
++    //   return Promise.resolve([]);
++    // }
++
++    let finalList = [];
++    finalList.push({
++      preLabel: "hi",
++      label: "hibrian",
++      text: "hibrian"
++    });
++    return Promise.resolve(finalList)
++    return Promise.resolve([]);
++  },
++};
++module.exports = ConsoleCompleter;
+diff --git a/devtools/client/sourceeditor/editor.js b/devtools/client/sourceeditor/editor.js
+--- a/devtools/client/sourceeditor/editor.js
++++ b/devtools/client/sourceeditor/editor.js
+@@ -802,16 +802,46 @@ Editor.prototype = {
+     let mark = cm.markText(from, to, { replacedWith: span });
+     return {
+       anchor: span,
+       clear: () => mark.clear()
+     };
+   },
+ 
+   /**
++   * Add some text directly next to a position
++   */
++  addWidget: function (pos, text, className = "widget-text") {
++    let cm = editors.get(this);
++
++    if (this.widget) {
++      this.widget.remove();
++    }
++    let wrapper = cm.getWrapperElement();
++    let widget = this.widget = wrapper.ownerDocument.createElement("span");
++    widget.style.position = "absolute";
++    widget.className = className;
++
++    let lineHeight = cm.defaultTextHeight();
++    // let lineHeight = wrapper.ownerDocument.defaultView.getComputedStyle(wrapper, "").lineHeight;
++    widget.style.marginTop = "-" + lineHeight + "px";
++    widget.textContent = text;
++    console.log("Adding widget", pos, cm.cursorCoords(pos));
++    // cm.setBookmark(pos, {
++    //   widget: widget
++    // });
++    cm.addWidget(pos, widget);
++
++    return {
++      anchor: widget,
++      clear: () => widget.remove()
++    };
++  },
++
++  /**
+    * Calculates and returns one or more {line, ch} objects for
+    * a zero-based index who's value is relative to the start of
+    * the editor's text.
+    *
+    * If only one argument is given, this method returns a single
+    * {line,ch} object. Otherwise it returns an array.
+    */
+   getPosition: function (...args) {
+diff --git a/devtools/client/sourceeditor/moz.build b/devtools/client/sourceeditor/moz.build
+--- a/devtools/client/sourceeditor/moz.build
++++ b/devtools/client/sourceeditor/moz.build
+@@ -5,14 +5,15 @@
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ DIRS += [
+     'tern',
+ ]
+ 
+ DevToolsModules(
+     'autocomplete.js',
++    'console-autocompleter.js',
+     'css-autocompleter.js',
+     'debugger.js',
+     'editor.js'
+ )
+ 
+ BROWSER_CHROME_MANIFESTS += ['test/browser.ini']
+diff --git a/devtools/client/themes/dark-theme.css b/devtools/client/themes/dark-theme.css
+--- a/devtools/client/themes/dark-theme.css
++++ b/devtools/client/themes/dark-theme.css
+@@ -238,16 +238,21 @@ div.CodeMirror div.debug-line {
+ /* Generic highlighted text */
+ div.CodeMirror span.marked-text {
+   background: rgba(255,255,0,0.2);
+   border: 1px dashed rgba(192,192,0,0.6);
+   -moz-margin-start: -1px;
+   -moz-margin-end: -1px;
+ }
+ 
++/* Suggestions for console */
++div.CodeMirror span.widget-text {
++  color: red;
++}
++
+ /* Highlight for evaluating current statement. */
+ div.CodeMirror span.eval-text {
+   background-color: #556;
+ }
+ 
+ .cm-s-mozilla .CodeMirror-linenumber { /* line number text */
+   color: var(--theme-content-color3);
+ }
+diff --git a/devtools/client/themes/light-theme.css b/devtools/client/themes/light-theme.css
+--- a/devtools/client/themes/light-theme.css
++++ b/devtools/client/themes/light-theme.css
+@@ -237,16 +237,21 @@ div.CodeMirror div.debug-line {
+ /* Generic highlighted text */
+ div.CodeMirror span.marked-text {
+   background: rgba(255,255,0,0.2);
+   border: 1px dashed rgba(192,192,0,0.6);
+   -moz-margin-start: -1px;
+   -moz-margin-end: -1px;
+ }
+ 
++/* Suggestions for console */
++div.CodeMirror span.widget-text {
++  color: red;
++}
++
+ /* Highlight for evaluating current statement. */
+ div.CodeMirror span.eval-text {
+   background-color: #ccd;
+ }
+ 
+ .cm-s-mozilla .CodeMirror-linenumber { /* line number text */
+   color: var(--theme-content-color3);
+ }
+diff --git a/devtools/client/themes/webconsole.css b/devtools/client/themes/webconsole.css
+--- a/devtools/client/themes/webconsole.css
++++ b/devtools/client/themes/webconsole.css
+@@ -362,16 +362,25 @@ a {
+ 
+ .theme-light .jsterm-input-container {
+   /* For light theme use a white background for the input - it looks better
+      than off-white */
+   background-color: #fff;
+   border-top-color: #e0e0e0;
+ }
+ 
++
++#input-container iframe {
++  height: 100%;
++  width: 100%;
++  border: none;
++  margin: 0;
++  padding: 0;
++}
++
+ .jsterm-input-node,
+ .jsterm-complete-node {
+   border: none;
+   padding: 0 0 0 16px;
+   -moz-appearance: none;
+   background-color: transparent;
+ }
+ 
 diff --git a/devtools/client/webconsole/test/browser_webconsole_autocomplete_and_selfxss.js b/devtools/client/webconsole/test/browser_webconsole_autocomplete_and_selfxss.js
 --- a/devtools/client/webconsole/test/browser_webconsole_autocomplete_and_selfxss.js
 +++ b/devtools/client/webconsole/test/browser_webconsole_autocomplete_and_selfxss.js
@@ -150,7 +812,57 @@ diff --git a/devtools/client/webconsole/test/browser_webconsole_context_menu_sto
 diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconsole/webconsole.js
 --- a/devtools/client/webconsole/webconsole.js
 +++ b/devtools/client/webconsole/webconsole.js
-@@ -618,39 +618,39 @@ WebConsoleFrame.prototype = {
+@@ -20,16 +20,17 @@ loader.lazyRequireGetter(this, "Autocomp
+ loader.lazyRequireGetter(this, "ToolSidebar", "devtools/client/framework/sidebar", true);
+ loader.lazyRequireGetter(this, "ConsoleOutput", "devtools/client/webconsole/console-output", true);
+ loader.lazyRequireGetter(this, "Messages", "devtools/client/webconsole/console-output", true);
+ loader.lazyRequireGetter(this, "asyncStorage", "devtools/shared/async-storage");
+ loader.lazyRequireGetter(this, "EnvironmentClient", "devtools/shared/client/main", true);
+ loader.lazyRequireGetter(this, "ObjectClient", "devtools/shared/client/main", true);
+ loader.lazyRequireGetter(this, "system", "devtools/shared/system");
+ loader.lazyRequireGetter(this, "Timers", "sdk/timers");
++loader.lazyRequireGetter(this, "Editor", "devtools/client/sourceeditor/editor");
+ loader.lazyImporter(this, "VariablesView", "resource://devtools/client/shared/widgets/VariablesView.jsm");
+ loader.lazyImporter(this, "VariablesViewController", "resource://devtools/client/shared/widgets/VariablesViewController.jsm");
+ loader.lazyImporter(this, "PluralForm", "resource://gre/modules/PluralForm.jsm");
+ loader.lazyImporter(this, "gDevTools", "resource://devtools/client/framework/gDevTools.jsm");
+ 
+ const STRINGS_URI = "chrome://devtools/locale/webconsole.properties";
+ var l10n = new WebConsoleUtils.l10n(STRINGS_URI);
+ 
+@@ -605,52 +606,71 @@ WebConsoleFrame.prototype = {
+     clearButton.addEventListener("command", () => {
+       this.owner._onClearButton();
+       this.jsterm.clearOutput(true);
+     });
+ 
+     this.jsterm = new JSTerm(this);
+     this.jsterm.init();
+ 
++    let config = {
++      mode: Editor.modes.js,
++      value: "var xpathResult = document.evaluate( 'body/div/div/div/div/div/div/div/div/div/div/div/div/div/div/div/div/div/div/div', document, null, XPathResult.ANY_TYPE,  );",
++      autocomplete: true,
++      lineWrapping: true,
++      autocompleteOpts: {
++        getFrameActor: this.jsterm.getFrameActor.bind(this.jsterm),
++        getWebConsoleClient: () => {
++          return this.webConsoleClient;
++        }
++      },
++    };
++
++    this.editor = new Editor(config);
++    let editorElement = doc.querySelector("#input-container");
++    this.editor.appendTo(editorElement).then(() => {
++
++    });
++
+     let toolbox = gDevTools.getToolbox(this.owner.target);
+     if (toolbox) {
+       toolbox.on("webconsole-selected", this._onPanelSelected);
+     }
+ 
      /*
       * Focus input line whenever the output area is clicked.
       * Reusing _addMEssageLinkCallback since it correctly filters
@@ -193,7 +905,29 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
     */
    _initDefaultFilterPrefs: function WCF__initDefaultFilterPrefs()
    {
-@@ -3620,17 +3620,17 @@ JSTerm.prototype = {
+@@ -3226,19 +3246,18 @@ JSTerm.prototype = {
+       this.inputNode.addEventListener("focus", this._focusEventHandler, false);
+     }
+ 
+     this.hud.window.addEventListener("blur", this._blurEventHandler, false);
+     this.lastInputValue && this.setInputValue(this.lastInputValue);
+   },
+ 
+   focus: function() {
+-    let inputNode = this.inputNode;
+-    if (!inputNode.getAttribute("focused")) {
+-      inputNode.focus();
++    if (!this.inputNode.getAttribute("focused")) {
++      this.inputNode.focus();
+     }
+   },
+ 
+   /**
+    * The JavaScript evaluation response handler.
+    *
+    * @private
+    * @param object [aAfterMessage]
+@@ -3620,17 +3639,17 @@ JSTerm.prototype = {
      let tag = aEvent.target.nodeName;
      if (aEvent.keyCode != Ci.nsIDOMKeyEvent.DOM_VK_ESCAPE || aEvent.shiftKey ||
          aEvent.altKey || aEvent.ctrlKey || aEvent.metaKey ||
@@ -212,7 +946,7 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
     *
     * @private
     * @param object aOptions
-@@ -3952,25 +3952,33 @@ JSTerm.prototype = {
+@@ -3952,25 +3971,33 @@ JSTerm.prototype = {
      this.lastInputValue = aNewValue;
      this.completeNode.value = "";
      this.resizeInput();
@@ -248,7 +982,7 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
     * The window "blur" event handler.
     * @private
     */
-@@ -4271,17 +4279,17 @@ JSTerm.prototype = {
+@@ -4271,17 +4298,17 @@ JSTerm.prototype = {
    /**
     * Test for multiline input.
     *
@@ -267,7 +1001,7 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
     *
     * @return boolean
     *         True if the caret is at a location that allows selecting the
-@@ -4352,17 +4360,17 @@ JSTerm.prototype = {
+@@ -4352,17 +4379,17 @@ JSTerm.prototype = {
     *        Optional function invoked when the autocomplete properties are
     *        updated.
     * @returns boolean true if there existed a completion for the current input,
@@ -286,7 +1020,7 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
        aCallback && aCallback(this);
        this.emit("autocomplete-updated");
        return false;
-@@ -4416,23 +4424,24 @@ JSTerm.prototype = {
+@@ -4416,23 +4443,24 @@ JSTerm.prototype = {
     *        Completion type. See this.complete() for details.
     * @param function [aCallback]
     *        Optional, function to invoke when completion results are received.
@@ -313,7 +1047,7 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
      // character we ask the server again for suggestions.
  
      // Check if last character is non-alphanumeric
-@@ -4492,17 +4501,17 @@ JSTerm.prototype = {
+@@ -4492,17 +4520,17 @@ JSTerm.prototype = {
     * @param object aMessage
     *        The JSON message which holds the completion results received from
     *        the content process.
@@ -332,7 +1066,7 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
      let cursor = inputNode.selectionStart;
      let inputUntilCursor = inputValue.substring(0, cursor);
  
-@@ -4529,17 +4538,17 @@ JSTerm.prototype = {
+@@ -4529,17 +4557,17 @@ JSTerm.prototype = {
  
      let completionType = this.lastCompletion.completionType;
      this.lastCompletion = {
@@ -351,7 +1085,7 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
      else if (items.length < 2 && popup.isOpen) {
        popup.hidePopup();
        this._autocompletePopupNavigated = false;
-@@ -4563,17 +4572,17 @@ JSTerm.prototype = {
+@@ -4563,17 +4591,17 @@ JSTerm.prototype = {
  
      aCallback && aCallback(this);
      this.emit("autocomplete-updated");
@@ -370,7 +1104,7 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
        let suffix = currentItem.label.substring(this.lastCompletion.
                                                 matchProp.length);
        this.updateCompleteNode(suffix);
-@@ -4609,17 +4618,17 @@ JSTerm.prototype = {
+@@ -4609,17 +4637,17 @@ JSTerm.prototype = {
    {
      let updated = false;
  
@@ -389,7 +1123,7 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
  
      this.clearCompletion();
  
-@@ -4630,17 +4639,17 @@ JSTerm.prototype = {
+@@ -4630,17 +4658,17 @@ JSTerm.prototype = {
     * Update the node that displays the currently selected autocomplete proposal.
     *
     * @param string aSuffix
@@ -408,3 +1142,26 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
     * Destroy the sidebar.
     * @private
     */
+diff --git a/devtools/client/webconsole/webconsole.xul b/devtools/client/webconsole/webconsole.xul
+--- a/devtools/client/webconsole/webconsole.xul
++++ b/devtools/client/webconsole/webconsole.xul
+@@ -207,17 +207,18 @@ function goUpdateConsoleCommands() {
+       </toolbar>
+ 
+       <hbox id="output-wrapper" flex="1" context="output-contextmenu" tooltip="aHTMLTooltip">
+         <div xmlns="http://www.w3.org/1999/xhtml" id="output-container"
+              tabindex="0" role="document" aria-live="polite" />
+       </hbox>
+       <notificationbox id="webconsole-notificationbox">
+         <hbox class="jsterm-input-container" style="direction:ltr">
+-          <stack class="jsterm-stack-node" flex="1">
++          <box id="input-container" flex="1" style="min-height: 20px;"></box>
++          <stack class="jsterm-stack-node" flex="1" hidden="true">
+             <textbox class="jsterm-complete-node devtools-monospace"
+                      multiline="true" rows="1" tabindex="-1"/>
+             <textbox class="jsterm-input-node devtools-monospace"
+                      multiline="true" rows="1" tabindex="0"
+                      aria-autocomplete="list"/>
+           </stack>
+         </hbox>
+       </notificationbox>
