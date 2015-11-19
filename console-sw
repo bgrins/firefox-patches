@@ -1,39 +1,12 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
 # Parent  22b421afcf73faf3db5bf2e39b291bbc300e1d9a
-Bug xxx: SW
+Bug 1222617 - WIP - Filter out service worker messages that happened before a page load
 
 diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webconsole.js
 --- a/devtools/server/actors/webconsole.js
 +++ b/devtools/server/actors/webconsole.js
-@@ -427,18 +427,24 @@ WebConsoleActor.prototype =
-     if (aUseObjectGlobal && typeof aValue == "object") {
-       try {
-         global = Cu.getGlobalForObject(aValue);
-       }
-       catch (ex) {
-         // The above can throw an exception if aValue is not an actual object.
-       }
-     }
--    let dbgGlobal = this.dbg.makeGlobalObjectReference(global);
--    return dbgGlobal.makeDebuggeeValue(aValue);
-+    try {
-+      let dbgGlobal = this.dbg.makeGlobalObjectReference(global);
-+      return dbgGlobal.makeDebuggeeValue(aValue);
-+    } catch(ex) {
-+      // Handle 'Object in compartment marked as invisible to debugger' error
-+      let dbgGlobal = this.dbg.makeGlobalObjectReference(this.window);
-+      return dbgGlobal.makeDebuggeeValue(ex.toString());
-+    }
-   },
- 
-   /**
-    * Create a grip for the given object.
-    *
-    * @param object aObject
-    *        The object you want.
-    * @param object aPool
-@@ -728,19 +734,21 @@ WebConsoleActor.prototype =
+@@ -728,22 +728,31 @@ WebConsoleActor.prototype =
  
      while (types.length > 0) {
        let type = types.shift();
@@ -45,13 +18,127 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
 +
            let cache = this.consoleAPIListener
                        .getCachedMessages(!this.parentActor.isRootActor);
++          let requestStartTime = this.parentActor.window.performance.timing.requestStart;
            cache.forEach((aMessage) => {
-+          console.log("Getting cached messages", this, this.parentActor.window.performance.timing.requestStart, aMessage);
-             let message = this.prepareConsoleMessageForRemote(aMessage);
-             message._type = type;
-             messages.push(message);
+-            let message = this.prepareConsoleMessageForRemote(aMessage);
+-            message._type = type;
+-            messages.push(message);
++
++            // Filter out messages that came from a ServiceWorker but happened
++            // before the page was opened.
++            let includeMessage = aMessage.innerID !== "ServiceWorker" ||
++                                 requestStartTime < aMessage.timeStamp;
++            if (includeMessage) {
++              let message = this.prepareConsoleMessageForRemote(aMessage);
++              message._type = type;
++              messages.push(message);
++            }
            });
            break;
          }
          case "PageError": {
            if (!this.consoleServiceListener) {
+             break;
+           }
+           let cache = this.consoleServiceListener
+diff --git a/devtools/shared/webconsole/test/test_console_serviceworker.html b/devtools/shared/webconsole/test/test_console_serviceworker.html
+--- a/devtools/shared/webconsole/test/test_console_serviceworker.html
++++ b/devtools/shared/webconsole/test/test_console_serviceworker.html
+@@ -129,18 +129,19 @@ function messageServiceWorker(win, scope
+ 
+ function unregisterServiceWorker(win) {
+   return win.navigator.serviceWorker.ready.then(swr => {
+     return swr.unregister();
+   });
+ }
+ 
+ let onAttach = Task.async(function*(state, response) {
+-  onConsoleAPICall = onConsoleAPICall.bind(null, state);
+-  state.dbgClient.addListener("consoleAPICall", onConsoleAPICall);
++  // XXX: Use getCachedMessages instead of a listener to
++  // onConsoleAPICall = onConsoleAPICall.bind(null, state);
++  // state.dbgClient.addListener("consoleAPICall", onConsoleAPICall);
+ 
+   let currentFrame;
+   try {
+     // First, we need a frame from which to register our script.  This
+     // will not trigger any console calls.
+     info("Loading a non-scope frame from which to register a service worker.");
+     currentFrame = yield withFrame(NONSCOPE_FRAME_URL);
+ 
+@@ -183,38 +184,35 @@ let onAttach = Task.async(function*(stat
+ 
+     // Now postMessage() the service worker to trigger its message event
+     // handler.  This will generate 1 or 2 to console.log() statements
+     // depending on if the worker thread needs to spin up again.  In either
+     // case, though, we should not get any console calls because we don't
+     // have a controlled or registering document.
+     info("Completed force refresh.  Messaging service worker.");
+     yield messageServiceWorker(currentFrame.contentWindow, SCOPE, MESSAGE);
+-
+-    info("Done messaging service worker.  Unregistering service worker.");
+-    yield unregisterServiceWorker(currentFrame.contentWindow);
+-
+-    info('Service worker unregistered.  Checking console calls.');
+-    state.dbgClient.removeListener("consoleAPICall", onConsoleAPICall);
+-    is(consoleCalls.length, expectedConsoleCalls.length,
+-       'received correct number of console calls');
+-    expectedConsoleCalls.forEach(function(aMessage, aIndex) {
+-      info("checking received console call #" + aIndex);
+-      checkConsoleAPICall(consoleCalls[aIndex], expectedConsoleCalls[aIndex]);
+-    });
+   } catch(error) {
+     ok(false, 'unexpected error: ' + error);
+   } finally {
+-    if (currentFrame) {
+-      currentFrame.remove();
+-      currentFrame = null;
+-    }
+-    consoleCalls = [];
+-    closeDebugger(state, function() {
+-      SimpleTest.finish();
++    // Need to renavigate to the frame otherwise no cached messages will show up,
++    // since the window's current state won't match the scope of the worker.
++    // Can try commenting this line out and see.
++    yield navigateFrame(currentFrame, SCOPE_FRAME_URL);
++
++    state.client.getCachedMessages(["ConsoleAPI"], function(calls) {
++
++      let consoleCalls = calls.messages;
++      console.log("Cached messages received!", consoleCalls);
++
++      is(consoleCalls.length, expectedConsoleCalls.length,
++      'received correct number of console calls');
++
++      closeDebugger(state, function() {
++        SimpleTest.finish();
++      });
+     });
+   }
+ });
+ 
+ function onConsoleAPICall(state, type, packet) {
+   info("received message level: " + packet.message.level);
+   is(packet.from, state.actor, "console API call actor");
+   consoleCalls.push(packet.message);
+diff --git a/devtools/shared/webconsole/utils.js b/devtools/shared/webconsole/utils.js
+--- a/devtools/shared/webconsole/utils.js
++++ b/devtools/shared/webconsole/utils.js
+@@ -971,16 +971,17 @@ ConsoleAPIListener.prototype =
+   isMessageRelevant: function(message) {
+     let workerType = WebConsoleUtils.getWorkerType(message);
+ 
+     if (this.window && workerType === "ServiceWorker") {
+       // For messages from Service Workers, message.ID is the
+       // scope, which can be used to determine whether it's controlling
+       // a window.
+       let scope = message.ID;
++      dump("Checking relevance: " + message.arguments + " " + scope + " " + this.window.location.toString() + " " + swm.shouldReportToWindow(this.window, scope) + "\n");
+ 
+       if (!swm.shouldReportToWindow(this.window, scope)) {
+         return false;
+       }
+     }
+ 
+     if (this.window && !workerType) {
+       let msgWindow = Services.wm.getCurrentInnerWindowWithId(message.innerID);
