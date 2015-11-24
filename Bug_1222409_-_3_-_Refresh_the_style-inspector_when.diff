@@ -1,0 +1,198 @@
+# vim: se ft=diff :
+# HG changeset patch
+# User Patrick Brosset <pbrosset@mozilla.com>
+# Date 1447932452 -3600
+Bug 1222409 - 3 - Refresh the style-inspector when the LayoutChangesObserver detects resize
+
+The implementation is simple, the inspector actor uses the
+LayoutChangesObserver to detect window resize, and when it does, it
+forwards the event to its front.
+This is similar to how we deal with reflow events, except that for
+reflows, the inspector actor (walker in this case), first filters on
+the server to see if the reflow would indeed impact known nodes.
+For resize events, it seemed more complex to do this kind of server
+side filtering as this would involve remembering which node is currently
+selected and which style were applied, and then compare that with the
+new styles.
+
+diff --git a/devtools/client/styleinspector/style-inspector.js b/devtools/client/styleinspector/style-inspector.js
+--- a/devtools/client/styleinspector/style-inspector.js
++++ b/devtools/client/styleinspector/style-inspector.js
+@@ -33,28 +33,30 @@ function RuleViewTool(inspector, window)
+   this.onLinkClicked = this.onLinkClicked.bind(this);
+   this.onSelected = this.onSelected.bind(this);
+   this.refresh = this.refresh.bind(this);
+   this.clearUserProperties = this.clearUserProperties.bind(this);
+   this.onPropertyChanged = this.onPropertyChanged.bind(this);
+   this.onViewRefreshed = this.onViewRefreshed.bind(this);
+   this.onPanelSelected = this.onPanelSelected.bind(this);
+   this.onMutations = this.onMutations.bind(this);
++  this.onResized = this.onResized.bind(this);
+ 
+   this.view.on("ruleview-changed", this.onPropertyChanged);
+   this.view.on("ruleview-refreshed", this.onViewRefreshed);
+   this.view.on("ruleview-linked-clicked", this.onLinkClicked);
+ 
+   this.inspector.selection.on("detached", this.onSelected);
+   this.inspector.selection.on("new-node-front", this.onSelected);
+   this.inspector.selection.on("pseudoclass", this.refresh);
+   this.inspector.target.on("navigate", this.clearUserProperties);
+   this.inspector.sidebar.on("ruleview-selected", this.onPanelSelected);
+   this.inspector.pageStyle.on("stylesheet-updated", this.refresh);
+   this.inspector.walker.on("mutations", this.onMutations);
++  this.inspector.inspector.on("resize", this.onResized);
+ 
+   this.onSelected();
+ }
+ 
+ RuleViewTool.prototype = {
+   isSidebarActive: function() {
+     if (!this.view) {
+       return false;
+@@ -157,18 +159,27 @@ RuleViewTool.prototype = {
+       if (target === this.inspector.selection.nodeFront &&
+           type === "attributes") {
+         this.refresh();
+         break;
+       }
+     }
+   },
+ 
++  /**
++   * When the window gets resized, this may cause media-queries to match, and
++   * therefore, different styles may apply.
++   */
++  onResized: function() {
++    this.refresh();
++  },
++
+   destroy: function() {
+     this.inspector.walker.off("mutations", this.onMutations);
++    this.inspector.inspector.off("resize", this.onResized);
+     this.inspector.selection.off("detached", this.onSelected);
+     this.inspector.selection.off("pseudoclass", this.refresh);
+     this.inspector.selection.off("new-node-front", this.onSelected);
+     this.inspector.target.off("navigate", this.clearUserProperties);
+     this.inspector.sidebar.off("ruleview-selected", this.onPanelSelected);
+     if (this.inspector.pageStyle) {
+       this.inspector.pageStyle.off("stylesheet-updated", this.refresh);
+     }
+@@ -189,23 +200,25 @@ function ComputedViewTool(inspector, win
+ 
+   this.view = new ComputedView.CssComputedView(this.inspector, this.document,
+                                                this.inspector.pageStyle);
+ 
+   this.onSelected = this.onSelected.bind(this);
+   this.refresh = this.refresh.bind(this);
+   this.onPanelSelected = this.onPanelSelected.bind(this);
+   this.onMutations = this.onMutations.bind(this);
++  this.onResized = this.onResized.bind(this);
+ 
+   this.inspector.selection.on("detached", this.onSelected);
+   this.inspector.selection.on("new-node-front", this.onSelected);
+   this.inspector.selection.on("pseudoclass", this.refresh);
+   this.inspector.sidebar.on("computedview-selected", this.onPanelSelected);
+   this.inspector.pageStyle.on("stylesheet-updated", this.refresh);
+   this.inspector.walker.on("mutations", this.onMutations);
++  this.inspector.inspector.on("resize", this.onResized);
+ 
+   this.view.selectElement(null);
+ 
+   this.onSelected();
+ }
+ 
+ ComputedViewTool.prototype = {
+   isSidebarActive: function() {
+@@ -269,18 +282,27 @@ ComputedViewTool.prototype = {
+       if (target === this.inspector.selection.nodeFront &&
+           type === "attributes") {
+         this.refresh();
+         break;
+       }
+     }
+   },
+ 
++  /**
++   * When the window gets resized, this may cause media-queries to match, and
++   * therefore, different styles may apply.
++   */
++  onResized: function() {
++    this.refresh();
++  },
++
+   destroy: function() {
+     this.inspector.walker.off("mutations", this.onMutations);
++    this.inspector.inspector.off("resize", this.onResized);
+     this.inspector.sidebar.off("computedview-selected", this.refresh);
+     this.inspector.selection.off("pseudoclass", this.refresh);
+     this.inspector.selection.off("new-node-front", this.onSelected);
+     this.inspector.selection.off("detached", this.onSelected);
+     this.inspector.sidebar.off("computedview-selected", this.onPanelSelected);
+     if (this.inspector.pageStyle) {
+       this.inspector.pageStyle.off("stylesheet-updated", this.refresh);
+     }
+diff --git a/devtools/server/actors/inspector.js b/devtools/server/actors/inspector.js
+--- a/devtools/server/actors/inspector.js
++++ b/devtools/server/actors/inspector.js
+@@ -3682,36 +3682,61 @@ var AttributeModificationList = Class({
+ })
+ 
+ /**
+  * Server side of the inspector actor, which is used to create
+  * inspector-related actors, including the walker.
+  */
+ var InspectorActor = exports.InspectorActor = protocol.ActorClass({
+   typeName: "inspector",
++
++  events: {
++    // The inspector actor emits a useful "resize" event to its front to let
++    // clients know when the browser window gets resized. This may be useful
++    // for refreshing a DOM node's styles for example, since those may depend on
++    // media-queries.
++    "resize": {type: "resize"}
++  },
++
+   initialize: function(conn, tabActor) {
+     protocol.Actor.prototype.initialize.call(this, conn);
+     this.tabActor = tabActor;
++
++    this.resizeObserver = getLayoutChangesObserver(this.tabActor);
++    this._onResize = this._onResize.bind(this);
++    this.resizeObserver.on("resize", this._onResize);
+   },
+ 
+   destroy: function () {
+     protocol.Actor.prototype.destroy.call(this);
++
++    this.resizeObserver.off("resize", this._onResize);
++    this.resizeObserver = null;
++    releaseLayoutChangesObserver(this.tabActor);
++
+     this._highlighterPromise = null;
+     this._pageStylePromise = null;
+     this._walkerPromise = null;
+     this.walker = null;
+     this.tabActor = null;
+   },
+ 
+   // Forces destruction of the actor and all its children
+   // like highlighter, walker and style actors.
+   disconnect: function() {
+     this.destroy();
+   },
+ 
++  /**
++   * When the browser window gets resized, relay the event to the front.
++   */
++  _onResize: function() {
++    events.emit(this, "resize");
++  },
++
+   get window() {
+     return this.tabActor.window;
+   },
+ 
+   getWalker: method(function(options={}) {
+     if (this._walkerPromise) {
+       return this._walkerPromise;
+     }
