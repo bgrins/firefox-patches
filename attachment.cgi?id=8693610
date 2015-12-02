@@ -1,0 +1,148 @@
+# HG changeset patch
+# User Panos Astithas <past@mozilla.com>
+
+Fix the lexical scope autocomplete for global 'let' and 'const' (bug 1207868). r=bgrins
+
+diff --git a/devtools/client/webconsole/test/browser_webconsole_autocomplete-properties-with-non-alphanumeric-names.js b/devtools/client/webconsole/test/browser_webconsole_autocomplete-properties-with-non-alphanumeric-names.js
+index 82bb721..3b3f466 100644
+--- a/devtools/client/webconsole/test/browser_webconsole_autocomplete-properties-with-non-alphanumeric-names.js
++++ b/devtools/client/webconsole/test/browser_webconsole_autocomplete-properties-with-non-alphanumeric-names.js
+@@ -17,28 +17,32 @@ var test = asyncTest(function*() {
+   function* autocomplete(term) {
+     let deferred = promise.defer();
+ 
+     jsterm.setInputValue(term);
+     jsterm.complete(jsterm.COMPLETE_HINT_ONLY, deferred.resolve);
+ 
+     yield deferred.promise;
+ 
+-    ok(popup.itemCount > 0, "There's suggestions for '" + term + "'");
++    ok(popup.itemCount > 0,
++       "There's " + popup.itemCount + " suggestions for '" + term + "'");
+   }
+ 
+   let { jsterm } = yield openConsole();
+   let popup = jsterm.autocompletePopup;
+ 
+   yield jsterm.execute("var testObject = {$$aaab: '', $$aaac: ''}");
+ 
+-  // FIXMEshu: global lexicals can't be autocompleted without extra platform
+-  // support. See bug 1207868.
+-  //yield jsterm.execute("let testObject = {$$aaab: '', $$aaac: ''}");
+-
+   // Should work with bug 967468.
+   yield autocomplete("Object.__d");
+   yield autocomplete("testObject.$$a");
+ 
+   // Here's when things go wrong in bug 967468.
+   yield autocomplete("Object.__de");
+   yield autocomplete("testObject.$$aa");
++
++  // Should work with bug 1207868.
++  yield jsterm.execute("let foobar = {a: ''}; const blargh = {a: 1};");
++  yield autocomplete("foobar");
++  yield autocomplete("blargh");
++  yield autocomplete("foobar.a");
++  yield autocomplete("blargh.a");
+ });
+diff --git a/devtools/client/webconsole/test/browser_webconsole_property_provider.js b/devtools/client/webconsole/test/browser_webconsole_property_provider.js
+index 7d67716..10b6773 100644
+--- a/devtools/client/webconsole/test/browser_webconsole_property_provider.js
++++ b/devtools/client/webconsole/test/browser_webconsole_property_provider.js
+@@ -16,17 +16,17 @@ function test() {
+ 
+ function testPropertyProvider({browser}) {
+   browser.removeEventListener("load", testPropertyProvider, true);
+   let {JSPropertyProvider} = require("devtools/shared/webconsole/js-property-provider");
+ 
+   let tmp = Cu.import("resource://gre/modules/jsdebugger.jsm", {});
+   tmp.addDebuggerToGlobal(tmp);
+   let dbg = new tmp.Debugger();
+-  let dbgWindow = dbg.makeGlobalObjectReference(content);
++  let dbgWindow = dbg.addDebuggee(content);
+ 
+   let completion = JSPropertyProvider(dbgWindow, null, "thisIsNotDefined");
+   is(completion.matches.length, 0, "no match for 'thisIsNotDefined");
+ 
+   // This is a case the PropertyProvider can't handle. Should return null.
+   completion = JSPropertyProvider(dbgWindow, null, "window[1].acb");
+   is(completion, null, "no match for 'window[1].acb");
+ 
+@@ -36,10 +36,11 @@ function testPropertyProvider({browser}) {
+   completion = JSPropertyProvider(dbgWindow, null, strComplete);
+   ok(completion.matches.length == 2, "two matches found");
+   ok(completion.matchProp == "locatio", "matching part is 'test'");
+   let matches = completion.matches;
+   matches.sort();
+   ok(matches[0] == "location", "the first match is 'location'");
+   ok(matches[1] == "locationbar", "the second match is 'locationbar'");
+ 
++  dbg.removeDebuggee(content);
+   finishTest();
+ }
+diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webconsole.js
+index d6d5539..1c80208 100644
+--- a/devtools/server/actors/webconsole.js
++++ b/devtools/server/actors/webconsole.js
+@@ -915,21 +915,24 @@ WebConsoleActor.prototype =
+       }
+       else {
+         DevToolsUtils.reportException("onAutocomplete",
+           Error("The frame actor was not found: " + frameActorId));
+       }
+     }
+     // This is the general case (non-paused debugger)
+     else {
+-      dbgObject = this.dbg.makeGlobalObjectReference(this.evalWindow);
++      dbgObject = this.dbg.addDebuggee(this.evalWindow);
+     }
+ 
+     let result = JSPropertyProvider(dbgObject, environment, aRequest.text,
+                                     aRequest.cursor, frameActorId) || {};
++    if (!frameActorId) {
++      this.dbg.removeDebuggee(this.evalWindow);
++    }
+     let matches = result.matches || [];
+     let reqText = aRequest.text.substr(0, aRequest.cursor);
+ 
+     // We consider '$' as alphanumerc because it is used in the names of some
+     // helper functions.
+     let lastNonAlphaIsDot = /[.][a-zA-Z0-9$]*$/.test(reqText);
+     if (!lastNonAlphaIsDot) {
+       if (!this._webConsoleCommandsCache) {
+diff --git a/devtools/shared/webconsole/js-property-provider.js b/devtools/shared/webconsole/js-property-provider.js
+index e19d750..0be7e4d 100644
+--- a/devtools/shared/webconsole/js-property-provider.js
++++ b/devtools/shared/webconsole/js-property-provider.js
+@@ -218,24 +218,23 @@ function JSPropertyProvider(aDbgObject, anEnvironment, aInputValue, aCursor)
+     }
+   }
+ 
+   // We are completing a variable / a property lookup.
+   let properties = completionPart.split(".");
+   let matchProp = properties.pop().trimLeft();
+   let obj = aDbgObject;
+ 
+-  // The first property must be found in the environment if the debugger is
+-  // paused.
+-  if (anEnvironment) {
+-    if (properties.length == 0) {
+-      return getMatchedPropsInEnvironment(anEnvironment, matchProp);
+-    }
+-    obj = getVariableInEnvironment(anEnvironment, properties.shift());
++  // The first property must be found in the environment of the paused debugger
++  // or of the global lexical scope.
++  let env = anEnvironment || obj.asEnvironment();
++  if (properties.length == 0) {
++    return getMatchedPropsInEnvironment(env, matchProp);
+   }
++  obj = getVariableInEnvironment(env, properties.shift());
+ 
+   if (!isObjectUsable(obj)) {
+     return null;
+   }
+ 
+   // We get the rest of the properties recursively starting from the Debugger.Object
+   // that wraps the first property
+   for (let prop of properties) {
+

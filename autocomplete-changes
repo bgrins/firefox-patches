@@ -1,0 +1,370 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  1f7c385693003de50881bf20e1ecdaf0ff87d99e
+
+diff --git a/devtools/shared/webconsole/js-property-provider.js b/devtools/shared/webconsole/js-property-provider.js
+--- a/devtools/shared/webconsole/js-property-provider.js
++++ b/devtools/shared/webconsole/js-property-provider.js
+@@ -27,16 +27,20 @@ const STATE_DQUOTE = 3;
+ const OPEN_BODY = "{[(".split("");
+ const CLOSE_BODY = "}])".split("");
+ const OPEN_CLOSE_BODY = {
+   "{": "}",
+   "[": "]",
+   "(": ")",
+ };
+ 
++function hasArrayIndex(str) {
++  return /\[\d+\]$/.test(str);
++}
++
+ /**
+  * Analyses a given string to find the last statement that is interesting for
+  * later completion.
+  *
+  * @param   string aStr
+  *          A string to analyse.
+  *
+  * @returns object
+@@ -215,93 +219,100 @@ function JSPropertyProvider(aDbgObject, 
+                  (typeof expression.value === "string")) {
+         return getMatchedProps(String.prototype, matchProp);
+       }
+     }
+   }
+ 
+   // We are completing a variable / a property lookup.
+   let properties = completionPart.split(".");
+-  let matchProp = properties.pop().trimLeft();
++  let matchProp = properties[properties.length - 1].trimLeft();
+   let obj = aDbgObject;
+ 
+   // The first property must be found in the environment of the paused debugger
+   // or of the global lexical scope.
+   let env = anEnvironment || obj.asEnvironment();
+-  if (properties.length == 0) {
++
++  if (properties.length === 1) {
+     return getMatchedPropsInEnvironment(env, matchProp);
+   }
+-  obj = getVariableInEnvironment(env, properties.shift());
++
++  let firstProp = properties.shift().trim();
++  if (firstProp === "this") {
++    // Special case for 'this' - try to get the Object from the Environment.
++    // No problem if it throws, we will just not autocomplete.
++    try {
++      obj = env.object;
++    } catch(e) { }
++  }
++  else if (hasArrayIndex(firstProp)) {
++    obj = getArrayMemberProperty(null, env, firstProp);
++  } else {
++    obj = getVariableInEnvironment(env, firstProp);
++  }
++
+ 
+   if (!isObjectUsable(obj)) {
+     return null;
+   }
+ 
+   // We get the rest of the properties recursively starting from the Debugger.Object
+   // that wraps the first property
+-  for (let i = 0; i < properties.length; i++) {
++  for (let i = 0; i < properties.length - 1; i++) {
+     let prop = properties[i].trim();
+     if (!prop) {
+       return null;
+     }
+ 
+-    // Special case for 'this' since it's not part of the global's properties
+-    // but we want autocompletion to work properly for it
+-    if (prop === "this" && obj === aDbgObject && i === 0) {
+-      continue;
+-    }
+-
+-    if (/\[\d+\]$/.test(prop)) {
++    if (hasArrayIndex(prop)) {
+       // The property to autocomplete is a member of array. For example
+       // list[i][j]..[n]. Traverse the array to get the actual element.
+-      obj = getArrayMemberProperty(obj, prop);
++      obj = getArrayMemberProperty(obj, null, prop);
+     }
+     else {
+       obj = DevToolsUtils.getProperty(obj, prop);
+     }
+ 
+     if (!isObjectUsable(obj)) {
+       return null;
+     }
+   }
+ 
+   // If the final property is a primitive
+   if (typeof obj != "object") {
+     return getMatchedProps(obj, matchProp);
+   }
+ 
+-  let matchedProps = getMatchedPropsInDbgObject(obj, matchProp);
+-  if (properties.length !== 0 || obj !== aDbgObject) {
+-    let thisInd = matchedProps.matches.indexOf("this");
+-    if (thisInd > -1) {
+-      matchedProps.matches.splice(thisInd, 1)
+-    }
+-  }
+-
+-  return matchedProps;
++  return getMatchedPropsInDbgObject(obj, matchProp);
+ }
+ 
+ /**
+  * Get the array member of aObj for the given aProp. For example, given
+  * aProp='list[0][1]' the element at [0][1] of aObj.list is returned.
+  *
+  * @param object aObj
+- *        The object to operate on.
++ *        The object to operate on. Should be null if aEnv is passed.
++ * @param object aEnv
++ *        The Environment to operate in. Should be null if aObj is passed.
+  * @param string aProp
+  *        The property to return.
+  * @return null or Object
+  *         Returns null if the property couldn't be located. Otherwise the array
+  *         member identified by aProp.
+  */
+-function getArrayMemberProperty(aObj, aProp)
++function getArrayMemberProperty(aObj, aEnv, aProp)
+ {
+   // First get the array.
+   let obj = aObj;
+   let propWithoutIndices = aProp.substr(0, aProp.indexOf("["));
+-  obj = DevToolsUtils.getProperty(obj, propWithoutIndices);
++
++  if (aEnv) {
++    obj = getVariableInEnvironment(aEnv, propWithoutIndices);
++  }
++
+   if (!isObjectUsable(obj)) {
+     return null;
+   }
+ 
+   // Then traverse the list of indices to get the actual element.
+   let result;
+   let arrayIndicesRegex = /\[[^\]]*\]/g;
+   while ((result = arrayIndicesRegex.exec(aProp)) !== null) {
+@@ -490,27 +501,17 @@ var DebuggerObjectSupport = {
+     while (aObj) {
+       yield aObj;
+       aObj = aObj.proto;
+     }
+   },
+ 
+   getProperties: function(aObj)
+   {
+-    let names = aObj.getOwnPropertyNames();
+-    // Include 'this' in results (in sorted order).  It will be removed
+-    // in all cases except for the first property request on the global, but
+-    // it needs to be added now so it can be filtered based on string input.
+-    for (let i = 0; i < names.length; i++) {
+-      if (i === names.length - 1 || names[i+1] > "this") {
+-        names.splice(i+1, 0, "this");
+-        break;
+-      }
+-    }
+-    return names;
++    return aObj.getOwnPropertyNames();
+   },
+ 
+   getProperty: function(aObj, aName, aRootObj)
+   {
+     // This is left unimplemented in favor to DevToolsUtils.getProperty().
+     throw "Unimplemented!";
+   },
+ };
+@@ -521,17 +522,27 @@ var DebuggerEnvironmentSupport = {
+     while (aObj) {
+       yield aObj;
+       aObj = aObj.parent;
+     }
+   },
+ 
+   getProperties: function(aObj)
+   {
+-    return aObj.names();
++    let names = aObj.names();
++
++    // Include 'this' in results (in sorted order)
++    for (let i = 0; i < names.length; i++) {
++      if (i === names.length - 1 || names[i+1] > "this") {
++        names.splice(i+1, 0, "this");
++        break;
++      }
++    }
++
++    return names;
+   },
+ 
+   getProperty: function(aObj, aName)
+   {
+     // TODO: we should use getVariableDescriptor() here - bug 725815.
+     let result = aObj.getVariable(aName);
+     // FIXME: Need actual UI, bug 941287.
+     if (result === undefined || result.optimizedOut || result.missingArguments) {
+diff --git a/devtools/shared/webconsole/test/unit/test_js_property_provider.js b/devtools/shared/webconsole/test/unit/test_js_property_provider.js
+--- a/devtools/shared/webconsole/test/unit/test_js_property_provider.js
++++ b/devtools/shared/webconsole/test/unit/test_js_property_provider.js
+@@ -24,108 +24,121 @@ function run_test() {
+   ];'
+ 
+   const testObject = 'var testObject = {"propA": [{"propB": "B"}]}';
+   const testHyphenated = 'var testHyphenated = {"prop-A": "res-A"}';
+ 
+   let sandbox = Components.utils.Sandbox("http://example.com");
+   let dbg = new Debugger;
+   let dbgObject = dbg.addDebuggee(sandbox);
++  let dbgEnv = dbgObject.asEnvironment();
+   Components.utils.evalInSandbox(testArray, sandbox);
+   Components.utils.evalInSandbox(testObject, sandbox);
+   Components.utils.evalInSandbox(testHyphenated, sandbox);
+ 
++  do_print("Running tests with dbgObject");
++  runChecks(dbgObject, null);
++
++  do_print("Running tests with dbgEnv");
++  runChecks(null, dbgEnv);
++
++}
++
++function runChecks(dbgObject, dbgEnv) {
++  do_print("Test that suggestions are given for 'this'");
++  let results = JSPropertyProvider(dbgObject, dbgEnv, "t");
++  test_has_result(results, "this");
++
++  if (dbgObject != null) {
++    do_print("Test that suggestions are given for 'this.'");
++    results = JSPropertyProvider(dbgObject, dbgEnv, "this.");
++    test_has_result(results, "testObject");
++
++    do_print("Test that no suggestions are given for 'this.this'");
++    results = JSPropertyProvider(dbgObject, dbgEnv, "this.this");
++    test_has_no_results(results);
++  }
++
+   do_print("Test that suggestions are given for 'foo[n]' where n is an integer.");
+-  let results = JSPropertyProvider(dbgObject, null, "testArray[0].");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "testArray[0].");
+   test_has_result(results, "propA");
+ 
+   do_print("Test that suggestions are given for multidimensional arrays.");
+-  results = JSPropertyProvider(dbgObject, null, "testArray[2][0].");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "testArray[2][0].");
+   test_has_result(results, "propE");
+ 
+   do_print("Test that suggestions are given for literal arrays.");
+-  results = JSPropertyProvider(dbgObject, null, "[1,2,3].");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "[1,2,3].");
+   test_has_result(results, "indexOf");
+ 
+   do_print("Test that suggestions are given for literal arrays with newlines.");
+-  results = JSPropertyProvider(dbgObject, null, "[1,2,3,\n4\n].");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "[1,2,3,\n4\n].");
+   test_has_result(results, "indexOf");
+ 
+-  do_print("Test that suggestions are given for 'this'");
+-  results = JSPropertyProvider(dbgObject, null, "t");
+-  test_has_result(results, "this");
+-
+-  do_print("Test that suggestions are given for 'this.'");
+-  results = JSPropertyProvider(dbgObject, null, "this.");
+-  test_has_result(results, "testObject");
+-
+-  do_print("Test that no suggestions are given for 'this.this'");
+-  results = JSPropertyProvider(dbgObject, null, "this.this");
+-  test_has_no_results(results);
+-
+   do_print("Test that suggestions are given for literal strings.");
+-  results = JSPropertyProvider(dbgObject, null, "'foo'.");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "'foo'.");
+   test_has_result(results, "charAt");
+-  results = JSPropertyProvider(dbgObject, null, '"foo".');
++  results = JSPropertyProvider(dbgObject, dbgEnv, '"foo".');
+   test_has_result(results, "charAt");
+-  results = JSPropertyProvider(dbgObject, null, "`foo`.");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "`foo`.");
+   test_has_result(results, "charAt");
+-  results = JSPropertyProvider(dbgObject, null, "'[1,2,3]'.");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "'[1,2,3]'.");
+   test_has_result(results, "charAt");
+ 
+   do_print("Test that suggestions are not given for syntax errors.");
+-  results = JSPropertyProvider(dbgObject, null, "'foo\"");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "'foo\"");
+   do_check_null(results);
+-  results = JSPropertyProvider(dbgObject, null, "[1,',2]");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "[1,',2]");
+   do_check_null(results);
+-  results = JSPropertyProvider(dbgObject, null, "'[1,2].");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "'[1,2].");
+   do_check_null(results);
+-  results = JSPropertyProvider(dbgObject, null, "'foo'..");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "'foo'..");
+   do_check_null(results);
+ 
+   do_print("Test that suggestions are not given without a dot.");
+-  results = JSPropertyProvider(dbgObject, null, "'foo'");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "'foo'");
+   test_has_no_results(results);
+-  results = JSPropertyProvider(dbgObject, null, "[1,2,3]");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "[1,2,3]");
+   test_has_no_results(results);
+-  results = JSPropertyProvider(dbgObject, null, "[1,2,3].\n'foo'");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "[1,2,3].\n'foo'");
+   test_has_no_results(results);
+ 
+   do_print("Test that suggestions are not given for numeric literals.");
+-  results = JSPropertyProvider(dbgObject, null, "1.");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "1.");
+   do_check_null(results);
+ 
+   do_print("Test that suggestions are not given for index that's out of bounds.");
+-  results = JSPropertyProvider(dbgObject, null, "testArray[10].");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "testArray[10].");
+   do_check_null(results);
+ 
+   do_print("Test that no suggestions are given if an index is not numerical somewhere in the chain.");
+-  results = JSPropertyProvider(dbgObject, null, "testArray[0]['propC'][0].");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "testArray[0]['propC'][0].");
+   do_check_null(results);
+ 
+-  results = JSPropertyProvider(dbgObject, null, "testObject['propA'][0].");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "testObject['propA'][0].");
+   do_check_null(results);
+ 
+-  results = JSPropertyProvider(dbgObject, null, "testArray[0]['propC'].");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "testArray[0]['propC'].");
+   do_check_null(results);
+ 
+-  results = JSPropertyProvider(dbgObject, null, "testArray[][1].");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "testArray[][1].");
+   do_check_null(results);
+ 
+   do_print("Test that suggestions are not given if there is an hyphen in the chain.");
+-  results = JSPropertyProvider(dbgObject, null, "testHyphenated['prop-A'].");
++  results = JSPropertyProvider(dbgObject, dbgEnv, "testHyphenated['prop-A'].");
+   do_check_null(results);
+ }
+ 
+ /**
+  * A helper that ensures an empty array of results were found.
+  * @param Object aResults
+  *        The results returned by JSPropertyProvider.
+  */
+ function test_has_no_results(aResults) {
++  do_print(aResults.matches);
+   do_check_neq(aResults, null);
+   do_check_eq(aResults.matches.length, 0);
+ }
+ /**
+  * A helper that ensures (required) results were found.
+  * @param Object aResults
+  *        The results returned by JSPropertyProvider.
+  * @param String aRequiredSuggestion
