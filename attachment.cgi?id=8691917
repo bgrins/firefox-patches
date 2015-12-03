@@ -1,0 +1,194 @@
+# HG changeset patch
+# User Hugo Arregui <hugo.arregui@gmail.com>
+
+Bug 1225063 - new option to enable or disable attribute collapsing (devtools.markup.collapseAttributes) in the
+inspector from settings panel
+
+
+diff --git a/devtools/client/framework/toolbox-options.xul b/devtools/client/framework/toolbox-options.xul
+index 78a50d0..3b52b85 100644
+--- a/devtools/client/framework/toolbox-options.xul
++++ b/devtools/client/framework/toolbox-options.xul
+@@ -64,6 +64,9 @@
+               </menulist>
+             </hbox>
+           </description>
++          <checkbox label="&options.collapseAttrs.label;"
++                    tooltiptext="&options.collapseAttrs.tooltip;"
++                    data-pref="devtools.markup.collapseAttributes"/>
+         </vbox>
+         <label>&options.webconsole.label;</label>
+         <vbox id="webconsole-options" class="options-groupbox">
+diff --git a/devtools/client/locales/en-US/toolbox.dtd b/devtools/client/locales/en-US/toolbox.dtd
+index c44a6b3..e144b8e 100644
+--- a/devtools/client/locales/en-US/toolbox.dtd
++++ b/devtools/client/locales/en-US/toolbox.dtd
+@@ -59,6 +59,12 @@ values from browser.dtd.  -->
+ <!ENTITY options.showUserAgentStyles.label "Show Browser Styles">
+ <!ENTITY options.showUserAgentStyles.tooltip "Turning this on will show default styles that are loaded by the browser.">
+ 
++<!-- LOCALIZATION NOTE (options.collapseAttrs.label): This is the label
++  -  for the checkbox option to enable collapse attributes in the Inspector
++  -  panel. -->
++<!ENTITY options.collapseAttrs.label "Truncate Inspector attributes">
++<!ENTITY options.collapseAttrs.tooltip "Turning this on will enable attributes collapsing in the inspector.">
++
+ <!-- LOCALIZATION NOTE (options.defaultColorUnit.label): This is the label for a
+   -  dropdown list that controls the default color unit used in the inspector.
+   -  This label is visible in the options panel. -->
+diff --git a/devtools/client/markupview/markup-view.js b/devtools/client/markupview/markup-view.js
+index c22e71d..7bf1829 100644
+--- a/devtools/client/markupview/markup-view.js
++++ b/devtools/client/markupview/markup-view.js
+@@ -18,6 +18,8 @@ const DRAG_DROP_MIN_AUTOSCROLL_SPEED = 5;
+ const DRAG_DROP_MAX_AUTOSCROLL_SPEED = 15;
+ const DRAG_DROP_MIN_INITIAL_DISTANCE = 10;
+ const AUTOCOMPLETE_POPUP_PANEL_ID = "markupview_autoCompletePopup";
++const ATTR_COLLAPSE_ENABLED_PREF = "devtools.markup.collapseAttributes";
++const ATTR_COLLAPSE_LENGTH_PREF = "devtools.markup.collapseAttributeLength";
+ 
+ const {UndoStack} = require("devtools/client/shared/undo");
+ const {editableField, InplaceEditor} = require("devtools/client/shared/inplace-editor");
+@@ -31,6 +33,7 @@ const {parseAttribute} = require("devtools/client/shared/node-attribute-parser")
+ const ELLIPSIS = Services.prefs.getComplexValue("intl.ellipsis", Ci.nsIPrefLocalizedString).data;
+ const {Task} = require("resource://gre/modules/Task.jsm");
+ const {scrollIntoViewIfNeeded} = require("devtools/shared/layout/utils");
++const {PrefObserver} = require("devtools/client/styleeditor/utils");
+ 
+ Cu.import("resource://devtools/shared/gcli/Templater.jsm");
+ Cu.import("resource://gre/modules/Services.jsm");
+@@ -72,6 +75,7 @@ function MarkupView(aInspector, aFrame, aControllerWindow) {
+   this.doc = this._frame.contentDocument;
+   this._elt = this.doc.querySelector("#root");
+   this.htmlEditor = new HTMLEditor(this.doc);
++  this.globalAttrChange = false;
+ 
+   try {
+     this.maxChildren = Services.prefs.getIntPref("devtools.markup.pagesize");
+@@ -79,8 +83,10 @@ function MarkupView(aInspector, aFrame, aControllerWindow) {
+     this.maxChildren = DEFAULT_MAX_CHILDREN;
+   }
+ 
++  this.collapseAttributes =
++    Services.prefs.getBoolPref(ATTR_COLLAPSE_ENABLED_PREF);
+   this.collapseAttributeLength =
+-    Services.prefs.getIntPref("devtools.markup.collapseAttributeLength");
++    Services.prefs.getIntPref(ATTR_COLLAPSE_LENGTH_PREF);
+ 
+   // Creating the popup to be used to show CSS suggestions.
+   let options = {
+@@ -109,6 +115,8 @@ function MarkupView(aInspector, aFrame, aControllerWindow) {
+   this._onMouseMove = this._onMouseMove.bind(this);
+   this._onMouseLeave = this._onMouseLeave.bind(this);
+   this._onToolboxPickerHover = this._onToolboxPickerHover.bind(this);
++  this._onCollapseAttributesPrefChange =
++    this._onCollapseAttributesPrefChange.bind(this);
+ 
+   // Listening to various events.
+   this._elt.addEventListener("click", this._onMouseClick, false);
+@@ -126,6 +134,12 @@ function MarkupView(aInspector, aFrame, aControllerWindow) {
+   this._onNewSelection();
+   this._initTooltips();
+ 
++  this._prefObserver = new PrefObserver("devtools.markup");
++  this._prefObserver.on(ATTR_COLLAPSE_ENABLED_PREF,
++                        this._onCollapseAttributesPrefChange);
++  this._prefObserver.on(ATTR_COLLAPSE_LENGTH_PREF,
++                        this._onCollapseAttributesPrefChange);
++
+   EventEmitter.decorate(this);
+ }
+ 
+@@ -260,6 +274,16 @@ MarkupView.prototype = {
+     }
+   },
+ 
++  _onCollapseAttributesPrefChange: function() {
++    this.collapseAttributes =
++      Services.prefs.getBoolPref(ATTR_COLLAPSE_ENABLED_PREF);
++    this.collapseAttributeLength =
++      Services.prefs.getIntPref(ATTR_COLLAPSE_LENGTH_PREF);
++    this.globalAttrChange = true;
++    this.update();
++    this.globalAttrChange = false;
++  },
++
+   cancelDragging: function() {
+     if (!this.isDragging) {
+       return;
+@@ -1547,6 +1571,12 @@ MarkupView.prototype = {
+     this._inspector.selection.off("new-node-front", this._onNewSelection);
+     this._inspector.toolbox.off("picker-node-hovered", this._onToolboxPickerHover);
+ 
++    this._prefObserver.off(ATTR_COLLAPSE_ENABLED_PREF, 
++                           this._onCollapseAttributesPrefChange);
++    this._prefObserver.off(ATTR_COLLAPSE_LENGTH_PREF,
++                           this._onCollapseAttributesPrefChange);
++    this._prefObserver.destroy();
++
+     this._elt = null;
+ 
+     for (let [, container] of this._containers) {
+@@ -2630,7 +2660,8 @@ ElementEditor.prototype = {
+     // attributes have already been removed at this point.
+     for (let attr of nodeAttributes) {
+       let el = this.attrElements.get(attr.name);
+-      let valueChanged = el && el.querySelector(".attr-value").textContent !== attr.value;
++      let valueChanged = el &&
++        (this.markup.globalAttrChange || el.querySelector(".attr-value").textContent !== attr.value);
+       let isEditing = el && el.querySelector(".editable").inplaceEditor;
+       let canSimplyShowEditor = el && (!valueChanged || isEditing);
+ 
+@@ -2808,9 +2839,9 @@ ElementEditor.prototype = {
+       if (value && value.match(COLLAPSE_DATA_URL_REGEX)) {
+         return truncateString(value, COLLAPSE_DATA_URL_LENGTH);
+       }
+-      return this.markup.collapseAttributeLength < 0
+-        ? value :
+-        truncateString(value, this.markup.collapseAttributeLength);
++      return this.markup.collapseAttributes
++        ? truncateString(value, this.markup.collapseAttributeLength)
++        : value;
+     };
+ 
+     val.innerHTML = "";
+diff --git a/devtools/client/markupview/test/browser_markupview_tag_edit_07.js b/devtools/client/markupview/test/browser_markupview_tag_edit_07.js
+index 6b51245..4c22f34 100644
+--- a/devtools/client/markupview/test/browser_markupview_tag_edit_07.js
++++ b/devtools/client/markupview/test/browser_markupview_tag_edit_07.js
+@@ -80,7 +80,7 @@ var TEST_DATA = [{
+     "data-long": LONG_ATTRIBUTE
+   },
+   setUp: function(inspector) {
+-    inspector.markup.collapseAttributeLength = -1;
++    SpecialPowers.setBoolPref("devtools.markup.collapseAttributes", false);
+   },
+   validate: (element, container, inspector) => {
+     let editor = container.editor;
+@@ -91,7 +91,7 @@ var TEST_DATA = [{
+     is(visibleAttrText, LONG_ATTRIBUTE);
+   },
+   tearDown: function(inspector) {
+-    inspector.markup.collapseAttributeLength = 120;
++    SpecialPowers.setBoolPref("devtools.markup.collapseAttributes", true);
+   }
+ }];
+ 
+diff --git a/devtools/client/preferences/devtools.js b/devtools/client/preferences/devtools.js
+index 3210e8c..acd9d6b 100644
+--- a/devtools/client/preferences/devtools.js
++++ b/devtools/client/preferences/devtools.js
+@@ -66,8 +66,10 @@ pref("devtools.inspector.showAllAnonymousContent", false);
+ // Enable the MDN docs tooltip
+ pref("devtools.inspector.mdnDocsTooltip.enabled", true);
+ 
+-// Collapse attributes that are too long.
+-// Use -1 to not collapse attributes at all.
++// Enable to collapse attributes that are too long.
++pref("devtools.markup.collapseAttributes", true);
++
++// Length to collapse attributes
+ pref("devtools.markup.collapseAttributeLength", 120);
+ 
+ // DevTools default color unit
+
