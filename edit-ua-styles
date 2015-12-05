@@ -1,0 +1,234 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  ca30d9070e53f75b90b9710d2533bb5bf0a74240
+Bug 1076788 - Add preference to edit UA styles in rule view;r=tromey
+
+diff --git a/devtools/client/framework/toolbox-process-window.js b/devtools/client/framework/toolbox-process-window.js
+--- a/devtools/client/framework/toolbox-process-window.js
++++ b/devtools/client/framework/toolbox-process-window.js
+@@ -47,16 +47,17 @@ var connect = Task.async(function*() {
+       });
+     }
+   });
+ });
+ 
+ // Certain options should be toggled since we can assume chrome debugging here
+ function setPrefDefaults() {
+   Services.prefs.setBoolPref("devtools.inspector.showUserAgentStyles", true);
++  Services.prefs.setBoolPref("devtools.inspector.editUserAgentStyles", true);
+   Services.prefs.setBoolPref("devtools.performance.ui.show-platform-data", true);
+   Services.prefs.setBoolPref("devtools.inspector.showAllAnonymousContent", true);
+   Services.prefs.setBoolPref("browser.dom.window.dump.enabled", true);
+ }
+ 
+ window.addEventListener("load", function() {
+   let cmdClose = document.getElementById("toolbox-cmd-close");
+   cmdClose.addEventListener("command", onCloseCommand);
+diff --git a/devtools/client/preferences/devtools.js b/devtools/client/preferences/devtools.js
+--- a/devtools/client/preferences/devtools.js
++++ b/devtools/client/preferences/devtools.js
+@@ -56,16 +56,18 @@ pref("devtools.inspector.enabled", true)
+ pref("devtools.inspector.activeSidebar", "ruleview");
+ pref("devtools.inspector.remote", false);
+ // Collapse pseudo-elements by default in the rule-view
+ pref("devtools.inspector.show_pseudo_elements", false);
+ // The default size for image preview tooltips in the rule-view/computed-view/markup-view
+ pref("devtools.inspector.imagePreviewTooltipSize", 300);
+ // Enable user agent style inspection in rule-view
+ pref("devtools.inspector.showUserAgentStyles", false);
++// Enable user agent style editing in rule-view
++pref("devtools.inspector.editUserAgentStyles", false);
+ // Show all native anonymous content (like controls in <video> tags)
+ pref("devtools.inspector.showAllAnonymousContent", false);
+ // Enable the MDN docs tooltip
+ pref("devtools.inspector.mdnDocsTooltip.enabled", true);
+ 
+ // Collapse attributes that are too long.
+ // Use -1 to not collapse attributes at all.
+ pref("devtools.markup.collapseAttributeLength", 120);
+diff --git a/devtools/client/styleinspector/rule-view.js b/devtools/client/styleinspector/rule-view.js
+--- a/devtools/client/styleinspector/rule-view.js
++++ b/devtools/client/styleinspector/rule-view.js
+@@ -41,16 +41,17 @@ loader.lazyRequireGetter(this, "StyleIns
+   "devtools/client/styleinspector/style-inspector-menu");
+ loader.lazyImporter(this, "Services", "resource://gre/modules/Services.jsm");
+ 
+ Cu.import("resource://gre/modules/XPCOMUtils.jsm");
+ 
+ const HTML_NS = "http://www.w3.org/1999/xhtml";
+ const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+ const PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
++const PREF_UA_EDIT = "devtools.inspector.editUserAgentStyles";
+ const PREF_DEFAULT_COLOR_UNIT = "devtools.defaultColorUnit";
+ const PREF_ENABLE_MDN_DOCS_TOOLTIP =
+       "devtools.inspector.mdnDocsTooltip.enabled";
+ const PROPERTY_NAME_CLASS = "ruleview-propertyname";
+ const FILTER_CHANGED_TIMEOUT = 150;
+ 
+ // This is used to parse user input when filtering.
+ const FILTER_PROP_RE = /\s*([^:\s]*)\s*:\s*(.*?)\s*;?$/;
+@@ -1361,19 +1362,21 @@ function CssRuleView(inspector, document
+   this.focusCheckbox.addEventListener("click", this._onTogglePseudoClass);
+ 
+   this._handlePrefChange = this._handlePrefChange.bind(this);
+   this._onSourcePrefChanged = this._onSourcePrefChanged.bind(this);
+ 
+   this._prefObserver = new PrefObserver("devtools.");
+   this._prefObserver.on(PREF_ORIG_SOURCES, this._onSourcePrefChanged);
+   this._prefObserver.on(PREF_UA_STYLES, this._handlePrefChange);
++  this._prefObserver.on(PREF_UA_EDIT, this._handlePrefChange);
+   this._prefObserver.on(PREF_DEFAULT_COLOR_UNIT, this._handlePrefChange);
+   this._prefObserver.on(PREF_ENABLE_MDN_DOCS_TOOLTIP, this._handlePrefChange);
+ 
++  this.editUserAgentStyles = Services.prefs.getBoolPref(PREF_UA_EDIT);
+   this.showUserAgentStyles = Services.prefs.getBoolPref(PREF_UA_STYLES);
+   this.enableMdnDocsTooltip =
+     Services.prefs.getBoolPref(PREF_ENABLE_MDN_DOCS_TOOLTIP);
+ 
+   let options = {
+     autoSelect: true,
+     theme: "auto"
+   };
+@@ -1733,16 +1736,19 @@ CssRuleView.prototype = {
+       this.element.querySelectorAll(".styleinspector-propertyeditor")
+         .length > 0;
+   },
+ 
+   _handlePrefChange: function(pref) {
+     if (pref === PREF_UA_STYLES) {
+       this.showUserAgentStyles = Services.prefs.getBoolPref(pref);
+     }
++    if (pref === PREF_UA_EDIT) {
++      this.editUserAgentStyles = Services.prefs.getBoolPref(pref);
++    }
+ 
+     // Reselect the currently selected element
+     let refreshOnPrefs = [PREF_UA_STYLES, PREF_DEFAULT_COLOR_UNIT];
+     if (refreshOnPrefs.indexOf(pref) > -1) {
+       this.selectElement(this._viewedElement, true);
+     }
+   },
+ 
+@@ -2653,17 +2659,17 @@ CssRuleView.prototype = {
+  * @param {Rule} aRule
+  *        The Rule object we're editing.
+  */
+ function RuleEditor(aRuleView, aRule) {
+   this.ruleView = aRuleView;
+   this.doc = this.ruleView.styleDocument;
+   this.rule = aRule;
+ 
+-  this.isEditable = !aRule.isSystem;
++  this.isEditable = this.ruleView.editUserAgentStyles || !aRule.isSystem;
+   // Flag that blocks updates of the selector and properties when it is
+   // being edited
+   this.isEditing = false;
+ 
+   this._onNewProperty = this._onNewProperty.bind(this);
+   this._newPropertyDestroy = this._newPropertyDestroy.bind(this);
+   this._onSelectorDone = this._onSelectorDone.bind(this);
+   this._locationChanged = this._locationChanged.bind(this);
+diff --git a/devtools/client/styleinspector/test/browser_ruleview_user-agent-styles-uneditable.js b/devtools/client/styleinspector/test/browser_ruleview_user-agent-styles-uneditable.js
+--- a/devtools/client/styleinspector/test/browser_ruleview_user-agent-styles-uneditable.js
++++ b/devtools/client/styleinspector/test/browser_ruleview_user-agent-styles-uneditable.js
+@@ -1,58 +1,81 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+-// Check that user agent styles are never editable via
+-// the UI
++// Check that user agent styles are only editable via
++// the UI if the devtools.inspector.editUserAgentStyles pref is set
+ 
+ const TEST_URI = `
+   <blockquote type=cite>
+    <pre _moz_quote=true>
+      inspect <a href='foo' style='color:orange'>user agent</a> styles
+    </pre>
+   </blockquote>
+ `;
+ 
+ var PREF_UA_STYLES = "devtools.inspector.showUserAgentStyles";
++var PREF_UA_EDIT = "devtools.inspector.editUserAgentStyles";
+ 
+ add_task(function*() {
+-  info("Starting the test with the pref set to true before toolbox is opened");
+-  Services.prefs.setBoolPref(PREF_UA_STYLES, true);
++  info("Starting the test with 'show' pref set to true");
++  yield new Promise(resolve => {
++    SpecialPowers.pushPrefEnv({"set": [
++      ["devtools.inspector.showUserAgentStyles", true],
++    ]}, resolve);
++  });
+ 
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+   let {inspector, view} = yield openRuleView();
+ 
+-  yield userAgentStylesUneditable(inspector, view);
++  yield checkUserAgentStylesEditable(inspector, view, false);
+ 
+-  info("Resetting " + PREF_UA_STYLES);
+-  Services.prefs.clearUserPref(PREF_UA_STYLES);
++  info("Starting the test with the 'show' and 'edit' prefs set to true");
++  yield new Promise(resolve => {
++    SpecialPowers.popPrefEnv(resolve);
++  });
++  yield new Promise(resolve => {
++    SpecialPowers.pushPrefEnv({"set": [
++      ["devtools.inspector.showUserAgentStyles", true],
++      ["devtools.inspector.editUserAgentStyles", true],
++    ]}, resolve);
++  });
++
++  yield checkUserAgentStylesEditable(inspector, view, true);
+ });
+ 
+-function* userAgentStylesUneditable(inspector, view) {
+-  info("Making sure that UI is not editable for user agent styles");
++function* checkUserAgentStylesEditable(inspector, view, isEditable) {
++  info("Checking that UI is only editable for UA styles if preffed on");
+ 
+   yield selectNode("a", inspector);
+-  let uaRules = view._elementStyle.rules.filter(rule=>!rule.editor.isEditable);
++  let uaRules = view._elementStyle.rules.filter(rule=>rule.isSystem);
++
++  ok (uaRules.length > 0, "There are some UA Rules");
+ 
+   for (let rule of uaRules) {
+-    ok(rule.editor.element.hasAttribute("uneditable"),
+-      "UA rules have uneditable attribute");
++    is(rule.editor.element.getAttribute("uneditable"),
++       isEditable ? "false" : "true",
++       "UA rules are uneditable depending on pref");
+ 
+     let firstProp = rule.textProps.filter(p => !p.invisible)[0];
+ 
+-    ok(!firstProp.editor.nameSpan._editable,
+-      "nameSpan is not editable");
+-    ok(!firstProp.editor.valueSpan._editable,
+-      "valueSpan is not editable");
+-    ok(!rule.editor.closeBrace._editable, "closeBrace is not editable");
++    is(!!firstProp.editor.nameSpan._editable,
++       isEditable,
++       "nameSpan is editable depending on pref");
++    is(!!firstProp.editor.valueSpan._editable,
++       isEditable,
++       "valueSpan is editable depending on pref");
++    is(!!rule.editor.closeBrace._editable,
++       isEditable,
++       "closeBrace is editable depending on pref");
+ 
+     let colorswatch = rule.editor.element
+       .querySelector(".ruleview-colorswatch");
+     if (colorswatch) {
+-      ok(!view.tooltips.colorPicker.swatches.has(colorswatch),
+-        "The swatch is not editable");
++      is(view.tooltips.colorPicker.swatches.has(colorswatch),
++         isEditable,
++         "The swatch is editable depending on pref");
+     }
+   }
+ }

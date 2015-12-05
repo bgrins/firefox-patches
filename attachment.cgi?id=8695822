@@ -1,0 +1,1221 @@
+# HG changeset patch
+# User Patrick Brosset <pbrosset@mozilla.com>
+# Date 1449227359 -3600
+#      Fri Dec 04 12:09:19 2015 +0100
+# Node ID e61069c9f3dc62ade95cb90dde79092c6c33881c
+# Parent  f32a93d9abd528102c124dbbaf6b14ac48c63a3c
+Bug 1228005 - 1 - Display animated property list with keyframes when an animation is selected; r=tromey
+
+diff --git a/devtools/client/animationinspector/components.js b/devtools/client/animationinspector/components.js
+--- a/devtools/client/animationinspector/components.js
++++ b/devtools/client/animationinspector/components.js
+@@ -252,17 +252,19 @@ AnimationTargetNode.prototype = {
+ 
+   onSelectNodeClick: function() {
+     if (!this.nodeFront) {
+       return;
+     }
+     this.inspector.selection.setNodeFront(this.nodeFront, "animationinspector");
+   },
+ 
+-  onHighlightNodeClick: function() {
++  onHighlightNodeClick: function(e) {
++    e.stopPropagation();
++
+     let classList = this.highlightNodeEl.classList;
+ 
+     let isHighlighted = classList.contains("selected");
+     if (isHighlighted) {
+       classList.remove("selected");
+       TargetNodeHighlighter.unhighlight().then(() => {
+         this.emit("target-highlighter-unlocked");
+       }, e => console.error(e));
+@@ -461,17 +463,18 @@ var TimeScale = {
+     let relevantDelay = delay < 0 ? delay / playbackRate : 0;
+     previousStartTime = previousStartTime || 0;
+ 
+     this.minStartTime = Math.min(this.minStartTime,
+                                  previousStartTime + relevantDelay);
+     let length = (delay / playbackRate) +
+                  ((duration / playbackRate) *
+                   (!iterationCount ? 1 : iterationCount));
+-    this.maxEndTime = Math.max(this.maxEndTime, previousStartTime + length);
++    let endTime = previousStartTime + length;
++    this.maxEndTime = Math.max(this.maxEndTime, endTime);
+   },
+ 
+   /**
+    * Reset the current time scale.
+    */
+   reset: function() {
+     this.minStartTime = Infinity;
+     this.maxEndTime = 0;
+@@ -488,27 +491,26 @@ var TimeScale = {
+   },
+ 
+   /**
+    * Convert a duration to a distance in %, in the current time scale.
+    * @param {Number} time
+    * @return {Number}
+    */
+   durationToDistance: function(duration) {
+-    return duration * 100 / (this.maxEndTime - this.minStartTime);
++    return duration * 100 / this.getDuration();
+   },
+ 
+   /**
+    * Convert a distance in % to a time, in the current time scale.
+    * @param {Number} distance
+    * @return {Number}
+    */
+   distanceToTime: function(distance) {
+-    return this.minStartTime +
+-      ((this.maxEndTime - this.minStartTime) * distance / 100);
++    return this.minStartTime + (this.getDuration() * distance / 100);
+   },
+ 
+   /**
+    * Convert a distance in % to a time, in the current time scale.
+    * The time will be relative to the current minimum start time.
+    * @param {Number} distance
+    * @return {Number}
+    */
+@@ -519,25 +521,54 @@ var TimeScale = {
+ 
+   /**
+    * Depending on the time scale, format the given time as milliseconds or
+    * seconds.
+    * @param {Number} time
+    * @return {String} The formatted time string.
+    */
+   formatTime: function(time) {
+-    let duration = this.maxEndTime - this.minStartTime;
+-
+     // Format in milliseconds if the total duration is short enough.
+-    if (duration <= MILLIS_TIME_FORMAT_MAX_DURATION) {
++    if (this.getDuration() <= MILLIS_TIME_FORMAT_MAX_DURATION) {
+       return L10N.getFormatStr("timeline.timeGraduationLabel", time.toFixed(0));
+     }
+ 
+     // Otherwise format in seconds.
+     return L10N.getFormatStr("player.timeLabel", (time / 1000).toFixed(1));
++  },
++
++  getDuration: function() {
++    return this.maxEndTime - this.minStartTime;
++  },
++
++  /**
++   * Given an animation, get the various dimensions (in %) useful to draw the
++   * animation in the timeline.
++   */
++  getAnimationDimensions: function({state}) {
++    let start = state.previousStartTime || 0;
++    let duration = state.duration;
++    let rate = state.playbackRate;
++    let count = state.iterationCount;
++    let delay = state.delay || 0;
++
++    // The start position.
++    let x = this.startTimeToDistance(start + (delay / rate));
++    // The width for a single iteration.
++    let w = this.durationToDistance(duration / rate);
++    // The width for all iterations.
++    let iterationW = w * (count || 1);
++    // The start position of the delay.
++    let delayX = this.durationToDistance((delay < 0 ? 0 : delay) / rate);
++    // The width of the delay.
++    let delayW = this.durationToDistance(Math.abs(delay) / rate);
++    // The width of the delay if it is positive, 0 otherwise.
++    let negativeDelayW = delay < 0 ? delayW : 0;
++
++    return {x, w, iterationW, delayX, delayW, negativeDelayW};
+   }
+ };
+ 
+ exports.TimeScale = TimeScale;
+ 
+ /**
+  * UI component responsible for displaying a timeline for animations.
+  * The timeline is essentially a graph with time along the x axis and animations
+@@ -551,25 +582,27 @@ exports.TimeScale = TimeScale;
+  * new time and state of the timeline.
+  *
+  * @param {InspectorPanel} inspector.
+  */
+ function AnimationsTimeline(inspector) {
+   this.animations = [];
+   this.targetNodes = [];
+   this.timeBlocks = [];
++  this.details = [];
+   this.inspector = inspector;
+ 
+   this.onAnimationStateChanged = this.onAnimationStateChanged.bind(this);
+   this.onScrubberMouseDown = this.onScrubberMouseDown.bind(this);
+   this.onScrubberMouseUp = this.onScrubberMouseUp.bind(this);
+   this.onScrubberMouseOut = this.onScrubberMouseOut.bind(this);
+   this.onScrubberMouseMove = this.onScrubberMouseMove.bind(this);
+   this.onAnimationSelected = this.onAnimationSelected.bind(this);
+   this.onWindowResize = this.onWindowResize.bind(this);
++  this.onFrameSelected = this.onFrameSelected.bind(this);
+ 
+   EventEmitter.decorate(this);
+ }
+ 
+ exports.AnimationsTimeline = AnimationsTimeline;
+ 
+ AnimationsTimeline.prototype = {
+   init: function(containerEl) {
+@@ -579,17 +612,17 @@ AnimationsTimeline.prototype = {
+       parent: containerEl,
+       attributes: {
+         "class": "animation-timeline"
+       }
+     });
+ 
+     let scrubberContainer = createNode({
+       parent: this.rootWrapperEl,
+-      attributes: {"class": "scrubber-wrapper"}
++      attributes: {"class": "scrubber-wrapper track-container"}
+     });
+ 
+     this.scrubberEl = createNode({
+       parent: scrubberContainer,
+       attributes: {
+         "class": "scrubber"
+       }
+     });
+@@ -600,17 +633,17 @@ AnimationsTimeline.prototype = {
+         "class": "scrubber-handle"
+       }
+     });
+     this.scrubberHandleEl.addEventListener("mousedown", this.onScrubberMouseDown);
+ 
+     this.timeHeaderEl = createNode({
+       parent: this.rootWrapperEl,
+       attributes: {
+-        "class": "time-header"
++        "class": "time-header track-container"
+       }
+     });
+     this.timeHeaderEl.addEventListener("mousedown", this.onScrubberMouseDown);
+ 
+     this.animationsEl = createNode({
+       parent: this.rootWrapperEl,
+       nodeType: "ul",
+       attributes: {
+@@ -638,67 +671,84 @@ AnimationsTimeline.prototype = {
+     this.timeHeaderEl = null;
+     this.animationsEl = null;
+     this.scrubberEl = null;
+     this.scrubberHandleEl = null;
+     this.win = null;
+     this.inspector = null;
+   },
+ 
+-  destroyTargetNodes: function() {
+-    for (let targetNode of this.targetNodes) {
+-      targetNode.destroy();
++  /**
++   * Destroy sub-components that have been created and stored on this instance.
++   * @param {String} name An array of components will be expected in this[name]
++   * @param {Array} handlers An option list of event handlers information that
++   * should be used to remove these handlers.
++   */
++  destroySubComponents: function(name, handlers = []) {
++    for (let component of this[name]) {
++      for (let {event, fn} of handlers) {
++        component.off(event, fn);
++      }
++      component.destroy();
+     }
+-    this.targetNodes = [];
+-  },
+-
+-  destroyTimeBlocks: function() {
+-    for (let timeBlock of this.timeBlocks) {
+-      timeBlock.off("selected", this.onAnimationSelected);
+-      timeBlock.destroy();
+-    }
+-    this.timeBlocks = [];
++    this[name] = [];
+   },
+ 
+   unrender: function() {
+     for (let animation of this.animations) {
+       animation.off("changed", this.onAnimationStateChanged);
+     }
+     TimeScale.reset();
+-    this.destroyTargetNodes();
+-    this.destroyTimeBlocks();
++    this.destroySubComponents("targetNodes");
++    this.destroySubComponents("timeBlocks");
++    this.destroySubComponents("details", [{
++      event: "frame-selected",
++      fn: this.onFrameSelected
++    }]);
+     this.animationsEl.innerHTML = "";
+   },
+ 
+   onWindowResize: function() {
+     if (this.windowResizeTimer) {
+       this.win.clearTimeout(this.windowResizeTimer);
+     }
+ 
+     this.windowResizeTimer = this.win.setTimeout(() => {
+       this.drawHeaderAndBackground();
+     }, TIMELINE_BACKGROUND_RESIZE_DEBOUNCE_TIMER);
+   },
+ 
+   onAnimationSelected: function(e, animation) {
+-    // Unselect the previously selected animation if any.
+-    [...this.rootWrapperEl.querySelectorAll(".animation.selected")].forEach(el => {
+-      el.classList.remove("selected");
+-    });
+-
+-    // Select the new animation.
+     let index = this.animations.indexOf(animation);
+     if (index === -1) {
+       return;
+     }
+-    this.rootWrapperEl.querySelectorAll(".animation")[index]
+-                      .classList.toggle("selected");
+ 
+-    // Relay the event to the parent component.
+-    this.emit("selected", animation);
++    let el = this.rootWrapperEl;
++    let animationEl = el.querySelectorAll(".animation")[index];
++    let propsEl = el.querySelectorAll(".animated-properties")[index];
++
++    // Toggle the selected state on this animation.
++    animationEl.classList.toggle("selected");
++    propsEl.classList.toggle("selected");
++
++    // Render the details component for this animation if it was shown.
++    if (animationEl.classList.contains("selected")) {
++      this.details[index].render(animation);
++      this.emit("animation-selected", animation);
++    } else {
++      this.emit("animation-unselected", animation);
++    }
++  },
++
++  /**
++   * When a frame gets selected, move the scrubber to the corresponding position
++   */
++  onFrameSelected: function(e, {x}) {
++    this.moveScrubberTo(x, true);
+   },
+ 
+   onScrubberMouseDown: function(e) {
+     this.moveScrubberTo(e.pageX);
+     this.win.addEventListener("mouseup", this.onScrubberMouseUp);
+     this.win.addEventListener("mouseout", this.onScrubberMouseOut);
+     this.win.addEventListener("mousemove", this.onScrubberMouseMove);
+ 
+@@ -723,24 +773,27 @@ AnimationsTimeline.prototype = {
+     this.win.removeEventListener("mouseout", this.onScrubberMouseOut);
+     this.win.removeEventListener("mousemove", this.onScrubberMouseMove);
+   },
+ 
+   onScrubberMouseMove: function(e) {
+     this.moveScrubberTo(e.pageX);
+   },
+ 
+-  moveScrubberTo: function(pageX) {
++  moveScrubberTo: function(pageX, noOffset) {
+     this.stopAnimatingScrubber();
+ 
+     // The offset needs to be in % and relative to the timeline's area (so we
+     // subtract the scrubber's left offset, which is equal to the sidebar's
+     // width).
+-    let offset = (pageX - this.timeHeaderEl.offsetLeft) * 100 /
+-                 this.timeHeaderEl.offsetWidth;
++    let offset = pageX;
++    if (!noOffset) {
++      offset -= this.timeHeaderEl.offsetLeft;
++    }
++    offset = offset * 100 / this.timeHeaderEl.offsetWidth;
+     if (offset < 0) {
+       offset = 0;
+     }
+ 
+     this.scrubberEl.style.left = offset + "%";
+ 
+     let time = TimeScale.distanceToRelativeTime(offset);
+ 
+@@ -777,44 +830,62 @@ AnimationsTimeline.prototype = {
+         nodeType: "li",
+         attributes: {
+           "class": "animation" + (animation.state.isRunningOnCompositor
+                                   ? " fast-track"
+                                   : "")
+         }
+       });
+ 
++      // Right below the line is a hidden-by-default line for displaying the
++      // inline keyframes.
++      let detailsEl = createNode({
++        parent: this.animationsEl,
++        nodeType: "li",
++        attributes: {
++          "class": "animated-properties"
++        }
++      });
++
++      let details = new AnimationDetails();
++      details.init(detailsEl);
++      details.on("frame-selected", this.onFrameSelected);
++      this.details.push(details);
++
+       // Left sidebar for the animated node.
+       let animatedNodeEl = createNode({
+         parent: animationEl,
+         attributes: {
+           "class": "target"
+         }
+       });
++
+       // Draw the animated node target.
+       let targetNode = new AnimationTargetNode(this.inspector, {compact: true});
+       targetNode.init(animatedNodeEl);
+       targetNode.render(animation);
+       this.targetNodes.push(targetNode);
+ 
+       // Right-hand part contains the timeline itself (called time-block here).
+       let timeBlockEl = createNode({
+         parent: animationEl,
+         attributes: {
+-          "class": "time-block"
++          "class": "time-block track-container"
+         }
+       });
++
+       // Draw the animation time block.
+       let timeBlock = new AnimationTimeBlock();
+       timeBlock.init(timeBlockEl);
+       timeBlock.render(animation);
+       this.timeBlocks.push(timeBlock);
+ 
+       timeBlock.on("selected", this.onAnimationSelected);
+     }
++
+     // Use the document's current time to position the scrubber (if the server
+     // doesn't provide it, hide the scrubber entirely).
+     // Note that because the currentTime was sent via the protocol, some time
+     // may have gone by since then, and so the scrubber might be a bit late.
+     if (!documentCurrentTime) {
+       this.scrubberEl.style.display = "none";
+     } else {
+       this.scrubberEl.style.display = "block";
+@@ -927,95 +998,88 @@ exports.AnimationTimeBlock = AnimationTi
+ AnimationTimeBlock.prototype = {
+   init: function(containerEl) {
+     this.containerEl = containerEl;
+     this.containerEl.addEventListener("click", this.onClick);
+   },
+ 
+   destroy: function() {
+     this.containerEl.removeEventListener("click", this.onClick);
+-    while (this.containerEl.firstChild) {
+-      this.containerEl.firstChild.remove();
+-    }
++    this.unrender();
+     this.containerEl = null;
+     this.animation = null;
+   },
+ 
++  unrender: function() {
++    while (this.containerEl.firstChild) {
++      this.containerEl.firstChild.remove();
++    }
++  },
++
+   render: function(animation) {
++    this.unrender();
++
+     this.animation = animation;
+     let {state} = this.animation;
+ 
+     // Create a container element to hold the delay and iterations.
+     // It is positioned according to its delay (divided by the playbackrate),
+     // and its width is according to its duration (divided by the playbackrate).
+-    let start = state.previousStartTime || 0;
+-    let duration = state.duration;
+-    let rate = state.playbackRate;
+-    let count = state.iterationCount;
+-    let delay = state.delay || 0;
+-
+-    let x = TimeScale.startTimeToDistance(start + (delay / rate));
+-    let w = TimeScale.durationToDistance(duration / rate);
+-    let iterationW = w * (count || 1);
+-    let delayW = TimeScale.durationToDistance(Math.abs(delay) / rate);
++    let {x, iterationW, delayX, delayW, negativeDelayW} =
++      TimeScale.getAnimationDimensions(animation);
+ 
+     let iterations = createNode({
+       parent: this.containerEl,
+       attributes: {
+-        "class": state.type + " iterations" + (count ? "" : " infinite"),
++        "class": state.type + " iterations" +
++                 (state.iterationCount ? "" : " infinite"),
+         // Individual iterations are represented by setting the size of the
+         // repeating linear-gradient.
+         "style": `left:${x}%;
+                   width:${iterationW}%;
+-                  background-size:${100 / (count || 1)}% 100%;`
++                  background-size:${100 / (state.iterationCount || 1)}% 100%;`
+       }
+     });
+ 
+     // The animation name is displayed over the iterations.
+     // Note that in case of negative delay, we push the name towards the right
+     // so the delay can be shown.
+-    let negativeDelayW = delay < 0 ? delayW : 0;
+     createNode({
+       parent: iterations,
+       attributes: {
+         "class": "name",
+         "title": this.getTooltipText(state),
+         // Make space for the negative delay with a margin-left.
+         "style": `margin-left:${negativeDelayW}%`
+       },
+       textContent: state.name
+     });
+ 
+     // Delay.
+-    if (delay) {
++    if (state.delay) {
+       // Negative delays need to start at 0.
+-      let delayX = TimeScale.durationToDistance((delay < 0 ? 0 : delay) / rate);
+       createNode({
+         parent: iterations,
+         attributes: {
+-          "class": "delay" + (delay < 0 ? " negative" : ""),
++          "class": "delay" + (state.delay < 0 ? " negative" : ""),
+           "style": `left:-${delayX}%;
+                     width:${delayW}%;`
+         }
+       });
+     }
+   },
+ 
+   getTooltipText: function(state) {
+     let getTime = time => L10N.getFormatStr("player.timeLabel",
+                             L10N.numberWithDecimals(time / 1000, 2));
+ 
+     let text = "";
+ 
+-    // Adding the name (the type isn't always available, older servers don't
+-    // send it).
+-    text +=
+-      state.type
+-      ? L10N.getFormatStr("timeline." + state.type + ".nameLabel", state.name)
+-      : state.name;
++    // Adding the name.
++    text += getFormattedAnimationTitle({state});
+     text += "\n";
+ 
+     // Adding the delay.
+     text += L10N.getStr("player.animationDelayLabel") + " ";
+     text += getTime(state.delay);
+     text += "\n";
+ 
+     // Adding the duration.
+@@ -1041,14 +1105,243 @@ AnimationTimeBlock.prototype = {
+     // needed.
+     if (state.isRunningOnCompositor) {
+       text += L10N.getStr("player.runningOnCompositorTooltip");
+     }
+ 
+     return text;
+   },
+ 
+-  onClick: function() {
++  onClick: function(e) {
++    e.stopPropagation();
+     this.emit("selected", this.animation);
+   }
+ };
+ 
++/**
++ * UI component responsible for displaying detailed information for a given
++ * animation.
++ * This includes information about timing, easing, keyframes, animated
++ * properties.
++ */
++function AnimationDetails() {
++  EventEmitter.decorate(this);
++
++  this.onFrameSelected = this.onFrameSelected.bind(this);
++
++  this.keyframeComponents = [];
++}
++
++exports.AnimationDetails = AnimationDetails;
++
++AnimationDetails.prototype = {
++  // These are part of frame objects but are not animated properties. This
++  // array is used to skip them.
++  NON_PROPERTIES: ["easing", "composite", "computedOffset", "offset"],
++
++  init: function(containerEl) {
++    this.containerEl = containerEl;
++  },
++
++  destroy: function() {
++    this.unrender();
++    this.containerEl = null;
++  },
++
++  unrender: function() {
++    for (let component of this.keyframeComponents) {
++      component.off("frame-selected", this.onFrameSelected);
++      component.destroy();
++    }
++    this.keyframeComponents = [];
++
++    while (this.containerEl.firstChild) {
++      this.containerEl.firstChild.remove();
++    }
++  },
++
++  /**
++   * Convert a list of frames into a list of tracks, one per animated property,
++   * each with a list of frames.
++   */
++  getTracksFromFrames: function(frames) {
++    let tracks = {};
++
++    for (let frame of frames) {
++      for (let name in frame) {
++        if (this.NON_PROPERTIES.indexOf(name) != -1) {
++          continue;
++        }
++
++        if (!tracks[name]) {
++          tracks[name] = [];
++        }
++
++        tracks[name].push({
++          value: frame[name],
++          offset: frame.computedOffset
++        });
++      }
++    }
++
++    return tracks;
++  },
++
++  render: Task.async(function*(animation) {
++    this.unrender();
++
++    if (!animation) {
++      return;
++    }
++    this.animation = animation;
++
++    let frames = yield animation.getFrames();
++
++    // We might have been destroyed in the meantime, or the component might
++    // have been re-rendered.
++    if (!this.containerEl || this.animation !== animation) {
++      return;
++    }
++    // Useful for tests to know when the keyframes have been retrieved.
++    this.emit("keyframes-retrieved");
++
++    // Build an element for each animated property track.
++    this.tracks = this.getTracksFromFrames(frames);
++    for (let propertyName in this.tracks) {
++      let line = createNode({
++        parent: this.containerEl,
++        attributes: {"class": "property"}
++      });
++
++      createNode({
++        // text-overflow doesn't work in flex items, so we need a second level
++        // of container to actually have an ellipsis on the name.
++        // See bug 972664.
++        parent: createNode({
++          parent: line,
++          attributes: {"class": "name"},
++        }),
++        textContent: getCssPropertyName(propertyName)
++      });
++
++      // Add the keyframes diagram for this property.
++      let framesWrapperEl = createNode({
++        parent: line,
++        attributes: {"class": "track-container"}
++      });
++
++      let framesEl = createNode({
++        parent: framesWrapperEl,
++        attributes: {"class": "frames"}
++      });
++
++      // Scale the list of keyframes according to the current time scale.
++      let {x, w} = TimeScale.getAnimationDimensions(animation);
++      framesEl.style.left = `${x}%`;
++      framesEl.style.width = `${w}%`;
++
++      let keyframesComponent = new Keyframes();
++      keyframesComponent.init(framesEl);
++      keyframesComponent.render({
++        keyframes: this.tracks[propertyName],
++        propertyName: propertyName,
++        animation: animation
++      });
++      keyframesComponent.on("frame-selected", this.onFrameSelected);
++
++      this.keyframeComponents.push(keyframesComponent);
++    }
++  }),
++
++  onFrameSelected: function(e, args) {
++    // Relay the event up, it's needed in parents too.
++    this.emit(e, args);
++  }
++};
++
++/**
++ * UI component responsible for displaying a list of keyframes.
++ */
++function Keyframes() {
++  EventEmitter.decorate(this);
++  this.onClick = this.onClick.bind(this);
++}
++
++exports.Keyframes = Keyframes;
++
++Keyframes.prototype = {
++  init: function(containerEl) {
++    this.containerEl = containerEl;
++
++    this.keyframesEl = createNode({
++      parent: this.containerEl,
++      attributes: {"class": "keyframes"}
++    });
++
++    this.containerEl.addEventListener("click", this.onClick);
++  },
++
++  destroy: function() {
++    this.containerEl.removeEventListener("click", this.onClick);
++    this.keyframesEl.remove();
++    this.containerEl = this.keyframesEl = this.animation = null;
++  },
++
++  render: function({keyframes, propertyName, animation}) {
++    this.keyframes = keyframes;
++    this.propertyName = propertyName;
++    this.animation = animation;
++
++    this.keyframesEl.classList.add(animation.state.type);
++    for (let frame of this.keyframes) {
++      createNode({
++        parent: this.keyframesEl,
++        attributes: {
++          "class": "frame",
++          "style": `left:${frame.offset * 100}%;`,
++          "data-offset": frame.offset,
++          "title": frame.value
++        }
++      });
++    }
++  },
++
++  onClick: function(e) {
++    // If the click happened on a frame, tell our parent about it.
++    if (!e.target.classList.contains("frame")) {
++      return;
++    }
++
++    e.stopPropagation();
++    this.emit("frame-selected", {
++      animation: this.animation,
++      propertyName: this.propertyName,
++      offset: parseFloat(e.target.dataset.offset),
++      value: e.target.getAttribute("title"),
++      x: e.target.offsetLeft + e.target.closest(".frames").offsetLeft
++    });
++  }
++};
++
+ let sortedUnique = arr => [...new Set(arr)].sort((a, b) => a > b);
++
++/**
++ * Get a formatted title for this animation. This will be either:
++ * "some-name", "some-name : CSS Transition", or "some-name : CSS Animation",
++ * depending if the server provides the type, and what type it is.
++ * @param {AnimationPlayerFront} animation
++ */
++function getFormattedAnimationTitle({state}) {
++  // Older servers don't send the type.
++  return state.type
++    ? L10N.getFormatStr("timeline." + state.type + ".nameLabel", state.name)
++    : state.name;
++}
++
++/**
++ * Turn propertyName into property-name.
++ * @param {String} jsPropertyName A camelcased CSS property name. Typically
++ * something that comes out of computed styles. E.g. borderBottomColor
++ * @return {String} The corresponding CSS property name: border-bottom-color
++ */
++function getCssPropertyName(jsPropertyName) {
++  return jsPropertyName.replace(/[A-Z]/g, "-$&").toLowerCase();
++}
+diff --git a/devtools/client/animationinspector/test/browser_animation_click_selects_animation.js b/devtools/client/animationinspector/test/browser_animation_click_selects_animation.js
+--- a/devtools/client/animationinspector/test/browser_animation_click_selects_animation.js
++++ b/devtools/client/animationinspector/test/browser_animation_click_selects_animation.js
+@@ -11,37 +11,45 @@ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_simple_animation.html");
+   let {panel} = yield openAnimationInspector();
+   let timeline = panel.animationsTimelineComponent;
+ 
+   let selected = timeline.rootWrapperEl.querySelectorAll(".animation.selected");
+   ok(!selected.length, "There are no animations selected by default");
+ 
+   info("Click on the first animation, expect the right event and right class");
+-  let animation0 = yield clickToSelect(timeline, 0);
++  let animation0 = yield clickToChangeSelection(timeline, 0);
+   is(animation0, timeline.animations[0],
+      "The selected event was emitted with the right animation");
+   ok(isTimeBlockSelected(timeline, 0),
+      "The time block has the right selected class");
+ 
+-  info("Click on the second animation, expect the first one to be unselected");
+-  let animation1 = yield clickToSelect(timeline, 1);
++  info("Click on the second animation, expect it to be selected too");
++  let animation1 = yield clickToChangeSelection(timeline, 1);
+   is(animation1, timeline.animations[1],
+      "The selected event was emitted with the right animation");
+   ok(isTimeBlockSelected(timeline, 1),
+      "The second time block has the right selected class");
++
++  info("Click again on the first animation and check if it unselects");
++  yield clickToChangeSelection(timeline, 0, true);
+   ok(!isTimeBlockSelected(timeline, 0),
+      "The first time block has been unselected");
+ });
+ 
+-function* clickToSelect(timeline, index) {
++function* clickToChangeSelection(timeline, index, isUnselect) {
+   info("Click on animation " + index + " in the timeline");
+-  let onSelected = timeline.once("selected");
++  let onSelectionChanged = timeline.once(isUnselect
++                                         ? "animation-unselected"
++                                         : "animation-selected");
+   let timeBlock = timeline.rootWrapperEl.querySelectorAll(".time-block")[index];
+   EventUtils.sendMouseEvent({type: "click"}, timeBlock,
+                             timeBlock.ownerDocument.defaultView);
+-  return yield onSelected;
++  return yield onSelectionChanged;
+ }
+ 
+ function isTimeBlockSelected(timeline, index) {
+   let animation = timeline.rootWrapperEl.querySelectorAll(".animation")[index];
+-  return animation.classList.contains("selected");
++  let animatedProperties = timeline.rootWrapperEl.querySelectorAll(
++    ".animated-properties")[index];
++  return animation.classList.contains("selected") &&
++         animatedProperties.classList.contains("selected");
+ }
+diff --git a/devtools/client/animationinspector/test/browser_animation_playerWidgets_appear_on_panel_init.js b/devtools/client/animationinspector/test/browser_animation_playerWidgets_appear_on_panel_init.js
+--- a/devtools/client/animationinspector/test/browser_animation_playerWidgets_appear_on_panel_init.js
++++ b/devtools/client/animationinspector/test/browser_animation_playerWidgets_appear_on_panel_init.js
+@@ -8,11 +8,10 @@
+ // initialized, if the selected node (<body> by default) is animated.
+ 
+ add_task(function*() {
+   yield addTab(TEST_URL_ROOT + "doc_body_animation.html");
+ 
+   let {panel} = yield openAnimationInspector();
+   is(panel.animationsTimelineComponent.animations.length, 1,
+     "One animation is handled by the timeline after init");
+-  is(panel.animationsTimelineComponent.animationsEl.childNodes.length, 1,
+-    "One animation is displayed after init");
++  assertAnimationsDisplayed(panel, 1, "One animation is displayed after init");
+ });
+diff --git a/devtools/client/animationinspector/test/head.js b/devtools/client/animationinspector/test/head.js
+--- a/devtools/client/animationinspector/test/head.js
++++ b/devtools/client/animationinspector/test/head.js
+@@ -15,47 +15,42 @@ const DevToolsUtils = require("devtools/
+ 
+ // All tests are asynchronous
+ waitForExplicitFinish();
+ 
+ const TEST_URL_ROOT = "http://example.com/browser/devtools/client/animationinspector/test/";
+ const ROOT_TEST_DIR = getRootDirectory(gTestPath);
+ const FRAME_SCRIPT_URL = ROOT_TEST_DIR + "doc_frame_script.js";
+ const COMMON_FRAME_SCRIPT_URL = "chrome://devtools/content/shared/frame-script-utils.js";
+-const NEW_UI_PREF = "devtools.inspector.animationInspectorV3";
+ const TAB_NAME = "animationinspector";
+ 
+ // Auto clean-up when a test ends
+ registerCleanupFunction(function*() {
+   yield closeAnimationInspector();
+ 
+   while (gBrowser.tabs.length > 1) {
+     gBrowser.removeCurrentTab();
+   }
+ });
+ 
+-// Make sure the new UI is off by default.
+-Services.prefs.setBoolPref(NEW_UI_PREF, false);
+-
+ // Uncomment this pref to dump all devtools emitted events to the console.
+ // Services.prefs.setBoolPref("devtools.dump.emit", true);
+ 
+ // Uncomment this pref to dump all devtools protocol traffic
+ // Services.prefs.setBoolPref("devtools.debugger.log", true);
+ 
+ // Set the testing flag on DevToolsUtils and reset it when the test ends
+ DevToolsUtils.testing = true;
+ registerCleanupFunction(() => DevToolsUtils.testing = false);
+ 
+ // Clean-up all prefs that might have been changed during a test run
+ // (safer here because if the test fails, then the pref is never reverted)
+ registerCleanupFunction(() => {
+   Services.prefs.clearUserPref("devtools.dump.emit");
+   Services.prefs.clearUserPref("devtools.debugger.log");
+-  Services.prefs.clearUserPref(NEW_UI_PREF);
+ });
+ 
+ /**
+  * Add a new test tab in the browser and load the given url.
+  * @param {String} url The url to be loaded in the new tab
+  * @return a promise that resolves to the tab object when the url is loaded
+  */
+ function addTab(url) {
+@@ -139,20 +134,21 @@ var selectNode = Task.async(function*(da
+ 
+ /**
+  * Check if there are the expected number of animations being displayed in the
+  * panel right now.
+  * @param {AnimationsPanel} panel
+  * @param {Number} nbAnimations The expected number of animations.
+  * @param {String} msg An optional string to be used as the assertion message.
+  */
+-function assertAnimationsDisplayed(panel, nbAnimations, msg="") {
++function assertAnimationsDisplayed(panel, nbAnimations, msg = "") {
+   msg = msg || `There are ${nbAnimations} animations in the panel`;
+-  is(panel.animationsTimelineComponent.animationsEl.childNodes.length,
+-     nbAnimations, msg);
++  is(panel.animationsTimelineComponent
++          .animationsEl
++          .querySelectorAll(".animation").length, nbAnimations, msg);
+ }
+ 
+ /**
+  * Takes an Inspector panel that was just created, and waits
+  * for a "inspector-updated" event as well as the animation inspector
+  * sidebar to be ready. Returns a promise once these are completed.
+  *
+  * @param {InspectorPanel} inspector
+diff --git a/devtools/client/themes/animationinspector.css b/devtools/client/themes/animationinspector.css
+--- a/devtools/client/themes/animationinspector.css
++++ b/devtools/client/themes/animationinspector.css
+@@ -10,20 +10,26 @@
+ 
+ .theme-light {
+   --even-animation-timeline-background-color: rgba(128,128,128,0.03);
+ }
+ 
+ :root {
+   /* How high should toolbars be */
+   --toolbar-height: 20px;
+-  /* How wide should the sidebar be */
+-  --timeline-sidebar-width: 150px;
++  /* How wide should the sidebar be (should be wide enough to contain long
++     property names like 'border-bottom-right-radius' without ellipsis) */
++  --timeline-sidebar-width: 200px;
+   /* How high should animations displayed in the timeline be */
+   --timeline-animation-height: 20px;
++  /* The size of a keyframe marker in the keyframes diagram */
++  --keyframes-marker-size: 10px;
++  /* The color of the time graduation borders. This should match the the color
++     devtools/client/animationinspector/utils.js */
++  --time-graduation-border-color: rgba(128, 136, 144, .5);
+ }
+ 
+ html {
+   height: 100%;
+ }
+ 
+ body {
+   margin: 0;
+@@ -161,31 +167,39 @@ body {
+   position: relative;
+   /* The timeline gets its background-image from a canvas element created in
+      /devtools/client/animationinspector/utils.js drawGraphElementBackground
+      thanks to document.mozSetImageElement("time-graduations", canvas)
+      This is done so that the background can be built dynamically from script */
+   background-image: -moz-element(#time-graduations);
+   background-repeat: repeat-y;
+   /* Make the background be 100% of the timeline area so that it resizes with
+-     it*/
+-  background-size: calc(100% - var(--timeline-sidebar-width)) 100%;
++     it and subtract the width of the sidebar and the buffer at the right of the
++     timeline */
++  background-size: calc(100% - var(--timeline-sidebar-width) - var(--keyframes-marker-size)) 100%;
+   background-position: var(--timeline-sidebar-width) 0;
+   display: flex;
+   flex-direction: column;
+ }
+ 
+-.animation-timeline .scrubber-wrapper {
++/* Useful for positioning animations or keyframes in the timeline */
++.animation-timeline .track-container {
+   position: absolute;
+   top: 0;
+-  bottom: 0;
+   left: var(--timeline-sidebar-width);
+-  right: 0;
++  /* Leave the width of a marker right of a track so the 100% markers can be
++     selected easily */
++  right: var(--keyframes-marker-size);
++  height: var(--timeline-animation-height);
++}
++
++.animation-timeline .scrubber-wrapper {
+   z-index: 1;
+   pointer-events: none;
++  height: 100%;
+ }
+ 
+ .animation-timeline .scrubber {
+   position: absolute;
+   height: 100%;
+   width: 0;
+   border-right: 1px solid red;
+   box-sizing: border-box;
+@@ -211,73 +225,63 @@ body {
+   /* Make it thick enough for easy dragging */
+   width: 6px;
+   right: -3px;
+   cursor: col-resize;
+   pointer-events: all;
+ }
+ 
+ .animation-timeline .time-header {
+-  margin-left: var(--timeline-sidebar-width);
+   min-height: var(--toolbar-height);
+-  overflow: hidden;
+-  position: relative;
+-  /* This is the same color as the time graduations in
+-     devtools/client/animationinspector/utils.js */
+-  border-bottom: 1px solid rgba(128, 136, 144, .5);
+   cursor: col-resize;
+   -moz-user-select: none;
+ }
+ 
+ .animation-timeline .time-header .time-tick {
+   position: absolute;
+   top: 3px;
+ }
+ 
+ .animation-timeline .animations {
+   width: 100%;
++  height: 100%;
+   overflow-y: auto;
+   overflow-x: hidden;
+-  margin: 0;
++  /* Leave some space for the header */
++  margin-top: var(--timeline-animation-height);
+   padding: 0;
+   list-style-type: none;
++  border-top: 1px solid var(--time-graduation-border-color);
+ }
+ 
+ /* Animation block widgets */
+ 
+ .animation-timeline .animation {
+-  padding: 2px 0;
++  margin: 2px 0;
+   height: var(--timeline-animation-height);
+   position: relative;
+ }
+ 
+-.animation-timeline .animation:nth-child(2n) {
++.animation-timeline .animation:nth-child(4n+1) {
+   background-color: var(--even-animation-timeline-background-color);
+ }
+ 
+-.animation-timeline .animation.selected {
+-  background-color: var(--theme-selection-background-semitransparent);
+-}
+-
+ .animation-timeline .animation .target {
+   width: var(--timeline-sidebar-width);
++  height: 100%;
+   overflow: hidden;
+-  height: 100%;
++  display: flex;
++  align-items: center;
+ }
+ 
+ .animation-timeline .animation-target {
+   background-color: transparent;
+ }
+ 
+ .animation-timeline .animation .time-block {
+-  position: absolute;
+-  top: 2px;
+-  left: var(--timeline-sidebar-width);
+-  right: 0;
+-  height: var(--timeline-animation-height);
+   cursor: pointer;
+ }
+ 
+ /* Animation iterations */
+ 
+ .animation-timeline .animation .iterations {
+   position: relative;
+   height: 100%;
+@@ -379,17 +383,17 @@ body {
+      a separation. */
+   border-width: 1px;
+ }
+ 
+ /* Animation target node gutter, contains a preview of the dom node */
+ 
+ .animation-target {
+   background-color: var(--theme-toolbar-background);
+-  padding: 1px 4px;
++  padding: 0 4px;
+   box-sizing: border-box;
+   overflow: hidden;
+   text-overflow: ellipsis;
+   white-space: nowrap;
+   cursor: pointer;
+ }
+ 
+ .animation-target .attribute-name {
+@@ -407,36 +411,104 @@ body {
+   filter: url(images/filters.svg#checked-icon-state);
+ }
+ 
+ .animation-target .node-highlighter:active,
+ .animation-target .node-highlighter.selected {
+   filter: url(images/filters.svg#checked-icon-state) brightness(0.9);
+ }
+ 
+-/* Animation title gutter, contains the name, duration, iteration */
++/* Inline keyframes info in the timeline */
+ 
+-.animation-title {
+-  background-color: var(--theme-toolbar-background);
+-  border-bottom: 1px solid var(--theme-splitter-color);
+-  padding: 1px 4px;
+-  word-wrap: break-word;
+-  overflow: auto;
++.animation-timeline .animated-properties:not(.selected) {
++  display: none;
+ }
+ 
+-.animation-title .meta-data {
+-  float: right;
++.animation-timeline .animated-properties {
++  background-color: var(--theme-selection-background-semitransparent);
+ }
+ 
+-.animation-title strong {
+-  margin: 0 .5em;
++.animation-timeline .animated-properties ul {
++  margin: 0;
++  padding: 0;
++  list-style-type: none;
+ }
+ 
+-.animation-title .meta-data .compositor-icon {
+-    display: none;
+-    background-image: url("images/animation-fast-track.svg");
+-    background-repeat: no-repeat;
+-    padding-left: 12px;
+-    /* Make sure the icon is positioned above the timeline range input so that
+-       its tooltip appears on hover */
+-    z-index: 1;
+-    position: relative;
++.animation-timeline .animated-properties .property {
++  height: var(--timeline-animation-height);
++  position: relative;
+ }
++
++.animation-timeline .animated-properties .property:nth-child(2n) {
++  background-color: var(--even-animation-timeline-background-color);
++}
++
++.animation-timeline .animated-properties .name {
++  width: var(--timeline-sidebar-width);
++  padding-right: var(--keyframes-marker-size);
++  box-sizing: border-box;
++  height: 100%;
++  color: var(--theme-body-color-alt);
++  white-space: nowrap;
++  display: flex;
++  justify-content: flex-end;
++  align-items: center;
++}
++
++.animation-timeline .animated-properties .name div {
++  overflow: hidden;
++  text-overflow: ellipsis;
++}
++
++.animation-timeline .animated-properties .frames {
++  /* The frames list is absolutely positioned and the left and width properties
++     are dynamically set from javascript to match the animation's startTime and
++     duration */
++  position: absolute;
++  top: 0;
++  height: 100%;
++  /* Using flexbox to vertically center the frames */
++  display: flex;
++  align-items: center;
++}
++
++/* Keyframes diagram, displayed below the timeline, inside the animation-details
++   element. */
++
++.keyframes {
++  /* Actual keyframe markers are positioned absolutely within this container and
++     their position is relative to its size (we know the offset of each frame
++     in percentage) */
++  position: relative;
++  width: 100%;
++  height: 0;
++}
++
++.keyframes.cssanimation {
++  background-color: var(--theme-contrast-background);
++}
++
++.keyframes.csstransition {
++  background-color: var(--theme-highlight-blue);
++}
++
++.keyframes .frame {
++  position: absolute;
++  top: 0;
++  width: 0;
++  height: 0;
++  background-color: inherit;
++  cursor: pointer;
++}
++
++.keyframes .frame::before {
++  content: "";
++  display: block;
++  transform:
++    translateX(calc(var(--keyframes-marker-size) * -.5))
++    /* The extra pixel on the Y axis is so that markers are centered on the
++       horizontal line in the keyframes diagram. */
++    translateY(calc(var(--keyframes-marker-size) * -.5 + 1px));
++  width: var(--keyframes-marker-size);
++  height: var(--keyframes-marker-size);
++  border-radius: 100%;
++  background-color: inherit;
++}
