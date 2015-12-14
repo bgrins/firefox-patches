@@ -1,0 +1,628 @@
+# vim: se ft=diff :
+# HG changeset patch
+# User Gabriel Luong <gabriel.luong@gmail.com>
+# Date 2015-12-09 11:28
+Bug 1231362 - Part 4: Upgrade CodeMirror mode to 5.9.0 r=bgrins
+
+diff --git a/devtools/client/sourceeditor/codemirror/mode/clike.js b/devtools/client/sourceeditor/codemirror/mode/clike.js
+--- a/devtools/client/sourceeditor/codemirror/mode/clike.js
++++ b/devtools/client/sourceeditor/codemirror/mode/clike.js
+@@ -20,38 +20,43 @@ CodeMirror.defineMode("clike", function(
+       builtin = parserConfig.builtin || {},
+       blockKeywords = parserConfig.blockKeywords || {},
+       defKeywords = parserConfig.defKeywords || {},
+       atoms = parserConfig.atoms || {},
+       hooks = parserConfig.hooks || {},
+       multiLineStrings = parserConfig.multiLineStrings,
+       indentStatements = parserConfig.indentStatements !== false,
+       indentSwitch = parserConfig.indentSwitch !== false,
+-      namespaceSeparator = parserConfig.namespaceSeparator;
+-  var isOperatorChar = /[+\-*&%=<>!?|\/]/;
++      namespaceSeparator = parserConfig.namespaceSeparator,
++      isPunctuationChar = parserConfig.isPunctuationChar || /[\[\]{}\(\),;\:\.]/,
++      numberStart = parserConfig.numberStart || /[\d\.]/,
++      number = parserConfig.number || /^(?:0x[a-f\d]+|0b[01]+|(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?)(u|ll?|l|f)?/i,
++      isOperatorChar = parserConfig.isOperatorChar || /[+\-*&%=<>!?|\/]/,
++      endStatement = parserConfig.endStatement || /^[;:,]$/;
+
+   var curPunc, isDefKeyword;
+
+   function tokenBase(stream, state) {
+     var ch = stream.next();
+     if (hooks[ch]) {
+       var result = hooks[ch](stream, state);
+       if (result !== false) return result;
+     }
+     if (ch == '"' || ch == "'") {
+       state.tokenize = tokenString(ch);
+       return state.tokenize(stream, state);
+     }
+-    if (/[\[\]{}\(\),;\:\.]/.test(ch)) {
++    if (isPunctuationChar.test(ch)) {
+       curPunc = ch;
+       return null;
+     }
+-    if (/\d/.test(ch)) {
+-      stream.eatWhile(/[\w\.]/);
+-      return "number";
++    if (numberStart.test(ch)) {
++      stream.backUp(1)
++      if (stream.match(number)) return "number"
++      stream.next()
+     }
+     if (ch == "/") {
+       if (stream.eat("*")) {
+         state.tokenize = tokenComment;
+         return tokenComment(stream, state);
+       }
+       if (stream.eat("/")) {
+         stream.skipToEnd();
+@@ -62,27 +67,27 @@ CodeMirror.defineMode("clike", function(
+       stream.eatWhile(isOperatorChar);
+       return "operator";
+     }
+     stream.eatWhile(/[\w\$_\xa1-\uffff]/);
+     if (namespaceSeparator) while (stream.match(namespaceSeparator))
+       stream.eatWhile(/[\w\$_\xa1-\uffff]/);
+
+     var cur = stream.current();
+-    if (keywords.propertyIsEnumerable(cur)) {
+-      if (blockKeywords.propertyIsEnumerable(cur)) curPunc = "newstatement";
+-      if (defKeywords.propertyIsEnumerable(cur)) isDefKeyword = true;
++    if (contains(keywords, cur)) {
++      if (contains(blockKeywords, cur)) curPunc = "newstatement";
++      if (contains(defKeywords, cur)) isDefKeyword = true;
+       return "keyword";
+     }
+-    if (types.propertyIsEnumerable(cur)) return "variable-3";
+-    if (builtin.propertyIsEnumerable(cur)) {
+-      if (blockKeywords.propertyIsEnumerable(cur)) curPunc = "newstatement";
++    if (contains(types, cur)) return "variable-3";
++    if (contains(builtin, cur)) {
++      if (contains(blockKeywords, cur)) curPunc = "newstatement";
+       return "builtin";
+     }
+-    if (atoms.propertyIsEnumerable(cur)) return "atom";
++    if (contains(atoms, cur)) return "atom";
+     return "variable";
+   }
+
+   function tokenString(quote) {
+     return function(stream, state) {
+       var escaped = false, next, end = false;
+       while ((next = stream.next()) != null) {
+         if (next == quote && !escaped) {end = true; break;}
+@@ -163,18 +168,17 @@ CodeMirror.defineMode("clike", function(
+         state.startOfLine = true;
+       }
+       if (stream.eatSpace()) return null;
+       curPunc = isDefKeyword = null;
+       var style = (state.tokenize || tokenBase)(stream, state);
+       if (style == "comment" || style == "meta") return style;
+       if (ctx.align == null) ctx.align = true;
+
+-      if ((curPunc == ";" || curPunc == ":" || curPunc == ","))
+-        while (isStatement(state.context.type)) popContext(state);
++      if (endStatement.test(curPunc)) while (isStatement(state.context.type)) popContext(state);
+       else if (curPunc == "{") pushContext(state, stream.column(), "}");
+       else if (curPunc == "[") pushContext(state, stream.column(), "]");
+       else if (curPunc == "(") pushContext(state, stream.column(), ")");
+       else if (curPunc == "}") {
+         while (isStatement(ctx.type)) ctx = popContext(state);
+         if (ctx.type == "}") ctx = popContext(state);
+         while (isStatement(ctx.type)) ctx = popContext(state);
+       }
+@@ -207,18 +211,26 @@ CodeMirror.defineMode("clike", function(
+       state.prevToken = isDefKeyword ? "def" : style || curPunc;
+       return style;
+     },
+
+     indent: function(state, textAfter) {
+       if (state.tokenize != tokenBase && state.tokenize != null) return CodeMirror.Pass;
+       var ctx = state.context, firstChar = textAfter && textAfter.charAt(0);
+       if (isStatement(ctx.type) && firstChar == "}") ctx = ctx.prev;
++      if (hooks.indent) {
++        var hook = hooks.indent(state, ctx, textAfter);
++        if (typeof hook == "number") return hook
++      }
+       var closing = firstChar == ctx.type;
+       var switchBlock = ctx.prev && ctx.prev.type == "switchstatement";
++      if (parserConfig.allmanIndentation && /[{(]/.test(firstChar)) {
++        while (ctx.type != "top" && ctx.type != "}") ctx = ctx.prev
++        return ctx.indented
++      }
+       if (isStatement(ctx.type))
+         return ctx.indented + (firstChar == "{" ? 0 : statementIndentUnit);
+       if (ctx.align && (!dontAlignCalls || ctx.type != ")"))
+         return ctx.column + (closing ? 0 : 1);
+       if (ctx.type == ")" && !closing)
+         return ctx.indented + statementIndentUnit;
+
+       return ctx.indented + (closing ? 0 : indentUnit) +
+@@ -233,19 +245,25 @@ CodeMirror.defineMode("clike", function(
+   };
+ });
+
+   function words(str) {
+     var obj = {}, words = str.split(" ");
+     for (var i = 0; i < words.length; ++i) obj[words[i]] = true;
+     return obj;
+   }
++  function contains(words, word) {
++    if (typeof words === "function") {
++      return words(word);
++    } else {
++      return words.propertyIsEnumerable(word);
++    }
++  }
+   var cKeywords = "auto if break case register continue return default do sizeof " +
+-    "static else struct switch extern typedef float union for " +
+-    "goto while enum const volatile";
++    "static else struct switch extern typedef union for goto while enum const volatile";
+   var cTypes = "int long char short double float unsigned signed void size_t ptrdiff_t";
+
+   function cppHook(stream, state) {
+     if (!state.startOfLine) return false;
+     for (;;) {
+       if (stream.skipTo("\\")) {
+         stream.next();
+         if (stream.eol()) {
+@@ -408,16 +426,17 @@ CodeMirror.defineMode("clike", function(
+                     "return static strictfp super switch synchronized this throw throws transient " +
+                     "try volatile while"),
+     types: words("byte short int long float double boolean char void Boolean Byte Character Double Float " +
+                  "Integer Long Number Object Short String StringBuffer StringBuilder Void"),
+     blockKeywords: words("catch class do else finally for if switch try while"),
+     defKeywords: words("class interface package enum"),
+     typeFirstDefinitions: true,
+     atoms: words("true false null"),
++    endStatement: /^[;:]$/,
+     hooks: {
+       "@": function(stream) {
+         stream.eatWhile(/[\w\$_]/);
+         return "meta";
+       }
+     },
+     modeProps: {fold: ["brace", "import"]}
+   });
+@@ -463,17 +482,17 @@ CodeMirror.defineMode("clike", function(
+     return "string";
+   }
+
+   def("text/x-scala", {
+     name: "clike",
+     keywords: words(
+
+       /* scala */
+-      "abstract case catch class def do else extends false final finally for forSome if " +
++      "abstract case catch class def do else extends final finally for forSome if " +
+       "implicit import lazy match new null object override package private protected return " +
+       "sealed super this throw trait try type val var while with yield _ : = => <- <: " +
+       "<% >: # @ " +
+
+       /* package scala */
+       "assert assume require print println printf readLine readBoolean readByte readShort " +
+       "readChar readInt readLong readFloat readDouble " +
+
+@@ -511,16 +530,69 @@ CodeMirror.defineMode("clike", function(
+       "'": function(stream) {
+         stream.eatWhile(/[\w\$_\xa1-\uffff]/);
+         return "atom";
+       }
+     },
+     modeProps: {closeBrackets: {triples: '"'}}
+   });
+
++  function tokenKotlinString(tripleString){
++    return function (stream, state) {
++      var escaped = false, next, end = false;
++      while (!stream.eol()) {
++        if (!tripleString && !escaped && stream.match('"') ) {end = true; break;}
++        if (tripleString && stream.match('"""')) {end = true; break;}
++        next = stream.next();
++        if(!escaped && next == "$" && stream.match('{'))
++          stream.skipTo("}");
++        escaped = !escaped && next == "\\" && !tripleString;
++      }
++      if (end || !tripleString)
++        state.tokenize = null;
++      return "string";
++    }
++  }
++
++  def("text/x-kotlin", {
++    name: "clike",
++    keywords: words(
++      /*keywords*/
++      "package as typealias class interface this super val " +
++      "var fun for is in This throw return " +
++      "break continue object if else while do try when !in !is as? " +
++
++      /*soft keywords*/
++      "file import where by get set abstract enum open inner override private public internal " +
++      "protected catch finally out final vararg reified dynamic companion constructor init " +
++      "sealed field property receiver param sparam lateinit data inline noinline tailrec " +
++      "external annotation crossinline const operator infix"
++    ),
++    types: words(
++      /* package java.lang */
++      "Boolean Byte Character CharSequence Class ClassLoader Cloneable Comparable " +
++      "Compiler Double Exception Float Integer Long Math Number Object Package Pair Process " +
++      "Runtime Runnable SecurityManager Short StackTraceElement StrictMath String " +
++      "StringBuffer System Thread ThreadGroup ThreadLocal Throwable Triple Void"
++    ),
++    intendSwitch: false,
++    indentStatements: false,
++    multiLineStrings: true,
++    blockKeywords: words("catch class do else finally for if where try while enum"),
++    defKeywords: words("class val var object package interface fun"),
++    atoms: words("true false null this"),
++    hooks: {
++      '"': function(stream, state) {
++        state.tokenize = tokenKotlinString(stream.match('""'));
++        return state.tokenize(stream, state);
++      }
++    },
++    modeProps: {closeBrackets: {triples: '"'}}
++  });
++
+   def(["x-shader/x-vertex", "x-shader/x-fragment"], {
+     name: "clike",
+     keywords: words("sampler1D sampler2D sampler3D samplerCube " +
+                     "sampler1DShadow sampler2DShadow " +
+                     "const attribute uniform varying " +
+                     "break continue discard return " +
+                     "for while do if else struct " +
+                     "in out inout"),
+@@ -593,17 +665,20 @@ CodeMirror.defineMode("clike", function(
+                     "inout nil oneway out Protocol SEL self super atomic nonatomic retain copy readwrite readonly"),
+     types: words(cTypes),
+     atoms: words("YES NO NULL NILL ON OFF true false"),
+     hooks: {
+       "@": function(stream) {
+         stream.eatWhile(/[\w\$]/);
+         return "keyword";
+       },
+-      "#": cppHook
++      "#": cppHook,
++      indent: function(_state, ctx, textAfter) {
++        if (ctx.type == "statement" && /^@\w/.test(textAfter)) return ctx.indented
++      }
+     },
+     modeProps: {fold: "brace"}
+   });
+
+   def("text/x-squirrel", {
+     name: "clike",
+     keywords: words("base break clone continue const default delete enum extends function in class" +
+                     " foreach local resume return this throw typeof yield constructor instanceof static"),
+@@ -611,9 +686,90 @@ CodeMirror.defineMode("clike", function(
+     blockKeywords: words("case catch class else for foreach if switch try while"),
+     defKeywords: words("function local class"),
+     typeFirstDefinitions: true,
+     atoms: words("true false null"),
+     hooks: {"#": cppHook},
+     modeProps: {fold: ["brace", "include"]}
+   });
+
++  // Ceylon Strings need to deal with interpolation
++  var stringTokenizer = null;
++  function tokenCeylonString(type) {
++    return function(stream, state) {
++      var escaped = false, next, end = false;
++      while (!stream.eol()) {
++        if (!escaped && stream.match('"') &&
++              (type == "single" || stream.match('""'))) {
++          end = true;
++          break;
++        }
++        if (!escaped && stream.match('``')) {
++          stringTokenizer = tokenCeylonString(type);
++          end = true;
++          break;
++        }
++        next = stream.next();
++        escaped = type == "single" && !escaped && next == "\\";
++      }
++      if (end)
++          state.tokenize = null;
++      return "string";
++    }
++  }
++
++  def("text/x-ceylon", {
++    name: "clike",
++    keywords: words("abstracts alias assembly assert assign break case catch class continue dynamic else" +
++                    " exists extends finally for function given if import in interface is let module new" +
++                    " nonempty object of out outer package return satisfies super switch then this throw" +
++                    " try value void while"),
++    types: function(word) {
++        // In Ceylon all identifiers that start with an uppercase are types
++        var first = word.charAt(0);
++        return (first === first.toUpperCase() && first !== first.toLowerCase());
++    },
++    blockKeywords: words("case catch class dynamic else finally for function if interface module new object switch try while"),
++    defKeywords: words("class dynamic function interface module object package value"),
++    builtin: words("abstract actual aliased annotation by default deprecated doc final formal late license" +
++                   " native optional sealed see serializable shared suppressWarnings tagged throws variable"),
++    isPunctuationChar: /[\[\]{}\(\),;\:\.`]/,
++    isOperatorChar: /[+\-*&%=<>!?|^~:\/]/,
++    numberStart: /[\d#$]/,
++    number: /^(?:#[\da-fA-F_]+|\$[01_]+|[\d_]+[kMGTPmunpf]?|[\d_]+\.[\d_]+(?:[eE][-+]?\d+|[kMGTPmunpf]|)|)/i,
++    multiLineStrings: true,
++    typeFirstDefinitions: true,
++    atoms: words("true false null larger smaller equal empty finished"),
++    indentSwitch: false,
++    styleDefs: false,
++    hooks: {
++      "@": function(stream) {
++        stream.eatWhile(/[\w\$_]/);
++        return "meta";
++      },
++      '"': function(stream, state) {
++          state.tokenize = tokenCeylonString(stream.match('""') ? "triple" : "single");
++          return state.tokenize(stream, state);
++        },
++      '`': function(stream, state) {
++          if (!stringTokenizer || !stream.match('`')) return false;
++          state.tokenize = stringTokenizer;
++          stringTokenizer = null;
++          return state.tokenize(stream, state);
++        },
++      "'": function(stream) {
++        stream.eatWhile(/[\w\$_\xa1-\uffff]/);
++        return "atom";
++      },
++      token: function(_stream, state, style) {
++          if ((style == "variable" || style == "variable-3") &&
++              state.prevToken == ".") {
++            return "variable-2";
++          }
++        }
++    },
++    modeProps: {
++        fold: ["brace", "import"],
++        closeBrackets: {triples: '"'}
++    }
++  });
++
+ });
+diff --git a/devtools/client/sourceeditor/codemirror/mode/css.js b/devtools/client/sourceeditor/codemirror/mode/css.js
+--- a/devtools/client/sourceeditor/codemirror/mode/css.js
++++ b/devtools/client/sourceeditor/codemirror/mode/css.js
+@@ -223,17 +223,17 @@ CodeMirror.defineMode("css", function(co
+   };
+
+   states.prop = function(type, stream, state) {
+     if (type == ";") return popContext(state);
+     if (type == "{" && allowNested) return pushContext(state, stream, "propBlock");
+     if (type == "}" || type == "{") return popAndPass(type, stream, state);
+     if (type == "(") return pushContext(state, stream, "parens");
+
+-    if (type == "hash" && !/^#([0-9a-fA-f]{3}|[0-9a-fA-f]{6})$/.test(stream.current())) {
++    if (type == "hash" && !/^#([0-9a-fA-f]{3,4}|[0-9a-fA-f]{6}|[0-9a-fA-f]{8})$/.test(stream.current())) {
+       override += " error";
+     } else if (type == "word") {
+       wordAsValue(stream);
+     } else if (type == "interpolation") {
+       return pushContext(state, stream, "interpolation");
+     }
+     return "prop";
+   };
+@@ -270,16 +270,18 @@ CodeMirror.defineMode("css", function(co
+     }
+   };
+
+   states.atBlock = function(type, stream, state) {
+     if (type == "(") return pushContext(state, stream, "atBlock_parens");
+     if (type == "}" || type == ";") return popAndPass(type, stream, state);
+     if (type == "{") return popContext(state) && pushContext(state, stream, allowNested ? "block" : "top");
+
++    if (type == "interpolation") return pushContext(state, stream, "interpolation");
++
+     if (type == "word") {
+       var word = stream.current().toLowerCase();
+       if (word == "only" || word == "not" || word == "and" || word == "or")
+         override = "keyword";
+       else if (mediaTypes.hasOwnProperty(word))
+         override = "attribute";
+       else if (mediaFeatures.hasOwnProperty(word))
+         override = "property";
+diff --git a/devtools/client/sourceeditor/codemirror/mode/javascript.js b/devtools/client/sourceeditor/codemirror/mode/javascript.js
+--- a/devtools/client/sourceeditor/codemirror/mode/javascript.js
++++ b/devtools/client/sourceeditor/codemirror/mode/javascript.js
+@@ -25,24 +25,24 @@ CodeMirror.defineMode("javascript", func
+
+   var keywords = function(){
+     function kw(type) {return {type: type, style: "keyword"};}
+     var A = kw("keyword a"), B = kw("keyword b"), C = kw("keyword c");
+     var operator = kw("operator"), atom = {type: "atom", style: "atom"};
+
+     var jsKeywords = {
+       "if": kw("if"), "while": A, "with": A, "else": B, "do": B, "try": B, "finally": B,
+-      "return": C, "break": C, "continue": C, "new": C, "delete": C, "throw": C, "debugger": C,
++      "return": C, "break": C, "continue": C, "new": kw("new"), "delete": C, "throw": C, "debugger": C,
+       "var": kw("var"), "const": kw("var"), "let": kw("var"),
+-      "async": kw("async"), "function": kw("function"), "catch": kw("catch"),
++      "function": kw("function"), "catch": kw("catch"),
+       "for": kw("for"), "switch": kw("switch"), "case": kw("case"), "default": kw("default"),
+       "in": operator, "typeof": operator, "instanceof": operator,
+       "true": atom, "false": atom, "null": atom, "undefined": atom, "NaN": atom, "Infinity": atom,
+       "this": kw("this"), "class": kw("class"), "super": kw("atom"),
+-      "await": C, "yield": C, "export": kw("export"), "import": kw("import"), "extends": C
++      "yield": C, "export": kw("export"), "import": kw("import"), "extends": C
+     };
+
+     // Extend the 'normal' keywords with the TypeScript language extensions
+     if (isTS) {
+       var type = {type: "variable", style: "variable-3"};
+       var tsKeywords = {
+         // object-like things
+         "interface": kw("interface"),
+@@ -51,17 +51,17 @@ CodeMirror.defineMode("javascript", func
+
+         // scope modifiers
+         "public": kw("public"),
+         "private": kw("private"),
+         "protected": kw("protected"),
+         "static": kw("static"),
+
+         // types
+-        "string": type, "number": type, "bool": type, "any": type
++        "string": type, "number": type, "boolean": type, "any": type
+       };
+
+       for (var attr in tsKeywords) {
+         jsKeywords[attr] = tsKeywords[attr];
+       }
+     }
+
+     return jsKeywords;
+@@ -116,18 +116,17 @@ CodeMirror.defineMode("javascript", func
+       return ret("number", "number");
+     } else if (ch == "/") {
+       if (stream.eat("*")) {
+         state.tokenize = tokenComment;
+         return tokenComment(stream, state);
+       } else if (stream.eat("/")) {
+         stream.skipToEnd();
+         return ret("comment", "comment");
+-      } else if (state.lastType == "operator" || state.lastType == "keyword c" ||
+-               state.lastType == "sof" || /^[\[{}\(,;:]$/.test(state.lastType)) {
++      } else if (/^(?:operator|sof|keyword c|case|new|[\[{}\(,;:])$/.test(state.lastType)) {
+         readRegexp(stream);
+         stream.match(/^\b(([gimyu])(?![gimyu]*\2))+\b/);
+         return ret("regexp", "string-2");
+       } else {
+         stream.eatWhile(isOperatorChar);
+         return ret("operator", "operator", stream.current());
+       }
+     } else if (ch == "`") {
+@@ -276,18 +275,18 @@ CodeMirror.defineMode("javascript", func
+   }
+   function register(varname) {
+     function inList(list) {
+       for (var v = list; v; v = v.next)
+         if (v.name == varname) return true;
+       return false;
+     }
+     var state = cx.state;
++    cx.marked = "def";
+     if (state.context) {
+-      cx.marked = "def";
+       if (inList(state.localVars)) return;
+       state.localVars = {name: varname, next: state.localVars};
+     } else {
+       if (inList(state.globalVars)) return;
+       if (parserConfig.globalVars)
+         state.globalVars = {name: varname, next: state.globalVars};
+     }
+   }
+@@ -368,24 +367,24 @@ CodeMirror.defineMode("javascript", func
+     if (cx.state.fatArrowAt == cx.stream.start) {
+       var body = noComma ? arrowBodyNoComma : arrowBody;
+       if (type == "(") return cont(pushcontext, pushlex(")"), commasep(pattern, ")"), poplex, expect("=>"), body, popcontext);
+       else if (type == "variable") return pass(pushcontext, pattern, expect("=>"), body, popcontext);
+     }
+
+     var maybeop = noComma ? maybeoperatorNoComma : maybeoperatorComma;
+     if (atomicTypes.hasOwnProperty(type)) return cont(maybeop);
+-    if (type == "async") return cont(expression);
+     if (type == "function") return cont(functiondef, maybeop);
+     if (type == "keyword c") return cont(noComma ? maybeexpressionNoComma : maybeexpression);
+     if (type == "(") return cont(pushlex(")"), maybeexpression, comprehension, expect(")"), poplex, maybeop);
+     if (type == "operator" || type == "spread") return cont(noComma ? expressionNoComma : expression);
+     if (type == "[") return cont(pushlex("]"), arrayLiteral, poplex, maybeop);
+     if (type == "{") return contCommasep(objprop, "}", null, maybeop);
+-    if (type == "quasi") { return pass(quasi, maybeop); }
++    if (type == "quasi") return pass(quasi, maybeop);
++    if (type == "new") return cont(maybeTarget(noComma));
+     return cont();
+   }
+   function maybeexpression(type) {
+     if (type.match(/[;\}\)\],]/)) return pass();
+     return pass(expression);
+   }
+   function maybeexpressionNoComma(type) {
+     if (type.match(/[;\}\)\],]/)) return pass();
+@@ -426,37 +425,49 @@ CodeMirror.defineMode("javascript", func
+   function arrowBody(type) {
+     findFatArrow(cx.stream, cx.state);
+     return pass(type == "{" ? statement : expression);
+   }
+   function arrowBodyNoComma(type) {
+     findFatArrow(cx.stream, cx.state);
+     return pass(type == "{" ? statement : expressionNoComma);
+   }
++  function maybeTarget(noComma) {
++    return function(type) {
++      if (type == ".") return cont(noComma ? targetNoComma : target);
++      else return pass(noComma ? expressionNoComma : expression);
++    };
++  }
++  function target(_, value) {
++    if (value == "target") { cx.marked = "keyword"; return cont(maybeoperatorComma); }
++  }
++  function targetNoComma(_, value) {
++    if (value == "target") { cx.marked = "keyword"; return cont(maybeoperatorNoComma); }
++  }
+   function maybelabel(type) {
+     if (type == ":") return cont(poplex, statement);
+     return pass(maybeoperatorComma, expect(";"), poplex);
+   }
+   function property(type) {
+     if (type == "variable") {cx.marked = "property"; return cont();}
+   }
+   function objprop(type, value) {
+-    if (type == "async") {
+-      return cont(objprop);
+-    } else if (type == "variable" || cx.style == "keyword") {
++    if (type == "variable" || cx.style == "keyword") {
+       cx.marked = "property";
+       if (value == "get" || value == "set") return cont(getterSetter);
+       return cont(afterprop);
+     } else if (type == "number" || type == "string") {
+       cx.marked = jsonldMode ? "property" : (cx.style + " property");
+       return cont(afterprop);
+     } else if (type == "jsonld-keyword") {
+       return cont(afterprop);
+     } else if (type == "[") {
+       return cont(expression, expect("]"), afterprop);
++    } else if (type == "spread") {
++      return cont(expression);
+     }
+   }
+   function getterSetter(type) {
+     if (type != "variable") return pass(afterprop);
+     cx.marked = "property";
+     return cont(functiondef);
+   }
+   function afterprop(type) {
+@@ -496,25 +507,27 @@ CodeMirror.defineMode("javascript", func
+   function typedef(type) {
+     if (type == "variable") {cx.marked = "variable-3"; return cont();}
+   }
+   function vardef() {
+     return pass(pattern, maybetype, maybeAssign, vardefCont);
+   }
+   function pattern(type, value) {
+     if (type == "variable") { register(value); return cont(); }
++    if (type == "spread") return cont(pattern);
+     if (type == "[") return contCommasep(pattern, "]");
+     if (type == "{") return contCommasep(proppattern, "}");
+   }
+   function proppattern(type, value) {
+     if (type == "variable" && !cx.stream.match(/^\s*:/, false)) {
+       register(value);
+       return cont(maybeAssign);
+     }
+     if (type == "variable") cx.marked = "property";
++    if (type == "spread") return cont(pattern);
+     return cont(expect(":"), pattern, maybeAssign);
+   }
+   function maybeAssign(_type, value) {
+     if (value == "=") return cont(expressionNoComma);
+   }
+   function vardefCont(type) {
+     if (type == ",") return cont(vardef);
+   }
