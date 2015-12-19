@@ -1,0 +1,199 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  ac00b0996a772cc017d2fef28b28c769507fe7b2
+Bug XXX: Make theme switching faster to prevent flash of unstyled content
+
+diff --git a/devtools/client/framework/test/browser_toolbox_theme_registration.js b/devtools/client/framework/test/browser_toolbox_theme_registration.js
+--- a/devtools/client/framework/test/browser_toolbox_theme_registration.js
++++ b/devtools/client/framework/test/browser_toolbox_theme_registration.js
+@@ -5,17 +5,17 @@
+ // Test for dynamically registering and unregistering themes
+ const CHROME_URL = "chrome://mochitests/content/browser/devtools/client/framework/test/";
+ 
+ var toolbox;
+ 
+ add_task(function* themeRegistration() {
+   let tab = yield addTab("data:text/html,test");
+   let target = TargetFactory.forTab(tab);
+-  toolbox = yield gDevTools.showToolbox(target);
++  toolbox = yield gDevTools.showToolbox(target, "options");
+ 
+   let themeId = yield new Promise(resolve => {
+     gDevTools.once("theme-registered", (e, themeId) => {
+       resolve(themeId);
+     });
+ 
+     gDevTools.registerTheme({
+       id: "test-theme",
+@@ -46,26 +46,33 @@ add_task(function* themeInOptionsPanel()
+ 
+   let color = panelWin.getComputedStyle(testThemeOption).color;
+   isnot(color, "rgb(255, 0, 0)", "style unapplied");
+ 
+   // Select test theme.
+   testThemeOption.click();
+ 
+   info("Waiting for theme to finish loading");
+-  yield once(panelWin, "theme-switch-complete");
++  yield once(gDevTools, "theme-switched");
+ 
+   color = panelWin.getComputedStyle(testThemeOption).color;
+   is(color, "rgb(255, 0, 0)", "style applied");
+ 
++  setTimeout(() => {
++  color = panelWin.getComputedStyle(testThemeOption).color;
++  is(color, "rgb(255, 0, 0)", "style applied");
++
++  }, 0);
++
++yield new Promise(_=>_);
+   // Select light theme
+   lightThemeOption.click();
+ 
+   info("Waiting for theme to finish loading");
+-  yield once(panelWin, "theme-switch-complete");
++  yield once(gDevTools, "theme-switched");
+ 
+   color = panelWin.getComputedStyle(testThemeOption).color;
+   isnot(color, "rgb(255, 0, 0)", "style unapplied");
+ 
+   // Select test theme again.
+   testThemeOption.click();
+ });
+ 
+diff --git a/devtools/client/shared/theme-switching.js b/devtools/client/shared/theme-switching.js
+--- a/devtools/client/shared/theme-switching.js
++++ b/devtools/client/shared/theme-switching.js
+@@ -25,60 +25,44 @@
+    *  - styleSheet: DOMNode
+    *  - loadPromise: Promise that resolves once the sheets loads or errors
+    */
+   function appendStyleSheet(url) {
+     let styleSheetAttr = `href="${url}" type="text/css"`;
+     let styleSheet = document.createProcessingInstruction(
+       "xml-stylesheet", styleSheetAttr);
+     let loadPromise = new Promise((resolve, reject) => {
+-      function onload() {
++      function onload(e) {
+         styleSheet.removeEventListener("load", onload);
+-        styleSheet.removeEventListener("error", onerror);
+-        resolve();
+-      }
+-      function onerror() {
+-        styleSheet.removeEventListener("load", onload);
+-        styleSheet.removeEventListener("error", onerror);
+-        reject("Failed to load theme file " + url);
++        styleSheet.removeEventListener("error", onload);
++        console.log("RECEIVED EVENT!!", e.type);
++        if (e.type === "load") {
++          resolve();
++        } else {
++          reject("Failed to load theme file " + url);
++        }
+       }
+ 
+       styleSheet.addEventListener("load", onload);
+-      styleSheet.addEventListener("error", onerror);
++      styleSheet.addEventListener("error", onload);
+     });
+     document.insertBefore(styleSheet, documentElement);
+     return {styleSheet, loadPromise};
+   }
+ 
+   /*
+-   * Notify the window that a theme switch finished so tests can check the DOM
+-   */
+-  function notifyWindow() {
+-    window.dispatchEvent(new CustomEvent("theme-switch-complete", {}));
+-  }
+-
+-  /*
+    * Apply all the sheets from `newTheme` and remove all of the sheets
+    * from `oldTheme`
+    */
+   function switchTheme(newTheme, oldTheme) {
+     if (newTheme === oldTheme) {
+       return;
+     }
+ 
+     let oldThemeDef = gDevTools.getThemeDefinition(oldTheme);
+-
+-    // Unload all theme stylesheets related to the old theme.
+-    if (oldThemeDef) {
+-      for (let sheet of devtoolsStyleSheets.get(oldThemeDef) || []) {
+-        sheet.remove();
+-      }
+-    }
+-
+-    // Load all stylesheets associated with the new theme.
+     let newThemeDef = gDevTools.getThemeDefinition(newTheme);
+ 
+     // The theme might not be available anymore (e.g. uninstalled)
+     // Use the default one.
+     if (!newThemeDef) {
+       newThemeDef = gDevTools.getThemeDefinition("light");
+     }
+ 
+@@ -105,38 +89,46 @@
+       if (newTheme == "dark") {
+         StylesheetUtils.loadSheet(window, SCROLLBARS_URL, "agent");
+       } else if (oldTheme == "dark") {
+         StylesheetUtils.removeSheet(window, SCROLLBARS_URL, "agent");
+       }
+       forceStyle();
+     }
+ 
+-    if (oldThemeDef) {
+-      for (let name of oldThemeDef.classList) {
+-        documentElement.classList.remove(name);
++    Promise.all(loadEvents).then(() => {
++
++      // Unload all theme stylesheets related to the old theme.
++      if (oldThemeDef) {
++        for (let name of oldThemeDef.classList) {
++          documentElement.classList.remove(name);
++        }
++
++        for (let sheet of devtoolsStyleSheets.get(oldThemeDef) || []) {
++          sheet.remove();
++        }
++
++        if (oldThemeDef.onUnapply) {
++          oldThemeDef.onUnapply(window, newTheme);
++        }
+       }
+ 
+-      if (oldThemeDef.onUnapply) {
+-        oldThemeDef.onUnapply(window, newTheme);
++      for (let name of newThemeDef.classList) {
++        documentElement.classList.add(name);
+       }
+-    }
+ 
+-    for (let name of newThemeDef.classList) {
+-      documentElement.classList.add(name);
+-    }
++      if (newThemeDef.onApply) {
++        newThemeDef.onApply(window, oldTheme);
++      }
+ 
+-    if (newThemeDef.onApply) {
+-      newThemeDef.onApply(window, oldTheme);
+-    }
++      console.log("Emitting ", newTheme, oldTheme);
+ 
+-    // Final notification for further theme-switching related logic.
+-    gDevTools.emit("theme-switched", window, newTheme, oldTheme);
+-
+-    Promise.all(loadEvents).then(notifyWindow, console.error.bind(console));
++      // Final notification for further theme-switching related logic.
++      gDevTools.emit("theme-switched", window, newTheme, oldTheme);
++    }, console.error.bind(console));
+   }
+ 
+   function handlePrefChange(event, data) {
+     if (data.pref == "devtools.theme") {
+       switchTheme(data.newValue, data.oldValue);
+     }
+   }
+ 
