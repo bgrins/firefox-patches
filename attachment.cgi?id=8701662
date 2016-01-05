@@ -1,0 +1,1921 @@
+commit ac33a248fea623eed0dd2348c46dcb7f1550c426
+Author: James Long <longster@gmail.com>
+Date:   Wed Dec 23 20:58:20 2015 -0500
+
+    Bug 1132501 - attach the thread on toolbox open instead of waiting for the debugger to initialize
+
+diff --git a/b2g/chrome/content/desktop.js b/b2g/chrome/content/desktop.js
+--- a/b2g/chrome/content/desktop.js
++++ b/b2g/chrome/content/desktop.js
+@@ -162,17 +162,17 @@ function initResponsiveDesign() {
+ function openDevtools() {
+   // Open devtool panel while maximizing its size according to screen size
+   Services.prefs.setIntPref('devtools.toolbox.sidebar.width',
+                             browserWindow.outerWidth - 550);
+   Services.prefs.setCharPref('devtools.toolbox.host', 'side');
+   let {gDevTools} = Cu.import('resource://devtools/client/framework/gDevTools.jsm', {});
+   let {devtools} = Cu.import("resource://devtools/shared/Loader.jsm", {});
+   let target = devtools.TargetFactory.forTab(browserWindow.gBrowser.selectedTab);
+-  gDevTools.showToolbox(target);
++  gDevTools.showToolbox(target, null, null, null, false);
+ }
+ 
+ window.addEventListener('ContentStart', function() {
+   // On Firefox Mulet, touch events are enabled within the responsive mode
+   if (!isMulet) {
+     enableTouch();
+   }
+   if (Services.prefs.getBoolPref('b2g.software-buttons')) {
+diff --git a/devtools/client/debugger/content/reducers/sources.js b/devtools/client/debugger/content/reducers/sources.js
+--- a/devtools/client/debugger/content/reducers/sources.js
++++ b/devtools/client/debugger/content/reducers/sources.js
+@@ -15,16 +15,33 @@ const initialState = Immutable({
+ });
+ 
+ function update(state = initialState, action, emitChange) {
+   switch(action.type) {
+   case constants.ADD_SOURCE:
+     emitChange('source', action.source);
+     return mergeIn(state, ['sources', action.source.actor], action.source);
+ 
++  case constants.LOAD_SOURCES:
++    if (action.status === "done") {
++      const sources = action.value;
++      if (!sources) {
++        return state;
++      }
++      const sourcesByActor = {};
++      sources.forEach(source => {
++        if (!state.sources[source.actor]) {
++          emitChange('source', source);
++        }
++        sourcesByActor[source.actor] = source;
++      });
++      return mergeIn(state, ['sources'], state.sources.merge(sourcesByActor))
++    }
++    break;
++
+   case constants.SELECT_SOURCE:
+     emitChange('source-selected', action.source);
+     return state.merge({
+       selectedSource: action.source.actor,
+       selectedSourceOpts: action.opts
+     });
+ 
+   case constants.LOAD_SOURCE_TEXT: {
+diff --git a/devtools/client/debugger/debugger-controller.js b/devtools/client/debugger/debugger-controller.js
+--- a/devtools/client/debugger/debugger-controller.js
++++ b/devtools/client/debugger/debugger-controller.js
+@@ -219,17 +219,17 @@ var DebuggerController = {
+    * @return object
+    *         A promise that is resolved when the debugger finishes startup.
+    */
+   startupDebugger: Task.async(function*() {
+     if (this._startup) {
+       return;
+     }
+ 
+-    DebuggerView.initialize();
++    yield DebuggerView.initialize();
+     this._startup = true;
+   }),
+ 
+   /**
+    * Destroys the view and disconnects the debugger client from the server.
+    *
+    * @return object
+    *         A promise that is resolved when the debugger finishes shutdown.
+@@ -254,36 +254,33 @@ var DebuggerController = {
+   /**
+    * Initiates remote debugging based on the current target, wiring event
+    * handlers as necessary.
+    *
+    * @return object
+    *         A promise that is resolved when the debugger finishes connecting.
+    */
+   connect: Task.async(function*() {
+-    if (this._connected) {
+-      return;
+-    }
++    let target = this._target;
+ 
+-    let target = this._target;
+-    let { client, form: { chromeDebugger, actor } } = target;
++    let { client } = target;
+     target.on("close", this._onTabDetached);
+     target.on("navigate", this._onNavigate);
+     target.on("will-navigate", this._onWillNavigate);
+     this.client = client;
++    this.activeThread = this._toolbox.threadClient;
+ 
+-    if (target.isAddon) {
+-      yield this._startAddonDebugging(actor);
+-    } else if (!target.isTabActor) {
+-      // Some actors like AddonActor or RootActor for chrome debugging
+-      // do not support attach/detach and can be used directly
+-      yield this._startChromeDebugging(chromeDebugger);
+-    } else {
+-      yield this._startDebuggingTab();
+-    }
++    // Disable asm.js so that we can set breakpoints and other things
++    // on asm.js scripts
++    yield this.reconfigureThread({ observeAsmJS: true });
++    yield this.connectThread();
++
++    // We need to call this to sync the state of the resume
++    // button in the toolbar with the state of the thread.
++    this.ThreadState._update();
+ 
+     this._hideUnsupportedFeatures();
+   }),
+ 
+   connectThread: function() {
+     const { newSource, fetchEventListeners } = bindActionCreators(actions, this.dispatch);
+ 
+     // TODO: bug 806775, update the globals list using aPacket.hostAnnotations
+@@ -302,17 +299,30 @@ var DebuggerController = {
+     this.Workers.connect();
+     this.ThreadState.connect();
+     this.StackFrames.connect();
+ 
+     // Load all of the sources. Note that the server will actually
+     // emit individual `newSource` notifications, which trigger
+     // separate actions, so this won't do anything other than force
+     // the server to traverse sources.
+-    this.dispatch(actions.loadSources());
++    this.dispatch(actions.loadSources()).then(() => {
++      // If the engine is already paused, update the UI to represent the
++      // paused state
++      if (this.activeThread) {
++        const pausedPacket = this.activeThread.getLastPausePacket();
++        DebuggerView.Toolbar.toggleResumeButtonState(
++          this.activeThread.state,
++          !!pausedPacket
++        );
++        if (pausedPacket) {
++          this.StackFrames._onPaused("paused", pausedPacket);
++        }
++      }
++    });
+   },
+ 
+   /**
+    * Disconnects the debugger client and removes event handlers as necessary.
+    */
+   disconnect: function() {
+     // Return early if the client didn't even have a chance to instantiate.
+     if (!this.client) {
+@@ -375,126 +385,46 @@ var DebuggerController = {
+    */
+   _ensureResumptionOrder: function(aResponse) {
+     if (aResponse.error == "wrongOrder") {
+       DebuggerView.Toolbar.showResumeWarning(aResponse.lastPausedUrl);
+     }
+   },
+ 
+   /**
+-   * Sets up a debugging session.
+-   *
+-   * @return object
+-   *         A promise resolved once the client attaches to the active thread.
+-   */
+-  _startDebuggingTab: function() {
+-    let deferred = promise.defer();
+-    let threadOptions = {
+-      useSourceMaps: Prefs.sourceMapsEnabled,
+-      autoBlackBox: Prefs.autoBlackBox
+-    };
+-
+-    this._target.activeTab.attachThread(threadOptions, (aResponse, aThreadClient) => {
+-      if (!aThreadClient) {
+-        deferred.reject(new Error("Couldn't attach to thread: " + aResponse.error));
+-        return;
+-      }
+-      this.activeThread = aThreadClient;
+-      this.connectThread();
+-
+-      if (aThreadClient.paused) {
+-        aThreadClient.resume(res => {
+-          this._ensureResumptionOrder(res)
+-        });
+-      }
+-
+-      deferred.resolve();
+-    });
+-
+-    return deferred.promise;
+-  },
+-
+-  /**
+-   * Sets up an addon debugging session.
+-   *
+-   * @param object aAddonActor
+-   *        The actor for the addon that is being debugged.
+-   * @return object
+-   *        A promise resolved once the client attaches to the active thread.
+-   */
+-  _startAddonDebugging: function(aAddonActor) {
+-    let deferred = promise.defer();
+-
+-    this.client.attachAddon(aAddonActor, aResponse => {
+-      this._startChromeDebugging(aResponse.threadActor).then(deferred.resolve);
+-    });
+-
+-    return deferred.promise;
+-  },
+-
+-  /**
+-   * Sets up a chrome debugging session.
+-   *
+-   * @param object aChromeDebugger
+-   *        The remote protocol grip of the chrome debugger.
+-   * @return object
+-   *         A promise resolved once the client attaches to the active thread.
+-   */
+-  _startChromeDebugging: function(aChromeDebugger) {
+-    let deferred = promise.defer();
+-    let threadOptions = {
+-      useSourceMaps: Prefs.sourceMapsEnabled,
+-      autoBlackBox: Prefs.autoBlackBox
+-    };
+-
+-    this.client.attachThread(aChromeDebugger, (aResponse, aThreadClient) => {
+-      if (!aThreadClient) {
+-        deferred.reject(new Error("Couldn't attach to thread: " + aResponse.error));
+-        return;
+-      }
+-      this.activeThread = aThreadClient;
+-      this.connectThread();
+-
+-      if (aThreadClient.paused) {
+-        aThreadClient.resume(this._ensureResumptionOrder);
+-      }
+-
+-      deferred.resolve();
+-    }, threadOptions);
+-
+-    return deferred.promise;
+-  },
+-
+-  /**
+    * Detach and reattach to the thread actor with useSourceMaps true, blow
+    * away old sources and get them again.
+    */
+-  reconfigureThread: function({ useSourceMaps, autoBlackBox }) {
+-    this.activeThread.reconfigure({
+-      useSourceMaps: useSourceMaps,
+-      autoBlackBox: autoBlackBox
+-    }, aResponse => {
+-      if (aResponse.error) {
+-        let msg = "Couldn't reconfigure thread: " + aResponse.message;
+-        Cu.reportError(msg);
+-        dumpn(msg);
+-        return;
++  reconfigureThread: function(opts) {
++    const deferred = promise.defer();
++    this.activeThread.reconfigure(
++      opts,
++      aResponse => {
++        if (aResponse.error) {
++          deferred.reject(aResponse.error);
++          return;
++        }
++
++        if (('useSourceMaps' in opts) || ('autoBlackBox' in opts)) {
++          // Reset the view and fetch all the sources again.
++          DebuggerView.handleTabNavigation();
++          this.dispatch(actions.unload());
++          this.dispatch(actions.loadSources());
++
++          // Update the stack frame list.
++          if (this.activeThread.paused) {
++            this.activeThread._clearFrames();
++            this.activeThread.fillFrames(CALL_STACK_PAGE_SIZE);
++          }
++        }
++
++        deferred.resolve();
+       }
+-
+-      // Reset the view and fetch all the sources again.
+-      DebuggerView.handleTabNavigation();
+-      this.dispatch(actions.unload());
+-      this.dispatch(actions.loadSources());
+-
+-      // Update the stack frame list.
+-      if (this.activeThread.paused) {
+-        this.activeThread._clearFrames();
+-        this.activeThread.fillFrames(CALL_STACK_PAGE_SIZE);
+-      }
+-    });
++    );
++    return deferred.promise;
+   },
+ 
+   waitForSourcesLoaded: function() {
+     const deferred = promise.defer();
+     this.dispatch({
+       type: services.WAIT_UNTIL,
+       predicate: action => (action.type === constants.LOAD_SOURCES &&
+                             action.status === "done"),
+@@ -601,18 +531,16 @@ ThreadState.prototype = {
+ 
+   /**
+    * Connect to the current thread client.
+    */
+   connect: function() {
+     dumpn("ThreadState is connecting...");
+     this.activeThread.addListener("paused", this._update);
+     this.activeThread.addListener("resumed", this._update);
+-    this.activeThread.pauseOnExceptions(Prefs.pauseOnExceptions,
+-                                        Prefs.ignoreCaughtExceptions);
+   },
+ 
+   /**
+    * Disconnect from the client.
+    */
+   disconnect: function() {
+     if (!this.activeThread) {
+       return;
+@@ -632,23 +560,22 @@ ThreadState.prototype = {
+     dumpn("Handling tab navigation in the ThreadState");
+     this._update();
+   },
+ 
+   /**
+    * Update the UI after a thread state change.
+    */
+   _update: function(aEvent, aPacket) {
+-    // Ignore "interrupted" events, to avoid UI flicker. These are generated
+-    // by the slow script dialog and internal events such as setting
+-    // breakpoints. Pressing the resume button does need to be shown, though.
+     if (aEvent == "paused") {
+       if (aPacket.why.type == "interrupted" &&
+-          !this.interruptedByResumeButton) {
+-        return;
++          this.interruptedByResumeButton) {
++        // Interrupt requests suppressed by default, but if this is an
++        // explicit interrupt by the pause button we want to emit it.
++        gTarget.emit("thread-paused", aPacket);
+       } else if (aPacket.why.type == "breakpointConditionThrown" && aPacket.why.message) {
+         let where = aPacket.frame.where;
+         let aLocation = {
+           line: where.line,
+           column: where.column,
+           actor: where.source ? where.source.actor : null
+         };
+         DebuggerView.Sources.showBreakpointConditionThrownMessage(
+@@ -658,20 +585,16 @@ ThreadState.prototype = {
+       }
+     }
+ 
+     this.interruptedByResumeButton = false;
+     DebuggerView.Toolbar.toggleResumeButtonState(
+       this.activeThread.state,
+       aPacket ? aPacket.frame : false
+     );
+-
+-    if (gTarget && (aEvent == "paused" || aEvent == "resumed")) {
+-      gTarget.emit("thread-" + aEvent);
+-    }
+   }
+ };
+ 
+ /**
+  * Keeps the stack frame list up-to-date, using the thread client's
+  * stack frame cache.
+  */
+ function StackFrames() {
+diff --git a/devtools/client/debugger/debugger-view.js b/devtools/client/debugger/debugger-view.js
+--- a/devtools/client/debugger/debugger-view.js
++++ b/devtools/client/debugger/debugger-view.js
+@@ -55,35 +55,37 @@ var DebuggerView = {
+ 
+   /**
+    * Initializes the debugger view.
+    *
+    * @return object
+    *         A promise that is resolved when the view finishes initializing.
+    */
+   initialize: function() {
+-    if (this._hasStartup) {
+-      return;
++    if (this._startup) {
++      return this._startup;
+     }
+-    this._hasStartup = true;
++    const deferred = promise.defer();
++    this._startup = deferred.promise;
+ 
+     this._initializePanes();
+     this.Toolbar.initialize();
+     this.Options.initialize();
+     this.Filtering.initialize();
+     this.StackFrames.initialize();
+     this.StackFramesClassicList.initialize();
+     this.Workers.initialize();
+     this.Sources.initialize();
+     this.VariableBubble.initialize();
+     this.WatchExpressions.initialize();
+     this.EventListeners.initialize();
+     this.GlobalSearch.initialize();
+     this._initializeVariablesView();
+-    this._initializeEditor();
++
++    this._initializeEditor(deferred.resolve);
+     this._editorSource = {};
+ 
+     document.title = L10N.getStr("DebuggerWindowTitle");
+ 
+     this.editor.on("cursorActivity", this.Sources._onEditorCursorActivity);
+ 
+     this.controller = DebuggerController;
+     const getState = this.controller.getState;
+@@ -103,16 +105,18 @@ var DebuggerView = {
+ 
+         if (selectedSource &&
+            selectedSource.actor === location.actor) {
+           this.editor.moveBreakpoint(prevLocation.line - 1,
+                                      location.line - 1);
+         }
+       }
+     }, this);
++
++    return deferred.promise;
+   },
+ 
+   /**
+    * Destroys the debugger view.
+    *
+    * @return object
+    *         A promise that is resolved when the view finishes destroying.
+    */
+@@ -274,17 +278,17 @@ var DebuggerView = {
+   },
+ 
+   /**
+    * Initializes the Editor instance.
+    *
+    * @param function aCallback
+    *        Called after the editor finishes initializing.
+    */
+-  _initializeEditor: function() {
++  _initializeEditor: function(callback) {
+     dumpn("Initializing the DebuggerView editor");
+ 
+     let extraKeys = {};
+     bindKey("_doTokenSearch", "tokenSearchKey");
+     bindKey("_doGlobalSearch", "globalSearchKey", { alt: true });
+     bindKey("_doFunctionSearch", "functionSearchKey");
+     extraKeys[Editor.keyFor("jumpToLine")] = false;
+     extraKeys["Esc"] = false;
+@@ -306,16 +310,17 @@ var DebuggerView = {
+       extraKeys: extraKeys,
+       contextMenu: "sourceEditorContextMenu",
+       enableCodeFolding: false
+     });
+ 
+     this.editor.appendTo(document.getElementById("editor")).then(() => {
+       this.editor.extend(DebuggerEditor);
+       this._loadingText = L10N.getStr("loadingText");
++      callback();
+     });
+ 
+     this.editor.on("gutterClick", (ev, line, button) => {
+       // A right-click shouldn't do anything but keep track of where
+       // it was clicked.
+       if (button == 2) {
+         this.clickedLine = line;
+       }
+diff --git a/devtools/client/debugger/panel.js b/devtools/client/debugger/panel.js
+--- a/devtools/client/debugger/panel.js
++++ b/devtools/client/debugger/panel.js
+@@ -17,19 +17,16 @@ function DebuggerPanel(iframeWindow, too
+ 
+   this._view = this.panelWin.DebuggerView;
+   this._controller = this.panelWin.DebuggerController;
+   this._view._hostType = this._toolbox.hostType;
+   this._controller._target = this.target;
+   this._controller._toolbox = this._toolbox;
+ 
+   this.handleHostChanged = this.handleHostChanged.bind(this);
+-  this.highlightWhenPaused = this.highlightWhenPaused.bind(this);
+-  this.unhighlightWhenResumed = this.unhighlightWhenResumed.bind(this);
+-
+   EventEmitter.decorate(this);
+ }
+ 
+ exports.DebuggerPanel = DebuggerPanel;
+ 
+ DebuggerPanel.prototype = {
+   /**
+    * Open is effectively an asynchronous constructor.
+@@ -50,18 +47,16 @@ DebuggerPanel.prototype = {
+       targetPromise = promise.resolve(this.target);
+     }
+ 
+     return targetPromise
+       .then(() => this._controller.startupDebugger())
+       .then(() => this._controller.connect())
+       .then(() => {
+         this._toolbox.on("host-changed", this.handleHostChanged);
+-        this.target.on("thread-paused", this.highlightWhenPaused);
+-        this.target.on("thread-resumed", this.unhighlightWhenResumed);
+         // Add keys from this document's keyset to the toolbox, so they
+         // can work when the split console is focused.
+         let keysToClone = ["resumeKey", "resumeKey2", "stepOverKey",
+                           "stepOverKey2", "stepInKey", "stepInKey2",
+                           "stepOutKey", "stepOutKey2"];
+         for (let key of keysToClone) {
+           let elm = this.panelWin.document.getElementById(key);
+           this._toolbox.useKeyWithSplitConsole(elm, "jsdebugger");
+@@ -82,19 +77,16 @@ DebuggerPanel.prototype = {
+   },
+ 
+   destroy: function() {
+     // Make sure this panel is not already destroyed.
+     if (this._destroyer) {
+       return this._destroyer;
+     }
+ 
+-    this.target.off("thread-paused", this.highlightWhenPaused);
+-    this.target.off("thread-resumed", this.unhighlightWhenResumed);
+-
+     if (!this.target.isRemote) {
+       this.target.tab.removeEventListener('TabSelect', this);
+     }
+ 
+     return this._destroyer = this._controller.shutdownDebugger().then(() => {
+       this.emit("destroyed");
+     });
+   },
+@@ -120,28 +112,16 @@ DebuggerPanel.prototype = {
+     const { dispatch } =  this._controller;
+     return dispatch(actions.blackbox(source, flag))
+   },
+ 
+   handleHostChanged: function() {
+     this._view.handleHostChanged(this._toolbox.hostType);
+   },
+ 
+-  highlightWhenPaused: function() {
+-    this._toolbox.highlightTool("jsdebugger");
+-
+-    // Also raise the toolbox window if it is undocked or select the
+-    // corresponding tab when toolbox is docked.
+-    this._toolbox.raise();
+-  },
+-
+-  unhighlightWhenResumed: function() {
+-    this._toolbox.unhighlightTool("jsdebugger");
+-  },
+-
+   // nsIDOMEventListener API
+ 
+   handleEvent: function(aEvent) {
+     if (aEvent.target == this.target.tab &&
+         this._controller.activeThread.state == "paused") {
+       // Wait a tick for the content focus event to be delivered.
+       DevToolsUtils.executeSoon(() => this._toolbox.focusTool("jsdebugger"));
+     }
+diff --git a/devtools/client/debugger/test/mochitest/browser.ini b/devtools/client/debugger/test/mochitest/browser.ini
+--- a/devtools/client/debugger/test/mochitest/browser.ini
++++ b/devtools/client/debugger/test/mochitest/browser.ini
+@@ -160,16 +160,17 @@ skip-if = e10s || true # bug 1113935
+ [browser_dbg_break-on-dom-07.js]
+ [browser_dbg_break-on-dom-08.js]
+ [browser_dbg_break-on-dom-event-01.js]
+ skip-if = e10s || os == "mac" || e10s # Bug 895426
+ [browser_dbg_break-on-dom-event-02.js]
+ skip-if = e10s # TODO
+ [browser_dbg_break-on-dom-event-03.js]
+ skip-if = e10s # TODO
++[browser_dbg_break-unselected.js]
+ [browser_dbg_breakpoints-actual-location.js]
+ [browser_dbg_breakpoints-actual-location2.js]
+ [browser_dbg_breakpoints-break-on-last-line-of-script-on-reload.js]
+ skip-if = e10s # Bug 1093535
+ [browser_dbg_breakpoints-button-01.js]
+ [browser_dbg_breakpoints-button-02.js]
+ [browser_dbg_breakpoints-condition-thrown-message.js]
+ skip-if = e10s && debug
+diff --git a/devtools/client/debugger/test/mochitest/browser_dbg_break-unselected.js b/devtools/client/debugger/test/mochitest/browser_dbg_break-unselected.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/debugger/test/mochitest/browser_dbg_break-unselected.js
+@@ -0,0 +1,47 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++/**
++ * Test setting breakpoints on an eval script
++ */
++
++const TAB_URL = EXAMPLE_URL + "doc_inline-debugger-statement.html";
++
++function test() {
++  Task.spawn(function*() {
++    const tab = yield getTab(TAB_URL);
++    const target = TargetFactory.forTab(tab);
++    const toolbox = yield gDevTools.showToolbox(target, "webconsole");
++
++    is(toolbox.currentToolId, "webconsole", "Console is the current panel");
++
++    toolbox.target.on('thread-paused', Task.async(function*() {
++      // Wait for the toolbox to handle the event and switch tools
++      yield waitForTick();
++
++      is(toolbox.currentToolId, "jsdebugger", "Debugger is the current panel");
++
++      // Wait until it's actually fully loaded
++      yield toolbox.loadTool("jsdebugger");
++
++      const panel = toolbox.getCurrentPanel();
++      const actions = bindActionCreators(panel);
++      const constants = panel.panelWin.require('./content/constants');
++      const queries = panel.panelWin.require('./content/queries');
++      const getState = panel.panelWin.DebuggerController.getState;
++
++      is(panel.panelWin.gThreadClient.state, "paused",
++         "Thread is still paused");
++
++      yield waitForSourceAndCaret(panel, "debugger-statement.html", 16);
++      is(queries.getSelectedSource(getState()).url, TAB_URL,
++         "Selected source is the current tab url");
++      is(queries.getSelectedSourceOpts(getState()).line, 16,
++         "Line 16 is highlighted in the editor");
++
++      resumeDebuggerThenCloseAndFinish(panel);
++    }));
++
++    callInTab(tab, "runDebuggerStatement");
++  });
++};
+diff --git a/devtools/client/debugger/test/mochitest/browser_dbg_bug-896139.js b/devtools/client/debugger/test/mochitest/browser_dbg_bug-896139.js
+--- a/devtools/client/debugger/test/mochitest/browser_dbg_bug-896139.js
++++ b/devtools/client/debugger/test/mochitest/browser_dbg_bug-896139.js
+@@ -13,17 +13,23 @@ function test() {
+     function testBreakpoint() {
+       let promise = waitForDebuggerEvents(panel, win.EVENTS.FETCHED_SCOPES);
+       callInTab(tab, "f");
+       return promise.then(() => doResume(panel));
+     }
+ 
+     let [tab,, panel] = yield initDebugger(EXAMPLE_URL + TAB_URL);
+     let win = panel.panelWin;
+-    yield waitForSourceShown(panel, SCRIPT_URL);
++
++    let Sources = win.DebuggerView.Sources;
++    yield waitForDebuggerEvents(panel, win.EVENTS.SOURCE_SHOWN);
++    if (Sources.selectedItem.attachment.source.url.indexOf(SCRIPT_URL) === -1) {
++      Sources.selectedValue = getSourceActor(win.DebuggerView.Sources, EXAMPLE_URL + SCRIPT_URL)
++    }
++
+     yield panel.addBreakpoint({
+       actor: getSourceActor(win.DebuggerView.Sources, EXAMPLE_URL + SCRIPT_URL),
+       line: 6
+     });
+ 
+     // Race condition: the setBreakpoint request sometimes leaves the
+     // debugger in paused state for a bit because we are called before
+     // that request finishes (see bug 1156531 for plans to fix)
+diff --git a/devtools/client/debugger/test/mochitest/browser_dbg_on-pause-raise.js b/devtools/client/debugger/test/mochitest/browser_dbg_on-pause-raise.js
+--- a/devtools/client/debugger/test/mochitest/browser_dbg_on-pause-raise.js
++++ b/devtools/client/debugger/test/mochitest/browser_dbg_on-pause-raise.js
+@@ -88,24 +88,18 @@ function testPause() {
+          gToolboxTab.getAttribute("highlighted") == "true",
+         "The highlighted class is present");
+       ok(gToolboxTab.hasAttribute("selected") &&
+          gToolboxTab.getAttribute("selected") == "true",
+         "...and the tab is selected, so the glow will not be present.");
+     }).then(testResume);
+   });
+ 
+-  EventUtils.sendMouseEvent({ type: "mousedown" },
+-    gDebugger.document.getElementById("resume"),
+-    gDebugger);
+-
+   // Evaluate a script to fully pause the debugger
+-  once(gDebugger.gClient, "willInterrupt").then(() => {
+-    evalInTab(gTab, "1+1;");
+-  });
++  evalInTab(gTab, "debugger;");
+ }
+ 
+ function testResume() {
+   gDebugger.gThreadClient.addOneTimeListener("resumed", () => {
+     gToolbox.selectTool("webconsole").then(() => {
+       ok(!gToolboxTab.hasAttribute("highlighted") ||
+           gToolboxTab.getAttribute("highlighted") != "true",
+         "The highlighted class is not present now after the resume");
+diff --git a/devtools/client/debugger/test/mochitest/browser_dbg_pause-warning.js b/devtools/client/debugger/test/mochitest/browser_dbg_pause-warning.js
+--- a/devtools/client/debugger/test/mochitest/browser_dbg_pause-warning.js
++++ b/devtools/client/debugger/test/mochitest/browser_dbg_pause-warning.js
+@@ -19,18 +19,18 @@ function test() {
+     gToolbox = gPanel._toolbox;
+ 
+     testPause();
+   });
+ }
+ 
+ function testPause() {
+   gDebugger.gThreadClient.addOneTimeListener("paused", () => {
+-    ok(gTarget.isThreadPaused,
+-      "target.isThreadPaused has been updated to true.");
++    ok(gDebugger.gThreadClient.paused,
++      "threadClient.paused has been updated to true.");
+ 
+     gToolbox.once("inspector-selected").then(inspector => {
+       inspector.once("inspector-updated").then(testNotificationIsUp1);
+     });
+     gToolbox.selectTool("inspector");
+   });
+ 
+   EventUtils.sendMouseEvent({ type: "mousedown" },
+@@ -72,18 +72,18 @@ function testNotificationIsUp2() {
+   ok(notification,
+     "Inspector notification is present again (3).");
+ 
+   testResume();
+ }
+ 
+ function testResume() {
+   gDebugger.gThreadClient.addOneTimeListener("resumed", () => {
+-    ok(!gTarget.isThreadPaused,
+-      "target.isThreadPaused has been updated to false.");
++    ok(!gDebugger.gThreadClient.paused,
++      "threadClient.paused has been updated to false.");
+ 
+     let notificationBox = gToolbox.getNotificationBox();
+     let notification = notificationBox.getNotificationWithValue("inspector-script-paused");
+ 
+     ok(!notification,
+       "Inspector notification was removed once debugger resumed.");
+ 
+     closeDebuggerAndFinish(gPanel);
+diff --git a/devtools/client/debugger/test/mochitest/browser_dbg_worker-window.js b/devtools/client/debugger/test/mochitest/browser_dbg_worker-window.js
+--- a/devtools/client/debugger/test/mochitest/browser_dbg_worker-window.js
++++ b/devtools/client/debugger/test/mochitest/browser_dbg_worker-window.js
+@@ -31,13 +31,13 @@ add_task(function* () {
+      "worker URL in host title");
+ 
+   let toolTabs = toolbox.doc.querySelectorAll(".devtools-tab");
+   let activeTools = [...toolTabs].map(tab=>tab.getAttribute("toolid"));
+ 
+   is(activeTools.join(","), "webconsole,jsdebugger,scratchpad,options",
+     "Correct set of tools supported by worker");
+ 
+-  yield gDevTools.closeToolbox(TargetFactory.forWorker(workerClient));
++  yield toolbox.destroy();
+   terminateWorkerInTab(tab, WORKER_URL);
+   yield waitForWorkerClose(workerClient);
+   yield close(client);
+ });
+diff --git a/devtools/client/debugger/test/mochitest/head.js b/devtools/client/debugger/test/mochitest/head.js
+--- a/devtools/client/debugger/test/mochitest/head.js
++++ b/devtools/client/debugger/test/mochitest/head.js
+@@ -521,23 +521,18 @@ function initDebugger(aTarget, aWindow) 
+     let target = TargetFactory.forTab(aTab);
+ 
+     gDevTools.showToolbox(target, "jsdebugger").then(aToolbox => {
+       info("Debugger panel shown successfully.");
+ 
+       let debuggerPanel = aToolbox.getCurrentPanel();
+       let panelWin = debuggerPanel.panelWin;
+ 
+-      // Wait for the initial resume...
+-      panelWin.gClient.addOneTimeListener("resumed", () => {
+-        info("Debugger client resumed successfully.");
+-
+-        prepareDebugger(debuggerPanel);
+-        deferred.resolve([aTab, debuggee, debuggerPanel, aWindow]);
+-      });
++      prepareDebugger(debuggerPanel);
++      deferred.resolve([aTab, debuggee, debuggerPanel, aWindow]);
+     });
+ 
+     return deferred.promise;
+   });
+ }
+ 
+ // Creates an add-on debugger for a given add-on. The returned AddonDebugger
+ // object must be destroyed before finishing the test
+@@ -590,17 +585,16 @@ AddonDebugger.prototype = {
+     this.target = TargetFactory.forTab(targetOptions);
+     let toolbox = yield gDevTools.showToolbox(this.target, "jsdebugger", Toolbox.HostType.CUSTOM, toolboxOptions);
+ 
+     info("Addon debugger panel shown successfully.");
+ 
+     this.debuggerPanel = toolbox.getCurrentPanel();
+ 
+     // Wait for the initial resume...
+-    yield waitForClientEvents(this.debuggerPanel, "resumed");
+     yield prepareDebugger(this.debuggerPanel);
+     yield this._attachConsole();
+   }),
+ 
+   destroy: Task.async(function*() {
+     let deferred = promise.defer();
+     this.client.close(deferred.resolve);
+     yield deferred.promise;
+@@ -1027,17 +1021,17 @@ function connect(client) {
+   return new Promise(function (resolve) {
+     client.connect(function () {
+       resolve();
+     });
+   });
+ }
+ 
+ function close(client) {
+-  info("Closing client.\n");
++  info("Waiting for client to close.\n");
+   return new Promise(function (resolve) {
+     client.close(() => {
+       resolve();
+     });
+   });
+ }
+ 
+ function listTabs(client) {
+diff --git a/devtools/client/framework/attach-thread.js b/devtools/client/framework/attach-thread.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/framework/attach-thread.js
+@@ -0,0 +1,80 @@
++const {Cc, Ci, Cu} = require("chrome");
++const Services = Cu.import("resource://gre/modules/Services.jsm", {}).Services;
++const promise = require("promise");
++
++function handleThreadState(toolbox, event, packet) {
++  // Suppress interrupted events by default because the thread is
++  // paused/resumed a lot for various actions.
++  if (event !== "paused" || packet.why.type !== "interrupted") {
++    // TODO: Bug 1225492, we continue emitting events on the target
++    // like we used to, but we should emit these only on the
++    // threadClient now.
++    toolbox.target.emit("thread-" + event);
++  }
++
++  if (event === "paused") {
++    toolbox.highlightTool("jsdebugger");
++
++    if (packet.why.type === 'debuggerStatement' ||
++       packet.why.type === 'breakpoint' ||
++       packet.why.type === 'exception') {
++      toolbox.raise();
++      toolbox.selectTool("jsdebugger");
++    }
++  }
++  else if (event === "resumed") {
++    toolbox.unhighlightTool("jsdebugger");
++  }
++}
++
++function attachThread(toolbox) {
++  let deferred = promise.defer();
++
++  let target = toolbox.target;
++  let { form: { chromeDebugger, actor } } = target;
++  let threadOptions = {
++    useSourceMaps: Services.prefs.getBoolPref("devtools.debugger.source-maps-enabled"),
++    autoBlackBox: Services.prefs.getBoolPref("devtools.debugger.auto-black-box"),
++    pauseOnExceptions: Services.prefs.getBoolPref("devtools.debugger.pause-on-exceptions"),
++    ignoreCaughtExceptions: Services.prefs.getBoolPref("devtools.debugger.ignore-caught-exceptions")
++  };
++
++  let handleResponse = (res, threadClient) => {
++    if (res.error) {
++      deferred.reject(new Error("Couldn't attach to thread: " + res.error));
++      return;
++    }
++    threadClient.addListener("paused", handleThreadState.bind(null, toolbox));
++    threadClient.addListener("resumed", handleThreadState.bind(null, toolbox));
++
++    if (!threadClient.paused) {
++      deferred.reject(
++        new Error("Thread in wrong state when starting up, should be paused")
++      );
++    }
++
++    threadClient.resume(res => deferred.resolve(threadClient));
++  }
++
++  if (target.isAddon) {
++    // Attaching an addon
++    target.client.attachAddon(actor, res => {
++      target.client.attachThread(res.threadActor, handleResponse);
++    });
++  } else if (target.isTabActor) {
++    // Attaching a normal thread
++    target.activeTab.attachThread(threadOptions, handleResponse);
++  } else {
++    // Attaching the browser debugger
++    target.client.attachThread(chromeDebugger, handleResponse);
++  }
++
++  return deferred.promise;
++}
++
++function detachThread(threadClient) {
++  threadClient.removeListener("paused");
++  threadClient.removeListener("resumed");
++}
++
++module.exports = { attachThread, detachThread };
+diff --git a/devtools/client/framework/gDevTools.jsm b/devtools/client/framework/gDevTools.jsm
+--- a/devtools/client/framework/gDevTools.jsm
++++ b/devtools/client/framework/gDevTools.jsm
+@@ -377,21 +377,24 @@ DevTools.prototype = {
+    * @param {Target} target
+    *         The target the toolbox will debug
+    * @param {string} toolId
+    *        The id of the tool to show
+    * @param {Toolbox.HostType} hostType
+    *        The type of host (bottom, window, side)
+    * @param {object} hostOptions
+    *        Options for host specifically
++   * @param {boolean} shouldAttachThread
++   *        If true (the default), the thread will automatically be
++   *        attached with a debugger
+    *
+    * @return {Toolbox} toolbox
+    *        The toolbox that was opened
+    */
+-  showToolbox: function(target, toolId, hostType, hostOptions) {
++  showToolbox: function(target, toolId, hostType, hostOptions, shouldAttachThread = true) {
+     let deferred = promise.defer();
+ 
+     let toolbox = this._toolboxes.get(target);
+     if (toolbox) {
+ 
+       let hostPromise = (hostType != null && toolbox.hostType != hostType) ?
+           toolbox.switchHost(hostType) :
+           promise.resolve(null);
+@@ -421,17 +424,17 @@ DevTools.prototype = {
+ 
+       toolbox.once("destroyed", () => {
+         this._toolboxes.delete(target);
+         this.emit("toolbox-destroyed", target);
+       });
+ 
+       // If toolId was passed in, it will already be selected before the
+       // open promise resolves.
+-      toolbox.open().then(() => {
++      toolbox.open({ shouldAttachThread }).then(() => {
+         deferred.resolve(toolbox);
+         this.emit("toolbox-ready", toolbox);
+       });
+     }
+ 
+     return deferred.promise;
+   },
+ 
+diff --git a/devtools/client/framework/moz.build b/devtools/client/framework/moz.build
+--- a/devtools/client/framework/moz.build
++++ b/devtools/client/framework/moz.build
+@@ -2,16 +2,17 @@
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ BROWSER_CHROME_MANIFESTS += ['test/browser.ini']
+ 
+ DevToolsModules(
++    'attach-thread.js',
+     'gDevTools.jsm',
+     'selection.js',
+     'sidebar.js',
+     'target.js',
+     'toolbox-highlighter-utils.js',
+     'toolbox-hosts.js',
+     'toolbox-options.js',
+     'toolbox.js',
+diff --git a/devtools/client/framework/target.js b/devtools/client/framework/target.js
+--- a/devtools/client/framework/target.js
++++ b/devtools/client/framework/target.js
+@@ -112,19 +112,16 @@ exports.TargetFactory = {
+ 
+ /**
+  * A TabTarget represents a page living in a browser tab. Generally these will
+  * be web pages served over http(s), but they don't have to be.
+  */
+ function TabTarget(tab) {
+   EventEmitter.decorate(this);
+   this.destroy = this.destroy.bind(this);
+-  this._handleThreadState = this._handleThreadState.bind(this);
+-  this.on("thread-resumed", this._handleThreadState);
+-  this.on("thread-paused", this._handleThreadState);
+   this.activeTab = this.activeConsole = null;
+   // Only real tabs need initialization here. Placeholder objects for remote
+   // targets will be initialized after a makeRemote method call.
+   if (tab && !["client", "form", "chrome"].every(tab.hasOwnProperty, tab)) {
+     this._tab = tab;
+     this._setupListeners();
+   } else {
+     this._form = tab.form;
+@@ -357,20 +354,16 @@ TabTarget.prototype = {
+   get isLocalTab() {
+     return !!this._tab;
+   },
+ 
+   get isMultiProcess() {
+     return !this.window;
+   },
+ 
+-  get isThreadPaused() {
+-    return !!this._isThreadPaused;
+-  },
+-
+   /**
+    * Adds remote protocol capabilities to the target, so that it can be used
+    * for tools that support the Remote Debugging Protocol even for local
+    * connections.
+    */
+   makeRemote: function() {
+     if (this._remote) {
+       return this._remote.promise;
+@@ -528,50 +521,36 @@ TabTarget.prototype = {
+           this.emit("visible", event);
+         } else {
+           this.emit("hidden", event);
+         }
+         break;
+     }
+   },
+ 
+-  /**
+-   * Handle script status.
+-   */
+-  _handleThreadState: function(event) {
+-    switch (event) {
+-      case "thread-resumed":
+-        this._isThreadPaused = false;
+-        break;
+-      case "thread-paused":
+-        this._isThreadPaused = true;
+-        break;
+-    }
++  getPausedDetails: function() {
++    return this._pausedPacket;
+   },
+ 
++
+   /**
+    * Target is not alive anymore.
+    */
+   destroy: function() {
+     // If several things call destroy then we give them all the same
+     // destruction promise so we're sure to destroy only once
+     if (this._destroyer) {
+       return this._destroyer.promise;
+     }
+ 
+     this._destroyer = promise.defer();
+ 
+     // Before taking any action, notify listeners that destruction is imminent.
+     this.emit("close");
+ 
+-    // First of all, do cleanup tasks that pertain to both remoted and
+-    // non-remoted targets.
+-    this.off("thread-resumed", this._handleThreadState);
+-    this.off("thread-paused", this._handleThreadState);
+-
+     if (this._tab) {
+       this._teardownListeners();
+     }
+ 
+     let cleanupAndResolve = () => {
+       this._cleanup();
+       this._destroyer.resolve(null);
+     };
+@@ -607,16 +586,17 @@ TabTarget.prototype = {
+    * Clean up references to what this target points to.
+    */
+   _cleanup: function() {
+     if (this._tab) {
+       targets.delete(this._tab);
+     } else {
+       promiseTargets.delete(this._form);
+     }
++
+     this.activeTab = null;
+     this.activeConsole = null;
+     this._client = null;
+     this._tab = null;
+     this._form = null;
+     this._remote = null;
+   },
+ 
+@@ -713,18 +693,16 @@ function WorkerTarget(workerClient) {
+  * for remote tabs (from which a TabClient can then be lazily obtained),
+  * WorkerTarget is constructed with a WorkerClient directly.
+  *
+  * WorkerClient is designed to mimic the interface of TabClient as closely as
+  * possible. This allows us to debug workers as if they were ordinary tabs,
+  * requiring only minimal changes to the rest of the frontend.
+  */
+ WorkerTarget.prototype = {
+-  destroy: function () {},
+-
+   get isRemote() {
+     return true;
+   },
+ 
+   get isTabActor() {
+     return true;
+   },
+ 
+diff --git a/devtools/client/framework/test/browser_toolbox_ready.js b/devtools/client/framework/test/browser_toolbox_ready.js
+--- a/devtools/client/framework/test/browser_toolbox_ready.js
++++ b/devtools/client/framework/test/browser_toolbox_ready.js
+@@ -1,41 +1,26 @@
+ /* vim: set ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+    http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+-function test()
+-{
++function test() {
+   gBrowser.selectedTab = gBrowser.addTab();
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+ 
+-  gBrowser.selectedBrowser.addEventListener("load", function onLoad(evt) {
+-    gBrowser.selectedBrowser.removeEventListener(evt.type, onLoad, true);
+-    gDevTools.showToolbox(target).then(testReady);
+-  }, true);
++  const onLoad = Task.async(function *(evt) {
++    gBrowser.selectedBrowser.removeEventListener("load", onLoad);
+ 
+-  content.location = "data:text/html,test for dynamically registering and unregistering tools";
+-}
++    const toolbox = yield gDevTools.showToolbox(target, "webconsole");
++    ok(toolbox.isReady, "toolbox isReady is set");
++    ok(toolbox.threadClient, "toolbox has a thread client");
+ 
+-function testReady(toolbox)
+-{
+-  ok(toolbox.isReady, "toolbox isReady is set");
+-  testDouble(toolbox);
+-}
++    const toolbox2 = yield gDevTools.showToolbox(toolbox.target, toolbox.toolId);
++    is(toolbox2, toolbox, "same toolbox");
+ 
+-function testDouble(toolbox)
+-{
+-  let target = toolbox.target;
+-  let toolId = toolbox.currentToolId;
+-
+-  gDevTools.showToolbox(target, toolId).then(function(toolbox2) {
+-    is(toolbox2, toolbox, "same toolbox");
+-    cleanup(toolbox);
+-  });
+-}
+-
+-function cleanup(toolbox)
+-{
+-  toolbox.destroy().then(function() {
++    yield toolbox.destroy();
+     gBrowser.removeCurrentTab();
+     finish();
+   });
++
++  gBrowser.selectedBrowser.addEventListener("load", onLoad, true);
++  content.location = "data:text/html,test for toolbox being ready";
+ }
+diff --git a/devtools/client/framework/toolbox.js b/devtools/client/framework/toolbox.js
+--- a/devtools/client/framework/toolbox.js
++++ b/devtools/client/framework/toolbox.js
+@@ -15,16 +15,17 @@ const OS_IS_64_BITS = "DEVTOOLS_OS_IS_64
+ const SCREENSIZE_HISTOGRAM = "DEVTOOLS_SCREEN_RESOLUTION_ENUMERATED_PER_USER";
+ 
+ var {Cc, Ci, Cu} = require("chrome");
+ var promise = require("promise");
+ var EventEmitter = require("devtools/shared/event-emitter");
+ var Telemetry = require("devtools/client/shared/telemetry");
+ var HUDService = require("devtools/client/webconsole/hudservice");
+ var viewSource = require("devtools/client/shared/view-source");
++var { attachThread, detachThread } = require("./attach-thread");
+ 
+ Cu.import("resource://gre/modules/Services.jsm");
+ Cu.import("resource://devtools/client/framework/gDevTools.jsm");
+ Cu.import("resource://devtools/client/scratchpad/scratchpad-manager.jsm");
+ Cu.import("resource://devtools/client/shared/DOMHelpers.jsm");
+ Cu.import("resource://gre/modules/Task.jsm");
+ 
+ loader.lazyImporter(this, "CommandUtils",
+@@ -246,16 +247,20 @@ Toolbox.prototype = {
+    * Get/alter the target of a Toolbox so we're debugging something different.
+    * See Target.jsm for more details.
+    * TODO: Do we allow |toolbox.target = null;| ?
+    */
+   get target() {
+     return this._target;
+   },
+ 
++  get threadClient() {
++    return this._threadClient;
++  },
++
+   /**
+    * Get/alter the host of a Toolbox, i.e. is it in browser or in a separate
+    * tab. See HostType for more details.
+    */
+   get hostType() {
+     return this._host.type;
+   },
+ 
+@@ -337,28 +342,41 @@ Toolbox.prototype = {
+     }
+     let focusedWin = Services.focus.focusedWindow;
+     return focusedWin && focusedWin ===
+       this.doc.querySelector("#toolbox-panel-iframe-webconsole").contentWindow;
+   },
+ 
+   /**
+    * Open the toolbox
++   * @param {Object} opts
++   *        An object with following options:
++   *        - shouldAttachThread (optional, defaults true)
++   *        automatically attach a debugger thread on open
+    */
+-  open: function() {
++  open: function(opts) {
++    const shouldAttachThread = 'shouldAttachThread' in opts ? opts.shouldAttachThread : true;
++
+     return Task.spawn(function*() {
+       let iframe = yield this._host.create();
+       let domReady = promise.defer();
+ 
+-      // Load the toolbox-level actor fronts and utilities now
+-      yield this._target.makeRemote();
+       iframe.setAttribute("src", this._URL);
+       iframe.setAttribute("aria-label", toolboxStrings("toolbox.label"));
+       let domHelper = new DOMHelpers(iframe.contentWindow);
+       domHelper.onceDOMReady(() => domReady.resolve());
++      // Optimization: fire up a few other things before waiting on
++      // the iframe being ready (makes startup faster)
++
++      // Load the toolbox-level actor fronts and utilities now
++      yield this._target.makeRemote();
++
++      if (shouldAttachThread) {
++        this._threadClient = yield attachThread(this);
++      }
+ 
+       yield domReady.promise;
+ 
+       this.isReady = true;
+       let framesPromise = this._listFrames();
+ 
+       this.closeButton = this.doc.getElementById("toolbox-close");
+       this.closeButton.addEventListener("command", this.destroy, true);
+@@ -1947,16 +1965,20 @@ Toolbox.prototype = {
+         this._pickerButton.removeEventListener("command", this._togglePicker, false);
+         this._pickerButton = null;
+       }
+     }));
+ 
+     // Destroy the profiler connection
+     outstanding.push(this.destroyPerformance());
+ 
++    // Detach the thread
++    detachThread(this._threadClient);
++    this._threadClient = null;
++
+     // We need to grab a reference to win before this._host is destroyed.
+     let win = this.frame.ownerGlobal;
+ 
+     if (this._requisition) {
+       CommandUtils.destroyRequisition(this._requisition, this.target);
+     }
+     this._telemetry.toolClosed("toolbox");
+     this._telemetry.destroy();
+diff --git a/devtools/client/inspector/inspector-panel.js b/devtools/client/inspector/inspector-panel.js
+--- a/devtools/client/inspector/inspector-panel.js
++++ b/devtools/client/inspector/inspector-panel.js
+@@ -167,27 +167,27 @@ InspectorPanel.prototype = {
+     if (this.target.isLocalTab) {
+       // Show a warning when the debugger is paused.
+       // We show the warning only when the inspector
+       // is selected.
+       this.updateDebuggerPausedWarning = () => {
+         let notificationBox = this._toolbox.getNotificationBox();
+         let notification = notificationBox.getNotificationWithValue("inspector-script-paused");
+         if (!notification && this._toolbox.currentToolId == "inspector" &&
+-            this.target.isThreadPaused) {
++            this._toolbox.threadClient.paused) {
+           let message = strings.GetStringFromName("debuggerPausedWarning.message");
+           notificationBox.appendNotification(message,
+             "inspector-script-paused", "", notificationBox.PRIORITY_WARNING_HIGH);
+         }
+ 
+         if (notification && this._toolbox.currentToolId != "inspector") {
+           notificationBox.removeNotification(notification);
+         }
+ 
+-        if (notification && !this.target.isThreadPaused) {
++        if (notification && !this._toolbox.threadClient.paused) {
+           notificationBox.removeNotification(notification);
+         }
+ 
+       };
+       this.target.on("thread-paused", this.updateDebuggerPausedWarning);
+       this.target.on("thread-resumed", this.updateDebuggerPausedWarning);
+       this._toolbox.on("select", this.updateDebuggerPausedWarning);
+       this.updateDebuggerPausedWarning();
+diff --git a/devtools/client/webconsole/test/browser_console_log_inspectable_object.js b/devtools/client/webconsole/test/browser_console_log_inspectable_object.js
+--- a/devtools/client/webconsole/test/browser_console_log_inspectable_object.js
++++ b/devtools/client/webconsole/test/browser_console_log_inspectable_object.js
+@@ -8,17 +8,17 @@
+ 
+ add_task(function*() {
+   yield loadTab("data:text/html;charset=utf8,test for bug 676722 - " +
+                 "inspectable objects for window.console");
+ 
+   let hud = yield openConsole();
+   hud.jsterm.clearOutput(true);
+ 
+-  hud.jsterm.execute("myObj = {abba: 'omgBug676722'}");
++  yield hud.jsterm.execute("myObj = {abba: 'omgBug676722'}");
+   hud.jsterm.execute("console.log('fooBug676722', myObj)");
+ 
+   let [result] = yield waitForMessages({
+     webconsole: hud,
+     messages: [{
+       text: "fooBug676722",
+       category: CATEGORY_WEBDEV,
+       severity: SEVERITY_LOG,
+diff --git a/devtools/client/webconsole/test/browser_console_optimized_out_vars.js b/devtools/client/webconsole/test/browser_console_optimized_out_vars.js
+--- a/devtools/client/webconsole/test/browser_console_optimized_out_vars.js
++++ b/devtools/client/webconsole/test/browser_console_optimized_out_vars.js
+@@ -9,19 +9,16 @@
+ function test() {
+   Task.spawn(function* () {
+     const TEST_URI = "http://example.com/browser/devtools/client/webconsole/" +
+                      "test/test-closure-optimized-out.html";
+     let {tab} = yield loadTab(TEST_URI);
+     let hud = yield openConsole(tab);
+     let { toolbox, panel, panelWin } = yield openDebugger();
+ 
+-    yield waitForThreadEvents(panel, "resumed");
+-    ok(true, "Debugger resumed");
+-
+     let sources = panelWin.DebuggerView.Sources;
+     yield panel.addBreakpoint({ actor: sources.values[0], line: 18 });
+     yield ensureThreadClientState(panel, "resumed");
+ 
+     let fetchedScopes = panelWin.once(panelWin.EVENTS.FETCHED_SCOPES);
+     let button = content.document.querySelector("button");
+     ok(button, "Button element found");
+     // Spin the event loop before causing the debuggee to pause, to allow
+diff --git a/devtools/client/webconsole/test/browser_webconsole_bug_1050691_click_function_to_source.js b/devtools/client/webconsole/test/browser_webconsole_bug_1050691_click_function_to_source.js
+--- a/devtools/client/webconsole/test/browser_webconsole_bug_1050691_click_function_to_source.js
++++ b/devtools/client/webconsole/test/browser_webconsole_bug_1050691_click_function_to_source.js
+@@ -9,32 +9,23 @@
+ 
+ const TEST_URI = "http://example.com/browser/devtools/client/webconsole/" +
+                  "test/test-bug_1050691_click_function_to_source.html";
+ 
+ add_task(function*() {
+   yield loadTab(TEST_URI);
+   let hud = yield openConsole();
+ 
+-  yield testWithoutDebuggerOpen(hud);
+-
+   // Open the Debugger panel.
+   let debuggerPanel = yield openDebugger();
+   // And right after come back to the Console panel.
+   yield openConsole();
+   yield testWithDebuggerOpen(hud, debuggerPanel);
+ });
+ 
+-function* testWithoutDebuggerOpen(hud) {
+-  let clickable = yield printFunction(hud);
+-  let onVariablesViewOpen = hud.jsterm.once("variablesview-fetched");
+-  synthesizeClick(clickable, hud);
+-  return onVariablesViewOpen;
+-}
+-
+ function* testWithDebuggerOpen(hud, debuggerPanel) {
+   let clickable = yield printFunction(hud);
+   let panelWin = debuggerPanel.panelWin;
+   let onEditorLocationSet = panelWin.once(panelWin.EVENTS.EDITOR_LOCATION_SET);
+   synthesizeClick(clickable, hud);
+   yield onEditorLocationSet;
+   ok(isDebuggerCaretPos(debuggerPanel, 7),
+     "Clicking on a function should go to its source in the debugger view");
+diff --git a/devtools/client/webconsole/test/browser_webconsole_bug_595350_multiple_windows_and_tabs.js b/devtools/client/webconsole/test/browser_webconsole_bug_595350_multiple_windows_and_tabs.js
+--- a/devtools/client/webconsole/test/browser_webconsole_bug_595350_multiple_windows_and_tabs.js
++++ b/devtools/client/webconsole/test/browser_webconsole_bug_595350_multiple_windows_and_tabs.js
+@@ -51,31 +51,35 @@ function addTabs(aWindow) {
+       if (loadedTabCount >= 4) {
+         executeSoon(openConsoles);
+       }
+     }, true);
+   }
+ }
+ 
+ function openConsoles() {
+-  // open the Web Console for each of the four tabs and log a message.
+-  let consolesOpen = 0;
+-  for (let i = 0; i < openTabs.length; i++) {
++  function open(i) {
+     let tab = openTabs[i];
+-    openConsole(tab).then(function(index, hud) {
+-      ok(hud, "HUD is open for tab " + index);
++    openConsole(tab).then(function(hud) {
++      ok(hud, "HUD is open for tab " + i);
+       let window = hud.target.tab.linkedBrowser.contentWindow;
+-      window.console.log("message for tab " + index);
+-      consolesOpen++;
+-      if (consolesOpen == 4) {
++      window.console.log("message for tab " + i);
++
++      if (i >= openTabs.length - 1) {
+         // Use executeSoon() to allow the promise to resolve.
+         executeSoon(closeConsoles);
+       }
+-    }.bind(null, i));
++      else {
++        executeSoon(() => open(i + 1));
++      }
++    });
+   }
++
++  // open the Web Console for each of the four tabs and log a message.
++  open(0);
+ }
+ 
+ function closeConsoles() {
+   let consolesClosed = 0;
+ 
+   function onWebConsoleClose(aSubject, aTopic) {
+     if (aTopic == "web-console-destroyed") {
+       consolesClosed++;
+diff --git a/devtools/client/webconsole/test/browser_webconsole_bug_597136_external_script_errors.js b/devtools/client/webconsole/test/browser_webconsole_bug_597136_external_script_errors.js
+--- a/devtools/client/webconsole/test/browser_webconsole_bug_597136_external_script_errors.js
++++ b/devtools/client/webconsole/test/browser_webconsole_bug_597136_external_script_errors.js
+@@ -14,24 +14,22 @@ const TEST_URI = "http://example.com/bro
+                  "webconsole/test/test-bug-597136-external-script-" +
+                  "errors.html";
+ 
+ function test() {
+   Task.spawn(function* () {
+     const {tab} = yield loadTab(TEST_URI);
+     const hud = yield openConsole(tab);
+ 
+-    let button = content.document.querySelector("button");
+-
+     // On e10s, the exception is triggered in child process
+     // and is ignored by test harness
+     if (!Services.appinfo.browserTabsRemoteAutostart) {
+       expectUncaughtException();
+     }
+-    EventUtils.sendMouseEvent({ type: "click" }, button, content);
++    BrowserTestUtils.synthesizeMouseAtCenter("button", {}, gBrowser.selectedBrowser);
+ 
+     yield waitForMessages({
+       webconsole: hud,
+       messages: [{
+         text: "bogus is not defined",
+         category: CATEGORY_JS,
+         severity: SEVERITY_ERROR,
+       }],
+diff --git a/devtools/client/webconsole/test/browser_webconsole_closure_inspection.js b/devtools/client/webconsole/test/browser_webconsole_closure_inspection.js
+--- a/devtools/client/webconsole/test/browser_webconsole_closure_inspection.js
++++ b/devtools/client/webconsole/test/browser_webconsole_closure_inspection.js
+@@ -13,40 +13,28 @@ const TEST_URI = "http://example.com/bro
+ 
+ var gWebConsole, gJSTerm, gVariablesView;
+ 
+ function test() {
+   registerCleanupFunction(() => {
+     gWebConsole = gJSTerm = gVariablesView = null;
+   });
+ 
+-  function resumeDebugger(toolbox, panelWin, deferred) {
+-    panelWin.gThreadClient.addOneTimeListener("resumed", () => {
+-      ok(true, "Debugger resumed");
+-      deferred.resolve({ toolbox: toolbox, panelWin: panelWin });
+-    });
+-  }
+-
+   function fetchScopes(hud, toolbox, panelWin, deferred) {
+     panelWin.once(panelWin.EVENTS.FETCHED_SCOPES, () => {
+       ok(true, "Scopes were fetched");
+       toolbox.selectTool("webconsole").then(() => consoleOpened(hud));
+       deferred.resolve();
+     });
+   }
+ 
+   loadTab(TEST_URI).then(() => {
+     openConsole().then((hud) => {
+       openDebugger().then(({ toolbox, panelWin }) => {
+         let deferred = promise.defer();
+-        resumeDebugger(toolbox, panelWin, deferred);
+-
+-        return deferred.promise;
+-      }).then(({ toolbox, panelWin }) => {
+-        let deferred = promise.defer();
+         fetchScopes(hud, toolbox, panelWin, deferred);
+ 
+         let button = content.document.querySelector("button");
+         ok(button, "button element found");
+         EventUtils.synthesizeMouseAtCenter(button, {}, content);
+ 
+         return deferred.promise;
+       });
+diff --git a/devtools/client/webconsole/test/browser_webconsole_count.js b/devtools/client/webconsole/test/browser_webconsole_count.js
+--- a/devtools/client/webconsole/test/browser_webconsole_count.js
++++ b/devtools/client/webconsole/test/browser_webconsole_count.js
+@@ -11,19 +11,17 @@ const TEST_URI = "http://example.com/bro
+ 
+ function test() {
+   Task.spawn(runner).then(finishTest);
+ 
+   function* runner() {
+     const {tab} = yield loadTab(TEST_URI);
+     const hud = yield openConsole(tab);
+ 
+-    let button = content.document.querySelector("#local");
+-    ok(button, "we have the local-tests button");
+-    EventUtils.sendMouseEvent({ type: "click" }, button, content);
++    BrowserTestUtils.synthesizeMouseAtCenter("#local", {}, gBrowser.selectedBrowser);
+     let messages = [];
+     [
+       "start",
+       "<no label>: 2",
+       "console.count() testcounter: 1",
+       "console.count() testcounter: 2",
+       "console.count() testcounter: 3",
+       "console.count() testcounter: 4",
+@@ -44,19 +42,17 @@ function test() {
+     });
+     yield waitForMessages({
+       webconsole: hud,
+       messages: messages
+     });
+ 
+     hud.jsterm.clearOutput();
+ 
+-    button = content.document.querySelector("#external");
+-    ok(button, "we have the external-tests button");
+-    EventUtils.sendMouseEvent({ type: "click" }, button, content);
++    BrowserTestUtils.synthesizeMouseAtCenter("#external", {}, gBrowser.selectedBrowser);
+     messages = [];
+     [
+       "start",
+       "console.count() testcounter: 5",
+       "console.count() testcounter: 6",
+       "end"
+     ].forEach(function(msg) {
+       messages.push({
+diff --git a/devtools/client/webconsole/test/browser_webconsole_output_02.js b/devtools/client/webconsole/test/browser_webconsole_output_02.js
+--- a/devtools/client/webconsole/test/browser_webconsole_output_02.js
++++ b/devtools/client/webconsole/test/browser_webconsole_output_02.js
+@@ -20,44 +20,41 @@ var inputTests = [
+     variablesViewLabel: "getElementById()",
+   },
+ 
+   // 1 - anonymous function
+   {
+     input: "(function() { return 42; })",
+     output: "function ()",
+     printOutput: "function () { return 42; }",
+-    inspectable: true,
++    suppressClick: true
+   },
+ 
+   // 2 - named function
+   {
+     input: "window.testfn1",
+     output: "function testfn1()",
+     printOutput: "function testfn1() { return 42; }",
+-    inspectable: true,
+-    variablesViewLabel: "testfn1()",
++    suppressClick: true
+   },
+ 
+   // 3 - anonymous function, but spidermonkey gives us an inferred name.
+   {
+     input: "testobj1.testfn2",
+     output: "function testobj1.testfn2()",
+     printOutput: "function () { return 42; }",
+-    inspectable: true,
+-    variablesViewLabel: "testobj1.testfn2()",
++    suppressClick: true
+   },
+ 
+   // 4 - named function with custom display name
+   {
+     input: "window.testfn3",
+     output: "function testfn3DisplayName()",
+     printOutput: "function testfn3() { return 42; }",
+-    inspectable: true,
+-    variablesViewLabel: "testfn3DisplayName()",
++    suppressClick: true
+   },
+ 
+   // 5 - basic array
+   {
+     input: "window.array1",
+     output: 'Array [ 1, 2, 3, "a", "b", "c", "4", "5" ]',
+     printOutput: "1,2,3,a,b,c,4,5",
+     inspectable: true,
+diff --git a/devtools/client/webconsole/test/head.js b/devtools/client/webconsole/test/head.js
+--- a/devtools/client/webconsole/test/head.js
++++ b/devtools/client/webconsole/test/head.js
+@@ -1513,17 +1513,20 @@ function checkOutputForInputs(hud, input
+                                                           deferredVariablesView);
+     hud.jsterm.on("variablesview-open", entry._onVariablesViewOpen);
+ 
+     let deferredTab = promise.defer();
+     entry._onTabOpen = onTabOpen.bind(null, entry, deferredTab);
+     container.addEventListener("TabOpen", entry._onTabOpen, true);
+ 
+     body.scrollIntoView();
+-    EventUtils.synthesizeMouse(body, 2, 2, {}, hud.iframeWindow);
++
++    if (!entry.suppressClick) {
++      EventUtils.synthesizeMouse(body, 2, 2, {}, hud.iframeWindow);
++    }
+ 
+     if (entry.inspectable) {
+       info("message body tagName '" + body.tagName + "' className '" +
+            body.className + "'");
+       yield deferredVariablesView.promise;
+     } else {
+       hud.jsterm.off("variablesview-open", entry._onVariablesView);
+       entry._onVariablesView = null;
+diff --git a/devtools/client/webide/test/test_runtime.html b/devtools/client/webide/test/test_runtime.html
+--- a/devtools/client/webide/test/test_runtime.html
++++ b/devtools/client/webide/test/test_runtime.html
+@@ -13,16 +13,17 @@
+   </head>
+ 
+   <body>
+ 
+     <script type="application/javascript;version=1.8">
+       window.onload = function() {
+         SimpleTest.waitForExplicitFinish();
+ 
++        const { DebuggerServer } = require("devtools/server/main");
+         let win;
+ 
+         SimpleTest.registerCleanupFunction(() => {
+           Task.spawn(function*() {
+             if (win) {
+               yield closeWebIDE(win);
+             }
+             DebuggerServer.destroy();
+@@ -34,18 +35,16 @@
+           function isPlayActive() {
+             return !win.document.querySelector("#cmd_play").hasAttribute("disabled");
+           }
+ 
+           function isStopActive() {
+             return !win.document.querySelector("#cmd_stop").hasAttribute("disabled");
+           }
+ 
+-          const { DebuggerServer } = require("devtools/server/main");
+-
+           if (!DebuggerServer.initialized) {
+             DebuggerServer.init();
+             DebuggerServer.addBrowserActors();
+           }
+ 
+           win = yield openWebIDE();
+           let docRuntime = getRuntimeDocument(win);
+           let docProject = getProjectDocument(win);
+diff --git a/devtools/server/actors/script.js b/devtools/server/actors/script.js
+--- a/devtools/server/actors/script.js
++++ b/devtools/server/actors/script.js
+@@ -673,20 +673,26 @@ ThreadActor.prototype = {
+       type: "detached"
+     };
+   },
+ 
+   onReconfigure: function (aRequest) {
+     if (this.state == "exited") {
+       return { error: "wrongState" };
+     }
+-
+-    update(this._options, aRequest.options || {});
++    const options = aRequest.options || {};
++
++    if ('observeAsmJS' in options) {
++      this.dbg.allowUnobservedAsmJS = !options.observeAsmJS;
++    }
++
++    update(this._options, options);
++
+     // Update the global source store
+-    this.sources.reconfigure(this._options);
++    this.sources.reconfigure(options);
+ 
+     return {};
+   },
+ 
+   /**
+    * Pause the debuggee, by entering a nested event loop, and return a 'paused'
+    * packet to the client.
+    *
+@@ -1916,31 +1922,36 @@ ThreadActor.prototype = {
+     // The scripts must be added to the ScriptStore before restoring
+     // breakpoints. If we try to add them to the ScriptStore any later, we can
+     // accidentally set a breakpoint in a top level script as a "closest match"
+     // because we wouldn't have added the child scripts to the ScriptStore yet.
+     this.scripts.addScripts(this.dbg.findScripts({ source: aSource }));
+ 
+     let sourceActor = this.sources.createNonSourceMappedActor(aSource);
+ 
++    // Set any stored breakpoints.
++    let bpActors = this.breakpointActorMap.findActors();
++    let promises = [];
++
+     // Go ahead and establish the source actors for this script, which
+     // fetches sourcemaps if available and sends onNewSource
+     // notifications.
+-    //
+-    // We need to use unsafeSynchronize here because if the page is being reloaded,
+-    // this call will replace the previous set of source actors for this source
+-    // with a new one. If the source actors have not been replaced by the time
+-    // we try to reset the breakpoints below, their location objects will still
+-    // point to the old set of source actors, which point to different scripts.
+-    this.unsafeSynchronize(this.sources.createSourceActors(aSource));
+-
+-    // Set any stored breakpoints.
+-    let promises = [];
+-
+-    for (let _actor of this.breakpointActorMap.findActors()) {
++    let sourceActorsCreated = this.sources.createSourceActors(aSource);
++
++    if (bpActors.length) {
++      // We need to use unsafeSynchronize here because if the page is being reloaded,
++      // this call will replace the previous set of source actors for this source
++      // with a new one. If the source actors have not been replaced by the time
++      // we try to reset the breakpoints below, their location objects will still
++      // point to the old set of source actors, which point to different
++      // scripts.
++      this.unsafeSynchronize(sourceActorsCreated);
++    }
++
++    for (let _actor of bpActors) {
+       // XXX bug 1142115: We do async work in here, so we need to create a fresh
+       // binding because for/of does not yet do that in SpiderMonkey.
+       let actor = _actor;
+ 
+       if (actor.isPending) {
+         promises.push(actor.originalLocation.originalSourceActor._setBreakpoint(actor));
+       } else {
+         promises.push(this.sources.getAllGeneratedLocations(actor.originalLocation)
+diff --git a/devtools/server/actors/utils/TabSources.js b/devtools/server/actors/utils/TabSources.js
+--- a/devtools/server/actors/utils/TabSources.js
++++ b/devtools/server/actors/utils/TabSources.js
+@@ -53,25 +53,31 @@ function TabSources(threadActor, allowSo
+  */
+ const MINIFIED_SOURCE_REGEXP = /\bmin\.js$/;
+ 
+ TabSources.prototype = {
+   /**
+    * Update preferences and clear out existing sources
+    */
+   reconfigure: function(options) {
++    let shouldReset = false;
++
+     if ('useSourceMaps' in options) {
++      shouldReset = true;
+       this._useSourceMaps = options.useSourceMaps;
+     }
+ 
+     if ('autoBlackBox' in options) {
++      shouldReset = true;
+       this._autoBlackBox = options.autoBlackBox;
+     }
+ 
+-    this.reset();
++    if (shouldReset) {
++      this.reset();
++    }
+   },
+ 
+   /**
+    * Clear existing sources so they are recreated on the next access.
+    *
+    * @param Object opts
+    *        Specify { sourceMaps: true } if you also want to clear
+    *        the source map cache (usually done on reload).
+@@ -387,17 +393,18 @@ TabSources.prototype = {
+ 
+     let sourceMapURL = aSource.sourceMapURL;
+     if (aSource.url) {
+       sourceMapURL = this._normalize(sourceMapURL, aSource.url);
+     }
+     let result = this._fetchSourceMap(sourceMapURL, aSource.url);
+ 
+     // The promises in `_sourceMaps` must be the exact same instances
+-    // as returned by `_fetchSourceMap` for `clearSourceMapCache` to work.
++    // as returned by `_fetchSourceMap` for `clearSourceMapCache` to
++    // work.
+     this._sourceMaps.set(aSource, result);
+     return result;
+   },
+ 
+   /**
+    * Return a promise of a SourceMapConsumer for the source map for
+    * `aSource`. The resolved result may be null if the source does not
+    * have a source map or source maps are disabled.
+diff --git a/devtools/server/actors/utils/make-debugger.js b/devtools/server/actors/utils/make-debugger.js
+--- a/devtools/server/actors/utils/make-debugger.js
++++ b/devtools/server/actors/utils/make-debugger.js
+@@ -61,16 +61,17 @@ const { reportException } = require("dev
+  *            - addDebuggees: A function which takes no arguments. It adds all
+  *              current globals that should be debuggees (as determined by
+  *              |findDebuggees|) to the |Debugger| instance.
+  */
+ module.exports = function makeDebugger({ findDebuggees, shouldAddNewGlobalAsDebuggee }) {
+   const dbg = new Debugger();
+   EventEmitter.decorate(dbg);
+ 
++  dbg.allowUnobservedAsmJS = true;
+   dbg.uncaughtExceptionHook = reportDebuggerHookException;
+ 
+   dbg.onNewGlobalObject = function(global) {
+     if (shouldAddNewGlobalAsDebuggee(global)) {
+       safeAddDebuggee(this, global);
+     }
+   };
+ 
+diff --git a/devtools/shared/client/main.js b/devtools/shared/client/main.js
+--- a/devtools/shared/client/main.js
++++ b/devtools/shared/client/main.js
+@@ -293,17 +293,16 @@ DebuggerClient.requester = function (aPa
+       if (thisCallback) {
+         thisCallback(aResponse);
+       }
+ 
+       if (histogram) {
+         histogram.add(+new Date - startTime);
+       }
+     }, "DebuggerClient.requester request callback"));
+-
+   }, "DebuggerClient.requester");
+ };
+ 
+ function args(aPos) {
+   return new DebuggerClient.Argument(aPos);
+ }
+ 
+ DebuggerClient.Argument = function (aPosition) {
+@@ -1432,16 +1431,19 @@ WorkerClient.prototype = {
+         aOnResponse(connectReponse, this.thread);
+       });
+     });
+   },
+ 
+   _onClose: function () {
+     this.removeListener("close", this._onClose);
+ 
++    if (this.thread) {
++      this.client.unregisterClient(this.thread);
++    }
+     this.client.unregisterClient(this);
+     this._isClosed = true;
+   },
+ 
+   reconfigure: function () {
+     return Promise.resolve();
+   },
+ 
+@@ -2164,22 +2166,30 @@ ThreadClient.prototype = {
+   },
+ 
+   /**
+    * Handle thread state change by doing necessary cleanup and notifying all
+    * registered listeners.
+    */
+   _onThreadState: function (aPacket) {
+     this._state = ThreadStateTypes[aPacket.type];
++    // The debugger UI may not be initialized yet so we want to keep
++    // the packet around so it knows what to pause state to display
++    // when it's initialized
++    this._lastPausePacket = aPacket.type === 'resumed' ? null : aPacket;
+     this._clearFrames();
+     this._clearPauseGrips();
+     aPacket.type === ThreadStateTypes.detached && this._clearThreadGrips();
+     this.client._eventsEnabled && this.emit(aPacket.type, aPacket);
+   },
+ 
++  getLastPausePacket: function() {
++    return this._lastPausePacket;
++  },
++
+   /**
+    * Return an EnvironmentClient instance for the given environment actor form.
+    */
+   environment: function (aForm) {
+     return new EnvironmentClient(this.client, aForm);
+   },
+ 
+   /**
