@@ -1,13 +1,12 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  6839e911644de35d72e6c31cf6c8c73b776e95a4
-Bug 1239750 - Add DAMP measurement for bulk console.log performance;r=fitzgen
+# Parent  ff9767245bdd26d0b0d0af7f7ecee66de0f885e4
+Bug 1239750 - Add DAMP measurement for rAF performance during streaming console.log messages;r=fitzgen
 
 diff --git a/testing/talos/talos/tests/devtools/addon/content/damp.html b/testing/talos/talos/tests/devtools/addon/content/damp.html
 --- a/testing/talos/talos/tests/devtools/addon/content/damp.html
 +++ b/testing/talos/talos/tests/devtools/addon/content/damp.html
-@@ -12,27 +12,29 @@ var defaultConfig = {
-   subtests: {
+@@ -13,28 +13,30 @@ var defaultConfig = {
      webconsoleOpen: true,
      inspectorOpen: true,
      debuggerOpen: true,
@@ -15,7 +14,8 @@ diff --git a/testing/talos/talos/tests/devtools/addon/content/damp.html b/testin
      performanceOpen: true,
      netmonitorOpen: true,
      saveAndReadHeapSnapshot: true,
-+    consoleBulkLogging: true,
+     consoleBulkLogging: true,
++    consoleStreamLogging: true,
    }
  };
  
@@ -27,7 +27,8 @@ diff --git a/testing/talos/talos/tests/devtools/addon/content/damp.html b/testin
    performanceOpen: "Measure open/close toolbox on performance panel",
    netmonitorOpen: "Measure open/close toolbox on network monitor panel",
    saveAndReadHeapSnapshot: "Measure open/close toolbox on memory panel and save/read heap snapshot",
-+  consoleBulkLogging: "Measure time for a bunch of sync console.log statements to appear",
+   consoleBulkLogging: "Measure time for a bunch of sync console.log statements to appear",
++  consoleStreamLogging: "Measure rAF on page during a stream of console.log statements",
  };
  
  function updateConfig() {
@@ -39,58 +40,59 @@ diff --git a/testing/talos/talos/tests/devtools/addon/content/damp.html b/testin
 diff --git a/testing/talos/talos/tests/devtools/addon/content/damp.js b/testing/talos/talos/tests/devtools/addon/content/damp.js
 --- a/testing/talos/talos/tests/devtools/addon/content/damp.js
 +++ b/testing/talos/talos/tests/devtools/addon/content/damp.js
-@@ -107,16 +107,65 @@ Damp.prototype = {
-     let end = performance.now();
-     this._results.push({
-       name: label + ".readHeapSnapshot",
+@@ -156,16 +156,66 @@ Damp.prototype = {
+       name: "console.bulklog",
        value: end - start
      });
-     return Promise.resolve();
-   },
  
-+  _consoleBulkLoggingTest: Task.async(function*() {
-+    let TOTAL_MESSAGES = 10;
+     yield this.closeToolbox(null);
+     yield this.testTeardown();
+   }),
+ 
++  // Log a stream of console messages, 1 per rAF.  Then record the average
++  // time per rAF.  The idea is that the console being slow can slow down
++  // content (i.e. Bug 1237368).
++  _consoleStreamLoggingTest: Task.async(function*() {
++    let TOTAL_MESSAGES = 100;
 +    let tab = yield this.testSetup(SIMPLE_URL);
 +    let messageManager = tab.linkedBrowser.messageManager;
 +    let {toolbox} = yield this.openToolbox("webconsole");
 +    let webconsole = toolbox.getPanel("webconsole");
 +
-+    // Resolve once the last message has been received.
-+    let allMessagesReceived = new Promise(resolve => {
-+      function receiveMessages(e, messages) {
-+        for (let m of messages) {
-+          if (m.node.textContent.includes("damp " + TOTAL_MESSAGES)) {
-+            webconsole.hud.ui.off("new-messages", receiveMessages);
-+            // Wait for the console to redraw
-+            requestAnimationFrame(resolve);
-+          }
-+        }
-+      }
-+      webconsole.hud.ui.on("new-messages", receiveMessages);
-+    });
-+
 +    // Load a frame script using a data URI so we can do logs
 +    // from the page.  So this is running in content.
 +    messageManager.loadFrameScript("data:,(" + encodeURIComponent(
 +      `function () {
-+        addMessageListener("do-logs", function () {
-+          for (var i = 0; i < ${TOTAL_MESSAGES}; i++) {
-+            content.console.log('damp', i+1, content);
++        let count = 0;
++        let startTime = content.performance.now();
++        function log() {
++          if (++count < ${TOTAL_MESSAGES}) {
++            content.document.querySelector("h1").textContent += count + "\\n";
++            content.console.log('damp', count,
++                                content,
++                                content.document,
++                                content.document.body,
++                                content.document.documentElement,
++                                new Array(100).join(" DAMP? DAMP! "));
++            content.requestAnimationFrame(log);
++          } else {
++            let avgTime = (content.performance.now() - startTime) / ${TOTAL_MESSAGES};
++            sendSyncMessage("done", Math.round(avgTime));
 +          }
-+        });
++        }
++        log();
 +      }`
 +    ) + ")()", true);
 +
-+    // Kick off the logging
-+    messageManager.sendAsyncMessage("do-logs");
-+
-+    let start = performance.now();
-+    yield allMessagesReceived;
-+    let end = performance.now();
++    let avgTime = yield new Promise(resolve => {
++      messageManager.addMessageListener("done", (e) => {
++        resolve(e.data);
++      });
++    });
 +
 +    this._results.push({
-+      name: "console.bulklog",
-+      value: end - start
++      name: "console.streamlog",
++      value: avgTime
 +    });
 +
 +    yield this.closeToolbox(null);
@@ -105,41 +107,17 @@ diff --git a/testing/talos/talos/tests/devtools/addon/content/damp.js b/testing/
          by: "coarseType",
          objects: {
            by: "objectClass",
-@@ -239,20 +288,21 @@ Damp.prototype = {
-         sequenceArray.push(subtests[config.subtests[i]]);
-       }
-     }
- 
-     return sequenceArray;
-   },
- 
-   testSetup: Task.async(function*(url) {
--    yield this.addTab(url);
-+    let tab = yield this.addTab(url);
-     yield new Promise(resolve => {
-       setTimeout(resolve, this._config.rest);
-     });
-+    return tab;
-   }),
- 
-   testTeardown: Task.async(function*(url) {
-     this.closeCurrentTab();
-     this._nextCommand();
-   }),
- 
-   // Everything below here are common pieces needed for the test runner to function,
-@@ -342,11 +392,15 @@ Damp.prototype = {
-     this._dampTab = this._win.gBrowser.selectedTab;
-     this._win.gBrowser.selectedBrowser.focus(); // Unfocus the URL bar to avoid caret blink
- 
-     Profiler.mark("DAMP - start", true);
+@@ -396,11 +446,14 @@ Damp.prototype = {
  
      let tests = [];
      tests = tests.concat(this._getToolLoadingTests(SIMPLE_URL, "simple"));
      tests = tests.concat(this._getToolLoadingTests(COMPLICATED_URL, "complicated"));
-+
-+    if (config.subtests.indexOf("consoleBulkLogging") > -1) {
-+      tests = tests.concat(this._consoleBulkLoggingTest);
+ 
+     if (config.subtests.indexOf("consoleBulkLogging") > -1) {
+       tests = tests.concat(this._consoleBulkLoggingTest);
+     }
++    if (config.subtests.indexOf("consoleStreamLogging") > -1) {
++      tests = tests.concat(this._consoleStreamLoggingTest);
 +    }
      this._doSequence(tests, this._doneInternal);
    }

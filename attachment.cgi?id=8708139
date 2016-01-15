@@ -1,0 +1,573 @@
+# HG changeset patch
+# User Gabriel Luong <gabriel.luong@gmail.com>
+# Parent  aac6ceff3873a09e901758841d6da442e0ecebc8
+Bug 1238133 - Part 3: Make the rule view live inside the inspector panel frame r=bgrins
+
+diff --git a/devtools/client/framework/sidebar.js b/devtools/client/framework/sidebar.js
+--- a/devtools/client/framework/sidebar.js
++++ b/devtools/client/framework/sidebar.js
+@@ -286,16 +286,22 @@ ToolSidebar.prototype = {
+     for (let tab of this._tabbox.tabs.querySelectorAll("tab")) {
+       if (knownTabs.indexOf(tab) !== -1) {
+         continue;
+       }
+
+       // Find an ID for this unknown tab
+       let id = tab.getAttribute("id") || "untitled-tab-" + (this.untitledTabsIndex++);
+
++      // If the existing tab contains the tab ID prefix, extract the ID of the
++      // tab
++      if (id.startsWith(this.TAB_ID_PREFIX)) {
++        id = id.split(this.TAB_ID_PREFIX).pop();
++      }
++
+       // Register the tab
+       this._tabs.set(id, tab);
+       this.emit("new-tab-registered", id);
+     }
+   },
+
+   /**
+    * Remove an existing tab.
+diff --git a/devtools/client/inspector/inspector-panel.js b/devtools/client/inspector/inspector-panel.js
+--- a/devtools/client/inspector/inspector-panel.js
++++ b/devtools/client/inspector/inspector-panel.js
+@@ -1,29 +1,32 @@
+ /* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+-const {Cc, Ci, Cu, Cr} = require("chrome");
++"use strict";
++
++const {Cc, Ci, Cu} = require("chrome");
+
+ Cu.import("resource://gre/modules/Services.jsm");
+
+ var promise = require("promise");
+ var EventEmitter = require("devtools/shared/event-emitter");
+ var clipboard = require("sdk/clipboard");
+ var {HostType} = require("devtools/client/framework/toolbox").Toolbox;
+
+ loader.lazyRequireGetter(this, "CSS", "CSS");
+
+ loader.lazyGetter(this, "MarkupView", () => require("devtools/client/inspector/markup/markup").MarkupView);
+ loader.lazyGetter(this, "HTMLBreadcrumbs", () => require("devtools/client/inspector/breadcrumbs").HTMLBreadcrumbs);
+ loader.lazyGetter(this, "ToolSidebar", () => require("devtools/client/framework/sidebar").ToolSidebar);
+ loader.lazyGetter(this, "InspectorSearch", () => require("devtools/client/inspector/inspector-search").InspectorSearch);
++loader.lazyGetter(this, "RuleViewTool", () => require("devtools/client/inspector/rules/rules").RuleViewTool);
+
+ loader.lazyGetter(this, "strings", () => {
+   return Services.strings.createBundle("chrome://devtools/locale/inspector.properties");
+ });
+ loader.lazyGetter(this, "toolboxStrings", () => {
+   return Services.strings.createBundle("chrome://devtools/locale/toolbox.properties");
+ });
+ loader.lazyGetter(this, "clipboardHelper", () => {
+@@ -347,19 +350,17 @@ InspectorPanel.prototype = {
+     let defaultTab = Services.prefs.getCharPref("devtools.inspector.activeSidebar");
+
+     this._setDefaultSidebar = (event, toolId) => {
+       Services.prefs.setCharPref("devtools.inspector.activeSidebar", toolId);
+     };
+
+     this.sidebar.on("select", this._setDefaultSidebar);
+
+-    this.sidebar.addTab("ruleview",
+-                        "chrome://devtools/content/inspector/rules/rules.xhtml",
+-                        "ruleview" == defaultTab);
++    this.ruleview = new RuleViewTool(this, this.panelWin);
+
+     this.sidebar.addTab("computedview",
+                         "chrome://devtools/content/inspector/computed/computed.xhtml",
+                         "computedview" == defaultTab);
+
+     if (Services.prefs.getBoolPref("devtools.fontinspector.enabled") && this.canGetUsedFontFaces) {
+       this.sidebar.addTab("fontinspector",
+                           "chrome://devtools/content/inspector/fonts/fonts.xhtml",
+@@ -581,16 +582,20 @@ InspectorPanel.prototype = {
+
+     this.target.off("will-navigate", this._onBeforeNavigate);
+
+     this.target.off("thread-paused", this.updateDebuggerPausedWarning);
+     this.target.off("thread-resumed", this.updateDebuggerPausedWarning);
+     this._toolbox.off("select", this.updateDebuggerPausedWarning);
+     this._toolbox.off("host-changed", this.onToolboxHostChanged);
+
++    if (this.ruleview) {
++      this.ruleview.destroy();
++    }
++
+     this.sidebar.off("select", this._setDefaultSidebar);
+     let sidebarDestroyer = this.sidebar.destroy();
+     this.sidebar = null;
+
+     this.nodemenu.removeEventListener("popupshowing", this._setupNodeMenu, true);
+     this.nodemenu.removeEventListener("popuphiding", this._resetNodeMenu, true);
+     this.breadcrumbs.destroy();
+     this._paneToggleButton.removeEventListener("mousedown",
+diff --git a/devtools/client/inspector/inspector.xul b/devtools/client/inspector/inspector.xul
+--- a/devtools/client/inspector/inspector.xul
++++ b/devtools/client/inspector/inspector.xul
+@@ -3,22 +3,25 @@
+    - License, v. 2.0. If a copy of the MPL was not distributed with this
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ <?xml-stylesheet href="chrome://global/skin/" type="text/css"?>
+ <?xml-stylesheet href="chrome://devtools/content/shared/widgets/widgets.css" type="text/css"?>
+ <?xml-stylesheet href="chrome://devtools/content/inspector/inspector.css" type="text/css"?>
+ <?xml-stylesheet href="chrome://devtools/skin/common.css" type="text/css"?>
+ <?xml-stylesheet href="chrome://devtools/skin/widgets.css" type="text/css"?>
+ <?xml-stylesheet href="chrome://devtools/skin/inspector.css" type="text/css"?>
++<?xml-stylesheet href="chrome://devtools/skin/rules.css" type="text/css"?>
++
+ <!DOCTYPE window [
+-  <!ENTITY % inspectorDTD SYSTEM "chrome://devtools/locale/inspector.dtd" >
+-   %inspectorDTD;
++  <!ENTITY % inspectorDTD SYSTEM "chrome://devtools/locale/inspector.dtd"> %inspectorDTD;
++  <!ENTITY % styleinspectorDTD SYSTEM "chrome://devtools/locale/styleinspector.dtd"> %styleinspectorDTD;
+ ]>
+
+-<window xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
++<window xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
++        xmlns:html="http://www.w3.org/1999/xhtml">
+
+   <script type="application/javascript;version=1.8"
+           src="chrome://devtools/content/shared/theme-switching.js"/>
+
+   <commandset>
+     <command id="nodeSearchCommand"
+       oncommand="inspector.searchBox.focus()"/>
+   </commandset>
+@@ -164,13 +167,39 @@
+           class="devtools-toolbarbutton"
+           tabindex="0" />
+       </toolbar>
+       <vbox flex="1" id="markup-box">
+       </vbox>
+     </vbox>
+     <splitter class="devtools-side-splitter"/>
+     <tabbox id="inspector-sidebar" handleCtrlTab="false" class="devtools-sidebar-tabs" hidden="true">
+-      <tabs/>
+-      <tabpanels flex="1"/>
++      <tabs>
++        <tab id="sidebar-tab-ruleview"
++             label="&ruleViewTitle;"
++             crop="end"/>
++      </tabs>
++      <tabpanels flex="1">
++        <tabpanel id="sidebar-panel-ruleview" class="devtools-monospace theme-sidebar">
++          <html:div id="ruleview-toolbar" class="devtools-toolbar devtools-sidebar-toolbar">
++            <html:div class="devtools-searchbox">
++              <html:input id="ruleview-searchbox"
++                          class="devtools-searchinput devtools-rule-searchbox"
++                          type="search"
++                          placeholder="&filterStylesPlaceholder;"/>
++              <html:button id="ruleview-searchinput-clear" class="devtools-searchinput-clear"></html:button>
++            </html:div>
++            <html:button id="ruleview-add-rule-button" title="&addRuleButtonTooltip;" class="devtools-button"></html:button>
++            <html:button id="pseudo-class-panel-toggle" title="&togglePseudoClassPanel;" class="devtools-button"></html:button>
++          </html:div>
++          <html:div id="pseudo-class-panel" class="devtools-toolbar devtools-sidebar-toolbar" hidden="true" tabindex="-1">
++            <html:label><html:input id="pseudo-hover-toggle" type="checkbox" value=":hover" tabindex="-1" />:hover</html:label>
++            <html:label><html:input id="pseudo-active-toggle" type="checkbox" value=":active" tabindex="-1" />:active</html:label>
++            <html:label><html:input id="pseudo-focus-toggle" type="checkbox" value=":focus" tabindex="-1" />:focus</html:label>
++          </html:div>
++
++          <html:div id="ruleview-container" class="ruleview">
++          </html:div>
++        </tabpanel>
++      </tabpanels>
+     </tabbox>
+   </box>
+ </window>
+diff --git a/devtools/client/inspector/rules/rules.js b/devtools/client/inspector/rules/rules.js
+--- a/devtools/client/inspector/rules/rules.js
++++ b/devtools/client/inspector/rules/rules.js
+@@ -232,17 +232,17 @@ function CssRuleView(inspector, document
+   this.showUserAgentStyles = Services.prefs.getBoolPref(PREF_UA_STYLES);
+   this.enableMdnDocsTooltip =
+     Services.prefs.getBoolPref(PREF_ENABLE_MDN_DOCS_TOOLTIP);
+
+   let options = {
+     autoSelect: true,
+     theme: "auto"
+   };
+-  this.popup = new AutocompletePopup(this.styleWindow.parent.document, options);
++  this.popup = new AutocompletePopup(this.styleDocument, options);
+
+   this._showEmpty();
+
+   this._contextmenu = new StyleInspectorMenu(this, { isRuleView: true });
+
+   // Add the tooltips and highlighters to the view
+   this.tooltips = new overlays.TooltipsOverlay(this);
+   this.tooltips.addToView();
+diff --git a/devtools/client/inspector/rules/rules.xhtml b/devtools/client/inspector/rules/rules.xhtml
+deleted file mode 100644
+--- a/devtools/client/inspector/rules/rules.xhtml
++++ /dev/null
+@@ -1,57 +0,0 @@
+-<?xml version="1.0"?>
+-<!-- This Source Code Form is subject to the terms of the Mozilla Public
+-   - License, v. 2.0. If a copy of the MPL was not distributed with this
+-   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-
+-<!DOCTYPE window [
+-  <!ENTITY % inspectorDTD SYSTEM "chrome://devtools/locale/styleinspector.dtd">
+-  %inspectorDTD;
+-  <!ENTITY % globalDTD SYSTEM "chrome://global/locale/global.dtd">
+-  %globalDTD;
+-]>
+-
+-<html xmlns="http://www.w3.org/1999/xhtml"
+-      xmlns:xul="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+-      class="theme-sidebar">
+-  <head>
+-    <title>&ruleViewTitle;</title>
+-    <link rel="stylesheet" href="chrome://global/skin/global.css"  type="text/css"/>
+-    <link rel="stylesheet" href="chrome://devtools/skin/common.css"  type="text/css"/>
+-    <link rel="stylesheet" href="chrome://devtools/skin/rules.css"  type="text/css"/>
+-    <script type="application/javascript;version=1.8" src="chrome://devtools/content/shared/theme-switching.js"/>
+-    <script type="application/javascript;version=1.8">
+-      window.setPanel = function(panel, iframe) {
+-        let {require} = Components.utils.import("resource://devtools/shared/Loader.jsm", {});
+-        let {RuleViewTool} = require("devtools/client/inspector/rules/rules");
+-        this.ruleview = new RuleViewTool(panel, window);
+-      }
+-      window.onunload = function() {
+-        if (this.ruleview) {
+-          this.ruleview.destroy();
+-        }
+-      }
+-    </script>
+-  </head>
+-  <body dir="&locale.dir;">
+-    <div id="root" class="devtools-monospace">
+-      <div id="ruleview-toolbar" class="devtools-toolbar">
+-        <div class="devtools-searchbox">
+-          <input id="ruleview-searchbox"
+-                 class="devtools-searchinput devtools-rule-searchbox"
+-                 type="search" placeholder="&filterStylesPlaceholder;"/>
+-          <button id="ruleview-searchinput-clear" class="devtools-searchinput-clear"></button>
+-        </div>
+-        <button id="ruleview-add-rule-button" title="&addRuleButtonTooltip;" class="devtools-button"></button>
+-        <button id="pseudo-class-panel-toggle" title="&togglePseudoClassPanel;" class="devtools-button"></button>
+-      </div>
+-      <div id="pseudo-class-panel" class="devtools-toolbar" hidden="true" tabindex="-1">
+-        <label><input id="pseudo-hover-toggle" type="checkbox" value=":hover" tabindex="-1" />:hover</label>
+-        <label><input id="pseudo-active-toggle" type="checkbox" value=":active" tabindex="-1" />:active</label>
+-        <label><input id="pseudo-focus-toggle" type="checkbox" value=":focus" tabindex="-1" />:focus</label>
+-      </div>
+-    </div>
+-
+-    <div id="ruleview-container" class="devtools-monospace">
+-    </div>
+-  </body>
+-</html>
+diff --git a/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_01.js b/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_01.js
+--- a/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_01.js
++++ b/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_01.js
+@@ -38,11 +38,11 @@ function* testCancelNew(view) {
+
+   info("Checking the state of cancelling a new property name editor");
+   ok(!elementRuleEditor.rule._applyingModifications,
+     "Shouldn't have an outstanding request after a cancel.");
+   is(elementRuleEditor.rule.textProps.length, 0,
+     "Should have cancelled creating a new text property.");
+   ok(!elementRuleEditor.propertyList.hasChildNodes(),
+     "Should not have any properties.");
+-  is(view.styleDocument.body, view.styleDocument.activeElement,
++  is(view.styleDocument.documentElement, view.styleDocument.activeElement,
+     "Correct element has focus");
+ }
+diff --git a/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_02.js b/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_02.js
+--- a/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_02.js
++++ b/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_02.js
+@@ -66,16 +66,16 @@ add_task(function*() {
+   info("Waiting for preview to be applied.");
+   yield view.once("ruleview-changed");
+
+   info("Escaping out of the field");
+   onRuleViewChanged = view.once("ruleview-changed");
+   EventUtils.synthesizeKey("VK_ESCAPE", {}, view.styleWindow);
+   yield onRuleViewChanged;
+
+-  is(view.styleDocument.body, view.styleDocument.activeElement,
++  is(view.styleDocument.documentElement, view.styleDocument.activeElement,
+     "Correct element has focus");
+
+   is(elementRuleEditor.rule.textProps.length, 1,
+     "Removed the new text property.");
+   is(elementRuleEditor.propertyList.children.length, 1,
+     "Removed the property editor.");
+ });
+diff --git a/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_03.js b/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_03.js
+--- a/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_03.js
++++ b/devtools/client/inspector/rules/test/browser_rules_add-property-cancel_03.js
+@@ -43,11 +43,11 @@ function* testCancelNewOnEscape(inspecto
+   yield onBlur;
+
+   ok(!elementRuleEditor.rule._applyingModifications,
+     "Shouldn't have an outstanding modification request after a cancel.");
+   is(elementRuleEditor.rule.textProps.length, 0,
+     "Should have canceled creating a new text property.");
+   ok(!elementRuleEditor.propertyList.hasChildNodes(),
+     "Should not have any properties.");
+-  is(view.styleDocument.body, view.styleDocument.activeElement,
++  is(view.styleDocument.documentElement, view.styleDocument.activeElement,
+     "Correct element has focus");
+ }
+diff --git a/devtools/client/inspector/rules/test/browser_rules_content_02.js b/devtools/client/inspector/rules/test/browser_rules_content_02.js
+--- a/devtools/client/inspector/rules/test/browser_rules_content_02.js
++++ b/devtools/client/inspector/rules/test/browser_rules_content_02.js
+@@ -39,17 +39,17 @@ add_task(function*() {
+
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+   let toolbox = gDevTools.getToolbox(target);
+
+   info("Getting the inspector and making sure it is fully updated");
+   let inspector = toolbox.getPanel("inspector");
+   yield inspector.once("inspector-updated");
+
+-  let view = inspector.sidebar.getWindowForTab("ruleview")["ruleview"].view;
++  let view = inspector.ruleview.view;
+
+   checkRuleViewContent(view);
+ });
+
+ function checkRuleViewContent({styleDocument}) {
+   info("Making sure the rule-view contains the expected content");
+
+   let headers = [...styleDocument.querySelectorAll(".ruleview-header")];
+diff --git a/devtools/client/inspector/rules/test/browser_rules_cycle-color.js b/devtools/client/inspector/rules/test/browser_rules_cycle-color.js
+--- a/devtools/client/inspector/rules/test/browser_rules_cycle-color.js
++++ b/devtools/client/inspector/rules/test/browser_rules_cycle-color.js
+@@ -12,25 +12,25 @@ const TEST_URI = `
+       color: #f00;
+     }
+   </style>
+   Test cycling color types in the rule view!
+ `;
+
+ add_task(function*() {
+   yield addTab("data:text/html;charset=utf-8," + encodeURIComponent(TEST_URI));
+-  let {inspector, view} = yield openRuleView();
++  let {view} = yield openRuleView();
+   let container = getRuleViewProperty(view, "body", "color").valueSpan;
+-  checkColorCycling(container, inspector);
++  checkColorCycling(container, view);
+ });
+
+-function checkColorCycling(container, inspector) {
++function checkColorCycling(container, view) {
+   let swatch = container.querySelector(".ruleview-colorswatch");
+   let valueNode = container.querySelector(".ruleview-color");
+-  let win = inspector.sidebar.getWindowForTab("ruleview");
++  let win = view.styleWindow;
+
+   // Hex
+   is(valueNode.textContent, "#f00", "Color displayed as a hex value.");
+
+   // HSL
+   EventUtils.synthesizeMouseAtCenter(swatch,
+                                      {type: "mousedown", shiftKey: true}, win);
+   is(valueNode.textContent, "hsl(0, 100%, 50%)",
+diff --git a/devtools/client/inspector/rules/test/browser_rules_edit-selector_05.js b/devtools/client/inspector/rules/test/browser_rules_edit-selector_05.js
+--- a/devtools/client/inspector/rules/test/browser_rules_edit-selector_05.js
++++ b/devtools/client/inspector/rules/test/browser_rules_edit-selector_05.js
+@@ -48,16 +48,22 @@ function* testEditSelector(view, name) {
+
+   info("Waiting for rule view to update");
+   let onRuleViewChanged = once(view, "ruleview-changed");
+
+   info("Entering the commit key");
+   EventUtils.synthesizeKey("VK_RETURN", {});
+   yield onRuleViewChanged;
+
++  // Escape the new property editor after editing the selector
++  let onBlur = once(view.styleDocument.activeElement, "blur");
++  EventUtils.synthesizeKey("VK_ESCAPE", {}, view.styleWindow);
++  yield onBlur;
++  yield ruleEditor.rule._applyingModifications;
++
+   is(view._elementStyle.rules.length, 2, "Should have 2 rules.");
+   ok(getRuleViewRule(view, name), "Rule with " + name + " selector exists.");
+   ok(getRuleViewRuleEditor(view, 1).element.getAttribute("unmatched"),
+     "Rule with " + name + " does not match the current element.");
+ }
+
+ function* checkModifiedElement(view, name) {
+   is(view._elementStyle.rules.length, 3, "Should have 3 rules.");
+diff --git a/devtools/client/inspector/rules/test/browser_rules_search-filter_context-menu.js b/devtools/client/inspector/rules/test/browser_rules_search-filter_context-menu.js
+--- a/devtools/client/inspector/rules/test/browser_rules_search-filter_context-menu.js
++++ b/devtools/client/inspector/rules/test/browser_rules_search-filter_context-menu.js
+@@ -31,18 +31,18 @@ add_task(function*() {
+   let onContextMenuPopup = once(searchContextMenu, "popupshowing");
+   EventUtils.synthesizeMouse(searchField, 2, 2,
+     {type: "contextmenu", button: 2}, win);
+   yield onContextMenuPopup;
+
+   is(cmdUndo.getAttribute("disabled"), "true", "cmdUndo is disabled");
+   is(cmdDelete.getAttribute("disabled"), "true", "cmdDelete is disabled");
+   is(cmdSelectAll.getAttribute("disabled"), "", "cmdSelectAll is enabled");
+-  is(cmdCut.getAttribute("disabled"), "", "cmdCut is enabled");
+-  is(cmdCopy.getAttribute("disabled"), "", "cmdCopy is enabled");
++  is(cmdCut.getAttribute("disabled"), "true", "cmdCut is disabled");
++  is(cmdCopy.getAttribute("disabled"), "true", "cmdCopy is disabled");
+   is(cmdPaste.getAttribute("disabled"), "true", "cmdPaste is disabled");
+
+   info("Closing context menu");
+   let onContextMenuHidden = once(searchContextMenu, "popuphidden");
+   searchContextMenu.hidePopup();
+   yield onContextMenuHidden;
+
+   info("Copy text in search field using the context menu");
+diff --git a/devtools/client/inspector/rules/test/head.js b/devtools/client/inspector/rules/test/head.js
+--- a/devtools/client/inspector/rules/test/head.js
++++ b/devtools/client/inspector/rules/test/head.js
+@@ -246,43 +246,27 @@ function waitForToolboxFrameFocus(toolbo
+  * corresponds to the given id selected
+  *
+  * @return a promise that resolves when the inspector is ready and the sidebar
+  * view is visible and ready
+  */
+ var openInspectorSideBar = Task.async(function*(id) {
+   let {toolbox, inspector} = yield openInspector();
+
+-  if (!hasSideBarTab(inspector, id)) {
+-    info("Waiting for the " + id + " sidebar to be ready");
+-    yield inspector.sidebar.once(id + "-ready");
+-  }
+-
+   info("Selecting the " + id + " sidebar");
+   inspector.sidebar.select(id);
+
+   return {
+     toolbox: toolbox,
+     inspector: inspector,
+-    view: inspector.sidebar.getWindowForTab(id)[id].view
++    view: inspector[id].view
+   };
+ });
+
+ /**
+- * Open the toolbox, with the inspector tool visible, and the computed-view
+- * sidebar tab selected.
+- *
+- * @return a promise that resolves when the inspector is ready and the computed
+- * view is visible and ready
+- */
+-function openComputedView() {
+-  return openInspectorSideBar("computedview");
+-}
+-
+-/**
+  * Open the toolbox, with the inspector tool visible, and the rule-view
+  * sidebar tab selected.
+  *
+  * @return a promise that resolves when the inspector is ready and the rule
+  * view is visible and ready
+  */
+ function openRuleView() {
+   return openInspectorSideBar("ruleview");
+@@ -573,28 +557,16 @@ function addStyle(doc, style) {
+   let node = doc.createElement("style");
+   node.setAttribute("type", "text/css");
+   node.textContent = style;
+   doc.getElementsByTagName("head")[0].appendChild(node);
+   return node;
+ }
+
+ /**
+- * Checks whether the inspector's sidebar corresponding to the given id already
+- * exists
+- *
+- * @param {InspectorPanel}
+- * @param {String}
+- * @return {Boolean}
+- */
+-function hasSideBarTab(inspector, id) {
+-  return !!inspector.sidebar.getWindowForTab(id);
+-}
+-
+-/**
+  * Get the dataURL for the font family tooltip.
+  *
+  * @param {String} font
+  *        The font family value.
+  * @param {object} nodeFront
+  *        The NodeActor that will used to retrieve the dataURL for the
+  *        font family tooltip contents.
+  */
+diff --git a/devtools/client/jar.mn b/devtools/client/jar.mn
+--- a/devtools/client/jar.mn
++++ b/devtools/client/jar.mn
+@@ -28,17 +28,16 @@ devtools.jar:
+     content/storage/storage.xul (storage/storage.xul)
+     content/inspector/computed/computed.xhtml (inspector/computed/computed.xhtml)
+     content/inspector/fonts/fonts.js (inspector/fonts/fonts.js)
+     content/inspector/fonts/fonts.xhtml (inspector/fonts/fonts.xhtml)
+     content/inspector/layout/layout.js (inspector/layout/layout.js)
+     content/inspector/layout/layout.xhtml (inspector/layout/layout.xhtml)
+     content/inspector/markup/markup.css (inspector/markup/markup.css)
+     content/inspector/markup/markup.xhtml (inspector/markup/markup.xhtml)
+-    content/inspector/rules/rules.xhtml (inspector/rules/rules.xhtml)
+     content/animationinspector/animation-controller.js (animationinspector/animation-controller.js)
+     content/animationinspector/animation-panel.js (animationinspector/animation-panel.js)
+     content/animationinspector/animation-inspector.xhtml (animationinspector/animation-inspector.xhtml)
+     content/sourceeditor/codemirror/addon/comment/comment.js (sourceeditor/codemirror/addon/comment/comment.js)
+     content/sourceeditor/codemirror/addon/edit/trailingspace.js (sourceeditor/codemirror/addon/edit/trailingspace.js)
+     content/sourceeditor/codemirror/addon/edit/matchbrackets.js (sourceeditor/codemirror/addon/edit/matchbrackets.js)
+     content/sourceeditor/codemirror/addon/edit/closebrackets.js (sourceeditor/codemirror/addon/edit/closebrackets.js)
+     content/sourceeditor/codemirror/addon/dialog/dialog.js (sourceeditor/codemirror/addon/dialog/dialog.js)
+diff --git a/devtools/client/themes/rules.css b/devtools/client/themes/rules.css
+--- a/devtools/client/themes/rules.css
++++ b/devtools/client/themes/rules.css
+@@ -8,25 +8,17 @@
+   --rule-filter-icon: url(images/magnifying-glass-light.png);
+ }
+
+ .theme-dark {
+   --rule-highlight-background-color: #594724;
+   --rule-filter-icon: url(images/magnifying-glass.png);
+ }
+
+-* {
+-  box-sizing: border-box;
+-}
+-
+-:root {
+-  height: 100%;
+-}
+-
+-body {
++#sidebar-panel-ruleview {
+   margin: 0;
+   display: flex;
+   flex-direction: column;
+   height: 100%;
+ }
+
+ #ruleview-container {
+   -moz-user-select: text;
+@@ -37,17 +29,17 @@ body {
+ }
+
+ #ruleview-container.non-interactive {
+   pointer-events: none;
+   visibility: collapse;
+   transition: visibility 0.25s;
+ }
+
+-.devtools-toolbar {
++.devtools-sidebar-toolbar {
+   width: 100%;
+   display: flex;
+ }
+
+ #pseudo-class-panel {
+   position: relative;
+   margin-top: -1px;
+   margin-bottom: -1px;
