@@ -1,0 +1,114 @@
+# HG changeset patch
+# User Nick Fitzgerald <fitzgen@gmail.com>
+
+Bug 1242691 - Merge overlapping SlotsEdges in the store buffer; r=terrence
+
+Frequently, the mutator will modify nearly the same elements of an object
+repeatedly. However, because the set of elements aren't exactly the same, the
+single item buffer in front of MonoTypeBuffer can't de-duplicate these
+edges. For example, in one CodeMirror test case, we would add 245 SlotsEdges
+entries for almost the same 50,000 elements in an object, causing us to trace
+these same 50,000 elements 245 times!
+
+This patch makes `js::gc::StoreBuffer::putSlot` check to see if the new range is
+overlapping with the last range added, and if so, merge the ranges rather than
+adding partially duplicated elements into the store buffer.
+
+This gives a 1000 point increase on Octane's pdf.js subsuite locally. The
+CodeMirror test case mentioned above goes from ~10 seconds execution time to
+~1.5 seconds, with the max minor gc pause dropping from up to 40 milliseconds,
+down to 4 milliseconds.
+
+diff --git a/js/src/gc/StoreBuffer.h b/js/src/gc/StoreBuffer.h
+index b21fa2d..c04d969 100644
+--- a/js/src/gc/StoreBuffer.h
++++ b/js/src/gc/StoreBuffer.h
+@@ -2,16 +2,18 @@
+  * vim: set ts=8 sts=4 et sw=4 tw=99:
+  * This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef gc_StoreBuffer_h
+ #define gc_StoreBuffer_h
+ 
++#include <algorithm>
++
+ #include "mozilla/Attributes.h"
+ #include "mozilla/DebugOnly.h"
+ #include "mozilla/ReentrancyGuard.h"
+ 
+ #include "jsalloc.h"
+ 
+ #include "ds/LifoAlloc.h"
+ #include "gc/Nursery.h"
+@@ -285,16 +287,45 @@ class StoreBuffer
+                    start_ == other.start_ &&
+                    count_ == other.count_;
+         }
+ 
+         bool operator!=(const SlotsEdge& other) const {
+             return !(*this == other);
+         }
+ 
++        // True if this SlotsEdge range overlaps with the other SlotsEdge range,
++        // false if they do not overlap.
++        bool overlaps(const SlotsEdge& other) const {
++            if (objectAndKind_ != other.objectAndKind_)
++                return false;
++
++            // Widen our range by one on each side so that we consider
++            // adjacent-but-not-actually-overlapping ranges as overlapping. This
++            // is particularly useful for coalescing a series of increasing or
++            // decreasing single index writes 0, 1, 2, ..., N into a SlotsEdge
++            // range of elements [0, N].
++            auto end = start_ + count_ + 1;
++            auto start = start_ - 1;
++
++            auto otherEnd = other.start_ + other.count_;
++            return (start <= other.start_ && other.start_ <= end) ||
++                   (start <= otherEnd && otherEnd <= end);
++        }
++
++        // Destructively make this SlotsEdge range the union of the other
++        // SlotsEdge range and this one. A precondition is that the ranges must
++        // overlap.
++        void merge(const SlotsEdge& other) {
++            MOZ_ASSERT(overlaps(other));
++            auto end = std::max(start_ + count_, other.start_ + other.count_);
++            start_ = std::min(start_, other.start_);
++            count_ = end - start_;
++        }
++
+         bool maybeInRememberedSet(const Nursery& n) const {
+             return !IsInsideNursery(reinterpret_cast<Cell*>(object()));
+         }
+ 
+         void trace(TenuringTracer& mover) const;
+ 
+         explicit operator bool() const { return objectAndKind_ != 0; }
+ 
+@@ -403,17 +434,21 @@ class StoreBuffer
+     size_t slotsCount() const { return bufferSlot.count(); }
+ 
+     /* Insert a single edge into the buffer/remembered set. */
+     void putValue(JS::Value* vp) { put(bufferVal, ValueEdge(vp)); }
+     void unputValue(JS::Value* vp) { unput(bufferVal, ValueEdge(vp)); }
+     void putCell(Cell** cellp) { put(bufferCell, CellPtrEdge(cellp)); }
+     void unputCell(Cell** cellp) { unput(bufferCell, CellPtrEdge(cellp)); }
+     void putSlot(NativeObject* obj, int kind, int32_t start, int32_t count) {
+-        put(bufferSlot, SlotsEdge(obj, kind, start, count));
++        SlotsEdge edge(obj, kind, start, count);
++        if (bufferSlot.last_.overlaps(edge))
++            bufferSlot.last_.merge(edge);
++        else
++            put(bufferSlot, edge);
+     }
+     void putWholeCell(Cell* cell) {
+         MOZ_ASSERT(cell->isTenured());
+         put(bufferWholeCell, WholeCellEdges(cell));
+     }
+ 
+     /* Insert an entry into the generic buffer. */
+     template <typename T>
+
