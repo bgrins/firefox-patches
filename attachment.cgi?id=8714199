@@ -1,0 +1,230 @@
+# HG changeset patch
+# User Maxime "Pepe_" Buquet <pep+code@bouah.net>
+# Parent  a1b94785b48437662c696c9143ed92639e9617b2
+Allow the Style Editor to be disabled via the configuration tab.
+
+Add a checkbox in the Devtools configuration to allow the
+activation/deactivation of the Style Editor. When the Style Editor is
+disabled, make the rule links in the Inspector unselectable.
+
+diff --git a/devtools/client/definitions.js b/devtools/client/definitions.js
+--- a/devtools/client/definitions.js
++++ b/devtools/client/definitions.js
+@@ -177,16 +177,17 @@ Tools.jsdebugger = {
+     return new DebuggerPanel(iframeWindow, toolbox);
+   }
+ };
+ 
+ Tools.styleEditor = {
+   id: "styleeditor",
+   key: l10n("open.commandkey", styleEditorStrings),
+   ordinal: 4,
++  visibilityswitch: "devtools.styleeditor.enabled",
+   accesskey: l10n("open.accesskey", styleEditorStrings),
+   modifiers: "shift",
+   icon: "chrome://devtools/skin/images/tool-styleeditor.svg",
+   invertIconForLightTheme: true,
+   url: "chrome://devtools/content/styleeditor/styleeditor.xul",
+   label: l10n("ToolboxStyleEditor.label", styleEditorStrings),
+   panelLabel: l10n("ToolboxStyleEditor.panelLabel", styleEditorStrings),
+   get tooltip() {
+diff --git a/devtools/client/inspector/rules/test/browser_rules_style-editor-link.js b/devtools/client/inspector/rules/test/browser_rules_style-editor-link.js
+--- a/devtools/client/inspector/rules/test/browser_rules_style-editor-link.js
++++ b/devtools/client/inspector/rules/test/browser_rules_style-editor-link.js
+@@ -58,16 +58,17 @@ add_task(function*() {
+   yield addTab(DOCUMENT_URL);
+   let {toolbox, inspector, view} = yield openRuleView();
+   yield selectNode("div", inspector);
+ 
+   yield testInlineStyle(view);
+   yield testFirstInlineStyleSheet(view, toolbox);
+   yield testSecondInlineStyleSheet(view, toolbox);
+   yield testExternalStyleSheet(view, toolbox);
++  yield testWithDisabledStyleEditor(view, toolbox);
+ });
+ 
+ function* testInlineStyle(view) {
+   info("Testing inline style");
+ 
+   let onTab = waitForTab();
+   info("Clicking on the first link in the rule-view");
+   clickLinkByIndex(view, 0);
+@@ -130,16 +131,43 @@ function* testExternalStyleSheet(view, t
+   clickLinkByIndex(view, 1);
+   let editor = yield onSelected;
+ 
+   is(toolbox.currentToolId, "styleeditor",
+     "The style editor is selected again");
+   validateStyleEditorSheet(editor, 2);
+ }
+ 
++function* testWithDisabledStyleEditor(view, toolbox) {
++  info("Testing with style editor disabled");
++  let gToolsPref = Services.prefs.getBoolPref("devtools.styleeditor.enabled");
++
++  info("Switching to the inspector panel in the toolbox");
++  yield toolbox.selectTool("inspector");
++
++  info("Disabling style editor");
++  Services.prefs.setBoolPref("devtools.styleeditor.enabled", false);
++  gDevTools.emit("tool-unregistered", "styleeditor");
++
++  info("Clicking on a link");
++  testUnselectableRuleViewLink(view, 1);
++  clickLinkByIndex(view, 1);
++
++  is(toolbox.currentToolId, "inspector", "The click should have no effect");
++
++  info("Enabling style editor");
++  Services.prefs.setBoolPref("devtools.styleeditor.enabled", true);
++  gDevTools.emit("tool-registered", "styleeditor");
++
++  info("Clicking on a link");
++  clickLinkByIndex(view, 1);
++
++  Services.prefs.setBoolPref("devtools.styleeditor.enabled", gToolsPref);
++}
++
+ function validateStyleEditorSheet(editor, expectedSheetIndex) {
+   info("validating style editor stylesheet");
+   is(editor.styleSheet.styleSheetIndex, expectedSheetIndex,
+      "loaded stylesheet index matches document stylesheet");
+ 
+   let sheet = content.document.styleSheets[expectedSheetIndex];
+   is(editor.styleSheet.href, sheet.href,
+     "loaded stylesheet href matches document stylesheet");
+@@ -152,13 +180,20 @@ function testRuleViewLinkLabel(view) {
+   let tooltipText = labelElem.getAttribute("tooltiptext");
+ 
+   is(value, EXTERNAL_STYLESHEET_FILE_NAME + ":1",
+     "rule view stylesheet display value matches filename and line number");
+   is(tooltipText, EXTERNAL_STYLESHEET_URL + ":1",
+     "rule view stylesheet tooltip text matches the full URI path");
+ }
+ 
++function testUnselectableRuleViewLink(view, index) {
++  let link = getRuleViewLinkByIndex(view, index);
++  let unselectable = link.hasAttribute("unselectable");
++
++  ok(unselectable, "rule view is unselectable");
++}
++
+ function clickLinkByIndex(view, index) {
+   let link = getRuleViewLinkByIndex(view, index);
+   link.scrollIntoView();
+   link.click();
+ }
+diff --git a/devtools/client/inspector/rules/views/rule-editor.js b/devtools/client/inspector/rules/views/rule-editor.js
+--- a/devtools/client/inspector/rules/views/rule-editor.js
++++ b/devtools/client/inspector/rules/views/rule-editor.js
+@@ -20,16 +20,17 @@ const {
+ } = require("devtools/client/inspector/shared/utils");
+ const {
+   parseDeclarations,
+   parsePseudoClassesAndAttributes,
+   SELECTOR_ATTRIBUTE,
+   SELECTOR_ELEMENT,
+   SELECTOR_PSEUDO_CLASS
+ } = require("devtools/client/shared/css-parsing-utils");
++const {gDevTools} = require("devtools/client/framework/gDevTools.jsm");
+ 
+ XPCOMUtils.defineLazyGetter(this, "_strings", function() {
+   return Services.strings.createBundle(
+     "chrome://devtools-shared/locale/styleinspector.properties");
+ });
+ 
+ const HTML_NS = "http://www.w3.org/1999/xhtml";
+ const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+@@ -54,25 +55,30 @@ function RuleEditor(ruleView, rule) {
+   // Flag that blocks updates of the selector and properties when it is
+   // being edited
+   this.isEditing = false;
+ 
+   this._onNewProperty = this._onNewProperty.bind(this);
+   this._newPropertyDestroy = this._newPropertyDestroy.bind(this);
+   this._onSelectorDone = this._onSelectorDone.bind(this);
+   this._locationChanged = this._locationChanged.bind(this);
++  this._toolRegistrationChanged = this._toolRegistrationChanged.bind(this);
+ 
+   this.rule.domRule.on("location-changed", this._locationChanged);
++  gDevTools.on("tool-registered", this._toolRegistrationChanged);
++  gDevTools.on("tool-unregistered", this._toolRegistrationChanged);
+ 
+   this._create();
+ }
+ 
+ RuleEditor.prototype = {
+   destroy: function() {
+     this.rule.domRule.off("location-changed");
++    gDevTools.off("tool-registered", this._toolRegistrationChanged);
++    gDevTools.off("tool-unregistered", this._toolRegistrationChanged);
+   },
+ 
+   get isSelectorEditable() {
+     let toolbox = this.ruleView.inspector.toolbox;
+     let trait = this.isEditable &&
+       toolbox.target.client.traits.selectorEditable &&
+       this.rule.domRule.type !== ELEMENT_STYLE &&
+       this.rule.domRule.type !== Ci.nsIDOMCSSRule.KEYFRAME_RULE;
+@@ -90,17 +96,17 @@ RuleEditor.prototype = {
+     this.element._ruleEditor = this;
+ 
+     // Give a relative position for the inplace editor's measurement
+     // span to be placed absolutely against.
+     this.element.style.position = "relative";
+ 
+     // Add the source link.
+     this.source = createChild(this.element, "div", {
+-      class: "ruleview-rule-source theme-link"
++      class: "ruleview-rule-source theme-link",
+     });
+     this.source.addEventListener("click", function() {
+       if (this.source.hasAttribute("unselectable")) {
+         return;
+       }
+       let rule = this.rule.domRule;
+       this.ruleView.emit("ruleview-linked-clicked", rule);
+     }.bind(this));
+@@ -216,26 +222,42 @@ RuleEditor.prototype = {
+       }
+     } else {
+       sourceLabel.setAttribute("value", title);
+       if (this.rule.ruleLine === -1 && this.rule.domRule.parentStyleSheet) {
+         sourceLabel.parentNode.setAttribute("unselectable", "true");
+       }
+     }
+ 
++    if (!this._isStyleEditorEnabled()) {
++      sourceLabel.parentNode.setAttribute("unselectable", "true");
++    }
++
+     let showOrig = Services.prefs.getBoolPref(PREF_ORIG_SOURCES);
+     if (showOrig && !this.rule.isSystem &&
+         this.rule.domRule.type !== ELEMENT_STYLE) {
+       this.rule.getOriginalSourceStrings().then((strings) => {
+         sourceLabel.setAttribute("value", strings.short);
+         sourceLabel.setAttribute("tooltiptext", strings.full);
+       }, console.error);
+     }
+   },
+ 
++  _isStyleEditorEnabled: function() {
++    return !!gDevTools.getToolDefinition("styleeditor");
++  },
++
++  _toolRegistrationChanged: function() {
++    if (this._isStyleEditorEnabled()) {
++      this.source.removeAttribute("unselectable");
++    } else {
++      this.source.setAttribute("unselectable", "true");
++    }
++  },
++
+   /**
+    * Update the rule editor with the contents of the rule.
+    */
+   populate: function() {
+     // Clear out existing viewers.
+     while (this.selectorText.hasChildNodes()) {
+       this.selectorText.removeChild(this.selectorText.lastChild);
+     }

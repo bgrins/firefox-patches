@@ -1,0 +1,239 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  935bf008a8004a0574c8ed2d895c32fca2c8c29a
+Add toolbox API for tool registration
+
+diff --git a/devtools/client/framework/test/browser_devtools_api.js b/devtools/client/framework/test/browser_devtools_api.js
+--- a/devtools/client/framework/test/browser_devtools_api.js
++++ b/devtools/client/framework/test/browser_devtools_api.js
+@@ -34,21 +34,21 @@ function runTests1(aTab) {
+     label: "someLabel",
+     build: function(iframeWindow, toolbox) {
+       let panel = new DevToolPanel(iframeWindow, toolbox);
+       return panel.open();
+     },
+   };
+ 
+   ok(gDevTools, "gDevTools exists");
+-  is(gDevTools.getToolDefinitionMap().has(toolId1), false,
++  ok(!gDevTools.getToolDefinitionMap().has(toolId1),
+     "The tool is not registered");
+ 
+   gDevTools.registerTool(toolDefinition);
+-  is(gDevTools.getToolDefinitionMap().has(toolId1), true,
++  ok(gDevTools.getToolDefinitionMap().has(toolId1),
+     "The tool is registered");
+ 
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+ 
+   let events = {};
+ 
+   // Check events on the gDevTools and toolbox objects.
+   gDevTools.once(toolId1 + "-init", (event, toolbox, iframe) => {
+@@ -93,22 +93,26 @@ function runTests2() {
+     visibilityswitch: "devtools.test-tool.enabled",
+     url: "about:blank",
+     label: "someLabel",
+     build: function(iframeWindow, toolbox) {
+       return new DevToolPanel(iframeWindow, toolbox);
+     },
+   };
+ 
+-  is(gDevTools.getToolDefinitionMap().has(toolId2), false,
++  ok(!gDevTools.getToolDefinitionMap().has(toolId2),
+     "The tool is not registered");
++  ok(!toolbox.isToolRegistered(toolId2),
++    "Toolbox: The tool is not registered");
+ 
+   gDevTools.registerTool(toolDefinition);
+-  is(gDevTools.getToolDefinitionMap().has(toolId2), true,
++  ok(gDevTools.getToolDefinitionMap().has(toolId2),
+     "The tool is registered");
++  ok(toolbox.isToolRegistered(toolId2),
++    "Toolbox: The tool is registered");
+ 
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+ 
+   let events = {};
+ 
+   // Check events on the gDevTools and toolbox objects.
+   gDevTools.once(toolId2 + "-init", (event, toolbox, iframe) => {
+     ok(iframe, "iframe argument available");
+@@ -155,23 +159,23 @@ function continueTests(toolbox, panel) {
+ 
+   ok(!toolbox.doc.getElementById("toolbox-tab-" + toolId2).hasAttribute("icon-invertable"),
+     "The tool tab does not have the invertable attribute");
+ 
+   ok(toolbox.doc.getElementById("toolbox-tab-inspector").hasAttribute("icon-invertable"),
+     "The builtin tool tabs do have the invertable attribute");
+ 
+   let toolDefinitions = gDevTools.getToolDefinitionMap();
+-  is(toolDefinitions.has(toolId2), true, "The tool is in gDevTools");
++  ok(toolDefinitions.has(toolId2), "The tool is in gDevTools");
+ 
+   let toolDefinition = toolDefinitions.get(toolId2);
+   is(toolDefinition.id, toolId2, "toolDefinition id is correct");
+ 
+   gDevTools.unregisterTool(toolId2);
+-  is(gDevTools.getToolDefinitionMap().has(toolId2), false,
++  ok(!gDevTools.getToolDefinitionMap().has(toolId2),
+     "The tool is no longer registered");
+ 
+   // Wait for unregisterTool to select the next tool before
+   // attempting to destroy.
+   toolbox.on("select", function selectListener (_, id) {
+     if (id !== "test-tool") {
+       toolbox.off("select", selectListener);
+       destroyToolbox(toolbox);
+diff --git a/devtools/client/framework/toolbox.js b/devtools/client/framework/toolbox.js
+--- a/devtools/client/framework/toolbox.js
++++ b/devtools/client/framework/toolbox.js
+@@ -1768,25 +1768,36 @@ Toolbox.prototype = {
+       // away.
+       this.frame.contentWindow.focus();
+ 
+       this.emit("host-changed");
+     });
+   },
+ 
+   /**
++   * Return if the tool is available as a tab (i.e. if it's checked
++   * in the options panel). This is different from Toolbox.getPanel -
++   * a tool could be registered but not yet opened in which case
++   * isToolRegistered would return true but getPanel would return false.
++   */
++  isToolRegistered: function(toolId) {
++    return gDevTools.getToolDefinitionMap().has(toolId);
++  },
++
++  /**
+    * Handler for the tool-registered event.
+    * @param  {string} event
+    *         Name of the event ("tool-registered")
+    * @param  {string} toolId
+    *         Id of the tool that was registered
+    */
+   _toolRegistered: function(event, toolId) {
+     let tool = gDevTools.getToolDefinition(toolId);
+     this._buildTabForTool(tool);
++    this.emit("tool-registered", toolId);
+   },
+ 
+   /**
+    * Handler for the tool-unregistered event.
+    * @param  {string} event
+    *         Name of the event ("tool-unregistered")
+    * @param  {string|object} toolId
+    *         Definition or id of the tool that was unregistered. Passing the
+@@ -1828,16 +1839,17 @@ Toolbox.prototype = {
+ 
+     if (this.hostType == Toolbox.HostType.WINDOW) {
+       let doc = this.doc.defaultView.parent.document;
+       let key = doc.getElementById("key_" + toolId);
+       if (key) {
+         key.parentNode.removeChild(key);
+       }
+     }
++    this.emit("tool-unregistered", toolId);
+   },
+ 
+   /**
+    * Initialize the inspector/walker/selection/highlighter fronts.
+    * Returns a promise that resolves when the fronts are initialized
+    */
+   initInspector: function() {
+     if (!this._initInspector) {
+diff --git a/devtools/client/inspector/rules/views/rule-editor.js b/devtools/client/inspector/rules/views/rule-editor.js
+--- a/devtools/client/inspector/rules/views/rule-editor.js
++++ b/devtools/client/inspector/rules/views/rule-editor.js
+@@ -43,42 +43,44 @@ const XUL_NS = "http://www.mozilla.org/k
+  *
+  * @param {CssRuleView} ruleView
+  *        The CssRuleView containg the document holding this rule editor.
+  * @param {Rule} rule
+  *        The Rule object we're editing.
+  */
+ function RuleEditor(ruleView, rule) {
+   this.ruleView = ruleView;
++  this.toolbox = ruleView.inspector.toolbox;
+   this.doc = this.ruleView.styleDocument;
+   this.rule = rule;
+ 
+   this.isEditable = !rule.isSystem;
+   // Flag that blocks updates of the selector and properties when it is
+   // being edited
+   this.isEditing = false;
+ 
+   this._onNewProperty = this._onNewProperty.bind(this);
+   this._newPropertyDestroy = this._newPropertyDestroy.bind(this);
+   this._onSelectorDone = this._onSelectorDone.bind(this);
+   this._locationChanged = this._locationChanged.bind(this);
+   this._toolRegistrationChanged = this._toolRegistrationChanged.bind(this);
++  this.updateSourceLink = this.updateSourceLink.bind(this);
+ 
+   this.rule.domRule.on("location-changed", this._locationChanged);
+-  gDevTools.on("tool-registered", this._toolRegistrationChanged);
+-  gDevTools.on("tool-unregistered", this._toolRegistrationChanged);
++  this.toolbox.on("tool-registered", this.updateSourceLink);
++  this.toolbox.on("tool-unregistered", this.updateSourceLink);
+ 
+   this._create();
+ }
+ 
+ RuleEditor.prototype = {
+   destroy: function() {
+     this.rule.domRule.off("location-changed");
+-    gDevTools.off("tool-registered", this._toolRegistrationChanged);
+-    gDevTools.off("tool-unregistered", this._toolRegistrationChanged);
++    this.toolbox.off("tool-registered", this._toolRegistrationChanged);
++    this.toolbox.off("tool-unregistered", this._toolRegistrationChanged);
+   },
+ 
+   get isSelectorEditable() {
+     let toolbox = this.ruleView.inspector.toolbox;
+     let trait = this.isEditable &&
+       toolbox.target.client.traits.selectorEditable &&
+       this.rule.domRule.type !== ELEMENT_STYLE &&
+       this.rule.domRule.type !== Ci.nsIDOMCSSRule.KEYFRAME_RULE;
+@@ -206,16 +208,18 @@ RuleEditor.prototype = {
+    * Event handler called when a property changes on the
+    * StyleRuleActor.
+    */
+   _locationChanged: function() {
+     this.updateSourceLink();
+   },
+ 
+   updateSourceLink: function() {
++
++    console.log("updateSourceLink")
+     let sourceLabel = this.element.querySelector(".ruleview-rule-source-label");
+     let title = this.rule.title;
+     let sourceHref = (this.rule.sheet && this.rule.sheet.href) ?
+       this.rule.sheet.href : title;
+     let sourceLine = this.rule.ruleLine > 0 ? ":" + this.rule.ruleLine : "";
+ 
+     sourceLabel.setAttribute("tooltiptext", sourceHref + sourceLine);
+ 
+@@ -233,18 +237,20 @@ RuleEditor.prototype = {
+       }
+     } else {
+       sourceLabel.setAttribute("value", title);
+       if (this.rule.ruleLine === -1 && this.rule.domRule.parentStyleSheet) {
+         sourceLabel.parentNode.setAttribute("unselectable", "true");
+       }
+     }
+ 
+-    if (!this._isStyleEditorEnabled()) {
+-      sourceLabel.parentNode.setAttribute("unselectable", "true");
++    if (this.toolbox.isToolRegistered("styleeditor")) {
++      this.source.removeAttribute("unselectable");
++    } else {
++      this.source.setAttribute("unselectable", "true");
+     }
+ 
+     let showOrig = Services.prefs.getBoolPref(PREF_ORIG_SOURCES);
+     if (showOrig && !this.rule.isSystem &&
+         this.rule.domRule.type !== ELEMENT_STYLE) {
+       this.rule.getOriginalSourceStrings().then((strings) => {
+         sourceLabel.setAttribute("value", strings.short);
+         sourceLabel.setAttribute("tooltiptext", strings.full);
