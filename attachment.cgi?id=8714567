@@ -1,0 +1,436 @@
+# HG changeset patch
+# User Morgan Phillips <winter2718@gmail.com>
+# Date 1454372764 21600
+#      Mon Feb 01 18:26:04 2016 -0600
+# Node ID 8a73dd8c06deda96c8c88a7d1d0761f6804fb4be
+# Parent  1b290ea60421e25cb0942e85c4975975815d2a27
+Bug 1243851 - Treat enter as shift+enter if input is valid but incomplete; r=fitzgen, bgrins
+
+diff --git a/devtools/client/preferences/devtools.js b/devtools/client/preferences/devtools.js
+--- a/devtools/client/preferences/devtools.js
++++ b/devtools/client/preferences/devtools.js
+@@ -286,16 +286,20 @@ pref("devtools.webconsole.inputHistoryCo
+ // be cleared each time page navigation happens.
+ pref("devtools.webconsole.persistlog", false);
+ 
+ // Web Console timestamp: |true| if you want the logs and instructions
+ // in the Web Console to display a timestamp, or |false| to not display
+ // any timestamps.
+ pref("devtools.webconsole.timestampMessages", false);
+ 
++// Web Console automatic multiline mode: |true| if you want incomplete statements
++// to automatically trigger multiline editing (equivalent to shift + enter).
++pref("devtools.webconsole.autoMultiline", true);
++
+ // The number of lines that are displayed in the web console for the Net,
+ // CSS, JS and Web Developer categories. These defaults should be kept in sync
+ // with DEFAULT_LOG_LIMIT in the webconsole frontend.
+ pref("devtools.hud.loglimit.network", 1000);
+ pref("devtools.hud.loglimit.cssparser", 1000);
+ pref("devtools.hud.loglimit.exception", 1000);
+ pref("devtools.hud.loglimit.console", 1000);
+ 
+diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
+--- a/devtools/client/webconsole/test/browser.ini
++++ b/devtools/client/webconsole/test/browser.ini
+@@ -332,16 +332,17 @@ skip-if = buildapp == 'mulet' || e10s # 
+ [browser_webconsole_input_field_focus_on_panel_select.js]
+ [browser_webconsole_inspect-parsed-documents.js]
+ [browser_webconsole_js_input_expansion.js]
+ [browser_webconsole_jsterm.js]
+ skip-if = e10s # Bug 1042253 - webconsole e10s tests (Linux debug timeout)
+ [browser_webconsole_live_filtering_of_message_types.js]
+ [browser_webconsole_live_filtering_on_search_strings.js]
+ [browser_webconsole_message_node_id.js]
++[browser_webconsole_multiline_input.js]
+ [browser_webconsole_netlogging.js]
+ [browser_webconsole_netlogging_basic.js]
+ [browser_webconsole_netlogging_panel.js]
+ [browser_webconsole_netlogging_reset_filter.js]
+ [browser_webconsole_notifications.js]
+ [browser_webconsole_open-links-without-callback.js]
+ [browser_webconsole_promise.js]
+ [browser_webconsole_output_copy_newlines.js]
+diff --git a/devtools/client/webconsole/test/browser_webconsole_multiline_input.js b/devtools/client/webconsole/test/browser_webconsole_multiline_input.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/test/browser_webconsole_multiline_input.js
+@@ -0,0 +1,69 @@
++/* vim:set ts=2 sw=2 sts=2 et: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++// Tests that the console waits for more input instead of evaluating
++// when valid, but incomplete, statements are present upon pressing enter
++// -or- when the user ends a line with shift + enter.
++
++"use strict";
++
++const TEST_URI = "http://example.com/browser/devtools/client/webconsole/" +
++                 "test/test-console.html";
++
++let SHOULD_ENTER_MULTILINE = [
++  {input: "function foo() {" },
++  {input: "var a = 1," },
++  {input: "var a = 1;", shiftKey: true },
++  {input: "function foo() { }", shiftKey: true },
++  {input: "function" },
++  {input: "(x) =>" },
++  {input: "let b = {" },
++  {input: "let a = [" },
++  {input: "{" },
++  {input: "{ bob: 3343," },
++  {input: "function x(y=" },
++  {input: "Array.from(" },
++  // shift + enter creates a new line despite parse errors
++  {input: "{2,}", shiftKey: true },
++];
++let SHOULD_EXECUTE = [
++  {input: "function foo() { }" },
++  {input: "var a = 1;" },
++  {input: "function foo() { var a = 1; }" },
++  {input: '"asdf"' },
++  {input: '99 + 3' },
++  {input: '1, 2, 3' },
++  // errors
++  {input: 'function f(x) { let y = 1, }' },
++  {input: 'function f(x=,) {' },
++  {input: '{2,}' },
++];
++
++add_task(function* () {
++  let { tab, browser } = yield loadTab(TEST_URI);
++  let hud = yield openConsole();
++  let inputNode = hud.jsterm.inputNode;
++
++  for (let test of SHOULD_ENTER_MULTILINE) {
++    hud.jsterm.setInputValue(test.input);
++    EventUtils.synthesizeKey("VK_RETURN", { shiftKey: test.shiftKey });
++    let inputValue = inputNode.value;
++    is(inputNode.selectionStart, inputNode.selectionEnd,
++       "selection is collapsed");
++    is(inputNode.selectionStart, inputValue.length,
++       "caret at end of multiline input");
++    let inputWithNewline = test.input + "\n";
++    is(inputValue, inputWithNewline, "Input value is correct");
++  }
++
++  for (let test of SHOULD_EXECUTE) {
++    hud.jsterm.setInputValue(test.input);
++    EventUtils.synthesizeKey("VK_RETURN", { shiftKey: test.shiftKey });
++    is(inputNode.selectionStart, 0, "selection starts/ends at 0");
++    is(inputNode.selectionEnd, 0, "selection starts/ends at 0");
++    is(inputNode.value, "", "Input value is cleared");
++  }
++
++});
+diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconsole/webconsole.js
+--- a/devtools/client/webconsole/webconsole.js
++++ b/devtools/client/webconsole/webconsole.js
+@@ -1,20 +1,22 @@
+ /* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
++
+ /* vim: set ft= javascript ts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const {Cc, Ci, Cu} = require("chrome");
+ 
+ const {Utils: WebConsoleUtils, CONSOLE_WORKER_IDS} = require("devtools/shared/webconsole/utils");
+ const promise = require("promise");
++const Debugger = require("Debugger");
+ 
+ loader.lazyServiceGetter(this, "clipboardHelper",
+                          "@mozilla.org/widget/clipboardhelper;1",
+                          "nsIClipboardHelper");
+ loader.lazyImporter(this, "Services", "resource://gre/modules/Services.jsm");
+ loader.lazyRequireGetter(this, "EventEmitter", "devtools/shared/event-emitter");
+ loader.lazyRequireGetter(this, "AutocompletePopup", "devtools/client/shared/autocomplete-popup", true);
+ loader.lazyRequireGetter(this, "ToolSidebar", "devtools/client/framework/sidebar", true);
+@@ -178,16 +180,17 @@ const THROTTLE_UPDATES = 1000; // millis
+ const FILTER_PREFS_PREFIX = "devtools.webconsole.filter.";
+ 
+ // The minimum font size.
+ const MIN_FONT_SIZE = 10;
+ 
+ const PREF_CONNECTION_TIMEOUT = "devtools.debugger.remote-timeout";
+ const PREF_PERSISTLOG = "devtools.webconsole.persistlog";
+ const PREF_MESSAGE_TIMESTAMP = "devtools.webconsole.timestampMessages";
++const PREF_AUTO_MULTILINE = "devtools.webconsole.autoMultiline";
+ const PREF_INPUT_HISTORY_COUNT = "devtools.webconsole.inputHistoryCount";
+ 
+ /**
+  * A WebConsoleFrame instance is an interactive console initialized *per target*
+  * that displays console log data as well as provides an interactive terminal to
+  * manipulate the target's document content.
+  *
+  * The WebConsoleFrame is responsible for the actual Web Console UI
+@@ -3842,22 +3845,25 @@ JSTerm.prototype = {
+             inputNode.focus();
+           }
+           this.clearCompletion();
+           break;
+         default:
+           break;
+       }
+       return;
+-    } else if (event.shiftKey &&
+-        event.keyCode == Ci.nsIDOMKeyEvent.DOM_VK_RETURN) {
+-      // shift return
+-      // TODO: expand the inputNode height by one line
++    }  else if (event.keyCode == Ci.nsIDOMKeyEvent.DOM_VK_RETURN) {
++    let autoMultiline = Services.prefs.getBoolPref(PREF_AUTO_MULTILINE);
++    if (event.shiftKey ||
++        (autoMultiline && !Debugger.isCompilableUnit(inputValue))) {
++      // shift return or incomplete statement
+       return;
+     }
++  }
++
+ 
+     switch (event.keyCode) {
+       case Ci.nsIDOMKeyEvent.DOM_VK_ESCAPE:
+         if (this.autocompletePopup.isOpen) {
+           this.clearCompletion();
+           event.preventDefault();
+           event.stopPropagation();
+         } else if (this.sidebar) {
+diff --git a/js/src/doc/Debugger/Debugger.md b/js/src/doc/Debugger/Debugger.md
+--- a/js/src/doc/Debugger/Debugger.md
++++ b/js/src/doc/Debugger/Debugger.md
+@@ -531,8 +531,18 @@ other kinds of objects.
+ 
+ <code>makeGlobalObjectReference(<i>global</i>)</code>
+ :   Return the [`Debugger.Object`][object] whose referent is the global object
+     designated by <i>global</i>, without adding the designated global as a
+     debuggee. If <i>global</i> does not designate a global object, throw a
+     `TypeError`. Determine which global is designated by <i>global</i>
+     using the same rules as [`Debugger.prototype.addDebuggee`][add].
+ 
++## Static methods of the Debugger Object
++
++The functions described below are not called with a `this` value.
++
++<code id="isCompilableUnit">isCompilableUnit(<i>source</i>)</code>
++:   Given a string of source code, designated by <i>source</i>, return false if
++    the string might become a valid JavaScript statement with the addition of
++    more lines. Otherwise return true. The intent is to support interactive
++    compilation - accumulate lines in a buffer until isCompilableUnit is true,
++    then pass it to the compiler.
+diff --git a/js/src/jit-test/tests/debug/Debugger-isCompilableUnit.js b/js/src/jit-test/tests/debug/Debugger-isCompilableUnit.js
+new file mode 100644
+--- /dev/null
++++ b/js/src/jit-test/tests/debug/Debugger-isCompilableUnit.js
+@@ -0,0 +1,50 @@
++load(libdir + "asserts.js");
++
++const bad_types = [
++    2112,
++    {geddy: "lee"},
++    () => 1,
++    [],
++    Array
++]
++
++// We only accept strings around here!
++for (var badType of bad_types) {
++    assertThrowsInstanceOf(() => {
++        Debugger.isCompilableUnit(badType);
++    }, TypeError);
++}
++
++const compilable_units = [
++   "wubba-lubba-dub-dub",
++   "'Get Schwifty!'",
++   "1 + 2",
++   "function f(x) {}",
++   "function x(f,) {", // statements with bad syntax are always compilable
++   "let x = 100",
++   ";;;;;;;;",
++   "",
++   " ",
++   "\n",
++   "let x",
++]
++
++const non_compilable_units = [
++    "function f(x) {",
++    "(...d) =>",
++    "{geddy:",
++    "{",
++    "[1, 2",
++    "[",
++    "1 +",
++    "let x =",
++    "3 ==",
++]
++
++for (var code of compilable_units) {
++    assertEq(Debugger.isCompilableUnit(code), true);
++}
++
++for (var code of non_compilable_units) {
++    assertEq(Debugger.isCompilableUnit(code), false);
++}
+diff --git a/js/src/vm/Debugger.cpp b/js/src/vm/Debugger.cpp
+--- a/js/src/vm/Debugger.cpp
++++ b/js/src/vm/Debugger.cpp
+@@ -13,16 +13,17 @@
+ #include "jscntxt.h"
+ #include "jscompartment.h"
+ #include "jsfriendapi.h"
+ #include "jshashutil.h"
+ #include "jsnum.h"
+ #include "jsobj.h"
+ #include "jswrapper.h"
+ 
++#include "frontend/Parser.h"
+ #include "frontend/BytecodeCompiler.h"
+ #include "gc/Marking.h"
+ #include "jit/BaselineDebugModeOSR.h"
+ #include "jit/BaselineJIT.h"
+ #include "jit/JSONSpewer.h"
+ #include "jit/MIRGraph.h"
+ #include "js/GCAPI.h"
+ #include "js/UbiNodeBreadthFirst.h"
+@@ -4518,16 +4519,63 @@ Debugger::endTraceLogger(JSContext* cx, 
+     TraceLoggerDisable(logger);
+ 
+     args.rval().setUndefined();
+ 
+     return true;
+ }
+ 
+ bool
++Debugger::isCompilableUnit(JSContext* cx, unsigned argc, Value* vp)
++{
++    CallArgs args = CallArgsFromVp(argc, vp);
++
++    if (!args[0].isString()) {
++        JS_ReportErrorNumber(cx, GetErrorMessage, nullptr,
++                             JSMSG_NOT_EXPECTED_TYPE, "Debugger.isCompilableUnit",
++                             "string", InformalValueTypeName(args[0]));
++        return false;
++    }
++
++    JSString* str = args[0].toString();
++    size_t length = GetStringLength(str);
++
++    AutoStableStringChars chars(cx);
++    if (!chars.initTwoByte(cx, str))
++        return false;
++
++    bool result = true;
++
++    CompileOptions options(cx);
++    frontend::Parser<frontend::FullParseHandler> parser(cx, &cx->tempLifoAlloc(),
++                                                        options, chars.twoByteChars(),
++                                                        length, /* foldConstants = */ true,
++                                                        nullptr, nullptr);
++    JSErrorReporter older = JS_SetErrorReporter(cx->runtime(), nullptr);
++    if (!parser.checkOptions() || !parser.parse()) {
++        // We ran into an error. If it was because we ran out of memory we report
++        // it in the usual way.
++        if (cx->isThrowingOutOfMemory()) {
++            JS_SetErrorReporter(cx->runtime(), older);
++            return false;
++        }
++
++        // If it was because we ran out of source, we return false so our caller
++        // knows to try to collect more [source].
++        if (parser.isUnexpectedEOF())
++            result = false;
++
++        cx->clearPendingException();
++    }
++    JS_SetErrorReporter(cx->runtime(), older);
++    args.rval().setBoolean(result);
++    return true;
++}
++
++bool
+ Debugger::drainTraceLoggerScriptCalls(JSContext* cx, unsigned argc, Value* vp)
+ {
+     THIS_DEBUGGER(cx, argc, vp, "drainTraceLoggerScriptCalls", args, dbg);
+     if (!args.requireAtLeast(cx, "Debugger.drainTraceLoggerScriptCalls", 0))
+         return false;
+ 
+     size_t num;
+     TraceLoggerThread* logger = TraceLoggerForMainThread(cx->runtime());
+@@ -4638,17 +4686,21 @@ const JSFunctionSpec Debugger::methods[]
+ # ifdef NIGHTLY_BUILD
+     JS_FN("setupTraceLogger", Debugger::setupTraceLogger, 1, 0),
+     JS_FN("drainTraceLogger", Debugger::drainTraceLogger, 0, 0),
+ # endif
+ #endif
+     JS_FS_END
+ };
+ 
+-
++const JSFunctionSpec Debugger::static_methods[] {
++    JS_FN("isCompilableUnit", Debugger::isCompilableUnit, 1, 0),
++    JS_FS_END
++};
++
+ /*** Debugger.Script *****************************************************************************/
+ 
+ static inline JSScript*
+ GetScriptReferent(JSObject* obj)
+ {
+     MOZ_ASSERT(obj->getClass() == &DebuggerScript_class);
+     return static_cast<JSScript*>(obj->as<NativeObject>().getPrivate());
+ }
+@@ -8410,18 +8462,18 @@ JS_DefineDebuggerObject(JSContext* cx, H
+         objectProto(cx),
+         envProto(cx),
+         memoryProto(cx);
+     objProto = obj->as<GlobalObject>().getOrCreateObjectPrototype(cx);
+     if (!objProto)
+         return false;
+     debugProto = InitClass(cx, obj,
+                            objProto, &Debugger::jsclass, Debugger::construct,
+-                           1, Debugger::properties, Debugger::methods, nullptr, nullptr,
+-                           debugCtor.address());
++                           1, Debugger::properties, Debugger::methods, nullptr,
++                           Debugger::static_methods, debugCtor.address());
+     if (!debugProto)
+         return false;
+ 
+     frameProto = InitClass(cx, debugCtor, objProto, &DebuggerFrame_class,
+                            DebuggerFrame_construct, 0,
+                            DebuggerFrame_properties, DebuggerFrame_methods,
+                            nullptr, nullptr);
+     if (!frameProto)
+diff --git a/js/src/vm/Debugger.h b/js/src/vm/Debugger.h
+--- a/js/src/vm/Debugger.h
++++ b/js/src/vm/Debugger.h
+@@ -561,23 +561,25 @@ class Debugger : private mozilla::Linked
+     static bool findScripts(JSContext* cx, unsigned argc, Value* vp);
+     static bool findObjects(JSContext* cx, unsigned argc, Value* vp);
+     static bool findAllGlobals(JSContext* cx, unsigned argc, Value* vp);
+     static bool makeGlobalObjectReference(JSContext* cx, unsigned argc, Value* vp);
+     static bool setupTraceLoggerScriptCalls(JSContext* cx, unsigned argc, Value* vp);
+     static bool drainTraceLoggerScriptCalls(JSContext* cx, unsigned argc, Value* vp);
+     static bool startTraceLogger(JSContext* cx, unsigned argc, Value* vp);
+     static bool endTraceLogger(JSContext* cx, unsigned argc, Value* vp);
++    static bool isCompilableUnit(JSContext* cx, unsigned argc, Value* vp);
+ #ifdef NIGHTLY_BUILD
+     static bool setupTraceLogger(JSContext* cx, unsigned argc, Value* vp);
+     static bool drainTraceLogger(JSContext* cx, unsigned argc, Value* vp);
+ #endif
+     static bool construct(JSContext* cx, unsigned argc, Value* vp);
+     static const JSPropertySpec properties[];
+     static const JSFunctionSpec methods[];
++    static const JSFunctionSpec static_methods[];
+ 
+     static void removeFromFrameMapsAndClearBreakpointsIn(JSContext* cx, AbstractFramePtr frame);
+     static bool updateExecutionObservabilityOfFrames(JSContext* cx, const ExecutionObservableSet& obs,
+                                                      IsObserving observing);
+     static bool updateExecutionObservabilityOfScripts(JSContext* cx, const ExecutionObservableSet& obs,
+                                                       IsObserving observing);
+     static bool updateExecutionObservability(JSContext* cx, ExecutionObservableSet& obs,
+                                              IsObserving observing);
