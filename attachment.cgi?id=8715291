@@ -1,0 +1,282 @@
+# HG changeset patch
+# User Patrick Brosset <pbrosset@mozilla.com>
+# Date 1454507038 -3600
+#      Wed Feb 03 14:43:58 2016 +0100
+# Node ID cea967df835d40f7fbd693256567994c666b7111
+# Parent  61378b2ad3039e0cf638eea3da1edb382daf337e
+Bug 1244120 - Enable browser_rules_content_02.js with e10s; r=bgrins
+
+Extracted a shared helper to open the browser context menu and choose
+the 'inspect element' item. This helper works with e10s.
+Adapted it a little bit so it waits for the right events in order to
+make sure the inspector is ready.
+
+Used this in browser_inspector_initialization.js and
+browser_rules_content_02.js.
+
+Also removed a now useless inspector-updated event that was trigger from
+the animation-inspector panel in some situation. This was left behind
+from a long time ago but didn't serve any purpose anymore.
+
+diff --git a/browser/base/content/nsContextMenu.js b/browser/base/content/nsContextMenu.js
+--- a/browser/base/content/nsContextMenu.js
++++ b/browser/base/content/nsContextMenu.js
+@@ -554,31 +554,44 @@ nsContextMenu.prototype = {
+     let insertBeforeElement = document.getElementById("fill-login-no-logins");
+     popup.insertBefore(fragment, insertBeforeElement);
+   },
+ 
+   openPasswordManager: function() {
+     LoginHelper.openPasswordManager(window, gContextMenuContentData.documentURIObject.host);
+   },
+ 
+-  inspectNode: function CM_inspectNode() {
++  inspectNode: function() {
+     let {devtools} = Cu.import("resource://devtools/shared/Loader.jsm", {});
+     let gBrowser = this.browser.ownerDocument.defaultView.gBrowser;
+-    let tt = devtools.TargetFactory.forTab(gBrowser.selectedTab);
+-    return gDevTools.showToolbox(tt, "inspector").then(function(toolbox) {
++    let target = devtools.TargetFactory.forTab(gBrowser.selectedTab);
++
++    return gDevTools.showToolbox(target, "inspector").then(toolbox => {
+       let inspector = toolbox.getCurrentPanel();
++
++      // new-node-front tells us when the node has been selected, whether the
++      // browser is remote or not.
++      // let onNewNode = inspector.selection.once("new-node-front");
++
+       if (this.isRemote) {
+         this.browser.messageManager.sendAsyncMessage("debug:inspect", {}, {node: this.target});
+         inspector.walker.findInspectingNode().then(nodeFront => {
+           inspector.selection.setNodeFront(nodeFront, "browser-context-menu");
+         });
+       } else {
+         inspector.selection.setNode(this.target, "browser-context-menu");
+       }
+-    }.bind(this));
++
++      return inspector.once("inspector-updated");
++
++      // return onNewNode.then(() => {
++      //   // Now that the node has been selected, wait until the inspector is
++      //   // fully updated.
++      // });
++    });
+   },
+ 
+   // Set various context menu attributes based on the state of the world.
+   setTarget: function (aNode, aRangeParent, aRangeOffset) {
+     // gContextMenuContentData.isRemote tells us if the event came from a remote
+     // process. gContextMenuContentData can be null if something (like tests)
+     // opens the context menu directly.
+     let editFlags;
+diff --git a/devtools/client/animationinspector/animation-panel.js b/devtools/client/animationinspector/animation-panel.js
+--- a/devtools/client/animationinspector/animation-panel.js
++++ b/devtools/client/animationinspector/animation-panel.js
+@@ -244,18 +244,16 @@ var AnimationsPanel = {
+     yield this.refreshAnimationsUI();
+   }),
+ 
+   /**
+    * Refresh the list of animations UI. This will empty the panel and re-render
+    * the various components again.
+    */
+   refreshAnimationsUI: Task.async(function*() {
+-    let done = gInspector.updating("animationspanel");
+-
+     // Empty the whole panel first.
+     this.togglePlayers(true);
+ 
+     // Re-render the timeline component.
+     this.animationsTimelineComponent.render(
+       AnimationsController.animationPlayers,
+       AnimationsController.documentCurrentTime);
+ 
+@@ -264,18 +262,16 @@ var AnimationsPanel = {
+       this.rateSelectorComponent.render(AnimationsController.animationPlayers);
+     }
+ 
+     // If there are no players to show, show the error message instead and
+     // return.
+     if (!AnimationsController.animationPlayers.length) {
+       this.togglePlayers(false);
+       this.emit(this.UI_UPDATED_EVENT);
+-      done();
+       return;
+     }
+ 
+     this.emit(this.UI_UPDATED_EVENT);
+-    done();
+   })
+ };
+ 
+ EventEmitter.decorate(AnimationsPanel);
+diff --git a/devtools/client/inspector/rules/test/browser.ini b/devtools/client/inspector/rules/test/browser.ini
+--- a/devtools/client/inspector/rules/test/browser.ini
++++ b/devtools/client/inspector/rules/test/browser.ini
+@@ -61,17 +61,16 @@ support-files =
+ [browser_rules_completion-new-property_01.js]
+ [browser_rules_completion-new-property_02.js]
+ [browser_rules_completion-new-property_03.js]
+ [browser_rules_computed-lists_01.js]
+ [browser_rules_computed-lists_02.js]
+ [browser_rules_completion-popup-hidden-after-navigation.js]
+ [browser_rules_content_01.js]
+ [browser_rules_content_02.js]
+-skip-if = e10s # Bug 1039528: "inspect element" contextual-menu doesn't work with e10s
+ [browser_rules_context-menu-show-mdn-docs-01.js]
+ [browser_rules_context-menu-show-mdn-docs-02.js]
+ [browser_rules_context-menu-show-mdn-docs-03.js]
+ [browser_rules_copy_styles.js]
+ [browser_rules_cssom.js]
+ [browser_rules_cubicbezier-appears-on-swatch-click.js]
+ [browser_rules_cubicbezier-commit-on-ENTER.js]
+ [browser_rules_cubicbezier-revert-on-ESC.js]
+diff --git a/devtools/client/inspector/rules/test/browser_rules_content_02.js b/devtools/client/inspector/rules/test/browser_rules_content_02.js
+--- a/devtools/client/inspector/rules/test/browser_rules_content_02.js
++++ b/devtools/client/inspector/rules/test/browser_rules_content_02.js
+@@ -14,44 +14,22 @@ const CONTENT = '<body style="color:red;
+                      </p>\
+                    </div>\
+                  </body>';
+ 
+ const STRINGS = Services.strings
+   .createBundle("chrome://devtools-shared/locale/styleinspector.properties");
+ 
+ add_task(function*() {
+-  yield addTab("data:text/html;charset=utf-8," + CONTENT);
++  let tab = yield addTab("data:text/html;charset=utf-8," + CONTENT);
+ 
+-  info("Getting the test element");
+-  let element = getNode("span");
++  let testActor = yield getTestActorWithoutToolbox(tab);
++  let inspector = yield clickOnInspectMenuItem(testActor, "span");
+ 
+-  info("Opening the inspector using the content context-menu");
+-  let onInspectorReady = gDevTools.once("inspector-ready");
+-
+-  document.popupNode = element;
+-  let contentAreaContextMenu = document.getElementById("contentAreaContextMenu");
+-  let contextMenu = new nsContextMenu(contentAreaContextMenu);
+-  yield contextMenu.inspectNode();
+-
+-  // Clean up context menu:
+-  contextMenu.hiding();
+-
+-  yield onInspectorReady;
+-
+-  let target = TargetFactory.forTab(gBrowser.selectedTab);
+-  let toolbox = gDevTools.getToolbox(target);
+-
+-  info("Getting the inspector and making sure it is fully updated");
+-  let inspector = toolbox.getPanel("inspector");
+-  yield inspector.once("inspector-updated");
+-
+-  let view = inspector.ruleview.view;
+-
+-  checkRuleViewContent(view);
++  checkRuleViewContent(inspector.ruleview.view);
+ });
+ 
+ function checkRuleViewContent({styleDocument}) {
+   info("Making sure the rule-view contains the expected content");
+ 
+   let headers = [...styleDocument.querySelectorAll(".ruleview-header")];
+   is(headers.length, 3, "There are 3 headers for inherited rules");
+ 
+@@ -76,8 +54,9 @@ function checkRuleViewContent({styleDocu
+ 
+     let propertyNames = [...rule.querySelectorAll(".ruleview-propertyname")];
+     is(propertyNames.length, 1, "There's only one property name, as expected");
+ 
+     let propertyValues = [...rule.querySelectorAll(".ruleview-propertyvalue")];
+     is(propertyValues.length, 1, "There's only one property value, as expected");
+   }
+ }
++
+diff --git a/devtools/client/inspector/test/browser_inspector_initialization.js b/devtools/client/inspector/test/browser_inspector_initialization.js
+--- a/devtools/client/inspector/test/browser_inspector_initialization.js
++++ b/devtools/client/inspector/test/browser_inspector_initialization.js
+@@ -109,32 +109,8 @@ function* testBreadcrumbs(selector, insp
+   let nodeFront = yield getNodeFront(selector, inspector);
+ 
+   let b = inspector.breadcrumbs;
+   let expectedText = b.prettyPrintNodeAsText(nodeFront);
+   let button = b.container.querySelector("button[checked=true]");
+   ok(button, "A crumbs is checked=true");
+   is(button.getAttribute("tooltiptext"), expectedText, "Crumb refers to the right node");
+ }
+-
+-function* clickOnInspectMenuItem(testActor, selector) {
+-  info("Showing the contextual menu on node " + selector);
+-  let contentAreaContextMenu = document.querySelector("#contentAreaContextMenu");
+-  let contextOpened = once(contentAreaContextMenu, "popupshown");
+-
+-  yield testActor.synthesizeMouse({
+-    selector: selector,
+-    center: true,
+-    options: {type: "contextmenu", button: 2}
+-  });
+-
+-  yield contextOpened;
+-
+-  info("Triggering inspect action and hiding the menu.");
+-  yield gContextMenu.inspectNode();
+-
+-  let contextClosed = once(contentAreaContextMenu, "popuphidden");
+-  contentAreaContextMenu.hidePopup();
+-
+-  info("Waiting for inspector to update.");
+-  yield getActiveInspector().once("inspector-updated");
+-  yield contextClosed;
+-}
+diff --git a/devtools/client/inspector/test/head.js b/devtools/client/inspector/test/head.js
+--- a/devtools/client/inspector/test/head.js
++++ b/devtools/client/inspector/test/head.js
+@@ -157,16 +157,46 @@ var openInspector = Task.async(function*
+ });
+ 
+ function getActiveInspector() {
+   let target = TargetFactory.forTab(gBrowser.selectedTab);
+   return gDevTools.getToolbox(target).getPanel("inspector");
+ }
+ 
+ /**
++ * Right click on a node in the test page and click on the inspect menu item.
++ * @param {TestActor}
++ * @param {String} selector The selector for the node to click on in the page.
++ * @return {Promise} Resolves to the inspector when it has opened and is updated
++ */
++var clickOnInspectMenuItem = Task.async(function*(testActor, selector) {
++  info("Showing the contextual menu on node " + selector);
++  let contentAreaContextMenu = document.querySelector("#contentAreaContextMenu");
++  let contextOpened = once(contentAreaContextMenu, "popupshown");
++
++  yield testActor.synthesizeMouse({
++    selector: selector,
++    center: true,
++    options: {type: "contextmenu", button: 2}
++  });
++
++  yield contextOpened;
++
++  info("Triggering the inspect action");
++  yield gContextMenu.inspectNode();
++
++  info("Hiding the menu");
++  let contextClosed = once(contentAreaContextMenu, "popuphidden");
++  contentAreaContextMenu.hidePopup();
++  yield contextClosed;
++
++  return getActiveInspector();
++});
++
++/**
+  * Open the toolbox, with the inspector tool visible, and the one of the sidebar
+  * tabs selected.
+  * @param {String} id The ID of the sidebar tab to be opened
+  * @param {String} hostType Optional hostType, as defined in Toolbox.HostType
+  * @return a promise that resolves when the inspector is ready and the tab is
+  * visible and ready
+  */
+ var openInspectorSidebarTab = Task.async(function*(id, hostType) {
