@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  3fe39e86cc29110c6b523d56aeb4dcd644bd7f37
-Bug 1243984 - browser_webconsole_bug_593003_iframe_wrong_hud.js
+# Parent  02f4d61b3c5511f933c35adfdc741fd000f87d04
+Bug 1243984 - e10s fixes for browser_webconsole_bug_593003_iframe_wrong_hud.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini
