@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  15b10075e156adacca93f2a1561d237cf2e38f0f
+# Parent  bdd606bd44d5481eb7f33030512cd2adc8ea4c4d
 Bug 1243992 - e10s fixes for browser_webconsole_bug_585991_autocomplete_keys.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
@@ -20,10 +20,10 @@ diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webco
  [browser_webconsole_bug_586388_select_all.js]
  [browser_webconsole_bug_587617_output_copy.js]
  [browser_webconsole_bug_588342_document_focus.js]
- skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_webconsole_bug_588730_text_node_insertion.js]
  [browser_webconsole_bug_588967_input_expansion.js]
  [browser_webconsole_bug_589162_css_filter.js]
+ [browser_webconsole_bug_592442_closing_brackets.js]
 diff --git a/devtools/client/webconsole/test/browser_webconsole_bug_585991_autocomplete_keys.js b/devtools/client/webconsole/test/browser_webconsole_bug_585991_autocomplete_keys.js
 --- a/devtools/client/webconsole/test/browser_webconsole_bug_585991_autocomplete_keys.js
 +++ b/devtools/client/webconsole/test/browser_webconsole_bug_585991_autocomplete_keys.js

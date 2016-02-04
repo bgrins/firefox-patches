@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  915636bf875c63e170e6a5241ac16fb6d1a34e9d
+# Parent  013c2c0af10d345c558204b87be2805457a96ace
 Bug 1243962 - e10s fixes for browser_console_variables_view_while_debugging_and_inspecting.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
@@ -57,7 +57,7 @@ diff --git a/devtools/client/webconsole/test/browser_console_variables_view_whil
 +function* waitForFrameAdded(dbgPanel) {
 +  let thread = dbgPanel.panelWin.DebuggerController.activeThread;
 +
-+  info("Waiting for onFramesAdded");
++  info("Waiting for framesadded");
 +  yield new Promise(resolve => {
 +    thread.addOneTimeListener("framesadded", resolve);
 +    info("firstCall()");

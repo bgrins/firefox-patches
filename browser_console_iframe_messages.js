@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  29098be65d483e3e49430f9236c3a3fe28ea6464
+# Parent  db010d7c2272140accf80139afc79f8d13fae324
 Bug 1243983 - e10s fixes for browser_console_iframe_messages.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
@@ -27,7 +27,7 @@ diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webco
 diff --git a/devtools/client/webconsole/test/browser_console_iframe_messages.js b/devtools/client/webconsole/test/browser_console_iframe_messages.js
 --- a/devtools/client/webconsole/test/browser_console_iframe_messages.js
 +++ b/devtools/client/webconsole/test/browser_console_iframe_messages.js
-@@ -50,54 +50,62 @@ const expectedMessagesAny = [
+@@ -50,54 +50,65 @@ const expectedMessagesAny = [
      name: "iframe 1 (repeats: 2)",
      text: "iframe 1",
      category: CATEGORY_WEBDEV,
@@ -49,23 +49,18 @@ diff --git a/devtools/client/webconsole/test/browser_console_iframe_messages.js 
 +
 +  yield loadTab(TEST_URI);
 +  let hud = yield openConsole();
++  ok(hud, "web console opened");
 +
 +  yield testWebConsole(hud);
 +  yield closeConsole();
 +  info("web console closed");
 +
-+  // The browser console doesn't show page's console.log statements in
-+  // e10s windows. See Bug 1241289.
-+  if (!Services.appinfo.browserTabsRemoteAutostart) {
-+    hud = yield HUDService.toggleBrowserConsole();
-+    yield testBrowserConsole(hud);
-+    yield closeConsole();
-+  }
++  hud = yield HUDService.toggleBrowserConsole();
++  yield testBrowserConsole(hud);
++  yield closeConsole();
 +});
 +
 +function* testWebConsole(hud) {
-+  ok(hud, "web console opened");
-+
 +  yield waitForMessages({
 +    webconsole: hud,
 +    messages: expectedMessages,
@@ -82,10 +77,17 @@ diff --git a/devtools/client/webconsole/test/browser_console_iframe_messages.js 
  
 -function consoleOpened(hud) {
 -  ok(hud, "web console opened");
--
--  waitForMessages({
 +function* testBrowserConsole(hud) {
 +  ok(hud, "browser console opened");
+ 
+-  waitForMessages({
++  // TODO: The browser console doesn't show page's console.log statements
++  // in e10s windows. See Bug 1241289.
++  if (Services.appinfo.browserTabsRemoteAutostart) {
++    todo(false, "Bug 1241289");
++    return;
++  }
++
 +  yield waitForMessages({
      webconsole: hud,
      messages: expectedMessages,

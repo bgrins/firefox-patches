@@ -1,15 +1,15 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  02f4d61b3c5511f933c35adfdc741fd000f87d04
+# Parent  1f1280ca0cdc984a96815190a5736e9a4bb5e269
 Bug 1243984 - e10s fixes for browser_webconsole_bug_593003_iframe_wrong_hud.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini
 +++ b/devtools/client/webconsole/test/browser.ini
-@@ -220,17 +220,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+@@ -219,17 +219,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+ [browser_webconsole_bug_586388_select_all.js]
  [browser_webconsole_bug_587617_output_copy.js]
  [browser_webconsole_bug_588342_document_focus.js]
- skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_webconsole_bug_588730_text_node_insertion.js]
  [browser_webconsole_bug_588967_input_expansion.js]
  [browser_webconsole_bug_589162_css_filter.js]
@@ -27,7 +27,7 @@ diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webco
 diff --git a/devtools/client/webconsole/test/browser_webconsole_bug_593003_iframe_wrong_hud.js b/devtools/client/webconsole/test/browser_webconsole_bug_593003_iframe_wrong_hud.js
 --- a/devtools/client/webconsole/test/browser_webconsole_bug_593003_iframe_wrong_hud.js
 +++ b/devtools/client/webconsole/test/browser_webconsole_bug_593003_iframe_wrong_hud.js
-@@ -10,62 +10,57 @@ const TEST_URI = "http://example.com/bro
+@@ -10,62 +10,59 @@ const TEST_URI = "http://example.com/bro
  
  const TEST_IFRAME_URI = "http://example.com/browser/devtools/client/" +
                          "webconsole/test/test-bug-593003-iframe-wrong-" +
@@ -43,7 +43,9 @@ diff --git a/devtools/client/webconsole/test/browser_webconsole_bug_593003_ifram
 -  loadTab(TEST_URI).then(({tab}) => {
 -    tab1 = tab;
 +  let tab1 = (yield loadTab(TEST_URI)).tab;
-+  content.console.log("FOO");
++  yield ContentTask.spawn(gBrowser.selectedBrowser, {}, function*() {
++    content.console.log("FOO");
++  });
 +  yield openConsole();
  
 -    content.console.log("FOO");
