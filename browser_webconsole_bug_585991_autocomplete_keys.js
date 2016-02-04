@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  a249d911b0de51319719494e175e76065c5b0c05
-Bug 1243992 - browser_webconsole_bug_585991_autocomplete_keys.js
+# Parent  15b10075e156adacca93f2a1561d237cf2e38f0f
+Bug 1243992 - e10s fixes for browser_webconsole_bug_585991_autocomplete_keys.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini

@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  0cae9cca480a57ac885e5bf04d11fb256a89d74d
-Bug 1243995 - browser_console_optimized_out_vars.js
+# Parent  6fd58e450fa7eb141447050398ed60f1236c01ba
+Bug 1243995 - e10s fixes for browser_console_optimized_out_vars.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini

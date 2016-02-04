@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  a7fa43dfa2fe3cc81af895ec3145517cf3141b74
-Bug 1243983 - browser_console_iframe_messages.js
+# Parent  29098be65d483e3e49430f9236c3a3fe28ea6464
+Bug 1243983 - e10s fixes for browser_console_iframe_messages.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini

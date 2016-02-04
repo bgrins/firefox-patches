@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  6780a4ca51820816e2f94f809a11677d6447d286
-Bug 1243968 - browser_console_variables_view_while_debugging.js
+# Parent  6cd8b252d4977e3dee1a5ec02ee7e604f2695a93
+Bug 1243968 - e10s fixes for browser_console_variables_view_while_debugging.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini

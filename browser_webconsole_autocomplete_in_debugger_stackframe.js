@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  4aafc8861d1236b4baed01b646bac6697c5704f9
-Bug 1243959 - browser_webconsole_autocomplete_in_debugger_stackframe.js
+# Parent  4fb374a2299f21def20eebea0dce3832251caea6
+Bug 1243959 - e10s fixes for browser_webconsole_autocomplete_in_debugger_stackframe.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini
