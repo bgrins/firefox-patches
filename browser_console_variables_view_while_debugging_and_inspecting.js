@@ -1,8 +1,29 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  fba7edb825180905b51843a8f91cde32c430e37e
+# Parent  d15b4d5b6e1419459b2d9a1e2ee20999abd37ae6
 Bug 1243962 - browser_console_variables_view_while_debugging_and_inspecting.js
 
+diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
+--- a/devtools/client/webconsole/test/browser.ini
++++ b/devtools/client/webconsole/test/browser.ini
+@@ -182,17 +182,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_console_variables_view_filter.js]
+ [browser_console_variables_view_dom_nodes.js]
+ [browser_console_variables_view_dont_sort_non_sortable_classes_properties.js]
+ [browser_console_variables_view_special_names.js]
+ [browser_console_variables_view_while_debugging.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_console_variables_view_while_debugging_and_inspecting.js]
+-skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_eval_in_debugger_stackframe.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_eval_in_debugger_stackframe2.js]
+ [browser_jsterm_inspect.js]
+ skip-if = e10s && debug && os == 'win'
+ [browser_longstring_hang.js]
+ [browser_output_breaks_after_console_dir_uninspectable.js]
+ [browser_output_longstring_expand.js]
 diff --git a/devtools/client/webconsole/test/browser_console_variables_view_while_debugging_and_inspecting.js b/devtools/client/webconsole/test/browser_console_variables_view_while_debugging_and_inspecting.js
 --- a/devtools/client/webconsole/test/browser_console_variables_view_while_debugging_and_inspecting.js
 +++ b/devtools/client/webconsole/test/browser_console_variables_view_while_debugging_and_inspecting.js

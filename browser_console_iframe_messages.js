@@ -1,8 +1,29 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  082700c31ecafd2b4b4b24c6c37bc7ff398e98dc
+# Parent  a7fa43dfa2fe3cc81af895ec3145517cf3141b74
 Bug 1243983 - browser_console_iframe_messages.js
 
+diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
+--- a/devtools/client/webconsole/test/browser.ini
++++ b/devtools/client/webconsole/test/browser.ini
+@@ -161,17 +161,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+ [browser_console_copy_command.js]
+ [browser_console_dead_objects.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_console_copy_entire_message_context_menu.js]
+ [browser_console_error_source_click.js]
+ skip-if = e10s # Bug 1042253 - webconsole e10s tests
+ [browser_console_filters.js]
+ [browser_console_iframe_messages.js]
+-skip-if = e10s # Bug 1042253 - webconsole e10s tests
+ [browser_console_keyboard_accessibility.js]
+ [browser_console_log_inspectable_object.js]
+ [browser_console_native_getters.js]
+ [browser_console_navigation_marker.js]
+ [browser_console_netlogging.js]
+ [browser_console_nsiconsolemessage.js]
+ [browser_console_optimized_out_vars.js]
+ [browser_console_private_browsing.js]
 diff --git a/devtools/client/webconsole/test/browser_console_iframe_messages.js b/devtools/client/webconsole/test/browser_console_iframe_messages.js
 --- a/devtools/client/webconsole/test/browser_console_iframe_messages.js
 +++ b/devtools/client/webconsole/test/browser_console_iframe_messages.js

@@ -1,8 +1,29 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  ee24cd83e73e45dc42a62e25749fca7359485512
+# Parent  4aafc8861d1236b4baed01b646bac6697c5704f9
 Bug 1243959 - browser_webconsole_autocomplete_in_debugger_stackframe.js
 
+diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
+--- a/devtools/client/webconsole/test/browser.ini
++++ b/devtools/client/webconsole/test/browser.ini
+@@ -345,17 +345,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+ skip-if = e10s # Bug 1042253 - webconsole e10s tests (Linux debug timeout)
+ [browser_webconsole_trackingprotection_errors.js]
+ tags = trackingprotection
+ [browser_webconsole_view_source.js]
+ [browser_webconsole_reflow.js]
+ [browser_webconsole_log_file_filter.js]
+ [browser_webconsole_expandable_timestamps.js]
+ [browser_webconsole_autocomplete_in_debugger_stackframe.js]
+-skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_webconsole_autocomplete_popup_close_on_tab_switch.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_webconsole_autocomplete-properties-with-non-alphanumeric-names.js]
+ [browser_console_hide_jsterm_when_devtools_chrome_enabled_false.js]
+ [browser_console_history_persist.js]
+ [browser_webconsole_output_01.js]
+ skip-if = e10s # Bug 1042253 - webconsole e10s tests
+ [browser_webconsole_output_02.js]
 diff --git a/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_debugger_stackframe.js b/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_debugger_stackframe.js
 --- a/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_debugger_stackframe.js
 +++ b/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_debugger_stackframe.js

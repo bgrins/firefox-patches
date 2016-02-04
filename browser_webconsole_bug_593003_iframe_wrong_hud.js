@@ -1,8 +1,29 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  3412ad2a06c5284ce5641db98d256c1a618b51f6
+# Parent  3fe39e86cc29110c6b523d56aeb4dcd644bd7f37
 Bug 1243984 - browser_webconsole_bug_593003_iframe_wrong_hud.js
 
+diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
+--- a/devtools/client/webconsole/test/browser.ini
++++ b/devtools/client/webconsole/test/browser.ini
+@@ -220,17 +220,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+ [browser_webconsole_bug_587617_output_copy.js]
+ [browser_webconsole_bug_588342_document_focus.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_webconsole_bug_588730_text_node_insertion.js]
+ [browser_webconsole_bug_588967_input_expansion.js]
+ [browser_webconsole_bug_589162_css_filter.js]
+ [browser_webconsole_bug_592442_closing_brackets.js]
+ [browser_webconsole_bug_593003_iframe_wrong_hud.js]
+-skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_webconsole_bug_594497_history_arrow_keys.js]
+ [browser_webconsole_bug_595223_file_uri.js]
+ [browser_webconsole_bug_595350_multiple_windows_and_tabs.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_webconsole_bug_595934_message_categories.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+ [browser_webconsole_bug_597103_deactivateHUDForContext_unfocused_window.js]
+ [browser_webconsole_bug_597136_external_script_errors.js]
 diff --git a/devtools/client/webconsole/test/browser_webconsole_bug_593003_iframe_wrong_hud.js b/devtools/client/webconsole/test/browser_webconsole_bug_593003_iframe_wrong_hud.js
 --- a/devtools/client/webconsole/test/browser_webconsole_bug_593003_iframe_wrong_hud.js
 +++ b/devtools/client/webconsole/test/browser_webconsole_bug_593003_iframe_wrong_hud.js
