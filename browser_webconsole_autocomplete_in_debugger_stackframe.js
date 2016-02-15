@@ -1,12 +1,12 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  4fb374a2299f21def20eebea0dce3832251caea6
+# Parent  b3b28baf85983a33353d43dd4924110b0b1c1f71
 Bug 1243959 - e10s fixes for browser_webconsole_autocomplete_in_debugger_stackframe.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini
 +++ b/devtools/client/webconsole/test/browser.ini
-@@ -345,17 +345,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+@@ -342,17 +342,16 @@ skip-if = e10s # Bug 1042253 - webconsol
  skip-if = e10s # Bug 1042253 - webconsole e10s tests (Linux debug timeout)
  [browser_webconsole_trackingprotection_errors.js]
  tags = trackingprotection
@@ -27,7 +27,7 @@ diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webco
 diff --git a/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_debugger_stackframe.js b/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_debugger_stackframe.js
 --- a/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_debugger_stackframe.js
 +++ b/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_debugger_stackframe.js
-@@ -6,62 +6,56 @@
+@@ -6,62 +6,58 @@
  // Test that makes sure web console autocomplete happens in the user-selected
  // stackframe from the js debugger.
  
@@ -38,6 +38,9 @@ diff --git a/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_
  
 -var testDriver, gStackframes;
 +var gStackframes;
++registerCleanupFunction(function() {
++  gStackframes = null;
++});
  
 -function test() {
 -  requestLongerTimeout(2);
@@ -59,7 +62,6 @@ diff --git a/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_
 +  yield loadTab(TEST_URI);
 +  let hud = yield openConsole();
 +  yield testCompletion(hud);
-+  gStackframes = null;
 +});
  
  function* testCompletion(hud) {
@@ -104,7 +106,7 @@ diff --git a/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_
       }), "autocomplete results do contain foo1");
    ok(!newItems.every(function(item) {
         return item.label != "foo1Obj";
-@@ -77,48 +71,56 @@ function* testCompletion(hud) {
+@@ -77,48 +73,56 @@ function* testCompletion(hud) {
       }), "autocomplete results do not contain foo3");
    ok(newItems.every(function(item) {
         return item.label != "foo3Obj";
@@ -170,7 +172,7 @@ diff --git a/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_
       }), "autocomplete results do contain foo3");
    ok(!newItems.every(function(item) {
         return item.label != "foo3Obj";
-@@ -131,29 +133,29 @@ function* testCompletion(hud) {
+@@ -131,29 +135,29 @@ function* testCompletion(hud) {
       }), "autocomplete results do contain foo1Obj");
    ok(newItems.every(function(item) {
         return item.label != "foo2";
@@ -208,7 +210,7 @@ diff --git a/devtools/client/webconsole/test/browser_webconsole_autocomplete_in_
       }), "autocomplete results do contain foo2");
    ok(!newItems.every(function(item) {
         return item.label != "foo2Obj";
-@@ -169,75 +171,67 @@ function* testCompletion(hud) {
+@@ -169,75 +173,67 @@ function* testCompletion(hud) {
       }), "autocomplete results do not contain foo3");
    ok(newItems.every(function(item) {
         return item.label != "foo3Obj";

@@ -1,15 +1,15 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  c356f2d919d9d24096c9528c2c3acee8911fa7e7
+# Parent  3bbbecf4589f2501fefc71322ce7fb8e6ff671ad
 Bug 1243968 - e10s fixes for browser_console_variables_view_while_debugging.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini
 +++ b/devtools/client/webconsole/test/browser.ini
-@@ -180,17 +180,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+@@ -177,17 +177,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+ skip-if = e10s # Bug 1042253 - webconsole e10s tests
  [browser_console_server_logging.js]
  [browser_console_variables_view.js]
- skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_console_variables_view_filter.js]
  [browser_console_variables_view_dom_nodes.js]
  [browser_console_variables_view_dont_sort_non_sortable_classes_properties.js]
@@ -17,17 +17,17 @@ diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webco
  [browser_console_variables_view_while_debugging.js]
 -skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_console_variables_view_while_debugging_and_inspecting.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_eval_in_debugger_stackframe.js]
  skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_eval_in_debugger_stackframe2.js]
  [browser_jsterm_inspect.js]
  skip-if = e10s && debug && os == 'win'
  [browser_longstring_hang.js]
- [browser_output_breaks_after_console_dir_uninspectable.js]
 diff --git a/devtools/client/webconsole/test/browser_console_variables_view_while_debugging.js b/devtools/client/webconsole/test/browser_console_variables_view_while_debugging.js
 --- a/devtools/client/webconsole/test/browser_console_variables_view_while_debugging.js
 +++ b/devtools/client/webconsole/test/browser_console_variables_view_while_debugging.js
-@@ -7,120 +7,96 @@
+@@ -7,120 +7,95 @@
  // from the js debugger, when changing the value of a property in the variables
  // view.
  
@@ -57,7 +57,6 @@ diff --git a/devtools/client/webconsole/test/browser_console_variables_view_whil
 +  info("Waiting for framesadded");
 +  yield new Promise(resolve => {
 +    thread.addOneTimeListener("framesadded", resolve);
-+    info("firstCall()");
 +    ContentTask.spawn(gBrowser.selectedBrowser, {}, function*() {
 +      content.wrappedJSObject.firstCall();
 +    });

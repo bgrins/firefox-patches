@@ -1,19 +1,19 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  013c2c0af10d345c558204b87be2805457a96ace
+# Parent  feb1037ca8602c2c8d37e59cc1b418ba02c535fe
 Bug 1243962 - e10s fixes for browser_console_variables_view_while_debugging_and_inspecting.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini
 +++ b/devtools/client/webconsole/test/browser.ini
-@@ -182,17 +182,16 @@ skip-if = e10s # Bug 1042253 - webconsol
- skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
+@@ -178,17 +178,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+ [browser_console_server_logging.js]
+ [browser_console_variables_view.js]
  [browser_console_variables_view_filter.js]
  [browser_console_variables_view_dom_nodes.js]
  [browser_console_variables_view_dont_sort_non_sortable_classes_properties.js]
  [browser_console_variables_view_special_names.js]
  [browser_console_variables_view_while_debugging.js]
- skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_console_variables_view_while_debugging_and_inspecting.js]
 -skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_eval_in_debugger_stackframe.js]
@@ -27,7 +27,7 @@ diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webco
 diff --git a/devtools/client/webconsole/test/browser_console_variables_view_while_debugging_and_inspecting.js b/devtools/client/webconsole/test/browser_console_variables_view_while_debugging_and_inspecting.js
 --- a/devtools/client/webconsole/test/browser_console_variables_view_while_debugging_and_inspecting.js
 +++ b/devtools/client/webconsole/test/browser_console_variables_view_while_debugging_and_inspecting.js
-@@ -6,116 +6,100 @@
+@@ -6,116 +6,99 @@
  // Test that makes sure web console eval works while the js debugger paused the
  // page, and while the inspector is active. See bug 886137.
  
@@ -60,7 +60,6 @@ diff --git a/devtools/client/webconsole/test/browser_console_variables_view_whil
 +  info("Waiting for framesadded");
 +  yield new Promise(resolve => {
 +    thread.addOneTimeListener("framesadded", resolve);
-+    info("firstCall()");
 +    ContentTask.spawn(gBrowser.selectedBrowser, {}, function*() {
 +      content.wrappedJSObject.firstCall();
 +    });

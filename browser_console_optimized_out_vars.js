@@ -1,13 +1,13 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  6fd58e450fa7eb141447050398ed60f1236c01ba
+# Parent  a5cfdf9bda1c0a5831ca5957fd6436e9e1ba8efb
 Bug 1243995 - e10s fixes for browser_console_optimized_out_vars.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini
 +++ b/devtools/client/webconsole/test/browser.ini
-@@ -169,17 +169,16 @@ skip-if = e10s # Bug 1042253 - webconsol
- skip-if = e10s # Bug 1042253 - webconsole e10s tests
+@@ -168,17 +168,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+ [browser_console_iframe_messages.js]
  [browser_console_keyboard_accessibility.js]
  [browser_console_log_inspectable_object.js]
  [browser_console_native_getters.js]
@@ -20,10 +20,10 @@ diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webco
  skip-if = e10s # Bug 1042253 - webconsole e10s tests
  [browser_console_server_logging.js]
  [browser_console_variables_view.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_console_variables_view_filter.js]
  [browser_console_variables_view_dom_nodes.js]
  [browser_console_variables_view_dont_sort_non_sortable_classes_properties.js]
- [browser_console_variables_view_special_names.js]
 diff --git a/devtools/client/webconsole/test/browser_console_optimized_out_vars.js b/devtools/client/webconsole/test/browser_console_optimized_out_vars.js
 --- a/devtools/client/webconsole/test/browser_console_optimized_out_vars.js
 +++ b/devtools/client/webconsole/test/browser_console_optimized_out_vars.js

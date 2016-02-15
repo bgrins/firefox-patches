@@ -1,16 +1,16 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  3664a54bbf0caabb9933868a452fdf1377942fec
+# Parent  2afe243f44d20bb2c9d7316a02e51836f0433032
 Bug 1243977 - e10s fixes for browser_console_variables_view.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini
 +++ b/devtools/client/webconsole/test/browser.ini
-@@ -174,17 +174,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+@@ -172,17 +172,16 @@ skip-if = e10s # Bug 1042253 - webconsol
+ [browser_console_navigation_marker.js]
  [browser_console_netlogging.js]
  [browser_console_nsiconsolemessage.js]
  [browser_console_optimized_out_vars.js]
- skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_console_private_browsing.js]
  skip-if = e10s # Bug 1042253 - webconsole e10s tests
  [browser_console_server_logging.js]
@@ -21,8 +21,8 @@ diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webco
  [browser_console_variables_view_dont_sort_non_sortable_classes_properties.js]
  [browser_console_variables_view_special_names.js]
  [browser_console_variables_view_while_debugging.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_console_variables_view_while_debugging_and_inspecting.js]
- [browser_eval_in_debugger_stackframe.js]
  skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
 diff --git a/devtools/client/webconsole/test/browser_console_variables_view.js b/devtools/client/webconsole/test/browser_console_variables_view.js
 --- a/devtools/client/webconsole/test/browser_console_variables_view.js
