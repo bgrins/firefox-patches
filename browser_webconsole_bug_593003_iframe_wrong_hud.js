@@ -1,15 +1,15 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  1f1280ca0cdc984a96815190a5736e9a4bb5e269
+# Parent  e73efeaf2ec8332e30cbc8d224c3dc15dc38b686
 Bug 1243984 - e10s fixes for browser_webconsole_bug_593003_iframe_wrong_hud.js;r=linclark
 
 diff --git a/devtools/client/webconsole/test/browser.ini b/devtools/client/webconsole/test/browser.ini
 --- a/devtools/client/webconsole/test/browser.ini
 +++ b/devtools/client/webconsole/test/browser.ini
-@@ -219,17 +219,16 @@ skip-if = e10s # Bug 1042253 - webconsol
- [browser_webconsole_bug_586388_select_all.js]
+@@ -214,17 +214,16 @@ tags = mcb
  [browser_webconsole_bug_587617_output_copy.js]
  [browser_webconsole_bug_588342_document_focus.js]
+ skip-if = e10s # Bug 1042253 - webconsole tests disabled with e10s
  [browser_webconsole_bug_588730_text_node_insertion.js]
  [browser_webconsole_bug_588967_input_expansion.js]
  [browser_webconsole_bug_589162_css_filter.js]
