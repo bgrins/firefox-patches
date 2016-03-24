@@ -28,10 +28,128 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
      if (this._parentIsContentActor) {
        appId = this.parentActor.docShell.appId;
        messageManager = this.parentActor.messageManager;
+@@ -591,16 +586,20 @@ WebConsoleActor.prototype =
+           if (!this.consoleAPIListener) {
+             this.consoleAPIListener =
+               new ConsoleAPIListener(window, this);
+             this.consoleAPIListener.init();
+           }
+           startedListeners.push(listener);
+           break;
+         case "NetworkActivity":
++          // XXXworkers not supporting this message type for now
++          if (isWorker) {
++            break;
++          }
+           if (!this.networkMonitor) {
+             if (appId || messageManager) {
+               // Start a network monitor in the parent process to listen to
+               // most requests than happen in parent
+               this.networkMonitor =
+                 new NetworkMonitorChild(appId, messageManager,
+                                         this.parentActor.actorID, this);
+               this.networkMonitor.init();
+@@ -612,34 +611,46 @@ WebConsoleActor.prototype =
+             else {
+               this.networkMonitor = new NetworkMonitor({ window: window }, this);
+               this.networkMonitor.init();
+             }
+           }
+           startedListeners.push(listener);
+           break;
+         case "FileActivity":
++          // XXXworkers not supporting this message type for now
++          if (isWorker) {
++            break;
++          }
+           if (this.window instanceof Ci.nsIDOMWindow) {
+             if (!this.consoleProgressListener) {
+               this.consoleProgressListener =
+                 new ConsoleProgressListener(this.window, this);
+             }
+             this.consoleProgressListener.startMonitor(this.consoleProgressListener.
+                                                       MONITOR_FILE_ACTIVITY);
+             startedListeners.push(listener);
+           }
+           break;
+         case "ReflowActivity":
++          // XXXworkers not supporting this message type for now
++          if (isWorker) {
++            break;
++          }
+           if (!this.consoleReflowListener) {
+             this.consoleReflowListener =
+               new ConsoleReflowListener(this.window, this);
+           }
+           startedListeners.push(listener);
+           break;
+         case "ServerLogging":
++          // XXXworkers not supporting this message type for now
++          if (isWorker) {
++            break;
++          }
+           if (!this.serverLoggingListener) {
+             this.serverLoggingListener =
+               new ServerLoggingListener(this.window, this);
+           }
+           startedListeners.push(listener);
+           break;
+       }
+     }
+@@ -1413,16 +1424,17 @@ WebConsoleActor.prototype =
+    * This method sends the object to the remote Web Console client.
+    *
+    * @see ConsoleAPIListener
+    * @param object aMessage
+    *        The console API call we need to send to the remote client.
+    */
+   onConsoleAPICall: function WCA_onConsoleAPICall(aMessage)
+   {
++    dump("doing a console API call: " + this.actorID + "\n\n")
+     let packet = {
+       from: this.actorID,
+       type: "consoleAPICall",
+       message: this.prepareConsoleMessageForRemote(aMessage),
+     };
+     this.conn.send(packet);
+   },
+ 
+diff --git a/devtools/shared/client/main.js b/devtools/shared/client/main.js
+--- a/devtools/shared/client/main.js
++++ b/devtools/shared/client/main.js
+@@ -939,24 +939,27 @@ DebuggerClient.prototype = {
+ 
+   /**
+    * Called by DebuggerTransport to dispatch incoming packets as appropriate.
+    *
+    * @param aPacket object
+    *        The incoming packet.
+    */
+   onPacket: function (aPacket) {
++    dump("Message received: " + JSON.stringify(aPacket) + "\n\n");
++
+     if (!aPacket.from) {
+       DevToolsUtils.reportException(
+         "onPacket",
+         new Error("Server did not specify an actor, dropping packet: " +
+                   JSON.stringify(aPacket)));
+       return;
+     }
+ 
++
+     // If we have a registered Front for this actor, let it handle the packet
+     // and skip all the rest of this unpleasantness.
+     let front = this.getActor(aPacket.from);
+     if (front) {
+       front.onPacket(aPacket);
+       return;
+     }
+ 
 diff --git a/devtools/shared/webconsole/worker-utils.js b/devtools/shared/webconsole/worker-utils.js
 --- a/devtools/shared/webconsole/worker-utils.js
 +++ b/devtools/shared/webconsole/worker-utils.js
-@@ -8,13 +8,76 @@
+@@ -7,14 +7,104 @@
+ "use strict";
  
  // XXXworkers This file is loaded on the server side for worker debugging.
  // Since the server is running in the worker thread, it doesn't
@@ -39,9 +157,48 @@ diff --git a/devtools/shared/webconsole/worker-utils.js b/devtools/shared/webcon
  // is stubbed out to prevent errors, and will need to implemented
  // for Bug 1209353.
  
- exports.Utils = { L10n: function() {} };
+-exports.Utils = { L10n: function() {} };
 -exports.ConsoleServiceListener = function() {};
 -exports.ConsoleAPIListener = function() {};
++const CONSOLE_WORKER_IDS = exports.CONSOLE_WORKER_IDS = [];
++
++// XXX: Share utils in a single file between worker and non and have custom
++// files for listeners
++exports.Utils = {
++  L10n: function() {},
++  cloneObject: function(object, recursive, filter) {
++    if (typeof object != "object") {
++      return object;
++    }
++
++    let temp;
++
++    if (Array.isArray(object)) {
++      temp = [];
++      Array.forEach(object, function(value, index) {
++        if (!filter || filter(index, value, object)) {
++          temp.push(recursive ? WebConsoleUtils.cloneObject(value) : value);
++        }
++      });
++    } else {
++      temp = {};
++      for (let key in object) {
++        let value = object[key];
++        if (object.hasOwnProperty(key) &&
++            (!filter || filter(key, value, object))) {
++          temp[key] = recursive ? WebConsoleUtils.cloneObject(value) : value;
++        }
++      }
++    }
++
++    return temp;
++  },
++  getWorkerType: function(message) {
++    let id = message ? message.innerID : null;
++    return CONSOLE_WORKER_IDS[CONSOLE_WORKER_IDS.indexOf(id)] || null;
++  },
++ };
++
 +function ConsoleServiceListener(window, listener) {
 +  this.window = window;
 +  this.listener = listener;
@@ -49,31 +206,17 @@ diff --git a/devtools/shared/webconsole/worker-utils.js b/devtools/shared/webcon
 +ConsoleServiceListener.prototype =
 +{
 +  init: function() {
++    dump("\n\n\nConsoleServiceListener.init\n\n\n");
++  },
++  destroy: function() {
++    dump("\n\n\nConsoleServiceListener.destroy\n\n\n");
 +  },
 +  observe: function(message) {
++    dump("\n\n\nConsoleServiceListener.observe\n\n\n");
 +  },
 +  getCachedMessages: function() {
++    dump("\n\n\nConsoleServiceListener.getCachedMessages\n\n\n");
 +    return [];
-+  }
-+};
-+
-+ConsoleAPIListener.prototype =
-+{
-+  init: function() {
-+    dump("ConsoleAPIListener init\n\n\n\n")
-+    setConsoleEventHandler(this.observe.bind(this));
-+  },
-+
-+  observe: function(message) {
-+    // Here, wrappedJSObject is not a security wrapper but a property defined
-+    // by the XPCOM component which allows us to unwrap the XPCOM interface and
-+    // access the underlying JSObject.
-+    let apiMessage = message.wrappedJSObject;
-+    this.owner.onConsoleAPICall(apiMessage);
-+  },
-+  getCachedMessages: function() {
-+    let messages = retrieveConsoleEvents();
-+    dump("\n\n\nin worker " + JSON.stringify(messages) + "\n\n\n");
 +  }
 +};
 +
@@ -86,21 +229,25 @@ diff --git a/devtools/shared/webconsole/worker-utils.js b/devtools/shared/webcon
 +ConsoleAPIListener.prototype =
 +{
 +  init: function() {
-+    dump("ConsoleAPIListener init\n\n\n\n")
-+    setConsoleEventHandler(this.observe.bind(this));
++    dump("\n\n\nConsoleAPIListener.init\n\n\n");
++    this.observe = this.observe.bind(this);
++    setConsoleEventHandler(this.observe);
 +  },
-+
++  destroy: function() {
++    dump("\n\n\nConsoleAPIListener.destroy\n\n\n");
++    // XXX: How do we clear out the console event handler?
++    setConsoleEventHandler(() => {})
++    // setConsoleEventHandler(null);
++  },
 +  observe: function(message) {
-+    // Here, wrappedJSObject is not a security wrapper but a property defined
-+    // by the XPCOM component which allows us to unwrap the XPCOM interface and
-+    // access the underlying JSObject.
-+    let apiMessage = message.wrappedJSObject;
-+    this.owner.onConsoleAPICall(apiMessage);
++    dump("\n\n\nConsoleAPIListener.observe\n\n\n");
++    dump("\n\n\n message: "+JSON.stringify(Object.keys(message))+"\n\n\n");
++    dump("\n\n\n args: "+JSON.stringify(message.arguments)+"\n\n\n");
++    this.owner.onConsoleAPICall(message.wrappedJSObject);
 +  },
 +  getCachedMessages: function() {
-+    let messages = retrieveConsoleEvents();
-+    dump("\n\n\nin worker " + JSON.stringify(messages) + "\n\n\n");
-+    return [];
++    dump("\n\n\nConsoleAPIListener.getCachedMessages\n\n\n");
++    return retrieveConsoleEvents();
 +  }
 +};
 +
@@ -109,11 +256,11 @@ diff --git a/devtools/shared/webconsole/worker-utils.js b/devtools/shared/webcon
 +
  exports.addWebConsoleCommands = function() {};
  exports.ConsoleReflowListener = function() {};
- exports.CONSOLE_WORKER_IDS = [];
+-exports.CONSOLE_WORKER_IDS = [];
 diff --git a/devtools/shared/worker/loader.js b/devtools/shared/worker/loader.js
 --- a/devtools/shared/worker/loader.js
 +++ b/devtools/shared/worker/loader.js
-@@ -368,17 +368,19 @@ var {
+@@ -368,17 +368,17 @@ var {
    Debugger,
    URL,
    createSandbox,
@@ -124,8 +271,6 @@ diff --git a/devtools/shared/worker/loader.js b/devtools/shared/worker/loader.js
    setImmediate,
 -  xpcInspector
 +  xpcInspector,
-+  retrieveConsoleEvents,
-+  setConsoleEventHandler
  } = (function () {
    if (typeof Components === "object") { // Main thread
      let {
@@ -134,26 +279,7 @@ diff --git a/devtools/shared/worker/loader.js b/devtools/shared/worker/loader.js
        manager: Cm,
        interfaces: Ci,
        results: Cr,
-@@ -469,33 +471,37 @@ var {
-       Debugger: this.Debugger,
-       URL: this.URL,
-       createSandbox: this.createSandbox,
-       dump: this.dump,
-       rpc: this.rpc,
-       loadSubScript: this.loadSubScript,
-       reportError: this.reportError,
-       setImmediate: this.setImmediate,
--      xpcInspector: xpcInspector
-+      xpcInspector: xpcInspector,
-+      retrieveConsoleEvents: this.retrieveConsoleEvents,
-+      setConsoleEventHandler: this.setConsoleEventHandler
-     };
-   }
- }).call(this);
- 
- // Create the default instance of the worker loader, using the APIs we defined
- // above.
- 
+@@ -485,17 +485,19 @@ var {
  this.worker = new WorkerDebuggerLoader({
    createSandbox: createSandbox,
    globals: {
@@ -165,7 +291,7 @@ diff --git a/devtools/shared/worker/loader.js b/devtools/shared/worker/loader.js
 -    "setImmediate": setImmediate
 +    "setImmediate": setImmediate,
 +    "retrieveConsoleEvents": this.retrieveConsoleEvents,
-+    "setConsoleEventHandler": this.setConsoleEventHandler
++    "setConsoleEventHandler": this.setConsoleEventHandler,
    },
    loadSubScript: loadSubScript,
    modules: {
