@@ -1,8 +1,48 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  239b0664d4d98b3190eb7aa567ebd158dcab0690
+# Parent  999c9ef48f08e5efec39e529e3eb6d6447fbc514
 Bug 1259603 - Use ConsoleEvents for cached messages and observing messages when webconsole actor is running
 
+diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconsole/webconsole.js
+--- a/devtools/client/webconsole/webconsole.js
++++ b/devtools/client/webconsole/webconsole.js
+@@ -3170,28 +3170,24 @@ WebConsoleConnectionProxy.prototype = {
+       this._connectTimer.cancel();
+       this._connectTimer = null;
+     }, () => {
+       this._connectTimer = null;
+     });
+ 
+     let client = this.client = this.target.client;
+ 
+-    if (this.target.isWorkerTarget) {
+-      // XXXworkers: Not Console API yet inside of workers (Bug 1209353).
+-    } else {
+-      client.addListener("logMessage", this._onLogMessage);
+-      client.addListener("pageError", this._onPageError);
+-      client.addListener("consoleAPICall", this._onConsoleAPICall);
+-      client.addListener("fileActivity", this._onFileActivity);
+-      client.addListener("reflowActivity", this._onReflowActivity);
+-      client.addListener("serverLogCall", this._onServerLogCall);
+-      client.addListener("lastPrivateContextExited",
+-                         this._onLastPrivateContextExited);
+-    }
++    client.addListener("logMessage", this._onLogMessage);
++    client.addListener("pageError", this._onPageError);
++    client.addListener("consoleAPICall", this._onConsoleAPICall);
++    client.addListener("fileActivity", this._onFileActivity);
++    client.addListener("reflowActivity", this._onReflowActivity);
++    client.addListener("serverLogCall", this._onServerLogCall);
++    client.addListener("lastPrivateContextExited",
++                       this._onLastPrivateContextExited);
+     this.target.on("will-navigate", this._onTabNavigated);
+     this.target.on("navigate", this._onTabNavigated);
+ 
+     this._consoleActor = this.target.form.consoleActor;
+     if (this.target.isTabActor) {
+       let tab = this.target.form;
+       this.webConsoleFrame.onLocationChange(tab.url, tab.title);
+     }
 diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webconsole.js
 --- a/devtools/server/actors/webconsole.js
 +++ b/devtools/server/actors/webconsole.js
@@ -37,7 +77,7 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
            startedListeners.push(listener);
            break;
          case "NetworkActivity":
-+          // XXXworkers not supporting this message type for now
++          // Workers don't support this message type
 +          if (isWorker) {
 +            break;
 +          }
@@ -58,7 +98,7 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
            startedListeners.push(listener);
            break;
          case "FileActivity":
-+          // XXXworkers not supporting this message type for now
++          // Workers don't support this message type
 +          if (isWorker) {
 +            break;
 +          }
@@ -73,7 +113,7 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
            }
            break;
          case "ReflowActivity":
-+          // XXXworkers not supporting this message type for now
++          // Workers don't support this message type
 +          if (isWorker) {
 +            break;
 +          }
@@ -84,7 +124,7 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
            startedListeners.push(listener);
            break;
          case "ServerLogging":
-+          // XXXworkers not supporting this message type for now
++          // Workers don't support this message type
 +          if (isWorker) {
 +            break;
 +          }
@@ -96,55 +136,27 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
            break;
        }
      }
-@@ -1414,16 +1425,17 @@ WebConsoleActor.prototype =
-    * This method sends the object to the remote Web Console client.
-    *
-    * @see ConsoleAPIListener
-    * @param object aMessage
-    *        The console API call we need to send to the remote client.
-    */
-   onConsoleAPICall: function WCA_onConsoleAPICall(aMessage)
-   {
-+    dump("doing a console API call: " + this.actorID + "\n\n")
-     let packet = {
-       from: this.actorID,
-       type: "consoleAPICall",
-       message: this.prepareConsoleMessageForRemote(aMessage),
+diff --git a/devtools/server/worker.js b/devtools/server/worker.js
+--- a/devtools/server/worker.js
++++ b/devtools/server/worker.js
+@@ -73,16 +73,17 @@ this.addEventListener("message",  functi
+         return sources;
+       },
+ 
+       window: global
      };
-     this.conn.send(packet);
-   },
  
-diff --git a/devtools/shared/client/main.js b/devtools/shared/client/main.js
---- a/devtools/shared/client/main.js
-+++ b/devtools/shared/client/main.js
-@@ -939,24 +939,27 @@ DebuggerClient.prototype = {
+     let threadActor = new ThreadActor(parent, global);
+     pool.addActor(threadActor);
++    parent.threadActor = threadActor;
  
-   /**
-    * Called by DebuggerTransport to dispatch incoming packets as appropriate.
-    *
-    * @param aPacket object
-    *        The incoming packet.
-    */
-   onPacket: function (aPacket) {
-+    dump("Message received: " + JSON.stringify(aPacket) + "\n\n");
-+
-     if (!aPacket.from) {
-       DevToolsUtils.reportException(
-         "onPacket",
-         new Error("Server did not specify an actor, dropping packet: " +
-                   JSON.stringify(aPacket)));
-       return;
-     }
+     let consoleActor = new WebConsoleActor(connection, parent);
+     pool.addActor(consoleActor);
  
-+
-     // If we have a registered Front for this actor, let it handle the packet
-     // and skip all the rest of this unpleasantness.
-     let front = this.getActor(aPacket.from);
-     if (front) {
-       front.onPacket(aPacket);
-       return;
-     }
- 
+     // Step 5: Send a response packet to the parent to notify
+     // it that a connection has been established.
+     postMessage(JSON.stringify({
+       type: "connected",
 diff --git a/devtools/shared/webconsole/test/chrome.ini b/devtools/shared/webconsole/test/chrome.ini
 --- a/devtools/shared/webconsole/test/chrome.ini
 +++ b/devtools/shared/webconsole/test/chrome.ini
@@ -169,9 +181,17 @@ diff --git a/devtools/shared/webconsole/test/chrome.ini b/devtools/shared/webcon
 diff --git a/devtools/shared/webconsole/test/common.js b/devtools/shared/webconsole/test/common.js
 --- a/devtools/shared/webconsole/test/common.js
 +++ b/devtools/shared/webconsole/test/common.js
-@@ -98,16 +98,17 @@ function _attachConsole(aListeners, aCal
+@@ -91,23 +91,24 @@ function _attachConsole(aListeners, aCal
+           Cu.reportError("listTabs failed: " + aResponse.error + " " +
+                          aResponse.message);
+           aCallback(aState, aResponse);
+           return;
+         }
+         let tab = aResponse.tabs[aResponse.selected];
+         aState.dbgClient.attachTab(tab.actor, function (response, tabClient) {
            if (aAttachToWorker) {
-             var worker = new Worker("console-test-worker.js");
+-            var worker = new Worker("console-test-worker.js");
++            var worker = top.worker2 = new Worker("console-test-worker.js");
              worker.addEventListener("message", function listener() {
                worker.removeEventListener("message", listener);
                tabClient.listWorkers(function (response) {
@@ -190,10 +210,11 @@ diff --git a/devtools/shared/webconsole/test/common.js b/devtools/shared/webcons
 diff --git a/devtools/shared/webconsole/test/console-test-worker.js b/devtools/shared/webconsole/test/console-test-worker.js
 --- a/devtools/shared/webconsole/test/console-test-worker.js
 +++ b/devtools/shared/webconsole/test/console-test-worker.js
-@@ -1,16 +1,21 @@
+@@ -1,16 +1,22 @@
  "use strict";
  
-+console.log("Log from worker init")
++console.log("Log from worker init");
++
  function f() {
    var a = 1;
    var b = 2;
@@ -312,7 +333,7 @@ new file mode 100644
 diff --git a/devtools/shared/webconsole/worker-utils.js b/devtools/shared/webconsole/worker-utils.js
 --- a/devtools/shared/webconsole/worker-utils.js
 +++ b/devtools/shared/webconsole/worker-utils.js
-@@ -7,14 +7,104 @@
+@@ -7,14 +7,102 @@
  "use strict";
  
  // XXXworkers This file is loaded on the server side for worker debugging.
@@ -405,8 +426,6 @@ diff --git a/devtools/shared/webconsole/worker-utils.js b/devtools/shared/webcon
 +  },
 +  observe: function(message) {
 +    dump("\n\n\nConsoleAPIListener.observe\n\n\n");
-+    dump("\n\n\n message: "+JSON.stringify(Object.keys(message))+"\n\n\n");
-+    dump("\n\n\n args: "+JSON.stringify(message.arguments)+"\n\n\n");
 +    this.owner.onConsoleAPICall(message.wrappedJSObject);
 +  },
 +  getCachedMessages: function() {
