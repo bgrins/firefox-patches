@@ -1,0 +1,249 @@
+# HG changeset patch
+# User Hallvord R. M. Steen <hsteen@mozilla.com>
+# Parent  29b22e412b6534c86acf37dbf45e2ae9d4a0cc84
+Bug 1154874 - Add DAMP test for stepping into in the debugger;r=bgrins
+
+diff --git a/testing/talos/talos/tests/devtools/addon/content/damp.html b/testing/talos/talos/tests/devtools/addon/content/damp.html
+--- a/testing/talos/talos/tests/devtools/addon/content/damp.html
++++ b/testing/talos/talos/tests/devtools/addon/content/damp.html
+@@ -14,29 +14,31 @@ var defaultConfig = {
+     inspectorOpen: true,
+     debuggerOpen: true,
+     styleEditorOpen: true,
+     performanceOpen: true,
+     netmonitorOpen: true,
+     saveAndReadHeapSnapshot: true,
+     consoleBulkLogging: true,
+     consoleStreamLogging: true,
++    debuggerStepping: true
+   }
+ };
+ 
+ var testsInfo = {
+   webconsoleOpen: "Measure open/close toolbox on webconsole panel",
+   inspectorOpen: "Measure open/close toolbox on inspector panel",
+   debuggerOpen: "Measure open/close toolbox on debugger panel",
+   styleEditorOpen: "Measure open/close toolbox on style editor panel",
+   performanceOpen: "Measure open/close toolbox on performance panel",
+   netmonitorOpen: "Measure open/close toolbox on network monitor panel",
+   saveAndReadHeapSnapshot: "Measure open/close toolbox on memory panel and save/read heap snapshot",
+   consoleBulkLogging: "Measure time for a bunch of sync console.log statements to appear",
+   consoleStreamLogging: "Measure rAF on page during a stream of console.log statements",
++  debuggerStepping: "Measure performance while stepping in complex scripts"
+ };
+ 
+ function updateConfig() {
+   config = {subtests: []};
+   for (var test in defaultConfig.subtests) {
+     if ($("subtest-" + test).checked) {
+       config.subtests.push(test);
+     }
+@@ -57,16 +59,17 @@ function updateConfig() {
+ <div id="hide-during-run">
+    Visit <a href="https://wiki.mozilla.org/Buildbot/Talos/Tests#DAMP">talos/TART</a> for detailed info.<br/>
+   <ul>
+     <li><b>If you just opened the browser</b> - give Firefox few seconds to settle down before testing.</li>
+   </ul>
+ 
+ Utilities:
+   <a href="pages/simple.html">simple page</a>&nbsp;&nbsp;&nbsp;
++  <a href="pages/stepping.html">stepping page</a>&nbsp;&nbsp;&nbsp;
+   <a href="http://localhost/tests/tp5n/bild.de/www.bild.de/index.html">complicated page</a>&nbsp;&nbsp;&nbsp;
+ <br/><br/>
+ <b>Configure DAMP</b> (CTRL-F5 to reset to talos defaults) <button type="button" onclick="deselectAll()">Deselect all tests</button><br/>
+ <script>
+   for (var test in defaultConfig.subtests) {
+     document.write('<input type="checkbox" id="subtest-' + test + '" ' + (defaultConfig.subtests[test] ? "" : "un") + 'checked>'
+                   + test + '</input>'
+                   + '<span style="color:grey">&nbsp;&nbsp;&nbsp;' + testsInfo[test] + '</span>'
+diff --git a/testing/talos/talos/tests/devtools/addon/content/damp.js b/testing/talos/talos/tests/devtools/addon/content/damp.js
+--- a/testing/talos/talos/tests/devtools/addon/content/damp.js
++++ b/testing/talos/talos/tests/devtools/addon/content/damp.js
+@@ -7,16 +7,17 @@ const { getActiveTab } = devtools.requir
+ const { getMostRecentBrowserWindow } = devtools.require("sdk/window/utils");
+ const ThreadSafeChromeUtils = devtools.require("ThreadSafeChromeUtils");
+ const {Task} = Cu.import("resource://gre/modules/Task.jsm", {});
+ 
+ const webserver = Services.prefs.getCharPref("addon.test.damp.webserver");
+ 
+ const SIMPLE_URL = "chrome://damp/content/pages/simple.html";
+ const COMPLICATED_URL = webserver + "/tests/tp5n/bild.de/www.bild.de/index.html";
++const STEPPING_URL = "chrome://damp/content/pages/stepping.html";
+ 
+ function Damp() {
+   // Path to the temp file where the heap snapshot file is saved. Set by
+   // saveHeapSnapshot and read by readHeapSnapshot.
+   this._heapSnapshotFilePath = null;
+   // HeapSnapshot instance. Set by readHeapSnapshot, used by takeCensus.
+   this._snapshot = null;
+ }
+@@ -152,17 +153,17 @@ Damp.prototype = {
+     yield allMessagesReceived;
+     let end = performance.now();
+ 
+     this._results.push({
+       name: "console.bulklog",
+       value: end - start
+     });
+ 
+-    yield this.closeToolbox(null);
++    yield this.closeToolbox();
+     yield this.testTeardown();
+   }),
+ 
+   // Log a stream of console messages, 1 per rAF.  Then record the average
+   // time per rAF.  The idea is that the console being slow can slow down
+   // content (i.e. Bug 1237368).
+   _consoleStreamLoggingTest: Task.async(function*() {
+     let TOTAL_MESSAGES = 100;
+@@ -202,17 +203,17 @@ Damp.prototype = {
+       });
+     });
+ 
+     this._results.push({
+       name: "console.streamlog",
+       value: avgTime
+     });
+ 
+-    yield this.closeToolbox(null);
++    yield this.closeToolbox();
+     yield this.testTeardown();
+   }),
+ 
+   takeCensus: function(label) {
+     let start = performance.now();
+ 
+     this._snapshot.takeCensus({
+       breakdown: {
+@@ -242,16 +243,61 @@ Damp.prototype = {
+     this._results.push({
+       name: label + ".takeCensus",
+       value: end - start
+     });
+ 
+     return Promise.resolve();
+   },
+ 
++  _getDebuggerSteppingTest: Task.async(function*() {
++    let tab = yield this.testSetup(STEPPING_URL);
++    let {toolbox} = yield this.openToolbox("jsdebugger");
++    let messageManager = tab.linkedBrowser.messageManager;
++    let stepCounter = 10;
++    let panelWin = toolbox.getPanel("jsdebugger").panelWin;
++    let gStepInbutton = panelWin.document.getElementById("step-in");
++
++
++    // Pause the page by clicking a button that triggers a debugger statement.
++    // Doing it in a timeout so it doesn't pause this thread
++    messageManager.loadFrameScript("data:,(" + encodeURIComponent(
++      `function () {
++          setTimeout(() => {
++            content.document.getElementById("start").click();
++          }, 0);
++      }`
++    ) + ")()", true);
++
++    // now we need to wait until the debugger stopped
++    yield new Promise(resolve => {
++      panelWin.gThreadClient.addOneTimeListener("paused", resolve);
++    });
++
++    let start = performance.now();
++    for(let i = 0; i < stepCounter; i++) {
++      let wasPaused = new Promise(resolve => {
++        panelWin.gThreadClient.addOneTimeListener("paused", resolve);
++      });
++      gStepInbutton.click();
++      yield wasPaused;
++    }
++
++    let end = performance.now();
++
++    // Return "average milliseconds taken per 'step into' command"
++    this._results.push({
++      name: "debuggerstep",
++      value: ( end - start ) / stepCounter
++    });
++
++    yield this.closeToolbox();
++    yield this.testTeardown();
++  }),
++
+   _getToolLoadingTests: function(url, label) {
+ 
+     let openToolboxAndLog = Task.async(function*(name, tool) {
+       let {time, toolbox} = yield this.openToolbox(tool);
+       this._results.push({name: name + ".open.DAMP", value: time });
+       return toolbox;
+     }.bind(this));
+ 
+@@ -449,11 +495,14 @@ Damp.prototype = {
+     tests = tests.concat(this._getToolLoadingTests(COMPLICATED_URL, "complicated"));
+ 
+     if (config.subtests.indexOf("consoleBulkLogging") > -1) {
+       tests = tests.concat(this._consoleBulkLoggingTest);
+     }
+     if (config.subtests.indexOf("consoleStreamLogging") > -1) {
+       tests = tests.concat(this._consoleStreamLoggingTest);
+     }
++    if (config.subtests.indexOf("debuggerStepping") > -1) {
++      tests = tests.concat(this._getDebuggerSteppingTest);
++    }
+     this._doSequence(tests, this._doneInternal);
+   }
+ }
+diff --git a/testing/talos/talos/tests/devtools/addon/content/pages/stepping.html b/testing/talos/talos/tests/devtools/addon/content/pages/stepping.html
+new file mode 100644
+--- /dev/null
++++ b/testing/talos/talos/tests/devtools/addon/content/pages/stepping.html
+@@ -0,0 +1,50 @@
++<!-- Any copyright is dedicated to the Public Domain.
++     http://creativecommons.org/publicdomain/zero/1.0/ -->
++<!doctype html>
++
++<html>
++  <head>
++    <meta charset="utf-8"/>
++    <title>Debugger test page</title>
++  </head>
++
++  <body>
++    <button id="start">Start!</button>
++
++    <script type="text/javascript">
++      function normal(aArg) {
++        var r = 10;
++        var a = squareAndOne(r);
++        var b = squareUntil(r, 99999999999); //recurses 3 times, returns on 4th call
++        var c = addUntil(r, 5, 1050); // recurses 208 times and returns on the 209th call
++        return a + b + c;
++
++      }
++
++      function squareAndOne(arg){
++        return (arg * arg) + 1;
++      }
++      function squareUntil(arg, limit){
++        if(arg * arg >= limit){
++          return arg * arg;
++        }else{
++          return squareUntil(arg * arg, limit);
++        }
++      }
++
++      function addUntil(arg1, arg2, limit){
++        if(arg1 + arg2 > limit){
++          return arg1 + arg2;
++        }else{
++          if(arg1 === 950) debugger;
++          return addUntil(arg1 + arg2, arg2, limit);
++        }
++      }
++
++      var normalBtn = document.getElementById("start");
++      normalBtn.addEventListener("click", normal, false);
++
++    </script>
++  </body>
++
++</html>
