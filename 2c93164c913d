@@ -1,0 +1,453 @@
+
+# HG changeset patch
+# User Julian Descottes <jdescottes@mozilla.com>
+# Date 1462203736 -7200
+# Node ID 2c93164c913d89100741105044599c89cff89609
+# Parent  3e2e4184eeffe605002d06eca912050e88ec3e04
+Bug 1259834 - Create basic HTML tooltip API
+
+MozReview-Commit-ID: 8njiKBubLSj
+
+diff --git a/devtools/client/jar.mn b/devtools/client/jar.mn
+--- a/devtools/client/jar.mn
++++ b/devtools/client/jar.mn
+@@ -129,6 +129,7 @@
+     content/shared/widgets/spectrum-frame.xhtml (shared/widgets/spectrum-frame.xhtml)
+     content/shared/widgets/spectrum.css (shared/widgets/spectrum.css)
+     content/shared/widgets/cubic-bezier-frame.xhtml (shared/widgets/cubic-bezier-frame.xhtml)
++    content/shared/widgets/tooltip-frame.xhtml (shared/widgets/tooltip-frame.xhtml)
+     content/shared/widgets/cubic-bezier.css (shared/widgets/cubic-bezier.css)
+     content/shared/widgets/mdn-docs-frame.xhtml (shared/widgets/mdn-docs-frame.xhtml)
+     content/shared/widgets/mdn-docs.css (shared/widgets/mdn-docs.css)
+diff --git a/devtools/client/shared/test/browser.ini b/devtools/client/shared/test/browser.ini
+--- a/devtools/client/shared/test/browser.ini
++++ b/devtools/client/shared/test/browser.ini
+@@ -111,6 +111,7 @@
+ skip-if = e10s # Bug 1221911, bug 1222289, frequent e10s timeouts
+ [browser_graphs-16.js]
+ skip-if = e10s # Bug 1221911, bug 1222289, frequent e10s timeouts
++[browser_html_tooltip-01.js]
+ [browser_inplace-editor-01.js]
+ [browser_inplace-editor-02.js]
+ [browser_inplace-editor_maxwidth.js]
+diff --git a/devtools/client/shared/test/browser_html_tooltip-01.js b/devtools/client/shared/test/browser_html_tooltip-01.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/shared/test/browser_html_tooltip-01.js
+@@ -0,0 +1,57 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++const HTML_NS = "http://www.w3.org/1999/xhtml";
++const TEST_URI = "data:text/html;charset=utf-8," +
++  "<p>browser_html_tooltip-01.js</p><div>test</div>";
++
++const {HTMLTooltip} = require("devtools/client/shared/widgets/HTMLTooltip");
++
++requestLongerTimeout(100);
++
++add_task(function* () {
++  yield addTab(TEST_URI);
++
++  let target = TargetFactory.forTab(gBrowser.selectedTab);
++  let toolbox = yield gDevTools.showToolbox(target, "inspector");
++  let tooltip = new HTMLTooltip(toolbox, {
++    consumeOutsideClicks: true
++  });
++
++  let tooltipContent = toolbox.doc.createElementNS(HTML_NS, "div");
++  tooltipContent.innerHTML = "Tooltip content";
++  tooltipContent.style.cssText =
++   `height: 100%;
++    box-sizing:border-box;
++    border:1px solid black;
++    padding:5px;`;
++
++  let width = 200, height = 120;
++  tooltip.setContent(tooltipContent, width, height);
++
++  toolbox.doc.defaultView.addEventListener("click", function (e) {
++    let reference = e.target;
++    if (tooltip.isVisible()) {
++      tooltip.hide();
++    } else {
++      tooltip.show(reference, { position: "top" });
++    }
++  });
++
++  yield new Promise(r => {});
++});
++
++function createTooltipContent(document) {
++  let node = document.createElementNS(HTML_NS, "div");
++
++  node.style.cssText =
++   `height: 100%;
++    box-sizing:border-box;
++    border:1px solid black;
++    padding:5px;`;
++
++  node.innerHTML = "Tooltip content";
++  return node;
++}
+diff --git a/devtools/client/shared/widgets/HTMLTooltip.js b/devtools/client/shared/widgets/HTMLTooltip.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/shared/widgets/HTMLTooltip.js
+@@ -0,0 +1,298 @@
++/* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++const EventEmitter = require("devtools/shared/event-emitter");
++const XUL_NS = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
++const XHTML_NS = "http://www.w3.org/1999/xhtml";
++
++const IFRAME_URL = "chrome://devtools/content/shared/widgets/tooltip-frame.xhtml";
++const IFRAME_CONTAINER_ID = "tooltip-iframe-container";
++
++/**
++ * The HTMLTooltip can display HTML content in a tooltip popup.
++ *
++ * @param {Toolbox} toolbox
++ *        The devtools toolbox, needed to get the devtools main window.
++ * @param {Object}
++ *        - {String} type
++ *          Display type of the tooltip. Possible values: "normal"
++ *        - {Boolean} autofocus
++ *          Defaults to true. Should the tooltip be focused when opening it.
++ *        - {Boolean} consumeOutsideClicks
++ *          Defaults to true. The tooltip is closed when clicking outside.
++ *          Should this event be stopped and consumed or not.
++ */
++exports.HTMLTooltip = function (toolbox,
++  {type = "normal", autofocus = true, consumeOutsideClicks = true} = {}) {
++  EventEmitter.decorate(this);
++
++  this.document = toolbox.doc;
++  this.type = type;
++  this.autofocus = autofocus;
++  this.consumeOutsideClicks = consumeOutsideClicks;
++
++  // Use the topmost window to listen for click events to close the tooltip
++  this.topWindow = this.document.defaultView.top;
++
++  this._onClick = this._onClick.bind(this);
++
++  this.container = this._createContainer();
++
++  // Promise that will resolve when the container can be filled with content.
++  this.containerReady = new Promise(resolve => {
++    if (this._isXUL()) {
++      // In XUL context, load a placeholder document in the iframe container.
++      let onLoad = () => {
++        this.container.removeEventListener("load", onLoad, true);
++        resolve();
++      };
++
++      this.container.addEventListener("load", onLoad, true);
++      this.container.setAttribute("src", IFRAME_URL);
++    } else {
++      // In non-XUL context the container is ready to use as is.
++      resolve();
++    }
++  });
++};
++
++exports.HTMLTooltip.prototype = {
++  position: {
++    TOP: "top",
++    BOTTOM: "bottom",
++  },
++
++  /**
++   * Set the tooltip content element. The preferred width/height should also be
++   * specified here.
++   *
++   * @param {Element} content
++   *        The tooltip content, should be a HTML element.
++   * @param {Number} width
++   *        Preferred width for the tooltip container
++   * @param {Number} height
++   *        Preferred height for the tooltip container
++   * @return {Promise} a promise that will resolve when the content has been
++   *         added in the tooltip container.
++   */
++  setContent: function (content, width, height) {
++    this.preferredWidth = width;
++    this.preferredHeight = height;
++
++    return this.containerReady.then(() => {
++      let parent;
++      if (this._isXUL()) {
++        // In XUL context, we are wrapping the HTML content in an iframe.
++        let win = this.container.contentWindow.wrappedJSObject;
++        parent = win.document.getElementById(IFRAME_CONTAINER_ID);
++      } else {
++        parent = this.container;
++      }
++
++      parent.innerHTML = "";
++      parent.appendChild(content);
++    });
++  },
++
++  /**
++   * Show the tooltip next to the provided anchor element. A preferred position
++   * can be set. The event "popupshowing" will be fired before displaying the
++   * tooltip, "popupshown" afterwards.
++   *
++   * @param {Element} anchor
++   *        The reference element with which the tooltip should be aligned
++   * @param {Object}
++   *        - {String} position: optional, possible values: top|bottom
++   *          If layout permits, the tooltip will be displayed on top/bottom
++   *          of the anchor. If ommitted, the tooltip will be displayed where
++   *          more space is available.
++   */
++  show: function (anchor, {position} = {}) {
++    this.emit("popupshowing");
++    this.containerReady.then(() => {
++      let {top, left, width, height} = this._findBestPosition(anchor, position);
++
++      if (this._isXUL()) {
++        this.container.setAttribute("width", width);
++        this.container.setAttribute("height", height);
++      } else {
++        this.container.style.width = width + "px";
++        this.container.style.height = height + "px";
++      }
++
++      this.container.style.top = top + "px";
++      this.container.style.left = left + "px";
++      this.container.style.display = "block";
++
++      if (this.autofocus) {
++        this.container.focus();
++      }
++
++      this.attachEventsTimer = this.document.defaultView.setTimeout(() => {
++        this.topWindow.addEventListener("click", this._onClick, true);
++      }, 0);
++
++      this.emit("popupshown");
++    });
++  },
++
++  /**
++   * Hide the current tooltip. Will fire the event "popuphiding" before hiding
++   * the tooltip and "popuphidden" afterwards.
++   */
++  hide: function () {
++    this.document.defaultView.clearTimeout(this.attachEventsTimer);
++
++    if (this.isVisible()) {
++      this.emit("popuphiding");
++
++      this.topWindow.removeEventListener("click", this._onClick, true);
++      this.container.style.display = "none";
++
++      this.emit("popuphidden");
++    }
++  },
++
++  /**
++   * Check if the tooltip is currently displayed.
++   * @return {Boolean} true if the tooltip is visible
++   */
++  isVisible: function () {
++    return this.container.style.display != "none";
++  },
++
++  /**
++   * Destroy the tooltip instance. Hide the tooltip if displayed, remove the
++   * tooltip container from the document.
++   */
++  destroy: function () {
++    this.hide();
++    this.container.remove();
++  },
++
++  _createContainer: function () {
++    let container;
++    if (this._isXUL()) {
++      container = this.document.createElementNS(XHTML_NS, "iframe");
++      container.setAttribute("transparent", true);
++      container.setAttribute("flex", "1");
++      container.style.border = "none";
++      this.document.querySelector("window").appendChild(container);
++    } else {
++      container = this.document.createElementNS(XHTML_NS, "div");
++      this.document.body.appendChild(container);
++    }
++
++    container.style.display = "none";
++    container.style.position = "fixed";
++    container.style.zIndex = "9999";
++
++    return container;
++  },
++
++  _onClick: function (e) {
++    if (this._isInTooltipContainer(e.target)) {
++      return;
++    }
++
++    this.hide();
++    if (this.consumeOutsideClicks) {
++      e.preventDefault();
++      e.stopPropagation();
++    }
++  },
++
++  _isInTooltipContainer: function (node) {
++    if (this._isXUL()) {
++      let win = this.container.contentWindow.wrappedJSObject;
++      if (node.ownerDocument.defaultView == win) {
++        return true;
++      }
++    } else {
++      while (node) {
++        if (node === this.container) {
++          return true;
++        }
++        node = node.parentNode;
++      }
++    }
++    return false;
++  },
++
++  _findBestPosition: function (anchor, position) {
++    let top, left;
++    let {TOP, BOTTOM} = this.position;
++
++    let {left: anchorLeft, top: anchorTop, height: anchorHeight}
++      = this._getRelativeRect(anchor, this.document);
++
++    let {bottom: docBottom, right: docRight} =
++      this.document.documentElement.getBoundingClientRect();
++
++    let height = this.preferredHeight;
++    // Check if the popup can fit above the anchor.
++    let availableTop = anchorTop;
++    let fitsAbove = availableTop >= height;
++    // Check if the popup can fit below the anchor.
++    let availableBelow = docBottom - (anchorTop + anchorHeight);
++    let fitsBelow = availableBelow >= height;
++
++    let isPositionSuitable = (fitsAbove && position == TOP)
++      || (fitsBelow && position == BOTTOM);
++    if (!isPositionSuitable) {
++      // If the preferred position does not fit the preferred height,
++      // pick the position offering the most height.
++      position = availableTop > availableBelow ? TOP : BOTTOM;
++    }
++
++    // Calculate height, capped by the maximum height available.
++    height = Math.min(height, Math.max(availableTop, availableBelow));
++    top = position == TOP ? anchorTop - height : anchorTop + anchorHeight;
++
++    let availableWidth = docRight;
++    let width = Math.min(this.preferredWidth, availableWidth);
++
++    // By default, align the tooltip's left edge with the anchor left edge.
++    if (anchorLeft + width <= docRight) {
++      left = anchorLeft;
++    } else {
++      // If the tooltip cannot fit, shift to the left just enough to fit.
++      left = docRight - width;
++    }
++
++    return {top, left, width, height};
++  },
++
++  /**
++   * Get the bounding client rectangle for a given node, relative to a custom
++   * reference element (instead of the default for getBoundingClientRect which
++   * is always the element's ownerDocument).
++   */
++  _getRelativeRect: function (node, relativeTo) {
++    // Width and Height can be taken from the rect.
++    let {width, height} = node.getBoundingClientRect();
++
++    // Find the smallest top/left coordinates from all quads.
++    let top = Infinity, left = Infinity;
++    let quads = node.getBoxQuads({relativeTo: relativeTo});
++    for (let quad of quads) {
++      top = Math.min(top, quad.bounds.top);
++      left = Math.min(left, quad.bounds.left);
++    }
++
++    // Compute right and bottom coordinates using the rest of the data.
++    let right = left + width;
++    let bottom = top + height;
++
++    return {top, right, bottom, left, width, height};
++  },
++
++  _isXUL: function () {
++    return this.document.documentElement.namespaceURI === XUL_NS;
++  },
++};
+diff --git a/devtools/client/shared/widgets/moz.build b/devtools/client/shared/widgets/moz.build
+--- a/devtools/client/shared/widgets/moz.build
++++ b/devtools/client/shared/widgets/moz.build
+@@ -16,6 +16,7 @@
+     'FlameGraph.js',
+     'Graphs.js',
+     'GraphsWorker.js',
++    'HTMLTooltip.js',
+     'LineGraphWidget.js',
+     'MdnDocsWidget.js',
+     'MountainGraphWidget.js',
+diff --git a/devtools/client/shared/widgets/tooltip-frame.xhtml b/devtools/client/shared/widgets/tooltip-frame.xhtml
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/shared/widgets/tooltip-frame.xhtml
+@@ -0,0 +1,24 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<!DOCTYPE html>
++
++<html xmlns="http://www.w3.org/1999/xhtml">
++<head>
++  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
++  <script type="application/javascript;version=1.8" src="chrome://devtools/content/shared/theme-switching.js"/>
++  <style>
++    html, body, #tooltip-iframe-container {
++      margin: 0;
++      padding: 0;
++      width: 100%;
++      height: 100%;
++      overflow: auto;
++    }
++  </style>
++</head>
++<body role="application">
++  <div id="tooltip-iframe-container"></div>
++</body>
++</html>
+diff --git a/devtools/client/themes/common.css b/devtools/client/themes/common.css
+--- a/devtools/client/themes/common.css
++++ b/devtools/client/themes/common.css
+@@ -229,11 +229,6 @@
+   background-position: 0 0, 10px 10px;
+ }
+ 
+-.devtools-tooltip-iframe {
+-  border: none;
+-  background: transparent;
+-}
+-
+ /* links to source code, like displaying `myfile.js:45` */
+ 
+ .devtools-source-link {
+
