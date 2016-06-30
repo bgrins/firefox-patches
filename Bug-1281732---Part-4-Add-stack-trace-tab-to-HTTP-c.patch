@@ -1,0 +1,219 @@
+# vim: se ft=diff :
+# HG changeset patch
+# User Jarda Snajdr <jsnajdr@gmail.com>
+# Date 2016-06-28 09:29
+Bug 1281732 - Part 4: Add stack trace tab to HTTP console log message r=Honza
+
+diff --git a/devtools/client/locales/en-US/netmonitor.properties b/devtools/client/locales/en-US/netmonitor.properties
+index 51a3b76..943fa5b 100644
+--- a/devtools/client/locales/en-US/netmonitor.properties
++++ b/devtools/client/locales/en-US/netmonitor.properties
+@@ -315,8 +315,13 @@ netRequest.post=POST
+ 
+ # LOCALIZATION NOTE (netRequest.cookies): A label used for Cookies tab
+ # This tab displays request and response cookies.
+ netRequest.cookies=Cookies
+ 
+ # LOCALIZATION NOTE (netRequest.params): A label used for URL parameters tab
+ # This tab displays data parsed from URL query string.
+ netRequest.params=Params
++
++# LOCALIZATION NOTE (netRequest.callstack): A label used for request stacktrace tab
++# This tab displays the request's JavaScript stack trace. Should be identical to
++# debuggerUI.tabs.callstack
++netRequest.callstack=Call Stack
+diff --git a/devtools/client/webconsole/net/components/moz.build b/devtools/client/webconsole/net/components/moz.build
+index ff70b27..4b43dab 100644
+--- a/devtools/client/webconsole/net/components/moz.build
++++ b/devtools/client/webconsole/net/components/moz.build
+@@ -16,9 +16,10 @@ DevToolsModules(
+     'net-info-params.js',
+     'params-tab.js',
+     'post-tab.js',
+     'response-tab.css',
+     'response-tab.js',
+     'size-limit.css',
+     'size-limit.js',
+     'spinner.js',
++    'stacktrace-tab.js',
+ )
+diff --git a/devtools/client/webconsole/net/components/net-info-body.js b/devtools/client/webconsole/net/components/net-info-body.js
+index b1b9bce..8d7f7ae 100644
+--- a/devtools/client/webconsole/net/components/net-info-body.js
++++ b/devtools/client/webconsole/net/components/net-info-body.js
+@@ -8,16 +8,17 @@ const { createFactories } = require("devtools/client/shared/components/reps/rep-
+ const { Tabs, TabPanel } = createFactories(require("devtools/client/shared/components/tabs/tabs"));
+ 
+ // Network
+ const HeadersTab = React.createFactory(require("./headers-tab"));
+ const ResponseTab = React.createFactory(require("./response-tab"));
+ const ParamsTab = React.createFactory(require("./params-tab"));
+ const CookiesTab = React.createFactory(require("./cookies-tab"));
+ const PostTab = React.createFactory(require("./post-tab"));
++const StackTraceTab = React.createFactory(require("./stacktrace-tab"));
+ const NetUtils = require("../utils/net");
+ 
+ // Shortcuts
+ const PropTypes = React.PropTypes;
+ 
+ /**
+  * This template renders the basic Network log info body. It's not
+  * visible by default, the user needs to expand the network log
+@@ -63,16 +64,21 @@ var NetInfoBody = React.createClass({
+   },
+ 
+   hasCookies() {
+     let {request, response} = this.state.data;
+     return NetUtils.getHeaderValue(request.headers, "Cookie") ||
+       NetUtils.getHeaderValue(response.headers, "Cookie");
+   },
+ 
++  hasStackTrace() {
++    let {cause} = this.state.data;
++    return cause && cause.stacktrace && cause.stacktrace.length > 0;
++  },
++
+   getTabPanels() {
+     let actions = this.props.actions;
+     let data = this.state.data;
+     let {request} = data;
+ 
+     // Flags for optional tabs. Some tabs are visible only if there
+     // are data to display.
+     let hasParams = request.queryString && request.queryString.length;
+@@ -132,16 +138,31 @@ var NetInfoBody = React.createClass({
+           CookiesTab({
+             data: data,
+             actions: actions
+           })
+         )
+       );
+     }
+ 
++    // Stacktrace tab
++    if (this.hasStackTrace()) {
++      panels.push(
++        TabPanel({
++          className: "stacktrace-tab",
++          key: "stacktrace",
++          title: Locale.$STR("netRequest.callstack")},
++          StackTraceTab({
++            data: data,
++            actions: actions
++          })
++        )
++      );
++    }
++
+     return panels;
+   },
+ 
+   render() {
+     let tabActive = this.state.tabActive;
+     let tabPanels = this.getTabPanels();
+     return (
+       Tabs({
+diff --git a/devtools/client/webconsole/net/components/stacktrace-tab.js b/devtools/client/webconsole/net/components/stacktrace-tab.js
+new file mode 100644
+index 0000000..51eb7689
+--- /dev/null
++++ b/devtools/client/webconsole/net/components/stacktrace-tab.js
+@@ -0,0 +1,29 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++"use strict";
++
++const { PropTypes, createClass, createFactory } = require("devtools/client/shared/vendor/react");
++const StackTrace = createFactory(require("devtools/client/shared/components/stack-trace"));
++
++const StackTraceTab = createClass({
++  displayName: "StackTraceTab",
++
++  propTypes: {
++    data: PropTypes.object.isRequired,
++    actions: PropTypes.shape({
++      onViewSourceInDebugger: PropTypes.func.isRequired
++    })
++  },
++
++  render() {
++    let { stacktrace } = this.props.data.cause;
++    let { actions } = this.props;
++    let onViewSourceInDebugger = actions.onViewSourceInDebugger.bind(actions);
++
++    return StackTrace({ stacktrace, onViewSourceInDebugger });
++  }
++});
++
++// Exports from this module
++module.exports = StackTraceTab;
+diff --git a/devtools/client/webconsole/net/net-request.js b/devtools/client/webconsole/net/net-request.js
+index 2495e15..c42787c 100644
+--- a/devtools/client/webconsole/net/net-request.js
++++ b/devtools/client/webconsole/net/net-request.js
+@@ -34,17 +34,18 @@ const XHTML_NS = "http://www.w3.org/1999/xhtml";
+  * and rendered directly within the Console iframe.
+  */
+ function NetRequest(log) {
+   this.initialize(log);
+ }
+ 
+ NetRequest.prototype = {
+   initialize: function (log) {
+-    this.client = log.client;
++    this.client = log.consoleFrame.webConsoleClient;
++    this.owner = log.consoleFrame.owner;
+ 
+     // 'this.file' field is following HAR spec.
+     // http://www.softwareishard.com/blog/har-12-spec/
+     this.file = log.response;
+     this.parentNode = log.node;
+     this.file.request.queryString = parseURLParams(this.file.request.url);
+ 
+     // Map of fetched responses (to avoid unnecessary RDP round trip).
+@@ -272,16 +273,20 @@ NetRequest.prototype = {
+     return this.resolveHeaders(this.file.request.cookies);
+   },
+ 
+   onResponseCookies: function (response) {
+     this.file.response.cookies = response.cookies;
+     return this.resolveHeaders(this.file.response.cookies);
+   },
+ 
++  onViewSourceInDebugger: function (frame) {
++    this.owner.viewSourceInDebugger(frame.source, frame.line);
++  },
++
+   resolveHeaders: function (headers) {
+     let promises = [];
+ 
+     for (let header of headers) {
+       if (typeof header.value == "object") {
+         promises.push(this.resolveString(header.value).then(value => {
+           header.value = value;
+         }));
+diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconsole/webconsole.js
+index 8721954..ef6ba1e 100644
+--- a/devtools/client/webconsole/webconsole.js
++++ b/devtools/client/webconsole/webconsole.js
+@@ -1626,17 +1626,17 @@ WebConsoleFrame.prototype = {
+     this._addMessageLinkCallback(statusNode, onClick);
+ 
+     networkInfo.node = messageNode;
+ 
+     this._updateNetMessage(actorId);
+ 
+     if (this.window.NetRequest) {
+       this.window.NetRequest.onNetworkEvent({
+-        client: this.webConsoleClient,
++        consoleFrame: this,
+         response: networkInfo,
+         node: messageNode,
+         update: false
+       });
+     }
+ 
+     return messageNode;
+   },
+
