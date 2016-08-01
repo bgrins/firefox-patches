@@ -1,0 +1,394 @@
+# HG changeset patch
+# User Jaideep Bhoosreddy <jaideepb@buffalo.edu>
+# Parent  ceb63dec9267e9bb62f5e5e1f4c9d32d3ac1fbac
+Bug 1257913 - Add copy screenshot to clipboard feature; r?jryans
+
+diff --git a/devtools/client/framework/options-panel.css b/devtools/client/framework/options-panel.css
+--- a/devtools/client/framework/options-panel.css
++++ b/devtools/client/framework/options-panel.css
+@@ -100,8 +100,13 @@
+ 
+ #devtools-sourceeditor-keybinding-select {
+   min-width: 130px;
+ }
+ 
+ #devtools-sourceeditor-tabsize-select {
+   min-width: 80px;
+ }
++
++#screenshot-icon::before {
++  background-image: url(chrome://devtools/skin/images/command-screenshot.svg);
++  margin-left: 5px;
++}
+diff --git a/devtools/client/framework/toolbox-options.xhtml b/devtools/client/framework/toolbox-options.xhtml
+--- a/devtools/client/framework/toolbox-options.xhtml
++++ b/devtools/client/framework/toolbox-options.xhtml
+@@ -92,16 +92,34 @@
+           <span>&options.stylesheetSourceMaps.label;</span>
+         </label>
+         <label title="&options.stylesheetAutocompletion.tooltip;">
+           <input type="checkbox"
+                  data-pref="devtools.styleeditor.autocompletion-enabled"/>
+           <span>&options.stylesheetAutocompletion.label;</span>
+         </label>
+       </fieldset>
++
++      <fieldset id="screenshot-options" class="options-groupbox">
++        <legend>&options.screenshot.label;
++          <span id="screenshot-icon" class="command-button command-button-invertable devtools-button"></span>
++        </legend>
++        <label title="&options.screenshot.clipboard.tooltip;">
++          <input type="checkbox"
++                 id="devtools-screenshot-clipboard"
++                 data-pref="devtools.screenshot.clipboard.enabled"/>
++          <span>&options.screenshot.clipboard.label;</span>
++        </label>
++        <label title="&options.screenshot.audio.tooltip;">
++          <input type="checkbox"
++                 id="devtools-screenshot-audio"
++                 data-pref="devtools.screenshot.audio.enabled"/>
++          <span>&options.screenshot.audio.label;</span>
++        </label>
++      </fieldset>
+     </div>
+ 
+     <div class="options-vertical-pane">
+       <fieldset id="sourceeditor-options" class="options-groupbox">
+         <legend>&options.sourceeditor.label;</legend>
+         <label title="&options.sourceeditor.detectindentation.tooltip;">
+           <input type="checkbox"
+                  id="devtools-sourceeditor-detectindentation"
+diff --git a/devtools/client/framework/toolbox.js b/devtools/client/framework/toolbox.js
+--- a/devtools/client/framework/toolbox.js
++++ b/devtools/client/framework/toolbox.js
+@@ -515,16 +515,19 @@ Toolbox.prototype = {
+   _prefChanged: function (event, data) {
+     switch (data.pref) {
+       case "devtools.cache.disabled":
+         this._applyCacheSettings();
+         break;
+       case "devtools.serviceWorkers.testing.enabled":
+         this._applyServiceWorkersTestingSettings();
+         break;
++      case "devtools.screenshot.clipboard.enabled":
++        this._buildButtons();
++        break;
+     }
+   },
+ 
+   _buildOptions: function (shortcuts) {
+     let selectOptions = (name, event) => {
+       // Flip back to the last used panel if we are already
+       // on the options panel.
+       if (this.currentToolId === "options" &&
+@@ -943,23 +946,25 @@ Toolbox.prototype = {
+       return promise.resolve();
+     }
+ 
+     const options = {
+       environment: CommandUtils.createEnvironment(this, "_target")
+     };
+     return CommandUtils.createRequisition(this.target, options).then(requisition => {
+       this._requisition = requisition;
+-
+-      const spec = CommandUtils.getCommandbarSpec("devtools.toolbox.toolbarSpec");
++      let spec = this.getToolbarSpec();
+       return CommandUtils.createButtons(spec, this.target, this.doc,
+                                         requisition).then(buttons => {
+-                                          let container = this.doc.getElementById("toolbox-buttons");
+-                                          buttons.forEach(button=> {
+-                                            if (button) {
++                                          const container = this.doc.getElementById("toolbox-buttons");
++                                          buttons.forEach(button => {
++                                            const currentButton = this.doc.getElementById(button.id);
++                                            if (currentButton) {
++                                              container.replaceChild(button, currentButton);
++                                            } else {
+                                               container.appendChild(button);
+                                             }
+                                           });
+                                           this.setToolboxButtonsVisibility();
+                                         });
+     });
+   },
+ 
+@@ -1006,16 +1011,34 @@ Toolbox.prototype = {
+     if (this.target.activeTab) {
+       this.target.activeTab.reconfigure({
+         "serviceWorkersTestingEnabled": serviceWorkersTestingEnabled
+       });
+     }
+   },
+ 
+   /**
++   * Get the toolbar spec for toolbox
++   */
++  getToolbarSpec: function () {
++    let spec = CommandUtils.getCommandbarSpec("devtools.toolbox.toolbarSpec");
++    // Special case for screenshot command button to check for clipboard preference
++    const clipboardEnabled = Services.prefs
++      .getBoolPref("devtools.screenshot.clipboard.enabled");1
++    if (clipboardEnabled) {
++      for (let i = 0; i < spec.length; i++) {
++        if (spec[i] == "screenshot --fullpage --file") {
++          spec[i] += " --clipboard";
++        }
++      }
++    }
++    return spec;
++  },
++
++  /**
+    * Setter for the checked state of the picker button in the toolbar
+    * @param {Boolean} isChecked
+    */
+   set pickerButtonChecked(isChecked) {
+     if (isChecked) {
+       this._pickerButton.setAttribute("checked", "true");
+     } else {
+       this._pickerButton.removeAttribute("checked");
+diff --git a/devtools/client/inspector/inspector-panel.js b/devtools/client/inspector/inspector-panel.js
+--- a/devtools/client/inspector/inspector-panel.js
++++ b/devtools/client/inspector/inspector-panel.js
+@@ -1551,23 +1551,25 @@ InspectorPanel.prototype = {
+       clipboardHelper.copyString(selector);
+     }).then(null, console.error);
+   },
+ 
+   /**
+    * Initiate gcli screenshot command on selected node
+    */
+   screenshotNode: function () {
++    const command = Services.prefs.getBoolPref("devtools.screenshot-clipboard.enabled") ?
++        "screenshot --clipboard --selector " : "screenshot --selector ";
+     CommandUtils.createRequisition(this._target, {
+       environment: CommandUtils.createEnvironment(this, "_target")
+     }).then(requisition => {
+       // Bug 1180314 -  CssSelector might contain white space so need to make sure it is
+       // passed to screenshot as a single parameter.  More work *might* be needed if
+       // CssSelector could contain escaped single- or double-quotes, backslashes, etc.
+-      requisition.updateExec("screenshot --selector '" + this.selectionCssSelector + "'");
++      requisition.updateExec(command + "'" + this.selectionCssSelector + "'");
+     });
+   },
+ 
+   /**
+    * Scroll the node into view.
+    */
+   scrollNodeIntoView: function () {
+     if (!this.selection.isNode()) {
+diff --git a/devtools/client/locales/en-US/toolbox.dtd b/devtools/client/locales/en-US/toolbox.dtd
+--- a/devtools/client/locales/en-US/toolbox.dtd
++++ b/devtools/client/locales/en-US/toolbox.dtd
+@@ -169,16 +169,31 @@
+ <!ENTITY options.stylesheetSourceMaps.label      "Show original sources">
+ <!ENTITY options.stylesheetSourceMaps.tooltip    "Show original sources (e.g. Sass files) in the Style Editor and Inspector">
+ 
+ <!-- LOCALIZATION NOTE (options.stylesheetAutocompletion.label): This is the
+    - label for the checkbox that toggles autocompletion of css in the Style Editor -->
+ <!ENTITY options.stylesheetAutocompletion.label      "Autocomplete CSS">
+ <!ENTITY options.stylesheetAutocompletion.tooltip    "Autocomplete CSS properties, values and selectors in Style Editor as you type">
+ 
++<!-- LOCALIZATION NOTE (options.screenshot.label): This is the label for the
++   -  heading of the group of Screenshot preferences in the options
++   -  panel. -->
++<!ENTITY options.screenshot.label            "Screenshot Behaviour">
++
++<!-- LOCALIZATION NOTE (options.screenshot.clipboard.label): This is the
++   - label for the checkbox that toggles screenshot to clipboard feature. -->
++<!ENTITY options.screenshot.clipboard.label      "Screenshot to clipboard">
++<!ENTITY options.screenshot.clipboard.tooltip    "Saves to the screenshot directly to the clipboard">
++
++<!-- LOCALIZATION NOTE (options.screenshot.audio.label): This is the
++   - label for the checkbox that toggles the camera shutter audio for screenshot tool -->
++<!ENTITY options.screenshot.audio.label      "Play camera shutter sound">
++<!ENTITY options.screenshot.audio.tooltip    "Enables the camera audio sound when taking screenshot">
++
+ <!-- LOCALIZATION NOTE (options.commonprefs): This is the label for the heading
+       of all preferences that affect both the Web Console and the Network
+       Monitor -->
+ <!ENTITY options.commonPrefs.label           "Common Preferences">
+ 
+ <!-- LOCALIZATION NOTE (options.enablePersistentLogs.label): This is the
+   -  label for the checkbox that toggles persistent logs in the Web Console and
+   -  network monitor,  i.e. devtools.webconsole.persistlog a boolean preference in
+diff --git a/devtools/client/preferences/devtools.js b/devtools/client/preferences/devtools.js
+--- a/devtools/client/preferences/devtools.js
++++ b/devtools/client/preferences/devtools.js
+@@ -25,17 +25,17 @@ pref("devtools.toolbar.visible", false);
+ pref("devtools.webide.enabled", true);
+ 
+ // Toolbox preferences
+ pref("devtools.toolbox.footer.height", 250);
+ pref("devtools.toolbox.sidebar.width", 500);
+ pref("devtools.toolbox.host", "bottom");
+ pref("devtools.toolbox.previousHost", "side");
+ pref("devtools.toolbox.selectedTool", "webconsole");
+-pref("devtools.toolbox.toolbarSpec", '["splitconsole", "paintflashing toggle","scratchpad","resize toggle","screenshot --fullpage", "rulers", "measure"]');
++pref("devtools.toolbox.toolbarSpec", '["splitconsole", "paintflashing toggle","scratchpad","resize toggle","screenshot --fullpage --file", "rulers", "measure"]');
+ pref("devtools.toolbox.sideEnabled", true);
+ pref("devtools.toolbox.zoomValue", "1");
+ pref("devtools.toolbox.splitconsoleEnabled", false);
+ pref("devtools.toolbox.splitconsoleHeight", 100);
+ 
+ // Toolbox Button preferences
+ pref("devtools.command-button-pick.enabled", true);
+ pref("devtools.command-button-frames.enabled", true);
+@@ -195,16 +195,20 @@ pref("devtools.storage.enabled", false);
+ pref("devtools.styleeditor.enabled", true);
+ pref("devtools.styleeditor.source-maps-enabled", true);
+ pref("devtools.styleeditor.autocompletion-enabled", true);
+ pref("devtools.styleeditor.showMediaSidebar", true);
+ pref("devtools.styleeditor.mediaSidebarWidth", 238);
+ pref("devtools.styleeditor.navSidebarWidth", 245);
+ pref("devtools.styleeditor.transitions", true);
+ 
++// Screenshot Options
++pref("devtools.screenshot.clipboard.enabled", false);
++pref("devtools.screenshot.audio.enabled", true);
++
+ // Enable the Shader Editor.
+ pref("devtools.shadereditor.enabled", false);
+ 
+ // Enable the Canvas Debugger.
+ pref("devtools.canvasdebugger.enabled", false);
+ 
+ // Enable the Web Audio Editor
+ pref("devtools.webaudioeditor.enabled", false);
+diff --git a/devtools/shared/gcli/commands/screenshot.js b/devtools/shared/gcli/commands/screenshot.js
+--- a/devtools/shared/gcli/commands/screenshot.js
++++ b/devtools/shared/gcli/commands/screenshot.js
+@@ -22,16 +22,17 @@ loader.lazyImporter(this, "PrivateBrowsi
+ const BRAND_SHORT_NAME = Cc["@mozilla.org/intl/stringbundle;1"]
+                            .getService(Ci.nsIStringBundleService)
+                            .createBundle("chrome://branding/locale/brand.properties")
+                            .GetStringFromName("brandShortName");
+ 
+ // String used as an indication to generate default file name in the following
+ // format: "Screen Shot yyyy-mm-dd at HH.MM.SS.png"
+ const FILENAME_DEFAULT_VALUE = " ";
++const CONTAINER_FLASHING_DURATION = 500;
+ 
+ /*
+  * There are 2 commands and 1 converter here. The 2 commands are nearly
+  * identical except that one runs on the client and one in the server.
+  *
+  * The server command is hidden, and is designed to be called from the client
+  * command.
+  */
+@@ -90,17 +91,23 @@ const standardParams = {
+       manual: l10n.lookup("screenshotFullPageManual")
+     },
+     {
+       name: "selector",
+       type: "node",
+       defaultValue: null,
+       description: l10n.lookup("inspectNodeDesc"),
+       manual: l10n.lookup("inspectNodeManual")
+-    }
++    },
++    {
++      name: "file",
++      type: "boolean",
++      description: l10n.lookup("screenshotFileDesc"),
++      manual: l10n.lookup("screenshotFileManual"),
++    },
+   ]
+ };
+ 
+ exports.items = [
+   {
+     /**
+      * Format an 'imageSummary' (as output by the screenshot command).
+      * An 'imageSummary' is a simple JSON object that looks like this:
+@@ -205,22 +212,24 @@ exports.items = [
+ ];
+ 
+ /**
+  * This function is called to simulate camera effects
+  */
+ function simulateCameraEffect(document, effect) {
+   let window = document.defaultView;
+   if (effect === "shutter") {
+-    const audioCamera = new window.Audio("resource://devtools/client/themes/audio/shutter.wav");
+-    audioCamera.play();
++    if (Services.prefs.getBoolPref("devtools.screenshot.audio.enabled")) {
++      const audioCamera = new window.Audio("resource://devtools/client/themes/audio/shutter.wav");
++      audioCamera.play();
++    }
+   }
+   if (effect == "flash") {
+     const frames = Cu.cloneInto({ opacity: [ 0, 1 ] }, window);
+-    document.documentElement.animate(frames, 500);
++    document.documentElement.animate(frames, CONTAINER_FLASHING_DURATION);
+   }
+ }
+ 
+ /**
+  * This function simply handles the --delay argument before calling
+  * createScreenshotData
+  */
+ function captureScreenshot(args, document) {
+@@ -242,17 +251,17 @@ function captureScreenshot(args, documen
+  */
+ const SKIP = Promise.resolve();
+ 
+ /**
+  * Save the captured screenshot to one of several destinations.
+  */
+ function saveScreenshot(args, context, reply) {
+   const fileNeeded = args.filename != FILENAME_DEFAULT_VALUE ||
+-                      (!args.imgur && !args.clipboard);
++                      (!args.imgur && !args.clipboard) || args.file;
+ 
+   return Promise.all([
+     args.clipboard ? saveToClipboard(context, reply) : SKIP,
+     args.imgur     ? uploadToImgur(reply)            : SKIP,
+     fileNeeded     ? saveToFile(context, reply)      : SKIP,
+   ]).then(() => reply);
+ }
+ 
+diff --git a/devtools/shared/locales/en-US/gclicommands.properties b/devtools/shared/locales/en-US/gclicommands.properties
+--- a/devtools/shared/locales/en-US/gclicommands.properties
++++ b/devtools/shared/locales/en-US/gclicommands.properties
+@@ -85,26 +85,36 @@ screenshotDelayManual=The time to wait (
+ # a dialog when the user is using this command.
+ screenshotDPRDesc=Device pixel ratio
+ 
+ # LOCALIZATION NOTE (screenshotDPRManual) A fuller description of the
+ # 'dpr' parameter to the 'screenshot' command, displayed when the user
+ # asks for help on what it does.
+ screenshotDPRManual=The device pixel ratio to use when taking the screenshot
+ 
+-# LOCALIZATION NOTE (screenshotFullscreenDesc) A very short string to describe
+-# the 'fullscreen' parameter to the 'screenshot' command, which is displayed in
++# LOCALIZATION NOTE (screenshotFullPageDesc) A very short string to describe
++# the 'fullpage' parameter to the 'screenshot' command, which is displayed in
+ # a dialog when the user is using this command.
+ screenshotFullPageDesc=Entire webpage? (true/false)
+ 
+-# LOCALIZATION NOTE (screenshotFullscreenManual) A fuller description of the
+-# 'fullscreen' parameter to the 'screenshot' command, displayed when the user
++# LOCALIZATION NOTE (screenshotFullPageManual) A fuller description of the
++# 'fullpage' parameter to the 'screenshot' command, displayed when the user
+ # asks for help on what it does.
+ screenshotFullPageManual=True if the screenshot should also include parts of the webpage which are outside the current scrolled bounds.
+ 
++# LOCALIZATION NOTE (screenshotFileDesc) A very short string to describe
++# the 'file' parameter to the 'screenshot' command, which is displayed in
++# a dialog when the user is using this command.
++screenshotFileDesc=Save to file? (true/false)
++
++# LOCALIZATION NOTE (screenshotFileManual) A fuller description of the
++# 'file' parameter to the 'screenshot' command, displayed when the user
++# asks for help on what it does.
++screenshotFileManual=True if the screenshot should save the file even when other options are enabled (eg. clipboard).
++
+ # LOCALIZATION NOTE (screenshotGeneratedFilename) The auto generated filename
+ # when no file name is provided. The first argument (%1$S) is the date string
+ # in yyyy-mm-dd format and the second argument (%2$S) is the time string
+ # in HH.MM.SS format. Please don't add the extension here.
+ screenshotGeneratedFilename=Screen Shot %1$S at %2$S
+ 
+ # LOCALIZATION NOTE (screenshotErrorSavingToFile) Text displayed to user upon
+ # encountering error while saving the screenshot to the file specified.
