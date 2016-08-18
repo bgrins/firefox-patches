@@ -1,0 +1,177 @@
+# HG changeset patch
+# User Brian Grinstead <briangrinstead@gmail.com>
+Bug 1292325 - New console frontend: Add a waitForMessages function for end-to-end testing. r=linclark
+
+
+
+diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_init.js b/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_init.js
+index 29011f8..2565e4c 100644
+--- a/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_init.js
++++ b/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_init.js
+@@ -4,20 +4,65 @@
+  * http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+ const TEST_URI = "http://example.com/browser/devtools/client/webconsole/new-console-output/test/mochitest/test-console.html";
+ 
+ add_task(function* () {
+   let toolbox = yield openNewTabAndToolbox(TEST_URI, "webconsole");
+-  let ui = toolbox.getCurrentPanel().hud.ui;
++  let hud = toolbox.getCurrentPanel().hud;
++  let {ui} = hud;
+ 
+   ok(ui.jsterm, "jsterm exists");
+   ok(ui.newConsoleOutput, "newConsoleOutput exists");
+ 
+-  // @TODO: fix proptype errors and actually emit 'new-messages' event
+-  // let receivedLog = ui.once("new-messages");
+-  // yield ContentTask.spawn(gBrowser.selectedBrowser, {}, function() {
+-  //   content.wrappedJSObject.doLogs();
+-  // });
+-  // yield receivedLog;
++  // @TODO: fix proptype errors
++  let receievedMessages = waitForMessages({
++    hud,
++    messages: [{
++      text: '0',
++    }, {
++      text: '1',
++    }, {
++      text: '2',
++    }],
++  });
++
++  yield ContentTask.spawn(gBrowser.selectedBrowser, {}, function() {
++    content.wrappedJSObject.doLogs(3);
++  });
++
++  yield receievedMessages;
+ });
++
++/**
++ * Wait for messages in the web console output, resolving once they are receieved.
++ *
++ * @param object options
++ *        - hud: the webconsole
++ *        - messages: Array[Object]. An array of messages to match. Current supported options:
++ *            - text: Exact text match in .message-body
++ */
++function waitForMessages({ hud, messages }) {
++  return new Promise(resolve => {
++    let numMatched = 0;
++    let receivedLog = hud.ui.on("new-messages", function messagesReceieved(e, newMessage) {
++      for (let message of messages) {
++        if (message.matched) {
++          continue;
++        }
++
++        if (newMessage.node.querySelector(".message-body").textContent == message.text) {
++          numMatched++;
++          message.matched = true;
++          info("Matched a message with text: " + message.text + ", still waiting for " + (messages.length - numMatched) + " messages");
++        }
++
++        if (numMatched === messages.length) {
++          hud.ui.off("new-messages", messagesReceieved);
++          resolve();
++          return;
++        }
++      }
++    });
++  });
++}
+\ No newline at end of file
+diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconsole/webconsole.js
+index e0d9569..60a1ff4 100644
+--- a/devtools/client/webconsole/webconsole.js
++++ b/devtools/client/webconsole/webconsole.js
+@@ -3217,16 +3217,31 @@ WebConsoleConnectionProxy.prototype = {
+     this.webConsoleClient.on("networkEventUpdate", this._onNetworkEventUpdate);
+ 
+     let msgs = ["PageError", "ConsoleAPI"];
+     this.webConsoleClient.getCachedMessages(msgs, this._onCachedMessages);
+ 
+     this.webConsoleFrame._onUpdateListeners();
+   },
+ 
++  /**
++   * Dispatch a message add on the new frontend and emit an event for tests.
++   */
++  dispatchMessageAdd: function(packet) {
++    this.webConsoleFrame.newConsoleOutput.dispatchMessageAdd(packet);
++
++    // Return the last message in the DOM as the message that was just dispatched. This may not
++    // always be true in the case of filtered messages, but it's close enough for our tests.
++    let messageNodes = this.webConsoleFrame.experimentalOutputNode.querySelectorAll(".message");
++    this.webConsoleFrame.emit("new-messages", {
++      response: packet,
++      node: messageNodes[messageNodes.length - 1],
++    });
++  },
++
+   /**
+    * The "cachedMessages" response handler.
+    *
+    * @private
+    * @param object response
+    *        The JSON response object received from the server.
+    */
+   _onCachedMessages: function (response) {
+@@ -3244,17 +3259,17 @@ WebConsoleConnectionProxy.prototype = {
+     }
+ 
+     let messages =
+       response.messages.concat(...this.webConsoleClient.getNetworkEvents());
+     messages.sort((a, b) => a.timeStamp - b.timeStamp);
+ 
+     if (this.webConsoleFrame.NEW_CONSOLE_OUTPUT_ENABLED) {
+       for (let packet of messages) {
+-        this.webConsoleFrame.newConsoleOutput.dispatchMessageAdd(packet);
++        this.dispatchMessageAdd(packet);
+       }
+     } else {
+       this.webConsoleFrame.displayCachedMessages(messages);
+       if (!this._hasNativeConsoleAPI) {
+         this.webConsoleFrame.logWarningAboutReplacedAPI();
+       }
+     }
+ 
+@@ -3270,17 +3285,17 @@ WebConsoleConnectionProxy.prototype = {
+    * @param string type
+    *        Message type.
+    * @param object packet
+    *        The message received from the server.
+    */
+   _onPageError: function (type, packet) {
+     if (this.webConsoleFrame && packet.from == this._consoleActor) {
+       if (this.webConsoleFrame.NEW_CONSOLE_OUTPUT_ENABLED) {
+-        this.webConsoleFrame.newConsoleOutput.dispatchMessageAdd(packet);
++        this.dispatchMessageAdd(packet);
+         return;
+       }
+       this.webConsoleFrame.handlePageError(packet.pageError);
+     }
+   },
+ 
+   /**
+    * The "logMessage" message type handler. We redirect any message to the UI
+@@ -3306,17 +3321,17 @@ WebConsoleConnectionProxy.prototype = {
+    * @param string type
+    *        Message type.
+    * @param object packet
+    *        The message received from the server.
+    */
+   _onConsoleAPICall: function (type, packet) {
+     if (this.webConsoleFrame && packet.from == this._consoleActor) {
+       if (this.webConsoleFrame.NEW_CONSOLE_OUTPUT_ENABLED) {
+-        this.webConsoleFrame.newConsoleOutput.dispatchMessageAdd(packet);
++        this.dispatchMessageAdd(packet);
+       } else {
+         this.webConsoleFrame.handleConsoleAPICall(packet.message);
+       }
+     }
+   },
+ 
+   /**
+    * The "networkEvent" message type handler. We redirect any message to
