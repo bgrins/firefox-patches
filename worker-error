@@ -1,7 +1,9 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  a5571e6af4e9655ba6af3cb972286697f24813d1
-Bug 1224073 - Instead of unsafeDereference to get the string of an error in a worker, pass it back to the debugger
+# Parent  c0c2f6077694008794c06900943654db0143c2b9
+Bug 1224073 - Instead of unsafeDereference to get the string of an error in a worker, evaluate it in Debugger;r=ejpbruel
+
+MozReview-Commit-ID: 3juau0t3mus
 
 diff --git a/devtools/client/debugger/test/mochitest/browser_dbg_worker-console-02.js b/devtools/client/debugger/test/mochitest/browser_dbg_worker-console-02.js
 --- a/devtools/client/debugger/test/mochitest/browser_dbg_worker-console-02.js
@@ -17,7 +19,7 @@ diff --git a/devtools/client/debugger/test/mochitest/browser_dbg_worker-console-
    executed = yield command3;
 -  // XXXworkers This is failing until Bug 1215120 is resolved.
 -  todo(executed.textContent.includes("ReferenceError: foobar is not defined"),
-+  is(executed.textContent.includes("ReferenceError: foobar is not defined"),
++  ok(executed.textContent.includes("ReferenceError: foobar is not defined"),
        "command3 executed successfully");
  
    let onceResumed = gTarget.once("thread-resumed");
@@ -29,8 +31,7 @@ diff --git a/devtools/client/debugger/test/mochitest/browser_dbg_worker-console-
 diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webconsole.js
 --- a/devtools/server/actors/webconsole.js
 +++ b/devtools/server/actors/webconsole.js
-@@ -892,28 +892,23 @@ WebConsoleActor.prototype =
-     let result, errorDocURL, errorMessage, errorGrip = null;
+@@ -893,26 +893,22 @@ WebConsoleActor.prototype =
      if (evalResult) {
        if ("return" in evalResult) {
          result = evalResult.return;
@@ -38,7 +39,6 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
          result = evalResult.yield;
        } else if ("throw" in evalResult) {
          let error = evalResult.throw;
-+        errorMessage = String(error);
          errorGrip = this.createValueGrip(error);
 -        // XXXworkers: Calling unsafeDereference() returns an object with no
 -        // toString method in workers. See Bug 1215120.
@@ -47,14 +47,15 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
 -        errorMessage = unsafeDereference && unsafeDereference.toString
 -          ? unsafeDereference.toString()
 -          : String(error);
--
+ 
 -          // It is possible that we won't have permission to unwrap an
 -          // object and retrieve its errorMessageName.
++        let { frame, dbg } = this.getEvalDebugger();
++        let dbgWindow = dbg.makeGlobalObjectReference(this.evalWindow);
++        let evalErrorString = dbgWindow.executeInGlobalWithBindings("_self.toString()",
++                                                                    {_self: error});
++        errorMessage = evalErrorString.return || String(error);
          try {
-+          let dbgWindow = this.dbg.makeGlobalObjectReference(this.evalWindow);
-+          let evalErrorString = dbgWindow.executeInGlobalWithBindings("_self.toString()",
-+                                                                      {_self: error});
-+          errorMessage = evalErrorString.return;
            errorDocURL = ErrorDocs.GetURL(error);
          } catch (ex) {}
        }
@@ -62,4 +63,94 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
  
      // If a value is encountered that the debugger server doesn't support yet,
      // the console should remain functional.
-     let resultGrip;
+@@ -1133,16 +1129,52 @@ WebConsoleActor.prototype =
+         desc.value = aDebuggerGlobal.makeDebuggeeValue(desc.value);
+       }
+       Object.defineProperty(helpers.sandbox, name, desc);
+     }
+     return helpers;
+   },
+ 
+   /**
++   * Get debugger / frame information needed to evaluate code with an optional
++   * frame.
++   *
++   * @param string frameActorID
++   *        The actor for a frame (null if execution should happen in global)
++   * @return object
++   *         An object that holds the following properties:
++   *         - dbg: the debugger where code should be evaluated.
++   *         - frame: the frame where code should be evaluated (can be null)
++   */
++  getEvalDebugger(frameActorID = null) {
++    // Find the Debugger.Frame of the given FrameActor.
++    let frame = null, frameActor = null;
++    if (frameActorID) {
++      frameActor = this.conn.getActor(frameActorID);
++      if (frameActor) {
++        frame = frameActor.frame;
++      }
++      else {
++        DevToolsUtils.reportException("evalWithDebugger",
++          Error("The frame actor was not found: " + frameActorID));
++      }
++    }
++
++    // If we've been given a frame actor in whose scope we should evaluate the
++    // expression, be sure to use that frame's Debugger (that is, the JavaScript
++    // debugger's Debugger) for the whole operation, not the console's Debugger.
++    // (One Debugger will treat a different Debugger's Debugger.Object instances
++    // as ordinary objects, not as references to be followed, so mixing
++    // debuggers causes strange behaviors.)
++    let dbg = frame ? frameActor.threadActor.dbg : this.dbg;
++
++    return { frame, dbg };
++  },
++
++  /**
+    * Evaluates a string using the debugger API.
+    *
+    * To allow the variables view to update properties from the Web Console we
+    * provide the "bindObjectActor" mechanism: the Web Console tells the
+    * ObjectActor ID for which it desires to evaluate an expression. The
+    * Debugger.Object pointed at by the actor ID is bound such that it is
+    * available during expression evaluation (executeInGlobalWithBindings()).
+    *
+@@ -1207,36 +1239,17 @@ WebConsoleActor.prototype =
+       aString = "help()";
+     }
+ 
+     // Add easter egg for console.mihai().
+     if (trimmedString == "console.mihai()" || trimmedString == "console.mihai();") {
+       aString = "\"http://incompleteness.me/blog/2015/02/09/console-dot-mihai/\"";
+     }
+ 
+-    // Find the Debugger.Frame of the given FrameActor.
+-    let frame = null, frameActor = null;
+-    if (aOptions.frameActor) {
+-      frameActor = this.conn.getActor(aOptions.frameActor);
+-      if (frameActor) {
+-        frame = frameActor.frame;
+-      }
+-      else {
+-        DevToolsUtils.reportException("evalWithDebugger",
+-          Error("The frame actor was not found: " + aOptions.frameActor));
+-      }
+-    }
+-
+-    // If we've been given a frame actor in whose scope we should evaluate the
+-    // expression, be sure to use that frame's Debugger (that is, the JavaScript
+-    // debugger's Debugger) for the whole operation, not the console's Debugger.
+-    // (One Debugger will treat a different Debugger's Debugger.Object instances
+-    // as ordinary objects, not as references to be followed, so mixing
+-    // debuggers causes strange behaviors.)
+-    let dbg = frame ? frameActor.threadActor.dbg : this.dbg;
++    let { frame, dbg } = this.getEvalDebugger(aOptions.frameActor);
+     let dbgWindow = dbg.makeGlobalObjectReference(this.evalWindow);
+ 
+     // If we have an object to bind to |_self|, create a Debugger.Object
+     // referring to that object, belonging to dbg.
+     let bindSelf = null;
+     if (aOptions.bindObjectActor || aOptions.selectedObjectActor) {
+       let objActor = this.getActorByID(aOptions.bindObjectActor ||
+                                        aOptions.selectedObjectActor);
