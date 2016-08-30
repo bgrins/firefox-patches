@@ -1,0 +1,148 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  b18c8bcdc116eef8799880b7c50317bf54218474
+Bug 1298230 - Use a more descriptive Syntax Error when querySelector / querySelectorAll fails;r=bz
+
+MozReview-Commit-ID: DtIlA8ocMh0
+
+diff --git a/devtools/client/webconsole/test/browser_webconsole_exception_stackframe.js b/devtools/client/webconsole/test/browser_webconsole_exception_stackframe.js
+--- a/devtools/client/webconsole/test/browser_webconsole_exception_stackframe.js
++++ b/devtools/client/webconsole/test/browser_webconsole_exception_stackframe.js
+@@ -45,17 +45,17 @@ function test() {
+       webconsole: hud,
+       messages: [{
+         text: "nonExistingMethodCall is not defined",
+         category: CATEGORY_JS,
+         severity: SEVERITY_ERROR,
+         collapsible: true,
+         stacktrace: stack,
+       }, {
+-        text: "An invalid or illegal string was specified",
++        text: "SyntaxError: 'buggy;selector' is not a valid selector",
+         category: CATEGORY_JS,
+         severity: SEVERITY_ERROR,
+         collapsible: true,
+         stacktrace: [{
+           file: TEST_FILE,
+           fn: "domAPI",
+           line: 25,
+         }, {
+diff --git a/devtools/client/webconsole/test/browser_webconsole_output_04.js b/devtools/client/webconsole/test/browser_webconsole_output_04.js
+--- a/devtools/client/webconsole/test/browser_webconsole_output_04.js
++++ b/devtools/client/webconsole/test/browser_webconsole_output_04.js
+@@ -53,19 +53,18 @@ var inputTests = [
+     printOutput: '"TypeError: window.foobar is not a function"',
+     inspectable: true,
+     variablesViewLabel: "TypeError",
+   },
+ 
+   // 4
+   {
+     input: "testDOMException()",
+-    output: 'DOMException [SyntaxError: "An invalid or illegal string was ' +
+-            'specified"',
+-    printOutput: '"SyntaxError: An invalid or illegal string was specified"',
++    output: "DOMException [SyntaxError: \"'foo;()bar!' is not a valid selector\"",
++    printOutput: "SyntaxError: 'foo;()bar!' is not a valid selector",
+     inspectable: true,
+     variablesViewLabel: "SyntaxError",
+   },
+ 
+   // 5
+   {
+     input: "testCSSStyleDeclaration()",
+     output: 'CSS2Properties { color: "green", font-size: "2em" }',
+diff --git a/devtools/shared/webconsole/test/test_jsterm_queryselector.html b/devtools/shared/webconsole/test/test_jsterm_queryselector.html
+--- a/devtools/shared/webconsole/test/test_jsterm_queryselector.html
++++ b/devtools/shared/webconsole/test/test_jsterm_queryselector.html
+@@ -87,22 +87,22 @@ let checkQuerySelectorAllNotExist = Task
+   nextTest();
+ });
+ 
+ let checkQuerySelectorAllException = Task.async(function*() {
+   info ("$$ returns an exception if an invalid selector was provided");
+   let response = yield evaluateJS("$$(':foo')");
+   checkObject(response, {
+     input: "$$(':foo')",
+-    exceptionMessage: "SyntaxError: An invalid or illegal string was specified",
++    exceptionMessage: "SyntaxError: ':foo' is not a valid selector",
+     exception: {
+       preview: {
+         kind: "DOMException",
+         name: "SyntaxError",
+-        message: "An invalid or illegal string was specified"
++        message: "':foo' is not a valid selector"
+       }
+     }
+   });
+   nextTest();
+ });
+ 
+ function basicResultCheck(response, input, output) {
+   checkObject(response, {
+diff --git a/dom/base/nsINode.cpp b/dom/base/nsINode.cpp
+--- a/dom/base/nsINode.cpp
++++ b/dom/base/nsINode.cpp
+@@ -58,16 +58,17 @@
+ #include "nsIDOMDocumentType.h"
+ #include "nsIDOMEvent.h"
+ #include "nsIDOMEventListener.h"
+ #include "nsIDOMMutationEvent.h"
+ #include "nsIDOMNodeList.h"
+ #include "nsIEditor.h"
+ #include "nsIEditorIMESupport.h"
+ #include "nsILinkHandler.h"
++#include "nsPrintfCString.h"
+ #include "mozilla/dom/NodeInfo.h"
+ #include "mozilla/dom/NodeInfoInlines.h"
+ #include "nsIPresShell.h"
+ #include "nsIScriptError.h"
+ #include "nsIScriptGlobalObject.h"
+ #include "nsIScriptSecurityManager.h"
+ #include "nsIScrollableFrame.h"
+ #include "nsIServiceManager.h"
+@@ -2702,33 +2703,43 @@ nsINode::ParseSelectorList(const nsAStri
+ {
+   nsIDocument* doc = OwnerDoc();
+   nsIDocument::SelectorCache& cache = doc->GetSelectorCache();
+   nsCSSSelectorList* selectorList = nullptr;
+   bool haveCachedList = cache.GetList(aSelectorString, &selectorList);
+   if (haveCachedList) {
+     if (!selectorList) {
+       // Invalid selector.
+-      aRv.Throw(NS_ERROR_DOM_SYNTAX_ERR);
++      aRv.ThrowDOMException(
++        NS_ERROR_DOM_SYNTAX_ERR,
++        nsPrintfCString("'%s' is not a valid selector",
++                        NS_ConvertUTF16toUTF8(aSelectorString).get()));
+     }
+     return selectorList;
+   }
+ 
+   nsCSSParser parser(doc->CSSLoader());
+ 
+   aRv = parser.ParseSelectorString(aSelectorString,
+                                    doc->GetDocumentURI(),
+                                    0, // XXXbz get the line number!
+                                    &selectorList);
+   if (aRv.Failed()) {
+     // We hit this for syntax errors, which are quite common, so don't
+     // use NS_ENSURE_SUCCESS.  (For example, jQuery has an extended set
+     // of selectors, but it sees if we can parse them first.)
+     MOZ_ASSERT(aRv.ErrorCodeIs(NS_ERROR_DOM_SYNTAX_ERR),
+                "Unexpected error, so cached version won't return it");
++
++    // Change the error message to match above
++    aRv.ThrowDOMException(
++      NS_ERROR_DOM_SYNTAX_ERR,
++      nsPrintfCString("'%s' is not a valid selector",
++                      NS_ConvertUTF16toUTF8(aSelectorString).get()));
++
+     cache.CacheList(aSelectorString, nullptr);
+     return nullptr;
+   }
+ 
+   // Filter out pseudo-element selectors from selectorList
+   nsCSSSelectorList** slot = &selectorList;
+   do {
+     nsCSSSelectorList* cur = *slot;
