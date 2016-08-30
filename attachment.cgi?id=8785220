@@ -1,0 +1,411 @@
+# HG changeset patch
+# User Jan Odvarko <odvarko@gmail.com>
+# Date 1472203205 -7200
+#      Fri Aug 26 11:20:05 2016 +0200
+# Node ID 79bedb789f8c185195b6cd5e310ef29567fa9f22
+# Parent  74f16e8aed180aaf153827a6e5eedfb818c0cb11
+Bug 1281789 - Implement AllTabsMenu component; r=pbro
+
+diff --git a/devtools/client/inspector/inspector.xul b/devtools/client/inspector/inspector.xul
+--- a/devtools/client/inspector/inspector.xul
++++ b/devtools/client/inspector/inspector.xul
+@@ -24,16 +24,21 @@
+   <!ENTITY % layoutviewDTD SYSTEM "chrome://devtools/locale/layoutview.dtd"> %layoutviewDTD;
+ ]>
+ 
+ <window xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+         xmlns:html="http://www.w3.org/1999/xhtml">
+ 
+   <script type="application/javascript;version=1.8"
+           src="chrome://devtools/content/shared/theme-switching.js"/>
++
++  <!-- Popupset needed by `Menu` component. This should be removed
++    as soon as bug 1297412 is fixed. -->
++  <popupset />
++
+   <box flex="1" class="devtools-responsive-container theme-body">
+     <vbox flex="1" class="devtools-main-content">
+       <html:div id="inspector-toolbar"
+         class="devtools-toolbar"
+         nowindowdrag="true">
+         <html:button id="inspector-element-add-button"
+           title="&inspectorAddNode.label;"
+           class="devtools-button" />
+diff --git a/devtools/client/inspector/toolsidebar.js b/devtools/client/inspector/toolsidebar.js
+--- a/devtools/client/inspector/toolsidebar.js
++++ b/devtools/client/inspector/toolsidebar.js
+@@ -80,16 +80,17 @@ ToolSidebar.prototype = {
+ 
+   // Rendering
+ 
+   render: function () {
+     let Tabbar = this.React.createFactory(this.browserRequire(
+       "devtools/client/shared/components/tabs/tabbar"));
+ 
+     let sidebar = Tabbar({
++      showAllTabsMenu: true,
+       onSelect: this.handleSelectionChange.bind(this),
+     });
+ 
+     this._tabbar = this.ReactDOM.render(sidebar, this._tabbox);
+   },
+ 
+   addExistingTab: function (id, title, selected) {
+     this._tabbar.addTab(id, title, selected, this.InspectorTabPanel);
+diff --git a/devtools/client/shared/components/tabs/tabbar.css b/devtools/client/shared/components/tabs/tabbar.css
+--- a/devtools/client/shared/components/tabs/tabbar.css
++++ b/devtools/client/shared/components/tabs/tabbar.css
+@@ -29,18 +29,21 @@
+   height: 24px;
+ }
+ 
+ .tabs .tabs-menu-item a {
+   cursor: default;
+ }
+ 
+ /* The tab takes entire horizontal space and individual tabs
+-  should stretch accordingly. Use flexbox for the behavior. */
++  should stretch accordingly. Use flexbox for the behavior.
++  Use also `overflow: hidden` so, 'overflow' and 'underflow'
++  events are fired (it's utilized by the all-tabs-menu). */
+ .tabs .tabs-navigation .tabs-menu {
++  overflow: hidden;
+   display: flex;
+ }
+ 
+ .tabs .tabs-navigation .tabs-menu-item {
+   flex-grow: 1;
+ }
+ 
+ .tabs .tabs-navigation .tabs-menu-item a {
+diff --git a/devtools/client/shared/components/tabs/tabbar.js b/devtools/client/shared/components/tabs/tabbar.js
+--- a/devtools/client/shared/components/tabs/tabbar.js
++++ b/devtools/client/shared/components/tabs/tabbar.js
+@@ -2,29 +2,40 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const { DOM, createClass, PropTypes, createFactory } = require("devtools/client/shared/vendor/react");
++const { findDOMNode } = require("devtools/client/shared/vendor/react-dom");
+ const Tabs = createFactory(require("devtools/client/shared/components/tabs/tabs").Tabs);
+ 
++const Menu = require("devtools/client/framework/menu");
++const MenuItem = require("devtools/client/framework/menu-item");
++
+ // Shortcuts
+ const { div } = DOM;
+ 
+ /**
+  * Renders Tabbar component.
+  */
+ let Tabbar = createClass({
+   displayName: "Tabbar",
+ 
+   propTypes: {
+     onSelect: PropTypes.func,
++    showAllTabsMenu: PropTypes.bool,
++  },
++
++  getDefaultProps: function () {
++    return {
++      showAllTabsMenu: false,
++    };
+   },
+ 
+   getInitialState: function () {
+     return {
+       tabs: [],
+       activeTab: 0
+     };
+   },
+@@ -120,16 +131,45 @@ let Tabbar = createClass({
+       activeTab: index
+     });
+ 
+     if (this.props.onSelect) {
+       this.props.onSelect(this.state.tabs[index].id);
+     }
+   },
+ 
++  onAllTabsMenuClick: function (event) {
++    let menu = new Menu();
++    let target = event.target;
++
++    // Generate list of menu items from the list of tabs.
++    this.state.tabs.forEach(tab => {
++      menu.append(new MenuItem({
++        label: tab.title,
++        type: "checkbox",
++        checked: this.getCurrentTabId() == tab.id,
++        click: () => this.select(tab.id),
++      }));
++    });
++
++    // Show a drop down menu with frames.
++    // XXX Missing menu API for specifying target (anchor)
++    // and relative position to it. See also:
++    // https://developer.mozilla.org/en-US/docs/Mozilla/Tech/XUL/Method/openPopup
++    // https://bugzilla.mozilla.org/show_bug.cgi?id=1274551
++    let rect = target.getBoundingClientRect();
++    let screenX = target.ownerDocument.defaultView.mozInnerScreenX;
++    let screenY = target.ownerDocument.defaultView.mozInnerScreenY;
++    menu.popup(rect.left + screenX, rect.bottom + screenY, {
++      doc: target.ownerDocument
++    });
++
++    return menu;
++  },
++
+   // Rendering
+ 
+   renderTab: function (tab) {
+     if (typeof tab.panel === "function") {
+       return tab.panel({
+         key: tab.id,
+         title: tab.title,
+         id: tab.id,
+@@ -143,16 +183,18 @@ let Tabbar = createClass({
+   render: function () {
+     let tabs = this.state.tabs.map(tab => {
+       return this.renderTab(tab);
+     });
+ 
+     return (
+       div({className: "devtools-sidebar-tabs"},
+         Tabs({
++          onAllTabsMenuClick: this.onAllTabsMenuClick,
++          showAllTabsMenu: this.props.showAllTabsMenu,
+           tabActive: this.state.activeTab,
+           onAfterChange: this.onTabChanged},
+           tabs
+         )
+       )
+     );
+   },
+ });
+diff --git a/devtools/client/shared/components/tabs/tabs.css b/devtools/client/shared/components/tabs/tabs.css
+--- a/devtools/client/shared/components/tabs/tabs.css
++++ b/devtools/client/shared/components/tabs/tabs.css
+@@ -34,25 +34,47 @@
+ .tabs .panels {
+   height: calc(100% - 24px);
+ }
+ 
+ .tabs .tab-panel {
+   height: 100%;
+ }
+ 
++.tabs .all-tabs-menu  {
++  position: absolute;
++  top: 0;
++  right: 0;
++  width: 15px;
++  height: 100%;
++  border-style: solid;
++  border-width: 0;
++  border-inline-start-width: 1px;
++  border-color: var(--theme-splitter-color);
++  background: url("chrome://devtools/skin/images/dropmarker.svg");
++  background-repeat: no-repeat;
++  background-position: center;
++  background-color: var(--theme-tab-toolbar-background);
++}
++
++.tabs .all-tabs-menu:-moz-locale-dir(rtl) {
++  right: unset;
++  left: 0;
++}
++
+ /* Light Theme */
+ 
+ .theme-dark .tabs,
+ .theme-light .tabs {
+   background: var(--theme-body-background);
+ }
+ 
+ .theme-dark .tabs .tabs-navigation,
+ .theme-light .tabs .tabs-navigation {
++  position: relative;
+   border-bottom: 1px solid var(--theme-splitter-color);
+   background: var(--theme-tab-toolbar-background);
+ }
+ 
+ .theme-dark .tabs .tabs-menu-item,
+ .theme-light .tabs .tabs-menu-item {
+   margin: 0;
+   padding: 0;
+diff --git a/devtools/client/shared/components/tabs/tabs.js b/devtools/client/shared/components/tabs/tabs.js
+--- a/devtools/client/shared/components/tabs/tabs.js
++++ b/devtools/client/shared/components/tabs/tabs.js
+@@ -42,70 +42,108 @@ define(function (require, exports, modul
+       ]),
+       tabActive: React.PropTypes.number,
+       onMount: React.PropTypes.func,
+       onBeforeChange: React.PropTypes.func,
+       onAfterChange: React.PropTypes.func,
+       children: React.PropTypes.oneOfType([
+         React.PropTypes.array,
+         React.PropTypes.element
+-      ]).isRequired
++      ]).isRequired,
++      showAllTabsMenu: React.PropTypes.bool,
++      onAllTabsMenuClick: React.PropTypes.func,
+     },
+ 
+     getDefaultProps: function () {
+       return {
+-        tabActive: 0
++        tabActive: 0,
++        showAllTabsMenu: false,
+       };
+     },
+ 
+     getInitialState: function () {
+       return {
+         tabActive: this.props.tabActive,
+ 
+         // This array is used to store an information whether a tab
+         // at specific index has already been created (e.g. selected
+         // at least once).
+         // If yes, it's rendered even if not currently selected.
+         // This is because in some cases we don't want to re-create
+         // tab content when it's being unselected/selected.
+         // E.g. in case of an iframe being used as a tab-content
+         // we want the iframe to stay in the DOM.
+         created: [],
++
++        // True if tabs can't fit into available horizontal space.
++        overflow: false,
+       };
+     },
+ 
+     componentDidMount: function () {
+       let node = findDOMNode(this);
+       node.addEventListener("keydown", this.onKeyDown, false);
+ 
++      // Register overflow listeners to manage visibility
++      // of all-tabs-menu. This menu is displayed when there
++      // is not enough h-space to render all tabs.
++      // It allows the user to select a tab even if it's hidden.
++      if (this.props.showAllTabsMenu) {
++        node.addEventListener("overflow", this.onOverflow, false);
++        node.addEventListener("underflow", this.onUnderflow, false);
++      }
++
+       let index = this.state.tabActive;
+       if (this.props.onMount) {
+         this.props.onMount(index);
+       }
+     },
+ 
+     componentWillReceiveProps: function (newProps) {
+-      if (newProps.tabActive) {
++      // Check type of 'tabActive' props to see if it's valid
++      // (it's 0-based index).
++      if (typeof newProps.tabActive == "number") {
+         let created = [...this.state.created];
+         created[newProps.tabActive] = true;
+ 
+         this.setState(Object.assign({}, this.state, {
+           tabActive: newProps.tabActive,
+           created: created,
+         }));
+       }
+     },
+ 
+     componentWillUnmount: function () {
+       let node = findDOMNode(this);
+       node.removeEventListener("keydown", this.onKeyDown, false);
++
++      if (this.props.showAllTabsMenu) {
++        node.removeEventListener("overflow", this.onOverflow, false);
++        node.removeEventListener("underflow", this.onUnderflow, false);
++      }
+     },
+ 
+     // DOM Events
+ 
++    onOverflow: function (event) {
++      if (event.target.classList.contains("tabs-menu")) {
++        this.setState({
++          overflow: true
++        });
++      }
++    },
++
++    onUnderflow: function (event) {
++      if (event.target.classList.contains("tabs-menu")) {
++        this.setState({
++          overflow: false
++        });
++      }
++    },
++
+     onKeyDown: function (event) {
+       // Bail out if the focus isn't on a tab.
+       if (!event.target.closest(".tabs-menu-item")) {
+         return;
+       }
+ 
+       let tabActive = this.state.tabActive;
+       let tabCount = this.props.children.length;
+@@ -124,16 +162,22 @@ define(function (require, exports, modul
+       }
+     },
+ 
+     onClickTab: function (index, event) {
+       this.setActive(index);
+       event.preventDefault();
+     },
+ 
++    onAllTabsMenuClick: function (event) {
++      if (this.props.onAllTabsMenuClick) {
++        this.props.onAllTabsMenuClick(event);
++      }
++    },
++
+     // API
+ 
+     setActive: function (index) {
+       let onAfterChange = this.props.onAfterChange;
+       let onBeforeChange = this.props.onBeforeChange;
+ 
+       if (onBeforeChange) {
+         let cancel = onBeforeChange(index);
+@@ -213,21 +257,31 @@ define(function (require, exports, modul
+                 onClick: this.onClickTab.bind(this, index),
+               },
+                 title
+               )
+             )
+           );
+         });
+ 
++      // Display the menu only if there is not enough horizontal
++      // space for all tabs (and overflow happened).
++      let allTabsMenu = this.state.overflow ? (
++        DOM.div({
++          className: "all-tabs-menu",
++          onClick: this.props.onAllTabsMenuClick
++        })
++      ) : null;
++
+       return (
+         DOM.nav({className: "tabs-navigation"},
+           DOM.ul({className: "tabs-menu", role: "tablist"},
+             tabs
+-          )
++          ),
++          allTabsMenu
+         )
+       );
+     },
+ 
+     renderPanels: function () {
+       if (!this.props.children) {
+         throw new Error("There must be at least one Tab");
+       }
