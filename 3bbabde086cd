@@ -3,16 +3,22 @@
 # User Tom Tromey <tom@tromey.com>
 # Date 1470761578 21600
 # Node ID 3bbabde086cda686858282c036a8f5dafe125542
-# Parent  bdf79acb0726bf6e46453d3c94ad1df63a53b3ee
+# Parent  041a925171e431bf51fb50193ab19d156088c89a
 Bug 1291049 - Attempt to bundle the inspector with webpack
 
 MozReview-Commit-ID: Lk5pRrDCLV4
-
+* * *
+Bug 1291049 - Some more work towards bundling the inspector
 
 diff --git a/.hgignore b/.hgignore
 --- a/.hgignore
 +++ b/.hgignore
-@@ -75,6 +75,8 @@
+@@ -70,16 +70,18 @@
+ ^python/psutil/.*\.so
+ ^python/psutil/.*\.pyd
+ ^python/psutil/build/
+ 
+ # Git repositories
  .git/
  
  # Ignore chrome.manifest files from the devtools loader
@@ -21,10 +27,61 @@ diff --git a/.hgignore b/.hgignore
  ^devtools/client/chrome.manifest$
  ^devtools/shared/chrome.manifest$
  
+ # Ignore node_modules directories in devtools
+ ^devtools/client/.*/node_modules/
+ 
+ # git checkout of libstagefright
+ ^media/libstagefright/android$
+diff --git a/addon-sdk/source/lib/sdk/util/object.js b/addon-sdk/source/lib/sdk/util/object.js
+--- a/addon-sdk/source/lib/sdk/util/object.js
++++ b/addon-sdk/source/lib/sdk/util/object.js
+@@ -29,17 +29,17 @@ const { flatten } = require('./array');
+  *    b.name    // 'b'
+  */
+ function merge(source) {
+   let descriptor = {};
+ 
+   // `Boolean` converts the first parameter to a boolean value. Any object is
+   // converted to `true` where `null` and `undefined` becames `false`. Therefore
+   // the `filter` method will keep only objects that are defined and not null.
+-  Array.slice(arguments, 1).filter(Boolean).forEach(function onEach(properties) {
++  [].slice.call(arguments, 1).filter(Boolean).forEach(function onEach(properties) {
+     getOwnPropertyIdentifiers(properties).forEach(function(name) {
+       descriptor[name] = Object.getOwnPropertyDescriptor(properties, name);
+     });
+   });
+   return Object.defineProperties(source, descriptor);
+ }
+ exports.merge = merge;
+ 
+@@ -67,17 +67,17 @@ function each(obj, fn) {
+ exports.each = each;
+ 
+ /**
+  * Like `merge`, except no property descriptors are manipulated, for use
+  * with platform objects. Identical to underscore's `extend`. Useful for
+  * merging XPCOM objects
+  */
+ function safeMerge(source) {
+-  Array.slice(arguments, 1).forEach(function onEach (obj) {
++  [].slice.call(arguments, 1).forEach(function onEach (obj) {
+     for (let prop in obj) source[prop] = obj[prop];
+   });
+   return source;
+ }
+ exports.safeMerge = safeMerge;
+ 
+ /*
+  * Returns a copy of the object without omitted properties
 diff --git a/addon-sdk/source/lib/toolkit/loader.js b/addon-sdk/source/lib/toolkit/loader.js
 --- a/addon-sdk/source/lib/toolkit/loader.js
 +++ b/addon-sdk/source/lib/toolkit/loader.js
-@@ -770,6 +770,12 @@
+@@ -765,16 +765,22 @@ const Require = iced(function Require(lo
+   }
+ 
+   // Expose the `resolve` function for this `Require` instance
+   require.resolve = _require.resolve = function resolve(id) {
+     let { uri } = getRequirements(id);
      return uri;
    }
  
@@ -37,6 +94,11 @@ diff --git a/addon-sdk/source/lib/toolkit/loader.js b/addon-sdk/source/lib/toolk
    // Make `require.main === module` evaluate to true in main module scope.
    require.main = loader.main === requirer ? requirer : undefined;
    return iced(require);
+ });
+ Loader.Require = Require;
+ 
+ const main = iced(function main(loader, id) {
+   // If no main entry provided, and native loader is used,
 diff --git a/devtools/client/.babelrc b/devtools/client/.babelrc
 new file mode 100644
 --- /dev/null
@@ -47,7 +109,120 @@ new file mode 100644
 diff --git a/devtools/client/inspector/inspector-panel.js b/devtools/client/inspector/inspector-panel.js
 --- a/devtools/client/inspector/inspector-panel.js
 +++ b/devtools/client/inspector/inspector-panel.js
-@@ -602,13 +602,13 @@
+@@ -30,16 +30,20 @@ const {RuleViewTool} = require("devtools
+ const {ToolSidebar} = require("devtools/client/inspector/toolsidebar");
+ const {ViewHelpers} = require("devtools/client/shared/widgets/view-helpers");
+ const clipboardHelper = require("devtools/shared/platform/clipboard");
+ 
+ const {LocalizationHelper} = require("devtools/shared/l10n");
+ const INSPECTOR_L10N = new LocalizationHelper("devtools/locale/inspector.properties");
+ const TOOLBOX_L10N = new LocalizationHelper("devtools/locale/toolbox.properties");
+ 
++const { Selection } = require("devtools/client/framework/selection");
++const { InspectorFront } = require("devtools/shared/fronts/inspector");
++const { getHighlighterUtils } = require("devtools/client/framework/toolbox-highlighter-utils");
++
+ /**
+  * Represents an open instance of the Inspector for a tab.
+  * The inspector controls the breadcrumbs, the markup view, and the sidebar
+  * (computed view, rule view, font view and layout view).
+  *
+  * Events:
+  * - ready
+  *      Fired when the inspector panel is opened for the first time and ready to
+@@ -105,36 +109,45 @@ exports.InspectorPanel = InspectorPanel;
+ 
+ InspectorPanel.prototype = {
+   /**
+    * open is effectively an asynchronous constructor
+    */
+   open: Task.async(function* () {
+     this._cssPropertiesLoaded = initCssProperties(this.toolbox);
+     yield this._cssPropertiesLoaded;
++
++    this._inspector = InspectorFront(this._target.client, this._target.form);
++    this._walker = yield this.inspector.getWalker(
++      {showAllAnonymousContent: Services.prefs.getBoolPref("devtools.inspector.showAllAnonymousContent")}
++    );
++    console.log("Walker", this.walker, this.walker.on);
++    this._selection = new Selection(this.walker);
++    this._highlighter = yield this.inspector.getHighlighter(false);
++
+     yield this.target.makeRemote();
+     yield this._getPageStyle();
+     let defaultSelection = yield this._getDefaultNodeForSelection();
+     return yield this._deferredOpen(defaultSelection);
+   }),
+ 
+   get toolbox() {
+     return this._toolbox;
+   },
+ 
+   get inspector() {
+-    return this._toolbox.inspector;
++    return this._inspector;
+   },
+ 
+   get walker() {
+-    return this._toolbox.walker;
++    return this._walker;
+   },
+ 
+   get selection() {
+-    return this._toolbox.selection;
++    return this._selection;
+   },
+ 
+   get isOuterHTMLEditable() {
+     return this._target.client.traits.editOuterHTML;
+   },
+ 
+   get hasUrlToImageDataResolver() {
+     return this._target.client.traits.urlToImageDataResolver;
+@@ -256,17 +269,17 @@ InspectorPanel.prototype = {
+     this._defaultNode = null;
+     this.selection.setNodeFront(null);
+     this._destroyMarkup();
+     this.isDirty = false;
+     this._pendingSelection = null;
+   },
+ 
+   _getPageStyle: function () {
+-    return this._toolbox.inspector.getPageStyle().then(pageStyle => {
++    return this.inspector.getPageStyle().then(pageStyle => {
+       this.pageStyle = pageStyle;
+     }, this._handleRejectionIfNotDestroyed);
+   },
+ 
+   /**
+    * Return a promise that will resolve to the default node for selection.
+    */
+   _getDefaultNodeForSelection: function () {
+@@ -504,17 +517,17 @@ InspectorPanel.prototype = {
+         sidePaneContainer.height);
+     });
+   },
+ 
+   setupToolbar: function () {
+     this.teardownToolbar();
+ 
+     // Setup the sidebar toggle button.
+-    let SidebarToggle = this.React.createFactory(this.browserRequire(
++    let SidebarToggle = this.React.createFactory(require(
+       "devtools/client/shared/components/sidebar-toggle"));
+ 
+     let sidebarToggle = SidebarToggle({
+       onClick: this.onPaneToggleButtonClicked,
+       collapsed: false,
+       expandPaneTitle: INSPECTOR_L10N.getStr("inspector.expandPane"),
+       collapsePaneTitle: INSPECTOR_L10N.getStr("inspector.collapsePane"),
+     });
+@@ -597,23 +610,23 @@ InspectorPanel.prototype = {
+ 
+   _selectionCssSelector: null,
+ 
+   /**
+    * Set the currently selected node unique css selector.
     * Will store the current target url along with it to allow pre-selection at
     * reload
     */
@@ -63,6 +238,37 @@ diff --git a/devtools/client/inspector/inspector-panel.js b/devtools/client/insp
        url: this._target.url
      };
    },
+ 
+   /**
+    * Get the current selection unique css selector if any, that is, if a node
+    * is actually selected and that node has been selected while on the same url
+    */
+@@ -1194,22 +1207,22 @@ InspectorPanel.prototype = {
+     this._markupBox = doc.getElementById("markup-box");
+ 
+     // create tool iframe
+     this._markupFrame = doc.createElement("iframe");
+     this._markupFrame.setAttribute("flex", "1");
+     this._markupFrame.setAttribute("tooltip", "aHTMLTooltip");
+     this._markupFrame.addEventListener("contextmenu", this._onContextMenu, true);
+ 
+-    // This is needed to enable tooltips inside the iframe document.
+-    this._markupFrame.addEventListener("load", this._onMarkupFrameLoad, true);
+ 
+     this._markupBox.setAttribute("collapsed", true);
+     this._markupBox.appendChild(this._markupFrame);
+-    this._markupFrame.setAttribute("src", "chrome://devtools/content/inspector/markup/markup.xhtml");
++    this._markupFrame.setAttribute("src", "markup.xhtml");
++    // This is needed to enable tooltips inside the iframe document.
++    this._markupFrame.addEventListener("load", this._onMarkupFrameLoad, true);
+     this._markupFrame.setAttribute("aria-label",
+       INSPECTOR_L10N.getStr("inspector.panelLabel.markupView"));
+   },
+ 
+   _onMarkupFrameLoad: function () {
+     this._markupFrame.removeEventListener("load", this._onMarkupFrameLoad, true);
+ 
+     this._markupFrame.contentWindow.focus();
 diff --git a/devtools/client/inspector/inspector.xhtml b/devtools/client/inspector/inspector.xhtml
 new file mode 100644
 --- /dev/null
@@ -84,6 +290,38 @@ new file mode 100644
 +</body>
 +</html>
 \ No newline at end of file
+diff --git a/devtools/client/inspector/toolsidebar.js b/devtools/client/inspector/toolsidebar.js
+--- a/devtools/client/inspector/toolsidebar.js
++++ b/devtools/client/inspector/toolsidebar.js
+@@ -63,26 +63,26 @@ ToolSidebar.prototype = {
+ 
+   get browserRequire() {
+     return this._toolPanel.browserRequire;
+   },
+ 
+   get InspectorTabPanel() {
+     if (!this._InspectorTabPanel) {
+       this._InspectorTabPanel =
+-        this.React.createFactory(this.browserRequire(
++        this.React.createFactory(require(
+         "devtools/client/inspector/components/inspector-tab-panel"));
+     }
+     return this._InspectorTabPanel;
+   },
+ 
+   // Rendering
+ 
+   render: function () {
+-    let Tabbar = this.React.createFactory(this.browserRequire(
++    let Tabbar = this.React.createFactory(require(
+       "devtools/client/shared/components/tabs/tabbar"));
+ 
+     let sidebar = Tabbar({
+       toolbox: this._toolPanel._toolbox,
+       showAllTabsMenu: true,
+       onSelect: this.handleSelectionChange.bind(this),
+     });
+ 
 diff --git a/devtools/client/package.json b/devtools/client/package.json
 new file mode 100644
 --- /dev/null
@@ -110,11 +348,44 @@ new file mode 100644
 +    "webpack": "^1.13.1"
 +  }
 +}
+diff --git a/devtools/client/shared/undo.js b/devtools/client/shared/undo.js
+--- a/devtools/client/shared/undo.js
++++ b/devtools/client/shared/undo.js
+@@ -149,27 +149,27 @@ UndoStack.prototype = {
+    * ViewController implementation for undo/redo.
+    */
+ 
+   /**
+    * Install this object as a command controller.
+    */
+   installController: function (controllerWindow) {
+     this._controllerWindow = controllerWindow;
+-    controllerWindow.controllers.appendController(this);
++    // controllerWindow.controllers.appendController(this);
+   },
+ 
+   /**
+    * Uninstall this object from the command controller.
+    */
+   uninstallController: function () {
+     if (!this._controllerWindow) {
+       return;
+     }
+-    this._controllerWindow.controllers.removeController(this);
++    // this._controllerWindow.controllers.removeController(this);
+   },
+ 
+   supportsCommand: function (command) {
+     return (command == "cmd_undo" ||
+             command == "cmd_redo");
+   },
+ 
+   isCommandEnabled: function (command) {
 diff --git a/devtools/client/webpack.config.js b/devtools/client/webpack.config.js
 new file mode 100644
 --- /dev/null
 +++ b/devtools/client/webpack.config.js
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,120 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -140,6 +411,7 @@ new file mode 100644
 +  entry: './inspector/inspector-panel.js',
 +  output: {
 +    filename: './inspector/inspector.bundle.js',
++    library: 'Inspector',
 +  },
 +  module: {
 +    // Disable handling of unknown requires
@@ -189,6 +461,7 @@ new file mode 100644
 +    new webpack.DefinePlugin({
 +      "isWorker": JSON.stringify(false),
 +      "reportError": "console.error",
++      "AppConstants": "{ DEBUG: true, DEBUG_JS_MODULES: true }",
 +      "loader": "{ lazyRequireGetter: () => {} }",
 +      "dump": "console.log",
 +    }),
@@ -196,12 +469,26 @@ new file mode 100644
 +
 +  externals: [
 +    /codemirror\//,
-+    /server\//,
 +    {
 +      "promise": "var Promise",
++      "devtools/server/main": "{}",
 +
 +      // Just trying to get build to work.  These should be removed eventually:
 +      "chrome": "{}",
++
++      // In case you end up in chrome-land you can use this to help track down issues.
++      // SDK for instance does a bunch of this so if you somehow end up importing an SDK
++      // dependency this might help for debugging:
++      // "chrome": `{
++      //   Cc: {
++      //     '@mozilla.org/uuid-generator;1': { getService: () => { return {} } },
++      //     '@mozilla.org/observer-service;1': { getService: () => { return {} } },
++      //   },
++      //   Ci: {},
++      //   Cr: {},
++      //   Cm: {},
++      //   components: { classesByID: () => {} , ID: () => {} }
++      // }`,
 +
 +      "resource://gre/modules/XPCOMUtils.jsm": "{}",
 +      "resource://devtools/client/styleeditor/StyleEditorUI.jsm": "{}",
@@ -303,10 +590,38 @@ new file mode 100644
 +  }
 +  return newLines.join("\n");
 +};
+diff --git a/devtools/shared/DevToolsUtils.js b/devtools/shared/DevToolsUtils.js
+--- a/devtools/shared/DevToolsUtils.js
++++ b/devtools/shared/DevToolsUtils.js
+@@ -21,17 +21,18 @@ const ThreadSafeDevToolsUtils = require(
+ for (let key of Object.keys(ThreadSafeDevToolsUtils)) {
+   exports[key] = ThreadSafeDevToolsUtils[key];
+ }
+ 
+ /**
+  * Waits for the next tick in the event loop to execute a callback.
+  */
+ exports.executeSoon = function executeSoon(aFn) {
+-  if (isWorker) {
++  // XXX: Move setImmmediate chrome implementation to loader
++  if (typeof setImmediate !== "undefined") {
+     setImmediate(aFn);
+   } else {
+     let executor;
+     // Only enable async stack reporting when DEBUG_JS_MODULES is set
+     // (customized local builds) to avoid a performance penalty.
+     if (AppConstants.DEBUG_JS_MODULES || flags.testing) {
+       let stack = getStack();
+       executor = () => {
 diff --git a/devtools/shared/l10n.js b/devtools/shared/l10n.js
 --- a/devtools/shared/l10n.js
 +++ b/devtools/shared/l10n.js
-@@ -8,6 +8,17 @@
+@@ -3,27 +3,54 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ "use strict";
+ 
+ const parsePropertiesFile = require("devtools/shared/node-properties/node-properties");
+ const { sprintf } = require("devtools/shared/sprintfjs/sprintf");
  
  const propertiesMap = {};
  
@@ -324,7 +639,10 @@ diff --git a/devtools/shared/l10n.js b/devtools/shared/l10n.js
  /**
   * Memoized getter for properties files that ensures a given url is only required and
   * parsed once.
-@@ -18,7 +29,23 @@
+  *
+  * @param {String} url
+  *        The URL of the properties file to parse.
+  * @return {Object} parsed properties mapped in an object.
   */
  function getProperties(url) {
    if (!propertiesMap[url]) {
@@ -349,4 +667,46 @@ diff --git a/devtools/shared/l10n.js b/devtools/shared/l10n.js
    }
  
    return propertiesMap[url];
-
+ }
+ 
+ /**
+  * Localization convenience methods.
+  *
+diff --git a/devtools/shared/layout/utils.js b/devtools/shared/layout/utils.js
+--- a/devtools/shared/layout/utils.js
++++ b/devtools/shared/layout/utils.js
+@@ -1,32 +1,29 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const { Ci, Cc } = require("chrome");
+-const { memoize } = require("sdk/lang/functional");
+ const nodeFilterConstants = require("devtools/shared/dom-node-filter-constants");
+ 
+ loader.lazyRequireGetter(this, "setIgnoreLayoutChanges", "devtools/server/actors/layout", true);
+ exports.setIgnoreLayoutChanges = (...args) =>
+   this.setIgnoreLayoutChanges(...args);
+ 
+ /**
+  * Returns the `DOMWindowUtils` for the window given.
+  *
+  * @param {DOMWindow} win
+  * @returns {DOMWindowUtils}
+  */
+-const utilsFor = memoize(
+-  win => win.QueryInterface(Ci.nsIInterfaceRequestor)
+-            .getInterface(Ci.nsIDOMWindowUtils)
+-);
++const utilsFor = win => win.QueryInterface(Ci.nsIInterfaceRequestor)
++                           .getInterface(Ci.nsIDOMWindowUtils);
+ 
+ /**
+  * like win.top, but goes through mozbrowsers and mozapps iframes.
+  *
+  * @param {DOMWindow} win
+  * @return {DOMWindow}
+  */
+ function getTopWindow(win) {
