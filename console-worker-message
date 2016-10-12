@@ -1,12 +1,12 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  016e0f47e8ad66ba6eb11fe28958e3a69ef9e53d
+# Parent  efa3b654aa77bcb9b3dd7fc5a52efb6b5afc34d6
 Bug 1259603 - Use ConsoleEvents for cached messages and observing messages when webconsole actor is running
 
 diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconsole/webconsole.js
 --- a/devtools/client/webconsole/webconsole.js
 +++ b/devtools/client/webconsole/webconsole.js
-@@ -3157,28 +3157,24 @@ WebConsoleConnectionProxy.prototype = {
+@@ -3174,28 +3174,24 @@ WebConsoleConnectionProxy.prototype = {
        this._connectTimer.cancel();
        this._connectTimer = null;
      }, () => {
@@ -43,10 +43,121 @@ diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconso
        let tab = this.target.form;
        this.webConsoleFrame.onLocationChange(tab.url, tab.title);
      }
+diff --git a/devtools/server/actors/utils/webconsole-worker-utils.js b/devtools/server/actors/utils/webconsole-worker-utils.js
+--- a/devtools/server/actors/utils/webconsole-worker-utils.js
++++ b/devtools/server/actors/utils/webconsole-worker-utils.js
+@@ -7,14 +7,102 @@
+ "use strict";
+ 
+ // XXXworkers This file is loaded on the server side for worker debugging.
+ // Since the server is running in the worker thread, it doesn't
+ // have access to Services / Components.  This functionality
+ // is stubbed out to prevent errors, and will need to implemented
+ // for Bug 1209353.
+ 
+-exports.Utils = { L10n: function () {} };
+-exports.ConsoleServiceListener = function () {};
+-exports.ConsoleAPIListener = function () {};
++const CONSOLE_WORKER_IDS = exports.CONSOLE_WORKER_IDS = [];
++
++// XXX: Share utils in a single file between worker and non and have custom
++// files for listeners
++exports.Utils = {
++  L10n: function () {},
++  cloneObject: function(object, recursive, filter) {
++    if (typeof object != "object") {
++      return object;
++    }
++
++    let temp;
++
++    if (Array.isArray(object)) {
++      temp = [];
++      Array.forEach(object, function(value, index) {
++        if (!filter || filter(index, value, object)) {
++          temp.push(recursive ? WebConsoleUtils.cloneObject(value) : value);
++        }
++      });
++    } else {
++      temp = {};
++      for (let key in object) {
++        let value = object[key];
++        if (object.hasOwnProperty(key) &&
++            (!filter || filter(key, value, object))) {
++          temp[key] = recursive ? WebConsoleUtils.cloneObject(value) : value;
++        }
++      }
++    }
++
++    return temp;
++  },
++  getWorkerType: function(message) {
++    let id = message ? message.innerID : null;
++    return CONSOLE_WORKER_IDS[CONSOLE_WORKER_IDS.indexOf(id)] || null;
++  },
++ };
++
++function ConsoleServiceListener(window, listener) {
++  this.window = window;
++  this.listener = listener;
++}
++ConsoleServiceListener.prototype =
++{
++  init: function () {
++    dump("\n\n\nConsoleServiceListener.init\n\n\n");
++  },
++  destroy: function() {
++    dump("\n\n\nConsoleServiceListener.destroy\n\n\n");
++  },
++  observe: function(message) {
++    dump("\n\n\nConsoleServiceListener.observe\n\n\n");
++  },
++  getCachedMessages: function() {
++    dump("\n\n\nConsoleServiceListener.getCachedMessages\n\n\n");
++    return [];
++  }
++};
++
++function ConsoleAPIListener(window, owner, consoleID) {
++  this.window = window;
++  this.owner = owner;
++  this.consoleID = consoleID;
++}
++
++ConsoleAPIListener.prototype =
++{
++  init: function () {
++    dump("\n\n\nConsoleAPIListener.init\n\n\n");
++    this.observe = this.observe.bind(this);
++    setConsoleEventHandler(this.observe);
++  },
++  destroy: function () {
++    dump("\n\n\nConsoleAPIListener.destroy\n\n\n");
++    // XXX: How do we clear out the console event handler?
++    setConsoleEventHandler(() => {})
++    // setConsoleEventHandler(null);
++  },
++  observe: function(message) {
++    dump("\n\n\nConsoleAPIListener.observe\n\n\n");
++    this.owner.onConsoleAPICall(message.wrappedJSObject);
++  },
++  getCachedMessages: function() {
++    dump("\n\n\nConsoleAPIListener.getCachedMessages\n\n\n");
++    return retrieveConsoleEvents();
++  }
++};
++
++exports.ConsoleAPIListener = ConsoleAPIListener;
++exports.ConsoleServiceListener = ConsoleServiceListener;
++
+ exports.addWebConsoleCommands = function () {};
+-exports.ConsoleReflowListener = function () {};
+-exports.CONSOLE_WORKER_IDS = [];
++exports.ConsoleReflowListener = function() {};
 diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webconsole.js
 --- a/devtools/server/actors/webconsole.js
 +++ b/devtools/server/actors/webconsole.js
-@@ -558,21 +558,16 @@ WebConsoleActor.prototype =
+@@ -560,21 +560,16 @@ WebConsoleActor.prototype =
     *
     * @param object aRequest
     *        The JSON request object received from the Web Console client.
@@ -68,10 +179,10 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
      if (this._parentIsContentActor) {
        appId = this.parentActor.docShell.appId;
        messageManager = this.parentActor.messageManager;
-@@ -593,16 +588,20 @@ WebConsoleActor.prototype =
-           if (!this.consoleAPIListener) {
+@@ -598,16 +593,20 @@ WebConsoleActor.prototype =
              this.consoleAPIListener =
-               new ConsoleAPIListener(window, this);
+               new ConsoleAPIListener(window, this,
+                                      this.parentActor.consoleAPIListenerOptions);
              this.consoleAPIListener.init();
            }
            startedListeners.push(listener);
@@ -88,8 +199,8 @@ diff --git a/devtools/server/actors/webconsole.js b/devtools/server/actors/webco
              this.stackTraceCollector = new StackTraceCollector({ window, appId });
              this.stackTraceCollector.init();
  
-             if (appId || messageManager) {
-@@ -618,34 +617,46 @@ WebConsoleActor.prototype =
+             let processBoundary = Services.appinfo.processType !=
+@@ -625,34 +624,46 @@ WebConsoleActor.prototype =
              } else {
                this.networkMonitor = new NetworkMonitor({ window }, this);
                this.networkMonitor.init();
@@ -193,14 +304,14 @@ diff --git a/devtools/shared/webconsole/test/common.js b/devtools/shared/webcons
 -            let workerName = "console-test-worker.js#" + new Date().getTime();
 +            let workerName = top.worker2 = "console-test-worker.js#" + new Date().getTime();
              var worker = new Worker(workerName);
+             // Keep a strong reference to the Worker to avoid it being
+             // GCd during the test (bug 1237492).
+             aState._worker_ref = worker;
              worker.addEventListener("message", function listener() {
                worker.removeEventListener("message", listener);
                tabClient.listWorkers(function (response) {
                  let worker = response.workers.filter(w => w.url == workerName)[0];
-                 if (!worker) {
-                   console.error("listWorkers failed. Unable to find the " +
-                                 "worker actor\n");
-@@ -109,16 +109,17 @@ function _attachConsole(aListeners, aCal
+@@ -112,16 +112,17 @@ function _attachConsole(aListeners, aCal
                  tabClient.attachWorker(worker.actor, function (response, workerClient) {
                    if (!workerClient || response.error) {
                      console.error("attachWorker failed. No worker client or " +
@@ -340,121 +451,10 @@ new file mode 100644
 +</script>
 +</body>
 +</html>
-diff --git a/devtools/shared/webconsole/worker-utils.js b/devtools/shared/webconsole/worker-utils.js
---- a/devtools/shared/webconsole/worker-utils.js
-+++ b/devtools/shared/webconsole/worker-utils.js
-@@ -7,14 +7,102 @@
- "use strict";
- 
- // XXXworkers This file is loaded on the server side for worker debugging.
- // Since the server is running in the worker thread, it doesn't
- // have access to Services / Components.  This functionality
- // is stubbed out to prevent errors, and will need to implemented
- // for Bug 1209353.
- 
--exports.Utils = { L10n: function () {} };
--exports.ConsoleServiceListener = function () {};
--exports.ConsoleAPIListener = function () {};
-+const CONSOLE_WORKER_IDS = exports.CONSOLE_WORKER_IDS = [];
-+
-+// XXX: Share utils in a single file between worker and non and have custom
-+// files for listeners
-+exports.Utils = {
-+  L10n: function () {},
-+  cloneObject: function(object, recursive, filter) {
-+    if (typeof object != "object") {
-+      return object;
-+    }
-+
-+    let temp;
-+
-+    if (Array.isArray(object)) {
-+      temp = [];
-+      Array.forEach(object, function(value, index) {
-+        if (!filter || filter(index, value, object)) {
-+          temp.push(recursive ? WebConsoleUtils.cloneObject(value) : value);
-+        }
-+      });
-+    } else {
-+      temp = {};
-+      for (let key in object) {
-+        let value = object[key];
-+        if (object.hasOwnProperty(key) &&
-+            (!filter || filter(key, value, object))) {
-+          temp[key] = recursive ? WebConsoleUtils.cloneObject(value) : value;
-+        }
-+      }
-+    }
-+
-+    return temp;
-+  },
-+  getWorkerType: function(message) {
-+    let id = message ? message.innerID : null;
-+    return CONSOLE_WORKER_IDS[CONSOLE_WORKER_IDS.indexOf(id)] || null;
-+  },
-+ };
-+
-+function ConsoleServiceListener(window, listener) {
-+  this.window = window;
-+  this.listener = listener;
-+}
-+ConsoleServiceListener.prototype =
-+{
-+  init: function () {
-+    dump("\n\n\nConsoleServiceListener.init\n\n\n");
-+  },
-+  destroy: function() {
-+    dump("\n\n\nConsoleServiceListener.destroy\n\n\n");
-+  },
-+  observe: function(message) {
-+    dump("\n\n\nConsoleServiceListener.observe\n\n\n");
-+  },
-+  getCachedMessages: function() {
-+    dump("\n\n\nConsoleServiceListener.getCachedMessages\n\n\n");
-+    return [];
-+  }
-+};
-+
-+function ConsoleAPIListener(window, owner, consoleID) {
-+  this.window = window;
-+  this.owner = owner;
-+  this.consoleID = consoleID;
-+}
-+
-+ConsoleAPIListener.prototype =
-+{
-+  init: function () {
-+    dump("\n\n\nConsoleAPIListener.init\n\n\n");
-+    this.observe = this.observe.bind(this);
-+    setConsoleEventHandler(this.observe);
-+  },
-+  destroy: function () {
-+    dump("\n\n\nConsoleAPIListener.destroy\n\n\n");
-+    // XXX: How do we clear out the console event handler?
-+    setConsoleEventHandler(() => {})
-+    // setConsoleEventHandler(null);
-+  },
-+  observe: function(message) {
-+    dump("\n\n\nConsoleAPIListener.observe\n\n\n");
-+    this.owner.onConsoleAPICall(message.wrappedJSObject);
-+  },
-+  getCachedMessages: function() {
-+    dump("\n\n\nConsoleAPIListener.getCachedMessages\n\n\n");
-+    return retrieveConsoleEvents();
-+  }
-+};
-+
-+exports.ConsoleAPIListener = ConsoleAPIListener;
-+exports.ConsoleServiceListener = ConsoleServiceListener;
-+
- exports.addWebConsoleCommands = function () {};
--exports.ConsoleReflowListener = function () {};
--exports.CONSOLE_WORKER_IDS = [];
-+exports.ConsoleReflowListener = function() {};
 diff --git a/devtools/shared/worker/loader.js b/devtools/shared/worker/loader.js
 --- a/devtools/shared/worker/loader.js
 +++ b/devtools/shared/worker/loader.js
-@@ -368,17 +368,17 @@ var {
+@@ -362,17 +362,17 @@ var {
    Debugger,
    URL,
    createSandbox,
@@ -473,7 +473,7 @@ diff --git a/devtools/shared/worker/loader.js b/devtools/shared/worker/loader.js
        manager: Cm,
        interfaces: Ci,
        results: Cr,
-@@ -485,18 +485,20 @@ var {
+@@ -479,18 +479,20 @@ var {
  this.worker = new WorkerDebuggerLoader({
    createSandbox: createSandbox,
    globals: {
@@ -491,7 +491,7 @@ diff --git a/devtools/shared/worker/loader.js b/devtools/shared/worker/loader.js
    loadSubScript: loadSubScript,
    modules: {
      "Debugger": Debugger,
-     "PromiseDebugging": PromiseDebugging,
      "Services": Object.create(null),
      "chrome": chrome,
      "xpcInspector": xpcInspector
+   },
