@@ -1,0 +1,663 @@
+
+# HG changeset patch
+# User Julian Descottes <jdescottes@mozilla.com>
+# Date 1476869773 -7200
+# Node ID efa538f891f386ddf3eafcbc8a5b804b9ced9e0a
+# Parent  c94d4465bbdd76bb370fb7c06d3acdcc3684d672
+Bug 1291049 - Attempt to bundle the inspector using webpack
+
+MozReview-Commit-ID: IcZ2hNt0TVa
+
+diff --git a/.eslintignore b/.eslintignore
+--- a/.eslintignore
++++ b/.eslintignore
+@@ -169,6 +169,10 @@
+ devtools/client/webide/webide-prefs.js
+ devtools/client/preferences/**
+ 
++# Ignore inspector webpack bundle and html dev server dependencies
++devtools/client/inspector/inspector.bundle.js
++devtools/client/inspector/inspector-html-server/**
++
+ # Ignore devtools third-party libs
+ devtools/shared/jsbeautify/*
+ devtools/shared/acorn/*
+diff --git a/addon-sdk/source/lib/sdk/util/object.js b/addon-sdk/source/lib/sdk/util/object.js
+--- a/addon-sdk/source/lib/sdk/util/object.js
++++ b/addon-sdk/source/lib/sdk/util/object.js
+@@ -34,7 +34,7 @@
+   // `Boolean` converts the first parameter to a boolean value. Any object is
+   // converted to `true` where `null` and `undefined` becames `false`. Therefore
+   // the `filter` method will keep only objects that are defined and not null.
+-  Array.slice(arguments, 1).filter(Boolean).forEach(function onEach(properties) {
++  [].slice.call(arguments, 1).filter(Boolean).forEach(function onEach(properties) {
+     getOwnPropertyIdentifiers(properties).forEach(function(name) {
+       descriptor[name] = Object.getOwnPropertyDescriptor(properties, name);
+     });
+@@ -72,7 +72,7 @@
+  * merging XPCOM objects
+  */
+ function safeMerge(source) {
+-  Array.slice(arguments, 1).forEach(function onEach (obj) {
++  [].slice.call(arguments, 1).forEach(function onEach (obj) {
+     for (let prop in obj) source[prop] = obj[prop];
+   });
+   return source;
+diff --git a/addon-sdk/source/lib/toolkit/loader.js b/addon-sdk/source/lib/toolkit/loader.js
+--- a/addon-sdk/source/lib/toolkit/loader.js
++++ b/addon-sdk/source/lib/toolkit/loader.js
+@@ -795,6 +795,12 @@
+     return uri;
+   }
+ 
++  require.context = (prefix) => {
++    return (id) => {
++      return require(prefix + id);
++    };
++  };
++
+   // Make `require.main === module` evaluate to true in main module scope.
+   require.main = loader.main === requirer ? requirer : undefined;
+   return iced(require);
+diff --git a/devtools/client/framework/devtools.js b/devtools/client/framework/devtools.js
+--- a/devtools/client/framework/devtools.js
++++ b/devtools/client/framework/devtools.js
+@@ -15,9 +15,9 @@
+ const {defaultTools: DefaultTools, defaultThemes: DefaultThemes} =
+   require("devtools/client/definitions");
+ const EventEmitter = require("devtools/shared/event-emitter");
+-const {JsonView} = require("devtools/client/jsonview/main");
+-const AboutDevTools = require("devtools/client/framework/about-devtools-toolbox");
+-const {when: unload} = require("sdk/system/unload");
++loader.lazyRequireGetter(this, "JsonView", "devtools/client/jsonview/main", true);
++loader.lazyRequireGetter(this, "AboutDevTools", "devtools/client/framework/about-devtools-toolbox");
++loader.lazyRequireGetter(this, "systemUnload", "sdk/system/unload", true);
+ 
+ const FORBIDDEN_IDS = new Set(["toolbox", ""]);
+ const MAX_ORDINAL = 99;
+@@ -35,13 +35,20 @@
+   this.destroy = this.destroy.bind(this);
+ 
+   // JSON Viewer for 'application/json' documents.
+-  JsonView.initialize();
++  if (typeof JsonView != "undefined") {
++    JsonView.initialize();
++  }
+ 
+-  AboutDevTools.register();
++  // Only available in chrome
++  if (typeof AboutDevTools != "undefined") {
++    AboutDevTools.register();
++  }
+ 
+   EventEmitter.decorate(this);
+ 
+-  Services.obs.addObserver(this.destroy, "quit-application", false);
++  if (Services.obs) {
++    Services.obs.addObserver(this.destroy, "quit-application", false);
++  }
+ 
+   // This is important step in initialization codepath where we are going to
+   // start registering all default tools and themes: create menuitems, keys, emit
+@@ -49,7 +56,7 @@
+   this.registerDefaults();
+ };
+ 
+-DevTools.prototype = {
++this.DevTools.prototype = {
+   // The windowtype of the main window, used in various tools. This may be set
+   // to something different by other gecko apps.
+   chromeWindowType: "navigator:browser",
+@@ -482,7 +489,9 @@
+     for (let [target, toolbox] of this._toolboxes) {
+       toolbox.destroy();
+     }
+-    AboutDevTools.unregister();
++    if (typeof AboutDevTools != "undefined") {
++      AboutDevTools.unregister();
++    }
+   },
+ 
+   /**
+@@ -514,9 +523,11 @@
+   }
+ };
+ 
+-const gDevTools = exports.gDevTools = new DevTools();
++const gDevTools = exports.gDevTools = new this.DevTools();
+ 
+ // Watch for module loader unload. Fires when the tools are reloaded.
+-unload(function () {
+-  gDevTools._teardown();
+-});
++if (typeof systemUnload != "undefined") {
++  systemUnload.when(function () {
++    gDevTools._teardown();
++  });
++}
+diff --git a/devtools/client/inspector/inspector-html-bootstrap.js b/devtools/client/inspector/inspector-html-bootstrap.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/inspector/inspector-html-bootstrap.js
+@@ -0,0 +1,56 @@
++"use strict";
++
++/* eslint-env browser */
++
++var isInContent = !window.location.href.includes("chrome:");
++var hasFirefoxTabParam = window.location.href.indexOf("firefox-tab") != -1;
++var isInspectorRoot = !!document.documentElement.getAttribute("inspector-root");
++if (isInContent) {
++  if (isInspectorRoot) {
++    var inspectorScript = document.createElement("script");
++    inspectorScript.src = "inspector.bundle.js";
++    document.head.appendChild(inspectorScript);
++  }
++
++  // Replace all link URLs to remove chrome specific protocols.
++  document.head.querySelectorAll("link").forEach(function (link) {
++    link.href = link.href.replace(/\w+\:\/\//, "/");
++  });
++
++  // Add the light theme stylesheet to compensate for the missing theme-switching.js
++  var themeLink = document.createElement("link");
++  themeLink.setAttribute("rel", "stylesheet");
++  themeLink.setAttribute("href", "/devtools/skin/light-theme.css");
++  document.head.appendChild(themeLink);
++  document.documentElement.setAttribute("class", "theme-light");
++
++  var isMac = /Mac/.test(navigator.userAgent);
++  var isLinux = /(Linux)|(X11)/.test(navigator.userAgent);
++  if (isMac) {
++    document.documentElement.setAttribute("platform", "mac");
++  } else if (isLinux) {
++    document.documentElement.setAttribute("platform", "linux");
++  } else {
++    document.documentElement.setAttribute("platform", "win");
++  }
++}
++
++if (isInspectorRoot) {
++  window.addEventListener("DOMContentLoaded", function onInspectorDOMLoaded() {
++    window.removeEventListener("DOMContentLoaded", onInspectorDOMLoaded);
++
++    // Add an attribute on the body to remember we are running in content.
++    document.body.setAttribute("in-content", isInContent);
++    var isOnContentLandingPage = isInContent && !hasFirefoxTabParam;
++    if (isOnContentLandingPage) {
++      var inspectorRoot = document.querySelector(".inspector");
++      // Remove the inspector specific markup.
++      inspectorRoot.remove();
++
++      // Add the landing page root element.
++      var mount = document.createElement("div");
++      mount.setAttribute("id", "mount");
++      document.body.appendChild(mount);
++    }
++  });
++}
+diff --git a/devtools/client/inspector/inspector.js b/devtools/client/inspector/inspector.js
+--- a/devtools/client/inspector/inspector.js
++++ b/devtools/client/inspector/inspector.js
+@@ -8,8 +8,6 @@
+ 
+ "use strict";
+ 
+-var Cu = Components.utils;
+-var { require } = Cu.import("resource://devtools/shared/Loader.jsm", {});
+ var Services = require("Services");
+ var promise = require("promise");
+ var defer = require("devtools/shared/defer");
+@@ -113,6 +111,7 @@
+ 
+   this._target.on("will-navigate", this._onBeforeNavigate);
+   this._detectingActorFeatures = this._detectActorFeatures();
++  this.isInContent = this.panelDoc.body.getAttribute("in-content") === "true";
+ 
+   EventEmitter.decorate(this);
+ }
+@@ -427,9 +426,10 @@
+ 
+   get InspectorTabPanel() {
+     if (!this._InspectorTabPanel) {
+-      this._InspectorTabPanel =
+-        this.React.createFactory(this.browserRequire(
+-        "devtools/client/inspector/components/inspector-tab-panel"));
++      let TabPanelClass = this.isInContent ?
++        require("devtools/client/inspector/components/inspector-tab-panel") :
++        this.browserRequire("devtools/client/inspector/components/inspector-tab-panel");
++      this._InspectorTabPanel = this.React.createFactory(TabPanelClass);
+     }
+     return this._InspectorTabPanel;
+   },
+@@ -449,8 +449,10 @@
+    * the Inspector panel.
+    */
+   setupSplitter: function () {
+-    let SplitBox = this.React.createFactory(this.browserRequire(
+-      "devtools/client/shared/components/splitter/split-box"));
++    let SplitBoxClass = this.isInContent ?
++      require("devtools/client/shared/components/splitter/split-box") :
++      this.browserRequire("devtools/client/shared/components/splitter/split-box");
++    let SplitBox = this.React.createFactory(SplitBoxClass);
+ 
+     let splitter = SplitBox({
+       className: "inspector-sidebar-splitter",
+@@ -616,8 +618,10 @@
+     this.teardownToolbar();
+ 
+     // Setup the sidebar toggle button.
+-    let SidebarToggle = this.React.createFactory(this.browserRequire(
+-      "devtools/client/shared/components/sidebar-toggle"));
++    let SidebarToggleClass = this.isInContent ?
++      require("devtools/client/shared/components/sidebar-toggle") :
++      this.browserRequire("devtools/client/shared/components/sidebar-toggle");
++    let SidebarToggle = this.React.createFactory(SidebarToggleClass);
+ 
+     let sidebarToggle = SidebarToggle({
+       onClick: this.onPaneToggleButtonClicked,
+@@ -1321,15 +1325,15 @@
+     // create tool iframe
+     this._markupFrame = doc.createElement("iframe");
+     this._markupFrame.setAttribute("flex", "1");
++    // This is needed to enable tooltips inside the iframe document.
+     this._markupFrame.setAttribute("tooltip", "aHTMLTooltip");
+     this._markupFrame.addEventListener("contextmenu", this._onContextMenu);
+ 
+-    // This is needed to enable tooltips inside the iframe document.
+-    this._markupFrame.addEventListener("load", this._onMarkupFrameLoad, true);
+-
+     this._markupBox.setAttribute("collapsed", true);
+     this._markupBox.appendChild(this._markupFrame);
+-    this._markupFrame.setAttribute("src", "chrome://devtools/content/inspector/markup/markup.xhtml");
++
++    this._markupFrame.addEventListener("load", this._onMarkupFrameLoad, true);
++    this._markupFrame.setAttribute("src", "markup/markup.xhtml");
+     this._markupFrame.setAttribute("aria-label",
+       INSPECTOR_L10N.getStr("inspector.panelLabel.markupView"));
+   },
+@@ -1866,89 +1870,100 @@
+   }
+ };
+ 
++const buildFakeToolbox = Task.async(function* (
++  target, threadClient, react, reactDOM, browserRequire) {
++  const { InspectorFront } = require("devtools/shared/fronts/inspector");
++  const { Selection } = require("devtools/client/framework/selection");
++  const { getHighlighterUtils } = require("devtools/client/framework/toolbox-highlighter-utils");
++
++  let notImplemented = function () {
++    throw new Error("Not implemented in a tab");
++  };
++  let fakeToolbox = {
++    target,
++    hostType: "bottom",
++    doc: window.document,
++    win: window,
++    on() {}, emit() {}, off() {},
++    initInspector() {},
++    browserRequire,
++    React: react,
++    ReactDOM: reactDOM,
++    isToolRegistered() {
++      return false;
++    },
++    currentToolId: "inspector",
++    getCurrentPanel() {
++      return "inspector";
++    },
++    get textboxContextMenuPopup() {
++      notImplemented();
++    },
++    getPanel: notImplemented,
++    openSplitConsole: notImplemented,
++    viewCssSourceInStyleEditor: notImplemented,
++    viewJsSourceInDebugger: notImplemented,
++    viewSource: notImplemented,
++    viewSourceInDebugger: notImplemented,
++    viewSourceInStyleEditor: notImplemented,
++
++    // For attachThread:
++    highlightTool() {},
++    unhighlightTool() {},
++    selectTool() {},
++    raise() {},
++    getNotificationBox() {}
++  };
++  fakeToolbox.threadClient = threadClient;
++
++  let inspector = InspectorFront(target.client, target.form);
++  let showAllAnonymousContent =
++    Services.prefs.getBoolPref("devtools.inspector.showAllAnonymousContent");
++  let walker = yield inspector.getWalker({ showAllAnonymousContent });
++  let selection = new Selection(walker);
++  let highlighter = yield inspector.getHighlighter(false);
++  fakeToolbox.highlighterUtils = getHighlighterUtils(fakeToolbox);
++
++  fakeToolbox.inspector = inspector;
++  fakeToolbox.walker = walker;
++  fakeToolbox.selection = selection;
++  fakeToolbox.highlighter = highlighter;
++  return fakeToolbox;
++});
++
+ // URL constructor doesn't support chrome: scheme
+ let href = window.location.href.replace(/chrome:/, "http://");
+ let url = new window.URL(href);
+ 
+ // Only use this method to attach the toolbox if some query parameters are given
+-if (url.search.length > 1) {
+-  const { targetFromURL } = require("devtools/client/framework/target-from-url");
+-  const { attachThread } = require("devtools/client/framework/attach-thread");
+-  const { BrowserLoader } =
+-    Cu.import("resource://devtools/client/shared/browser-loader.js", {});
+-
+-  const { Selection } = require("devtools/client/framework/selection");
+-  const { InspectorFront } = require("devtools/shared/fronts/inspector");
+-  const { getHighlighterUtils } = require("devtools/client/framework/toolbox-highlighter-utils");
++if (href.indexOf("chrome://") === 0 && url.search.length > 1) {
++  let chromeOnlyDepencies = {};
++  loader.lazyRequireGetter(chromeOnlyDepencies, "targetFromURL", "devtools/client/framework/target-from-url", true);
++  loader.lazyRequireGetter(chromeOnlyDepencies, "BrowserLoader", "devtools/client/shared/browser-loader.js", true);
+ 
+   Task.spawn(function* () {
+-    let target = yield targetFromURL(url);
+-
+-    let notImplemented = function () {
+-      throw new Error("Not implemented in a tab");
+-    };
+-    let fakeToolbox = {
+-      target,
+-      hostType: "bottom",
+-      doc: window.document,
+-      win: window,
+-      on() {}, emit() {}, off() {},
+-      initInspector() {},
+-      browserRequire: BrowserLoader({
+-        window: window,
+-        useOnlyShared: true
+-      }).require,
+-      get React() {
+-        return this.browserRequire("devtools/client/shared/vendor/react");
+-      },
+-      get ReactDOM() {
+-        return this.browserRequire("devtools/client/shared/vendor/react-dom");
+-      },
+-      isToolRegistered() {
+-        return false;
+-      },
+-      currentToolId: "inspector",
+-      getCurrentPanel() {
+-        return "inspector";
+-      },
+-      get textboxContextMenuPopup() {
+-        notImplemented();
+-      },
+-      getPanel: notImplemented,
+-      openSplitConsole: notImplemented,
+-      viewCssSourceInStyleEditor: notImplemented,
+-      viewJsSourceInDebugger: notImplemented,
+-      viewSource: notImplemented,
+-      viewSourceInDebugger: notImplemented,
+-      viewSourceInStyleEditor: notImplemented,
+-
+-      // For attachThread:
+-      highlightTool() {},
+-      unhighlightTool() {},
+-      selectTool() {},
+-      raise() {},
+-      getNotificationBox() {}
+-    };
+-
+-    // attachThread also expect a toolbox as argument
+-    fakeToolbox.threadClient = yield attachThread(fakeToolbox);
+-
+-    let inspector = InspectorFront(target.client, target.form);
+-    let showAllAnonymousContent =
+-      Services.prefs.getBoolPref("devtools.inspector.showAllAnonymousContent");
+-    let walker = yield inspector.getWalker({ showAllAnonymousContent });
+-    let selection = new Selection(walker);
+-    let highlighter = yield inspector.getHighlighter(false);
+-
+-    fakeToolbox.inspector = inspector;
+-    fakeToolbox.walker = walker;
+-    fakeToolbox.selection = selection;
+-    fakeToolbox.highlighter = highlighter;
+-    fakeToolbox.highlighterUtils = getHighlighterUtils(fakeToolbox);
+-
++    let target = yield chromeOnlyDepencies.targetFromURL(url);
++    let react = this.browserRequire("devtools/client/shared/vendor/react");
++    let reactDOM = this.browserRequire("devtools/client/shared/vendor/react-dom");
++    let threadClient = { paused: false };
++    let browserRequire = chromeOnlyDepencies.BrowserLoader({
++      window: window,
++      useOnlyShared: true
++    }).require;
++    let fakeToolbox = yield buildFakeToolbox(target, threadClient, react, reactDOM,
++      browserRequire);
+     let inspectorUI = new Inspector(fakeToolbox);
+     inspectorUI.init();
+   }).then(null, e => {
+     window.alert("Unable to start the inspector:" + e.message + "\n" + e.stack);
+   });
+ }
++
++window.buildFakeToolboxInContent = Task.async(function* (target) {
++  const React = require("devtools/client/shared/vendor/react");
++  const ReactDOM = require("devtools/client/shared/vendor/react-dom");
++  let threadClient = { paused: false };
++  return buildFakeToolbox(target, threadClient, React, ReactDOM, () => {});
++});
++
++window.Inspector = Inspector;
+diff --git a/devtools/client/inspector/inspector.xhtml b/devtools/client/inspector/inspector.xhtml
+--- a/devtools/client/inspector/inspector.xhtml
++++ b/devtools/client/inspector/inspector.xhtml
+@@ -4,7 +4,7 @@
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ <!DOCTYPE html>
+ 
+-<html xmlns="http://www.w3.org/1999/xhtml" dir="">
++<html xmlns="http://www.w3.org/1999/xhtml" dir="" inspector-root="true">
+ <head>
+   <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+ 
+@@ -28,7 +28,15 @@
+ 
+   <script type="application/javascript;version=1.8"
+           src="chrome://devtools/content/shared/theme-switching.js"></script>
+-  <script type="application/javascript;version=1.8" src="inspector.js" defer="true"></script>
++  <script type="application/javascript;version=1.8" src="chrome://devtools/content/inspector/inspector.js" defer="true"></script>
++  <script type="text/javascript" src="/devtools/content/inspector/inspector-html-bootstrap.js"></script>
++  <script type="text/javascript">
++    var isInChrome = window.location.href.includes("chrome:");
++    if (isInChrome) {
++      var Cu = Components.utils;
++      var { require } = Cu.import("resource://devtools/shared/Loader.jsm", {});
++    }
++  </script>
+ </head>
+ <body class="theme-body" role="application">
+   <div class="inspector-responsive-container theme-body inspector">
+diff --git a/devtools/client/inspector/markup/markup.js b/devtools/client/inspector/markup/markup.js
+--- a/devtools/client/inspector/markup/markup.js
++++ b/devtools/client/inspector/markup/markup.js
+@@ -72,7 +72,7 @@
+   this.win = this._frame.contentWindow;
+   this.doc = this._frame.contentDocument;
+   this._elt = this.doc.querySelector("#root");
+-  this.htmlEditor = new HTMLEditor(this.doc);
++  this.htmlEditor = new HTMLEditor(this.doc, this.inspector);
+ 
+   try {
+     this.maxChildren = Services.prefs.getIntPref("devtools.markup.pagesize");
+diff --git a/devtools/client/inspector/markup/markup.xhtml b/devtools/client/inspector/markup/markup.xhtml
+--- a/devtools/client/inspector/markup/markup.xhtml
++++ b/devtools/client/inspector/markup/markup.xhtml
+@@ -7,6 +7,7 @@
+ <html xmlns="http://www.w3.org/1999/xhtml">
+ <head>
+   <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
++
+   <link rel="stylesheet" href="chrome://devtools/skin/markup.css" type="text/css"/>
+   <link rel="stylesheet" href="chrome://devtools/content/sourceeditor/codemirror/lib/codemirror.css" type="text/css"/>
+   <link rel="stylesheet" href="chrome://devtools/content/sourceeditor/codemirror/addon/dialog/dialog.css" type="text/css"/>
+@@ -16,7 +17,7 @@
+           src="chrome://devtools/content/shared/theme-switching.js"></script>
+   <script type="application/javascript;version=1.8"
+           src="chrome://devtools/content/sourceeditor/codemirror/codemirror.bundle.js"></script>
+-
++  <script type="text/javascript" src="/devtools/content/inspector/inspector-html-bootstrap.js"></script>
+ </head>
+ <body class="theme-body devtools-monospace" role="application">
+ 
+diff --git a/devtools/client/inspector/markup/views/html-editor.js b/devtools/client/inspector/markup/views/html-editor.js
+--- a/devtools/client/inspector/markup/views/html-editor.js
++++ b/devtools/client/inspector/markup/views/html-editor.js
+@@ -23,7 +23,7 @@
+  *         The document to attach the editor to.  Will also use this
+  *         document as a basis for listening resize events.
+  */
+-function HTMLEditor(htmlDocument) {
++function HTMLEditor(htmlDocument, inspector) {
+   this.doc = htmlDocument;
+   this.container = this.doc.createElement("div");
+   this.container.className = "html-editor theme-body";
+@@ -57,7 +57,10 @@
+   this.editorInner.addEventListener("click", stopPropagation, false);
+   this.editor = new Editor(config);
+ 
+-  this.editor.appendToLocalElement(this.editorInner);
++  if (!inspector.isInContent) {
++    // JDE: sourceeditor/editor.js is not working in content at the moment.
++    this.editor.appendToLocalElement(this.editorInner);
++  }
+   this.hide(false);
+ }
+ 
+diff --git a/devtools/client/inspector/toolsidebar.js b/devtools/client/inspector/toolsidebar.js
+--- a/devtools/client/inspector/toolsidebar.js
++++ b/devtools/client/inspector/toolsidebar.js
+@@ -65,6 +65,10 @@
+     return this._toolPanel.browserRequire;
+   },
+ 
++  get isInContent() {
++    return this._toolPanel.isInContent;
++  },
++
+   get InspectorTabPanel() {
+     return this._toolPanel.InspectorTabPanel;
+   },
+@@ -72,8 +76,10 @@
+   // Rendering
+ 
+   render: function () {
+-    let Tabbar = this.React.createFactory(this.browserRequire(
+-      "devtools/client/shared/components/tabs/tabbar"));
++    let TabbarClass = this.isInContent ?
++      require("devtools/client/shared/components/tabs/tabbar") :
++      this.browserRequire("devtools/client/shared/components/tabs/tabbar");
++    let Tabbar = this.React.createFactory(TabbarClass);
+ 
+     let sidebar = Tabbar({
+       toolbox: this._toolPanel._toolbox,
+diff --git a/devtools/client/shared/shim/Services.js b/devtools/client/shared/shim/Services.js
+--- a/devtools/client/shared/shim/Services.js
++++ b/devtools/client/shared/shim/Services.js
+@@ -599,6 +599,20 @@
+   thePref._setDefault(value);
+ }
+ 
++/**
++ * Create a shim for tools opening links in a browser tab.
++ */
++
++let fakeServiceWindow = {
++  openUILinkInWindow: function (url) {
++    window.open(url);
++  }
++};
++
++Services.wm = {
++  getMostRecentWindow: () => fakeServiceWindow
++};
++
+ module.exports = Services;
+ // This is exported to silence eslint.
+ exports.pref = pref;
+diff --git a/devtools/client/shared/undo.js b/devtools/client/shared/undo.js
+--- a/devtools/client/shared/undo.js
++++ b/devtools/client/shared/undo.js
+@@ -153,6 +153,11 @@
+    * Install this object as a command controller.
+    */
+   installController: function (controllerWindow) {
++    // Only available when running in a Firefox panel.
++    if (!controllerWindow.controllers) {
++      return;
++    }
++
+     this._controllerWindow = controllerWindow;
+     controllerWindow.controllers.appendController(this);
+   },
+diff --git a/devtools/shared/DevToolsUtils.js b/devtools/shared/DevToolsUtils.js
+--- a/devtools/shared/DevToolsUtils.js
++++ b/devtools/shared/DevToolsUtils.js
+@@ -26,7 +26,8 @@
+  * Waits for the next tick in the event loop to execute a callback.
+  */
+ exports.executeSoon = function executeSoon(aFn) {
+-  if (isWorker) {
++  // XXX: Move setImmmediate chrome implementation to loader
++  if (typeof setImmediate !== "undefined") {
+     setImmediate(aFn);
+   } else {
+     let executor;
+diff --git a/devtools/shared/l10n.js b/devtools/shared/l10n.js
+--- a/devtools/shared/l10n.js
++++ b/devtools/shared/l10n.js
+@@ -8,6 +8,17 @@
+ 
+ const propertiesMap = {};
+ 
++// Some shenanigans are needed for LocalizationHelper's dynamic
++// require to work with Webpack.  Here we a create different context
++// require for each possible locale directory.  Then later we use
++// these functions, rather than plain |require|, to load the resource.
++const reqShared = require.context("raw!devtools-shared/locale/",
++                                  true, /^.*\.properties$/);
++const reqClient = require.context("raw!devtools/locale/",
++                                  true, /^.*\.properties$/);
++const reqGlobal = require.context("raw!global/locale/",
++                                  true, /^.*\.properties$/);
++
+ /**
+  * Memoized getter for properties files that ensures a given url is only required and
+  * parsed once.
+@@ -18,7 +29,23 @@
+  */
+ function getProperties(url) {
+   if (!propertiesMap[url]) {
+-    propertiesMap[url] = parsePropertiesFile(require(`raw!${url}`));
++    // More shenanigans.  Here we take an input like
++    // "devtools-shared/locale/debugger.properties" and decide which
++    // context require function to use.  Despite the string processing
++    // here, in the end a string identical to |url| ends up being
++    // passed to "require".
++    let index = url.lastIndexOf("/");
++    // Turn "mumble/locale/resource.properties" => "./resource.properties".
++    let baseName = "." + url.substr(index);
++    let reqFn;
++    if (/^global/.test(url)) {
++      reqFn = reqGlobal;
++    } else if (/^devtools-shared/.test(url)) {
++      reqFn = reqShared;
++    } else {
++      reqFn = reqClient;
++    }
++    propertiesMap[url] = parsePropertiesFile(reqFn(baseName));
+   }
+ 
+   return propertiesMap[url];
+
