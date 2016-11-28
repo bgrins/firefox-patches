@@ -1,0 +1,545 @@
+
+# HG changeset patch
+# User Julian Descottes <jdescottes@mozilla.com>
+# Date 1480334617 -3600
+# Node ID 19eedc7cb1b8aa6dde9a4854754566512d2ef108
+# Parent  f3510cebedb5bdbfc2d7fd5d7bc61a9ec03e5464
+Bug 1291049 - Attempt to bundle the inspector using webpack
+
+MozReview-Commit-ID: 7U847msP6rW
+
+diff --git a/addon-sdk/source/lib/sdk/util/object.js b/addon-sdk/source/lib/sdk/util/object.js
+--- a/addon-sdk/source/lib/sdk/util/object.js
++++ b/addon-sdk/source/lib/sdk/util/object.js
+@@ -29,17 +29,17 @@
+  *    b.name    // 'b'
+  */
+ function merge(source) {
+   let descriptor = {};
+ 
+   // `Boolean` converts the first parameter to a boolean value. Any object is
+   // converted to `true` where `null` and `undefined` becames `false`. Therefore
+   // the `filter` method will keep only objects that are defined and not null.
+-  Array.slice(arguments, 1).filter(Boolean).forEach(function onEach(properties) {
++  [].slice.call(arguments, 1).filter(Boolean).forEach(function onEach(properties) {
+     getOwnPropertyIdentifiers(properties).forEach(function(name) {
+       descriptor[name] = Object.getOwnPropertyDescriptor(properties, name);
+     });
+   });
+   return Object.defineProperties(source, descriptor);
+ }
+ exports.merge = merge;
+ 
+@@ -67,17 +67,17 @@
+ exports.each = each;
+ 
+ /**
+  * Like `merge`, except no property descriptors are manipulated, for use
+  * with platform objects. Identical to underscore's `extend`. Useful for
+  * merging XPCOM objects
+  */
+ function safeMerge(source) {
+-  Array.slice(arguments, 1).forEach(function onEach (obj) {
++  [].slice.call(arguments, 1).forEach(function onEach (obj) {
+     for (let prop in obj) source[prop] = obj[prop];
+   });
+   return source;
+ }
+ exports.safeMerge = safeMerge;
+ 
+ /*
+  * Returns a copy of the object without omitted properties
+diff --git a/devtools/client/framework/devtools.js b/devtools/client/framework/devtools.js
+--- a/devtools/client/framework/devtools.js
++++ b/devtools/client/framework/devtools.js
+@@ -23,32 +23,34 @@
+ 
+ const FORBIDDEN_IDS = new Set(["toolbox", ""]);
+ const MAX_ORDINAL = 99;
+ 
+ /**
+  * DevTools is a class that represents a set of developer tools, it holds a
+  * set of tools and keeps track of open toolboxes in the browser.
+  */
+-this.DevTools = function DevTools() {
++const DevTools = function DevTools() {
+   this._tools = new Map();     // Map<toolId, tool>
+   this._themes = new Map();    // Map<themeId, theme>
+   this._toolboxes = new Map(); // Map<target, toolbox>
+ 
+   // destroy() is an observer's handler so we need to preserve context.
+   this.destroy = this.destroy.bind(this);
+ 
+   // JSON Viewer for 'application/json' documents.
+   JsonView.initialize();
+ 
+   AboutDevTools.register();
+ 
+   EventEmitter.decorate(this);
+ 
+-  Services.obs.addObserver(this.destroy, "quit-application", false);
++  if (Services.obs) {
++    Services.obs.addObserver(this.destroy, "quit-application", false);
++  }
+ 
+   // This is important step in initialization codepath where we are going to
+   // start registering all default tools and themes: create menuitems, keys, emit
+   // related events.
+   this.registerDefaults();
+ };
+ 
+ DevTools.prototype = {
+diff --git a/devtools/client/inspector/inspector-html-bootstrap.js b/devtools/client/inspector/inspector-html-bootstrap.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/inspector/inspector-html-bootstrap.js
+@@ -0,0 +1,28 @@
++"use strict";
++
++/* eslint-env browser */
++
++// Replace all link URLs to remove chrome/resource schemes.
++var links = document.head.querySelectorAll("link");
++for (var i = 0; i < links.length; i++) {
++  var link = links[i];
++  link.href = link.href.replace(/\w+\:\/\//, "/");
++}
++
++// Add the light theme stylesheet to compensate for the missing theme-switching.js
++var themeLink = document.createElement("link");
++themeLink.setAttribute("rel", "stylesheet");
++themeLink.setAttribute("href", "/devtools/skin/light-theme.css");
++
++document.head.appendChild(themeLink);
++document.documentElement.setAttribute("class", "theme-light");
++
++var isMac = /Mac/.test(navigator.userAgent);
++var isLinux = /(Linux)|(X11)/.test(navigator.userAgent);
++if (isMac) {
++  document.documentElement.setAttribute("platform", "mac");
++} else if (isLinux) {
++  document.documentElement.setAttribute("platform", "linux");
++} else {
++  document.documentElement.setAttribute("platform", "win");
++}
+diff --git a/devtools/client/inspector/inspector.js b/devtools/client/inspector/inspector.js
+--- a/devtools/client/inspector/inspector.js
++++ b/devtools/client/inspector/inspector.js
+@@ -1,20 +1,18 @@
+ /* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-/* global window */
++/* global window, BrowserLoader */
+ 
+ "use strict";
+ 
+-var Cu = Components.utils;
+-var { require } = Cu.import("resource://devtools/shared/Loader.jsm", {});
+ var Services = require("Services");
+ var promise = require("promise");
+ var defer = require("devtools/shared/defer");
+ var EventEmitter = require("devtools/shared/event-emitter");
+ const {executeSoon} = require("devtools/shared/DevToolsUtils");
+ var {KeyShortcuts} = require("devtools/client/shared/key-shortcuts");
+ var {Task} = require("devtools/shared/task");
+ const {initCssProperties} = require("devtools/shared/fronts/css-properties");
+@@ -1308,25 +1306,25 @@
+   _initMarkup: function () {
+     let doc = this.panelDoc;
+ 
+     this._markupBox = doc.getElementById("markup-box");
+ 
+     // create tool iframe
+     this._markupFrame = doc.createElement("iframe");
+     this._markupFrame.setAttribute("flex", "1");
++    // This is needed to enable tooltips inside the iframe document.
+     this._markupFrame.setAttribute("tooltip", "aHTMLTooltip");
+     this._markupFrame.addEventListener("contextmenu", this._onContextMenu);
+ 
+-    // This is needed to enable tooltips inside the iframe document.
+-    this._markupFrame.addEventListener("load", this._onMarkupFrameLoad, true);
+-
+     this._markupBox.setAttribute("collapsed", true);
+     this._markupBox.appendChild(this._markupFrame);
+-    this._markupFrame.setAttribute("src", "chrome://devtools/content/inspector/markup/markup.xhtml");
++
++    this._markupFrame.addEventListener("load", this._onMarkupFrameLoad, true);
++    this._markupFrame.setAttribute("src", "markup/markup.xhtml");
+     this._markupFrame.setAttribute("aria-label",
+       INSPECTOR_L10N.getStr("inspector.panelLabel.markupView"));
+   },
+ 
+   _onMarkupFrameLoad: function () {
+     this._markupFrame.removeEventListener("load", this._onMarkupFrameLoad, true);
+ 
+     this._markupFrame.contentWindow.focus();
+@@ -1842,94 +1840,116 @@
+     // When the inspector menu was setup on click (see _getNodeLinkMenuItems), we
+     // already checked that resolveRelativeURL existed.
+     this.inspector.resolveRelativeURL(link, this.selection.nodeFront).then(url => {
+       clipboardHelper.copyString(url);
+     }, console.error);
+   }
+ };
+ 
++/**
++ * Create a fake toolbox when running the inspector standalone, either in a chrome tab or
++ * in a content tab.
++ *
++ * @param {Target} target to debug
++ * @param {Function} createThreadClient
++ *        When supported the thread client needs a reference to the toolbox.
++ *        This callback will be called right after the toolbox object is created.
++ * @param {Object} dependencies
++ *        - react
++ *        - reactDOM
++ *        - browserRequire
++ */
++const buildFakeToolbox = Task.async(function* (
++  target, createThreadClient, {
++    React,
++    ReactDOM,
++    browserRequire
++  }) {
++  const { InspectorFront } = require("devtools/shared/fronts/inspector");
++  const { Selection } = require("devtools/client/framework/selection");
++  const { getHighlighterUtils } = require("devtools/client/framework/toolbox-highlighter-utils");
++
++  let notImplemented = function () {
++    throw new Error("Not implemented in a tab");
++  };
++  let fakeToolbox = {
++    target,
++    hostType: "bottom",
++    doc: window.document,
++    win: window,
++    on() {}, emit() {}, off() {},
++    initInspector() {},
++    browserRequire,
++    React,
++    ReactDOM,
++    isToolRegistered() {
++      return false;
++    },
++    currentToolId: "inspector",
++    getCurrentPanel() {
++      return "inspector";
++    },
++    get textboxContextMenuPopup() {
++      notImplemented();
++    },
++    getPanel: notImplemented,
++    openSplitConsole: notImplemented,
++    viewCssSourceInStyleEditor: notImplemented,
++    viewJsSourceInDebugger: notImplemented,
++    viewSource: notImplemented,
++    viewSourceInDebugger: notImplemented,
++    viewSourceInStyleEditor: notImplemented,
++
++    // For attachThread:
++    highlightTool() {},
++    unhighlightTool() {},
++    selectTool() {},
++    raise() {},
++    getNotificationBox() {}
++  };
++
++  fakeToolbox.threadClient = yield createThreadClient(fakeToolbox);
++
++  let inspector = InspectorFront(target.client, target.form);
++  let showAllAnonymousContent =
++    Services.prefs.getBoolPref("devtools.inspector.showAllAnonymousContent");
++  let walker = yield inspector.getWalker({ showAllAnonymousContent });
++  let selection = new Selection(walker);
++  let highlighter = yield inspector.getHighlighter(false);
++  fakeToolbox.highlighterUtils = getHighlighterUtils(fakeToolbox);
++
++  fakeToolbox.inspector = inspector;
++  fakeToolbox.walker = walker;
++  fakeToolbox.selection = selection;
++  fakeToolbox.highlighter = highlighter;
++  return fakeToolbox;
++});
++
+ // URL constructor doesn't support chrome: scheme
+ let href = window.location.href.replace(/chrome:/, "http://");
+ let url = new window.URL(href);
+ 
+-// Only use this method to attach the toolbox if some query parameters are given
+-if (url.search.length > 1) {
++// If query parameters are given in a chrome tab, the inspector is running in standalone.
++if (window.location.protocol === "chrome:" && url.search.length > 1) {
+   const { targetFromURL } = require("devtools/client/framework/target-from-url");
+   const { attachThread } = require("devtools/client/framework/attach-thread");
+-  const { BrowserLoader } =
+-    Cu.import("resource://devtools/client/shared/browser-loader.js", {});
+ 
+-  const { Selection } = require("devtools/client/framework/selection");
+-  const { InspectorFront } = require("devtools/shared/fronts/inspector");
+-  const { getHighlighterUtils } = require("devtools/client/framework/toolbox-highlighter-utils");
++  const browserRequire = BrowserLoader({ window, useOnlyShared: true }).require;
++  const React = browserRequire("devtools/client/shared/vendor/react");
++  const ReactDOM = browserRequire("devtools/client/shared/vendor/react-dom");
+ 
+   Task.spawn(function* () {
+     let target = yield targetFromURL(url);
+-
+-    let notImplemented = function () {
+-      throw new Error("Not implemented in a tab");
+-    };
+-    let fakeToolbox = {
++    let fakeToolbox = yield buildFakeToolbox(
+       target,
+-      hostType: "bottom",
+-      doc: window.document,
+-      win: window,
+-      on() {}, emit() {}, off() {},
+-      initInspector() {},
+-      browserRequire: BrowserLoader({
+-        window: window,
+-        useOnlyShared: true
+-      }).require,
+-      get React() {
+-        return this.browserRequire("devtools/client/shared/vendor/react");
+-      },
+-      get ReactDOM() {
+-        return this.browserRequire("devtools/client/shared/vendor/react-dom");
+-      },
+-      isToolRegistered() {
+-        return false;
+-      },
+-      currentToolId: "inspector",
+-      getCurrentPanel() {
+-        return "inspector";
+-      },
+-      get textboxContextMenuPopup() {
+-        notImplemented();
+-      },
+-      getPanel: notImplemented,
+-      openSplitConsole: notImplemented,
+-      viewCssSourceInStyleEditor: notImplemented,
+-      viewJsSourceInDebugger: notImplemented,
+-      viewSource: notImplemented,
+-      viewSourceInDebugger: notImplemented,
+-      viewSourceInStyleEditor: notImplemented,
+-
+-      // For attachThread:
+-      highlightTool() {},
+-      unhighlightTool() {},
+-      selectTool() {},
+-      raise() {},
+-      getNotificationBox() {}
+-    };
+-
+-    // attachThread also expect a toolbox as argument
+-    fakeToolbox.threadClient = yield attachThread(fakeToolbox);
+-
+-    let inspector = InspectorFront(target.client, target.form);
+-    let showAllAnonymousContent =
+-      Services.prefs.getBoolPref("devtools.inspector.showAllAnonymousContent");
+-    let walker = yield inspector.getWalker({ showAllAnonymousContent });
+-    let selection = new Selection(walker);
+-    let highlighter = yield inspector.getHighlighter(false);
+-
+-    fakeToolbox.inspector = inspector;
+-    fakeToolbox.walker = walker;
+-    fakeToolbox.selection = selection;
+-    fakeToolbox.highlighter = highlighter;
+-    fakeToolbox.highlighterUtils = getHighlighterUtils(fakeToolbox);
+-
++      (toolbox) => attachThread(toolbox),
++      { React, ReactDOM, browserRequire }
++    );
+     let inspectorUI = new Inspector(fakeToolbox);
+     inspectorUI.init();
+   }).then(null, e => {
+     window.alert("Unable to start the inspector:" + e.message + "\n" + e.stack);
+   });
+ }
++
++exports.Inspector = Inspector;
++exports.buildFakeToolbox = buildFakeToolbox;
+diff --git a/devtools/client/inspector/inspector.xhtml b/devtools/client/inspector/inspector.xhtml
+--- a/devtools/client/inspector/inspector.xhtml
++++ b/devtools/client/inspector/inspector.xhtml
+@@ -21,17 +21,30 @@
+   <link rel="stylesheet" href="resource://devtools/client/shared/components/tabs/tabs.css"/>
+   <link rel="stylesheet" href="resource://devtools/client/shared/components/tabs/tabbar.css"/>
+   <link rel="stylesheet" href="resource://devtools/client/inspector/components/inspector-tab-panel.css"/>
+   <link rel="stylesheet" href="resource://devtools/client/shared/components/splitter/split-box.css"/>
+   <link rel="stylesheet" href="resource://devtools/client/inspector/layout/components/Accordion.css"/>
+ 
+   <script type="application/javascript;version=1.8"
+           src="chrome://devtools/content/shared/theme-switching.js"></script>
++  <script type="text/javascript">
++    var isInChrome = window.location.href.includes("chrome:");
++    if (isInChrome) {
++      var exports = {};
++      var Cu = Components.utils;
++      var { require } = Cu.import("resource://devtools/shared/Loader.jsm", {});
++      var { BrowserLoader } = Cu.import("resource://devtools/client/shared/browser-loader.js", {});
++    }
++  </script>
++
++  <!-- in content, inspector.js is mapped to the dynamically generated webpack bundle -->
+   <script type="application/javascript;version=1.8" src="inspector.js" defer="true"></script>
++  <!-- in chrome, inspector-html-bootstrap is mapped to the empty webpack/bootstrap-sham.js -->
++  <script type="text/javascript" src="inspector-html-bootstrap.js"></script>
+ </head>
+ <body class="theme-body" role="application">
+   <div class="inspector-responsive-container theme-body inspector">
+ 
+     <!-- Main Panel Content -->
+     <div id="inspector-main-content" class="devtools-main-content">
+       <div id="inspector-toolbar" class="devtools-toolbar" nowindowdrag="true"
+                 data-localization-bundle="devtools/client/locales/inspector.properties">
+diff --git a/devtools/client/inspector/markup/markup.xhtml b/devtools/client/inspector/markup/markup.xhtml
+--- a/devtools/client/inspector/markup/markup.xhtml
++++ b/devtools/client/inspector/markup/markup.xhtml
+@@ -11,17 +11,17 @@
+   <link rel="stylesheet" href="chrome://devtools/content/sourceeditor/codemirror/lib/codemirror.css" type="text/css"/>
+   <link rel="stylesheet" href="chrome://devtools/content/sourceeditor/codemirror/addon/dialog/dialog.css" type="text/css"/>
+   <link rel="stylesheet" href="chrome://devtools/content/sourceeditor/codemirror/mozilla.css" type="text/css"/>
+ 
+   <script type="application/javascript;version=1.8"
+           src="chrome://devtools/content/shared/theme-switching.js"></script>
+   <script type="application/javascript;version=1.8"
+           src="chrome://devtools/content/sourceeditor/codemirror/codemirror.bundle.js"></script>
+-
++  <script type="text/javascript" src="../inspector-html-bootstrap.js"></script>
+ </head>
+ <body class="theme-body devtools-monospace" role="application">
+ 
+ <!-- NOTE THAT WE MAKE EXTENSIVE USE OF HTML COMMENTS IN THIS FILE IN ORDER -->
+ <!-- TO MAKE SPANS READABLE WHILST AVOIDING SIGNIFICANT WHITESPACE          -->
+ 
+   <div id="root-wrapper" role="presentation">
+     <div id="root" role="presentation"></div>
+diff --git a/devtools/client/inspector/webpack/bootstrap-sham.js b/devtools/client/inspector/webpack/bootstrap-sham.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/inspector/webpack/bootstrap-sham.js
+@@ -0,0 +1,11 @@
++/* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
++/* vim: set ts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++// This file is used to avoid 404 when inspector documents are trying to load the
++// inspector-html-bootstrap which is only available in content.
++// It is mapped to inspector/inspector-html-bootstrap in client/jar.mn
+diff --git a/devtools/client/jar.mn b/devtools/client/jar.mn
+--- a/devtools/client/jar.mn
++++ b/devtools/client/jar.mn
+@@ -20,16 +20,17 @@
+ *   content/scratchpad/scratchpad.xul (scratchpad/scratchpad.xul)
+     content/scratchpad/scratchpad.js (scratchpad/scratchpad.js)
+     content/shared/splitview.css (shared/splitview.css)
+     content/shared/theme-switching.js (shared/theme-switching.js)
+     content/shared/frame-script-utils.js (shared/frame-script-utils.js)
+     content/styleeditor/styleeditor.xul (styleeditor/styleeditor.xul)
+     content/storage/storage.xul (storage/storage.xul)
+     content/inspector/inspector.js (inspector/inspector.js)
++    content/inspector/inspector-html-bootstrap.js (inspector/webpack/bootstrap-sham.js)
+     content/inspector/markup/markup.xhtml (inspector/markup/markup.xhtml)
+     content/animationinspector/animation-controller.js (animationinspector/animation-controller.js)
+     content/animationinspector/animation-panel.js (animationinspector/animation-panel.js)
+     content/animationinspector/animation-inspector.xhtml (animationinspector/animation-inspector.xhtml)
+     content/sourceeditor/codemirror/addon/dialog/dialog.css (sourceeditor/codemirror/addon/dialog/dialog.css)
+     content/sourceeditor/codemirror/addon/hint/show-hint.js (sourceeditor/codemirror/addon/hint/show-hint.js)
+     content/sourceeditor/codemirror/addon/tern/tern.js (sourceeditor/codemirror/addon/tern/tern.js)
+     content/sourceeditor/codemirror/codemirror.bundle.js (sourceeditor/codemirror/codemirror.bundle.js)
+diff --git a/devtools/client/shared/undo.js b/devtools/client/shared/undo.js
+--- a/devtools/client/shared/undo.js
++++ b/devtools/client/shared/undo.js
+@@ -148,18 +148,24 @@
+   /**
+    * ViewController implementation for undo/redo.
+    */
+ 
+   /**
+    * Install this object as a command controller.
+    */
+   installController: function (controllerWindow) {
++    let controllers = controllerWindow.controllers;
++    // Only available when running in a Firefox panel.
++    if (!controllers || !controllers.appendController) {
++      return;
++    }
++
+     this._controllerWindow = controllerWindow;
+-    controllerWindow.controllers.appendController(this);
++    controllers.appendController(this);
+   },
+ 
+   /**
+    * Uninstall this object from the command controller.
+    */
+   uninstallController: function () {
+     if (!this._controllerWindow) {
+       return;
+diff --git a/devtools/client/shared/widgets/tooltip/TooltipToggle.js b/devtools/client/shared/widgets/tooltip/TooltipToggle.js
+--- a/devtools/client/shared/widgets/tooltip/TooltipToggle.js
++++ b/devtools/client/shared/widgets/tooltip/TooltipToggle.js
+@@ -64,25 +64,28 @@
+    *        - {Number} toggleDelay
+    *          An optional delay (in ms) that will be observed before showing
+    *          and before hiding the tooltip. Defaults to DEFAULT_TOGGLE_DELAY.
+    *        - {Boolean} interactive
+    *          If enabled, the tooltip is not hidden when mouse leaves the
+    *          target element and enters the tooltip. Allows the tooltip
+    *          content to be interactive.
+    */
+-  start: function (baseNode, targetNodeCb,
+-                   {toggleDelay = DEFAULT_TOGGLE_DELAY, interactive = false} = {}) {
++  start: function (baseNode, targetNodeCb, {toggleDelay, interactive = false} = {}) {
+     this.stop();
+ 
+     if (!baseNode) {
+       // Calling tool is in the process of being destroyed.
+       return;
+     }
+ 
++    if (typeof toggleDelay === "undefined") {
++      toggleDelay = DEFAULT_TOGGLE_DELAY;
++    }
++
+     this._baseNode = baseNode;
+     this._targetNodeCb = targetNodeCb || (() => true);
+     this._toggleDelay = toggleDelay;
+     this._interactive = interactive;
+ 
+     baseNode.addEventListener("mousemove", this._onMouseMove);
+     baseNode.addEventListener("mouseout", this._onMouseOut);
+ 
+diff --git a/devtools/shared/DevToolsUtils.js b/devtools/shared/DevToolsUtils.js
+--- a/devtools/shared/DevToolsUtils.js
++++ b/devtools/shared/DevToolsUtils.js
+@@ -21,17 +21,18 @@
+ for (let key of Object.keys(ThreadSafeDevToolsUtils)) {
+   exports[key] = ThreadSafeDevToolsUtils[key];
+ }
+ 
+ /**
+  * Waits for the next tick in the event loop to execute a callback.
+  */
+ exports.executeSoon = function executeSoon(aFn) {
+-  if (isWorker) {
++  // XXX: Move setImmmediate chrome implementation to loader
++  if (typeof setImmediate !== "undefined") {
+     setImmediate(aFn);
+   } else {
+     let executor;
+     // Only enable async stack reporting when DEBUG_JS_MODULES is set
+     // (customized local builds) to avoid a performance penalty.
+     if (AppConstants.DEBUG_JS_MODULES || flags.testing) {
+       let stack = getStack();
+       executor = () => {
+
