@@ -1,0 +1,1554 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  298ea2d458bf8e7a43c79dc11143b92ea5ce6958
+Bug 1326937 - Use launchpad with console frontend
+
+diff --git a/devtools/client/webconsole/.babelrc b/devtools/client/webconsole/.babelrc
+--- a/devtools/client/webconsole/.babelrc
++++ b/devtools/client/webconsole/.babelrc
+@@ -1,3 +1,1 @@
+-{
+-  "presets": ["es2015"]
+-}
+\ No newline at end of file
++{}
+\ No newline at end of file
+diff --git a/devtools/client/webconsole/bin/configure.js b/devtools/client/webconsole/bin/configure.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/bin/configure.js
+@@ -0,0 +1,29 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/* eslint-env node */
++
++"use strict";
++
++const fs = require("fs");
++const path = require("path");
++
++function getConfig() {
++  if (process.env.TARGET === "firefox-panel") {
++    return require("../configs/firefox-panel.json");
++  }
++
++  const developmentConfig = require("../configs/development.json");
++
++  let localConfig = {};
++  if (fs.existsSync(path.resolve(__dirname, "../configs/local.json"))) {
++    localConfig = require("../configs/local.json");
++  }
++
++  return Object.assign({}, developmentConfig, localConfig);
++}
++
++module.exports = {
++  getConfig,
++};
+diff --git a/devtools/client/webconsole/bin/dev-server.js b/devtools/client/webconsole/bin/dev-server.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/bin/dev-server.js
+@@ -0,0 +1,19 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/* eslint-env node */
++
++"use strict";
++
++const toolbox = require("devtools-launchpad/index");
++const feature = require("devtools-config");
++const { getConfig } = require("./configure");
++
++const envConfig = getConfig();
++
++feature.setConfig(envConfig);
++
++let webpackConfig = require("../webpack.config");
++
++toolbox.startDevServer(envConfig, webpackConfig, __dirname);
+diff --git a/devtools/client/webconsole/configs/development.json b/devtools/client/webconsole/configs/development.json
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/configs/development.json
+@@ -0,0 +1,36 @@
++{
++  "title": "Console",
++  "environment": "development",
++  "baseWorkerURL": "http://localhost:8000/public/build/",
++  "host": "",
++  "theme": "light",
++  "dir": "ltr",
++  "hotReloading": false,
++  "logging": {
++    "client": true,
++    "firefoxProxy": true,
++    "actions": true
++  },
++  "features": {
++  },
++  "chrome": {
++    "debug": true,
++    "host": "localhost",
++    "port": 9222
++  },
++  "node": {
++    "debug": true,
++    "host": "localhost",
++    "port": 9229
++  },
++  "firefox": {
++    "webSocketConnection": false,
++    "proxyHost": "localhost:9000",
++    "webSocketHost": "localhost:6080",
++    "mcPath": "./firefox"
++  },
++  "development": {
++    "serverPort": 8000,
++    "examplesPort": 7999
++  }
++}
+diff --git a/devtools/client/webconsole/configs/firefox-panel.json b/devtools/client/webconsole/configs/firefox-panel.json
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/configs/firefox-panel.json
+@@ -0,0 +1,11 @@
++{
++  "environment": "firefox-panel",
++  "baseWorkerURL": "resource://devtools/client/netmonitor/",
++  "logging": false,
++  "clientLogging": false,
++  "firefox": {
++    "mcPath": "./firefox"
++  },
++  "features": {
++  }
++}
+diff --git a/devtools/client/webconsole/local-dev/connection-proxy.js b/devtools/client/webconsole/local-dev/connection-proxy.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/local-dev/connection-proxy.js
+@@ -0,0 +1,509 @@
++const prefs = {
++  debuggerRemoteTimeout: 20000,
++}
++
++const PREF_CONNECTION_TIMEOUT = "devtools.debugger.remote-timeout";
++
++function defer() {
++  let resolve, reject;
++  let promise = new Promise(function() {
++    resolve = arguments[0];
++    reject = arguments[1];
++  });
++  return {
++    resolve: resolve,
++    reject: reject,
++    promise: promise
++  };
++};
++
++
++// Web Console connection proxy
++
++/**
++ * The WebConsoleConnectionProxy handles the connection between the Web Console
++ * and the application we connect to through the remote debug protocol.
++ *
++ * @constructor
++ * @param object webConsoleFrame
++ *        The WebConsoleFrame object that owns this connection proxy.
++ * @param RemoteTarget target
++ *        The target that the console will connect to.
++ */
++function WebConsoleConnectionProxy(webConsoleFrame, target) {
++  this.webConsoleFrame = webConsoleFrame;
++  this.target = target;
++
++  this._onPageError = this._onPageError.bind(this);
++  this._onLogMessage = this._onLogMessage.bind(this);
++  this._onConsoleAPICall = this._onConsoleAPICall.bind(this);
++  this._onNetworkEvent = this._onNetworkEvent.bind(this);
++  this._onNetworkEventUpdate = this._onNetworkEventUpdate.bind(this);
++  this._onFileActivity = this._onFileActivity.bind(this);
++  this._onReflowActivity = this._onReflowActivity.bind(this);
++  this._onServerLogCall = this._onServerLogCall.bind(this);
++  this._onTabNavigated = this._onTabNavigated.bind(this);
++  this._onAttachConsole = this._onAttachConsole.bind(this);
++  this._onCachedMessages = this._onCachedMessages.bind(this);
++  this._connectionTimeout = this._connectionTimeout.bind(this);
++  this._onLastPrivateContextExited =
++    this._onLastPrivateContextExited.bind(this);
++}
++
++
++
++WebConsoleConnectionProxy.prototype = {
++  /**
++   * The owning Web Console Frame instance.
++   *
++   * @see WebConsoleFrame
++   * @type object
++   */
++  webConsoleFrame: null,
++
++  /**
++   * The target that the console connects to.
++   * @type RemoteTarget
++   */
++  target: null,
++
++  /**
++   * The DebuggerClient object.
++   *
++   * @see DebuggerClient
++   * @type object
++   */
++  client: null,
++
++  /**
++   * The WebConsoleClient object.
++   *
++   * @see WebConsoleClient
++   * @type object
++   */
++  webConsoleClient: null,
++
++  /**
++   * Tells if the connection is established.
++   * @type boolean
++   */
++  connected: false,
++
++  /**
++   * Timer used for the connection.
++   * @private
++   * @type object
++   */
++  _connectTimer: null,
++
++  _connectDefer: null,
++  _disconnecter: null,
++
++  /**
++   * The WebConsoleActor ID.
++   *
++   * @private
++   * @type string
++   */
++  _consoleActor: null,
++
++  /**
++   * Tells if the window.console object of the remote web page is the native
++   * object or not.
++   * @private
++   * @type boolean
++   */
++  _hasNativeConsoleAPI: false,
++
++  /**
++   * Initialize a debugger client and connect it to the debugger server.
++   *
++   * @return object
++   *         A promise object that is resolved/rejected based on the success of
++   *         the connection initialization.
++   */
++  connect: function () {
++    if (this._connectDefer) {
++      return this._connectDefer.promise;
++    }
++
++    this._connectDefer = defer();
++
++    let timeout = prefs.debuggerRemoteTimeout;
++    window.setTimeout(this._connectionTimeout, timeout);
++
++    let connPromise = this._connectDefer.promise;
++    connPromise.then(() => {
++      this._connectTimer.cancel();
++      this._connectTimer = null;
++    }, () => {
++      this._connectTimer = null;
++    });
++
++    let client = this.client = this.target.client;
++
++    if (this.target.isWorkerTarget) {
++      // XXXworkers: Not Console API yet inside of workers (Bug 1209353).
++    } else {
++      client.addListener("logMessage", this._onLogMessage);
++      client.addListener("pageError", this._onPageError);
++      client.addListener("consoleAPICall", this._onConsoleAPICall);
++      client.addListener("fileActivity", this._onFileActivity);
++      client.addListener("reflowActivity", this._onReflowActivity);
++      client.addListener("serverLogCall", this._onServerLogCall);
++      client.addListener("lastPrivateContextExited",
++                         this._onLastPrivateContextExited);
++    }
++    this.target.on("will-navigate", this._onTabNavigated);
++    this.target.on("navigate", this._onTabNavigated);
++
++    this._consoleActor = this.target.form.consoleActor;
++    if (this.target.isTabActor) {
++      let tab = this.target.form;
++      this.webConsoleFrame.onLocationChange(tab.url, tab.title);
++    }
++
++    // this._attachConsole();
++    // return connPromise;
++  },
++
++  /**
++   * Connection timeout handler.
++   * @private
++   */
++  _connectionTimeout: function () {
++    let error = {
++      error: "timeout",
++      message: l10n.getStr("connectionTimeout"),
++    };
++
++    this._connectDefer.reject(error);
++  },
++
++  /**
++   * Attach to the Web Console actor.
++   * @private
++   */
++  _attachConsole: function () {
++    let listeners = ["PageError", "ConsoleAPI", "NetworkActivity",
++                     "FileActivity"];
++    this.client.attachConsole(this._consoleActor, listeners,
++                              this._onAttachConsole);
++  },
++
++  /**
++   * The "attachConsole" response handler.
++   *
++   * @private
++   * @param object response
++   *        The JSON response object received from the server.
++   * @param object webConsoleClient
++   *        The WebConsoleClient instance for the attached console, for the
++   *        specific tab we work with.
++   */
++  _onAttachConsole: function (response, webConsoleClient) {
++    if (response.error) {
++      console.error("attachConsole failed: " + response.error + " " +
++                    response.message);
++      this._connectDefer.reject(response);
++      return;
++    }
++
++    this.webConsoleClient = webConsoleClient;
++    this._hasNativeConsoleAPI = response.nativeConsoleAPI;
++
++    // There is no way to view response bodies from the Browser Console, so do
++    // not waste the memory.
++    let saveBodies = !this.webConsoleFrame.isBrowserConsole;
++    this.webConsoleFrame.setSaveRequestAndResponseBodies(saveBodies);
++
++    this.webConsoleClient.on("networkEvent", this._onNetworkEvent);
++    this.webConsoleClient.on("networkEventUpdate", this._onNetworkEventUpdate);
++
++    let msgs = ["PageError", "ConsoleAPI"];
++    this.webConsoleClient.getCachedMessages(msgs, this._onCachedMessages);
++
++    this.webConsoleFrame._onUpdateListeners();
++  },
++
++  /**
++   * Dispatch a message add on the new frontend and emit an event for tests.
++   */
++  dispatchMessageAdd: function(packet) {
++    this.webConsoleFrame.newConsoleOutput.dispatchMessageAdd(packet);
++  },
++
++  /**
++   * Batched dispatch of messages.
++   */
++  dispatchMessagesAdd: function(packets) {
++    this.webConsoleFrame.newConsoleOutput.dispatchMessagesAdd(packets);
++  },
++
++  /**
++   * The "cachedMessages" response handler.
++   *
++   * @private
++   * @param object response
++   *        The JSON response object received from the server.
++   */
++  _onCachedMessages: function (response) {
++    if (response.error) {
++      console.error("Web Console getCachedMessages error: " + response.error +
++                    " " + response.message);
++      this._connectDefer.reject(response);
++      return;
++    }
++
++    if (!this._connectTimer) {
++      // This happens if the promise is rejected (eg. a timeout), but the
++      // connection attempt is successful, nonetheless.
++      console.error("Web Console getCachedMessages error: invalid state.");
++    }
++
++    let messages =
++      response.messages.concat(...this.webConsoleClient.getNetworkEvents());
++    messages.sort((a, b) => a.timeStamp - b.timeStamp);
++
++    if (this.webConsoleFrame.NEW_CONSOLE_OUTPUT_ENABLED) {
++      // Filter out CSS page errors.
++      messages = messages.filter(message => !(message._type == "PageError"
++          && Utils.categoryForScriptError(message) === CATEGORY_CSS));
++      this.dispatchMessagesAdd(messages);
++    } else {
++      this.webConsoleFrame.displayCachedMessages(messages);
++      if (!this._hasNativeConsoleAPI) {
++        this.webConsoleFrame.logWarningAboutReplacedAPI();
++      }
++    }
++
++    this.connected = true;
++    this._connectDefer.resolve(this);
++  },
++
++  /**
++   * The "pageError" message type handler. We redirect any page errors to the UI
++   * for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onPageError: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      if (this.webConsoleFrame.NEW_CONSOLE_OUTPUT_ENABLED) {
++        let category = Utils.categoryForScriptError(packet.pageError);
++        if (category !== CATEGORY_CSS) {
++          this.dispatchMessageAdd(packet);
++        }
++        return;
++      }
++      this.webConsoleFrame.handlePageError(packet.pageError);
++    }
++  },
++
++  /**
++   * The "logMessage" message type handler. We redirect any message to the UI
++   * for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onLogMessage: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      this.webConsoleFrame.handleLogMessage(packet);
++    }
++  },
++
++  /**
++   * The "consoleAPICall" message type handler. We redirect any message to
++   * the UI for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onConsoleAPICall: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      if (this.webConsoleFrame.NEW_CONSOLE_OUTPUT_ENABLED) {
++        this.dispatchMessageAdd(packet);
++      } else {
++        this.webConsoleFrame.handleConsoleAPICall(packet.message);
++      }
++    }
++  },
++
++  /**
++   * The "networkEvent" message type handler. We redirect any message to
++   * the UI for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object networkInfo
++   *        The network request information.
++   */
++  _onNetworkEvent: function (type, networkInfo) {
++    if (this.webConsoleFrame) {
++      if (this.webConsoleFrame.NEW_CONSOLE_OUTPUT_ENABLED) {
++        this.dispatchMessageAdd(networkInfo);
++      } else {
++        this.webConsoleFrame.handleNetworkEvent(networkInfo);
++      }
++    }
++  },
++
++  /**
++   * The "networkEventUpdate" message type handler. We redirect any message to
++   * the UI for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   * @param object networkInfo
++   *        The network request information.
++   */
++  _onNetworkEventUpdate: function (type, { packet, networkInfo }) {
++    if (this.webConsoleFrame) {
++      this.webConsoleFrame.handleNetworkEventUpdate(networkInfo, packet);
++    }
++  },
++
++  /**
++   * The "fileActivity" message type handler. We redirect any message to
++   * the UI for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onFileActivity: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      this.webConsoleFrame.handleFileActivity(packet.uri);
++    }
++  },
++
++  _onReflowActivity: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      this.webConsoleFrame.handleReflowActivity(packet);
++    }
++  },
++
++  /**
++   * The "serverLogCall" message type handler. We redirect any message to
++   * the UI for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onServerLogCall: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      this.webConsoleFrame.handleConsoleAPICall(packet.message);
++    }
++  },
++
++  /**
++   * The "lastPrivateContextExited" message type handler. When this message is
++   * received the Web Console UI is cleared.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onLastPrivateContextExited: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      this.webConsoleFrame.jsterm.clearPrivateMessages();
++    }
++  },
++
++  /**
++   * The "will-navigate" and "navigate" event handlers. We redirect any message
++   * to the UI for displaying.
++   *
++   * @private
++   * @param string event
++   *        Event type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onTabNavigated: function (event, packet) {
++    if (!this.webConsoleFrame) {
++      return;
++    }
++
++    this.webConsoleFrame.handleTabNavigated(event, packet);
++  },
++
++  /**
++   * Release an object actor.
++   *
++   * @param string actor
++   *        The actor ID to send the request to.
++   */
++  releaseActor: function (actor) {
++    if (this.client) {
++      this.client.release(actor);
++    }
++  },
++
++  /**
++   * Disconnect the Web Console from the remote server.
++   *
++   * @return object
++   *         A promise object that is resolved when disconnect completes.
++   */
++  disconnect: function () {
++    if (this._disconnecter) {
++      return this._disconnecter.promise;
++    }
++
++    this._disconnecter = defer();
++
++    if (!this.client) {
++      this._disconnecter.resolve(null);
++      return this._disconnecter.promise;
++    }
++
++    this.client.removeListener("logMessage", this._onLogMessage);
++    this.client.removeListener("pageError", this._onPageError);
++    this.client.removeListener("consoleAPICall", this._onConsoleAPICall);
++    this.client.removeListener("fileActivity", this._onFileActivity);
++    this.client.removeListener("reflowActivity", this._onReflowActivity);
++    this.client.removeListener("serverLogCall", this._onServerLogCall);
++    this.client.removeListener("lastPrivateContextExited",
++                               this._onLastPrivateContextExited);
++    this.webConsoleClient.off("networkEvent", this._onNetworkEvent);
++    this.webConsoleClient.off("networkEventUpdate", this._onNetworkEventUpdate);
++    this.target.off("will-navigate", this._onTabNavigated);
++    this.target.off("navigate", this._onTabNavigated);
++
++    this.client = null;
++    this.webConsoleClient = null;
++    this.target = null;
++    this.connected = false;
++    this.webConsoleFrame = null;
++    this._disconnecter.resolve(null);
++
++    return this._disconnecter.promise;
++  },
++};
++
++
++exports.WebConsoleConnectionProxy = WebConsoleConnectionProxy;
++module.exports.WebConsoleConnectionProxy = WebConsoleConnectionProxy;
+diff --git a/devtools/client/webconsole/local-dev/console-frame.js b/devtools/client/webconsole/local-dev/console-frame.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/local-dev/console-frame.js
+@@ -0,0 +1,16 @@
++const ConsoleFrame = {
++  owner: window,
++
++  handleTabNavigated() {
++  },
++
++  onLocationChange(uri, title) {
++    this.contentLocation = uri;
++    if (this.owner.onLocationChange) {
++      this.owner.onLocationChange(uri, title);
++    }
++  },
++};
++
++
++module.exports = ConsoleFrame;
+diff --git a/devtools/client/webconsole/local-dev/strings.js b/devtools/client/webconsole/local-dev/strings.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/local-dev/strings.js
+@@ -0,0 +1,55 @@
++module.exports = {
++  "frame.unknownSource":"(unknown)",
++  "timestampFormat":"%02S:%02S:%02S.%03S",
++  "helperFuncUnsupportedTypeError":"Can’t call pprint on this type of object.",
++  "NetworkPanel.durationMS":"%Sms",
++  "ConsoleAPIDisabled":"The Web Console logging API (console.log, console.info, console.warn, console.error) has been disabled by a script on this page.",
++  "webConsoleWindowTitleAndURL":"Web Console - %S",
++  "webConsoleXhrIndicator":"XHR",
++  "webConsoleMixedContentWarning":"Mixed Content",
++  "webConsoleMoreInfoLabel":"Learn More",
++  "scratchpad.linkText":"Shift+RETURN - Open in Scratchpad",
++  "reflow.messageWithNoLink":"reflow: %Sms",
++  "reflow.messageWithLink":"reflow: %Sms\u0020",
++  "reflow.messageLinkText":"function %1$S, %2$S line %3$S",
++  "stacktrace.anonymousFunction":"<anonymous>",
++  "stacktrace.asyncStack":"(Async: %S)",
++  "timerStarted":"%S: timer started",
++  "timeEnd":"%1$S: %2$Sms",
++  "consoleCleared":"Console was cleared.",
++  "noCounterLabel":"<no label>",
++  "noGroupLabel":"<no group label>",
++  "Autocomplete.blank":"  <- no result",
++  "maxTimersExceeded":"The maximum allowed number of timers in this page was exceeded.",
++  "maxCountersExceeded":"The maximum allowed number of counters in this page was exceeded.",
++  "longStringEllipsis":"[…]",
++  "longStringTooLong":"The string you are trying to view is too long to be displayed by the Web Console.",
++  "connectionTimeout":"Connection timeout. Check the Error Console on both ends for potential error messages. Reopen the Web Console to try again.",
++  "propertiesFilterPlaceholder":"Filter properties",
++  "emptyPropertiesList":"No properties to display",
++  "messageRepeats.tooltip2":"#1 repeat;#1 repeats",
++  "openNodeInInspector":"Click to select the node in the inspector",
++  "cdFunctionInvalidArgument":"Cannot cd() to the given window. Invalid argument.",
++  "selfxss.msg":"Scam Warning: Take care when pasting things you don’t understand. This could allow attackers to steal your identity or take control of your computer. Please type ‘%S’ below (no need to press enter) to allow pasting.",
++  "selfxss.okstring":"allow pasting",
++  "messageToggleDetails":"Show/hide message details.",
++  "groupToggle":"Show/hide group.",
++  "emptySlotLabel":"#1 empty slot;#1 empty slots",
++  "table.index":"(index)",
++  "table.iterationIndex":"(iteration index)",
++  "table.key":"Key",
++  "table.value":"Values",
++  "severity.error":"Error",
++  "severity.warn":"Warning",
++  "severity.info":"Info",
++  "severity.log":"Log",
++  "level.error":"Error",
++  "level.warn":"Warning",
++  "level.info":"Info",
++  "level.log":"Log",
++  "level.debug":"Debug",
++  "webconsole.find.key":"CmdOrCtrl+F",
++  "webconsole.close.key":"CmdOrCtrl+W",
++  "webconsole.clear.key":"Ctrl+Shift+L",
++  "webconsole.clear.keyOSX":"Ctrl+L",
++}
+diff --git a/devtools/client/webconsole/local-dev/thunk.js b/devtools/client/webconsole/local-dev/thunk.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/local-dev/thunk.js
+@@ -0,0 +1,9 @@
++function thunk({ dispatch, getState }) {
++  return next => action => {
++    return (typeof action === "function")
++      ? action(dispatch, getState)
++      : next(action);
++  };
++}
++
++module.exports = {thunk}
+\ No newline at end of file
+diff --git a/devtools/client/webconsole/local-dev/toolbox.js b/devtools/client/webconsole/local-dev/toolbox.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/local-dev/toolbox.js
+@@ -0,0 +1,54 @@
++const React = require("react");
++
++const { bindActionCreators, combineReducers } = require("redux");
++const ReactDOM = require("react-dom");
++
++const {
++   bootstrap, L10N
++} = require("devtools-launchpad");
++
++const { getValue, isFirefoxPanel } = require("devtools-config");
++
++const NewConsoleOutputWrapper = require("../new-console-output/new-console-output-wrapper");
++const { WebConsoleConnectionProxy } = require("./connection-proxy");
++const ConsoleFrame = require("./console-frame");
++
++// this.experimentalOutputNode, this.jsterm, toolbox, this.owner, this.document
++const el = document.createElement("div")
++const jsterm = {
++  hud: {
++    proxy: { client: {} },
++    emit: () => {}
++  }
++};
++
++if (!isFirefoxPanel()) {
++  L10N.setBundle(require("./strings.js"));
++  window.l10n = L10N;
++}
++
++function onConnect({client} = {}) {
++  if (!client) {
++    return;
++  }
++
++  const tabTarget = client.getTabTarget();
++  const connectionProxy = new WebConsoleConnectionProxy(ConsoleFrame, tabTarget)
++  connectionProxy.connect();
++}
++
++const toolbox = {}
++
++app = new NewConsoleOutputWrapper(
++  el, jsterm, toolbox, window, document
++);
++app.init();
++
++window.eval = function(input) {
++  client.evaluate(input, {}).then(r => {
++    app.dispatchMessageAdd(r)
++  })
++}
++
++bootstrap(React, ReactDOM, app.parentNode)
++  .then(onConnect);
+diff --git a/devtools/client/webconsole/new-console-output/actions/index.js b/devtools/client/webconsole/new-console-output/actions/index.js
+--- a/devtools/client/webconsole/new-console-output/actions/index.js
++++ b/devtools/client/webconsole/new-console-output/actions/index.js
+@@ -1,18 +1,16 @@
+ /* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+-const actionModules = [
+-  "enhancers",
+-  "filters",
+-  "messages",
+-  "ui",
+-].map(filename => require(`./${filename}`));
+-
+-const actions = Object.assign({}, ...actionModules);
++const actions = {
++  enahancers: require("./enhancers"),
++  filters: require("./filters"),
++  messages: require("./messages"),
++  ui: require("./ui"),
++};
+ 
+ module.exports = actions;
+diff --git a/devtools/client/webconsole/new-console-output/connection-proxy.js b/devtools/client/webconsole/new-console-output/connection-proxy.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/new-console-output/connection-proxy.js
+@@ -0,0 +1,507 @@
++const { prefs } = require("./prefs");
++
++const PREF_CONNECTION_TIMEOUT = "devtools.debugger.remote-timeout";
++
++function defer() {
++  let resolve, reject;
++  let promise = new Promise(function() {
++    resolve = arguments[0];
++    reject = arguments[1];
++  });
++  return {
++    resolve: resolve,
++    reject: reject,
++    promise: promise
++  };
++};
++
++
++// Web Console connection proxy
++
++/**
++ * The WebConsoleConnectionProxy handles the connection between the Web Console
++ * and the application we connect to through the remote debug protocol.
++ *
++ * @constructor
++ * @param object webConsoleFrame
++ *        The WebConsoleFrame object that owns this connection proxy.
++ * @param RemoteTarget target
++ *        The target that the console will connect to.
++ */
++function WebConsoleConnectionProxy(webConsoleFrame, target) {
++  this.webConsoleFrame = webConsoleFrame;
++  this.target = target;
++
++  this._onPageError = this._onPageError.bind(this);
++  this._onLogMessage = this._onLogMessage.bind(this);
++  this._onConsoleAPICall = this._onConsoleAPICall.bind(this);
++  this._onNetworkEvent = this._onNetworkEvent.bind(this);
++  this._onNetworkEventUpdate = this._onNetworkEventUpdate.bind(this);
++  this._onFileActivity = this._onFileActivity.bind(this);
++  this._onReflowActivity = this._onReflowActivity.bind(this);
++  this._onServerLogCall = this._onServerLogCall.bind(this);
++  this._onTabNavigated = this._onTabNavigated.bind(this);
++  this._onAttachConsole = this._onAttachConsole.bind(this);
++  this._onCachedMessages = this._onCachedMessages.bind(this);
++  this._connectionTimeout = this._connectionTimeout.bind(this);
++  this._onLastPrivateContextExited =
++    this._onLastPrivateContextExited.bind(this);
++}
++
++
++
++WebConsoleConnectionProxy.prototype = {
++  /**
++   * The owning Web Console Frame instance.
++   *
++   * @see WebConsoleFrame
++   * @type object
++   */
++  webConsoleFrame: null,
++
++  /**
++   * The target that the console connects to.
++   * @type RemoteTarget
++   */
++  target: null,
++
++  /**
++   * The DebuggerClient object.
++   *
++   * @see DebuggerClient
++   * @type object
++   */
++  client: null,
++
++  /**
++   * The WebConsoleClient object.
++   *
++   * @see WebConsoleClient
++   * @type object
++   */
++  webConsoleClient: null,
++
++  /**
++   * Tells if the connection is established.
++   * @type boolean
++   */
++  connected: false,
++
++  /**
++   * Timer used for the connection.
++   * @private
++   * @type object
++   */
++  _connectTimer: null,
++
++  _connectDefer: null,
++  _disconnecter: null,
++
++  /**
++   * The WebConsoleActor ID.
++   *
++   * @private
++   * @type string
++   */
++  _consoleActor: null,
++
++  /**
++   * Tells if the window.console object of the remote web page is the native
++   * object or not.
++   * @private
++   * @type boolean
++   */
++  _hasNativeConsoleAPI: false,
++
++  /**
++   * Initialize a debugger client and connect it to the debugger server.
++   *
++   * @return object
++   *         A promise object that is resolved/rejected based on the success of
++   *         the connection initialization.
++   */
++  connect: function () {
++    if (this._connectDefer) {
++      return this._connectDefer.promise;
++    }
++
++    this._connectDefer = defer();
++
++    let timeout = prefs.debuggerRemoteTimeout;
++    window.setTimeout(this._connectionTimeout, timeout);
++
++    let connPromise = this._connectDefer.promise;
++    connPromise.then(() => {
++      this._connectTimer.cancel();
++      this._connectTimer = null;
++    }, () => {
++      this._connectTimer = null;
++    });
++
++    let client = this.client = this.target.client;
++
++    if (this.target.isWorkerTarget) {
++      // XXXworkers: Not Console API yet inside of workers (Bug 1209353).
++    } else {
++      client.addListener("logMessage", this._onLogMessage);
++      client.addListener("pageError", this._onPageError);
++      client.addListener("consoleAPICall", this._onConsoleAPICall);
++      client.addListener("fileActivity", this._onFileActivity);
++      client.addListener("reflowActivity", this._onReflowActivity);
++      client.addListener("serverLogCall", this._onServerLogCall);
++      client.addListener("lastPrivateContextExited",
++                         this._onLastPrivateContextExited);
++    }
++    this.target.on("will-navigate", this._onTabNavigated);
++    this.target.on("navigate", this._onTabNavigated);
++
++    this._consoleActor = this.target.form.consoleActor;
++    if (this.target.isTabActor) {
++      let tab = this.target.form;
++      this.webConsoleFrame.onLocationChange(tab.url, tab.title);
++    }
++
++    // this._attachConsole();
++    // return connPromise;
++  },
++
++  /**
++   * Connection timeout handler.
++   * @private
++   */
++  _connectionTimeout: function () {
++    let error = {
++      error: "timeout",
++      message: l10n.getStr("connectionTimeout"),
++    };
++
++    this._connectDefer.reject(error);
++  },
++
++  /**
++   * Attach to the Web Console actor.
++   * @private
++   */
++  _attachConsole: function () {
++    let listeners = ["PageError", "ConsoleAPI", "NetworkActivity",
++                     "FileActivity"];
++    this.client.attachConsole(this._consoleActor, listeners,
++                              this._onAttachConsole);
++  },
++
++  /**
++   * The "attachConsole" response handler.
++   *
++   * @private
++   * @param object response
++   *        The JSON response object received from the server.
++   * @param object webConsoleClient
++   *        The WebConsoleClient instance for the attached console, for the
++   *        specific tab we work with.
++   */
++  _onAttachConsole: function (response, webConsoleClient) {
++    if (response.error) {
++      console.error("attachConsole failed: " + response.error + " " +
++                    response.message);
++      this._connectDefer.reject(response);
++      return;
++    }
++
++    this.webConsoleClient = webConsoleClient;
++    this._hasNativeConsoleAPI = response.nativeConsoleAPI;
++
++    // There is no way to view response bodies from the Browser Console, so do
++    // not waste the memory.
++    let saveBodies = !this.webConsoleFrame.isBrowserConsole;
++    this.webConsoleFrame.setSaveRequestAndResponseBodies(saveBodies);
++
++    this.webConsoleClient.on("networkEvent", this._onNetworkEvent);
++    this.webConsoleClient.on("networkEventUpdate", this._onNetworkEventUpdate);
++
++    let msgs = ["PageError", "ConsoleAPI"];
++    this.webConsoleClient.getCachedMessages(msgs, this._onCachedMessages);
++
++    this.webConsoleFrame._onUpdateListeners();
++  },
++
++  /**
++   * Dispatch a message add on the new frontend and emit an event for tests.
++   */
++  dispatchMessageAdd: function(packet) {
++    this.webConsoleFrame.newConsoleOutput.dispatchMessageAdd(packet);
++  },
++
++  /**
++   * Batched dispatch of messages.
++   */
++  dispatchMessagesAdd: function(packets) {
++    this.webConsoleFrame.newConsoleOutput.dispatchMessagesAdd(packets);
++  },
++
++  /**
++   * The "cachedMessages" response handler.
++   *
++   * @private
++   * @param object response
++   *        The JSON response object received from the server.
++   */
++  _onCachedMessages: function (response) {
++    if (response.error) {
++      console.error("Web Console getCachedMessages error: " + response.error +
++                    " " + response.message);
++      this._connectDefer.reject(response);
++      return;
++    }
++
++    if (!this._connectTimer) {
++      // This happens if the promise is rejected (eg. a timeout), but the
++      // connection attempt is successful, nonetheless.
++      console.error("Web Console getCachedMessages error: invalid state.");
++    }
++
++    let messages =
++      response.messages.concat(...this.webConsoleClient.getNetworkEvents());
++    messages.sort((a, b) => a.timeStamp - b.timeStamp);
++
++    if (this.webConsoleFrame.NEW_CONSOLE_OUTPUT_ENABLED) {
++      // Filter out CSS page errors.
++      messages = messages.filter(message => !(message._type == "PageError"
++          && Utils.categoryForScriptError(message) === CATEGORY_CSS));
++      this.dispatchMessagesAdd(messages);
++    } else {
++      this.webConsoleFrame.displayCachedMessages(messages);
++      if (!this._hasNativeConsoleAPI) {
++        this.webConsoleFrame.logWarningAboutReplacedAPI();
++      }
++    }
++
++    this.connected = true;
++    this._connectDefer.resolve(this);
++  },
++
++  /**
++   * The "pageError" message type handler. We redirect any page errors to the UI
++   * for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onPageError: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      if (this.webConsoleFrame.NEW_CONSOLE_OUTPUT_ENABLED) {
++        let category = Utils.categoryForScriptError(packet.pageError);
++        if (category !== CATEGORY_CSS) {
++          this.dispatchMessageAdd(packet);
++        }
++        return;
++      }
++      this.webConsoleFrame.handlePageError(packet.pageError);
++    }
++  },
++
++  /**
++   * The "logMessage" message type handler. We redirect any message to the UI
++   * for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onLogMessage: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      this.webConsoleFrame.handleLogMessage(packet);
++    }
++  },
++
++  /**
++   * The "consoleAPICall" message type handler. We redirect any message to
++   * the UI for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onConsoleAPICall: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      if (this.webConsoleFrame.NEW_CONSOLE_OUTPUT_ENABLED) {
++        this.dispatchMessageAdd(packet);
++      } else {
++        this.webConsoleFrame.handleConsoleAPICall(packet.message);
++      }
++    }
++  },
++
++  /**
++   * The "networkEvent" message type handler. We redirect any message to
++   * the UI for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object networkInfo
++   *        The network request information.
++   */
++  _onNetworkEvent: function (type, networkInfo) {
++    if (this.webConsoleFrame) {
++      if (this.webConsoleFrame.NEW_CONSOLE_OUTPUT_ENABLED) {
++        this.dispatchMessageAdd(networkInfo);
++      } else {
++        this.webConsoleFrame.handleNetworkEvent(networkInfo);
++      }
++    }
++  },
++
++  /**
++   * The "networkEventUpdate" message type handler. We redirect any message to
++   * the UI for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   * @param object networkInfo
++   *        The network request information.
++   */
++  _onNetworkEventUpdate: function (type, { packet, networkInfo }) {
++    if (this.webConsoleFrame) {
++      this.webConsoleFrame.handleNetworkEventUpdate(networkInfo, packet);
++    }
++  },
++
++  /**
++   * The "fileActivity" message type handler. We redirect any message to
++   * the UI for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onFileActivity: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      this.webConsoleFrame.handleFileActivity(packet.uri);
++    }
++  },
++
++  _onReflowActivity: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      this.webConsoleFrame.handleReflowActivity(packet);
++    }
++  },
++
++  /**
++   * The "serverLogCall" message type handler. We redirect any message to
++   * the UI for displaying.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onServerLogCall: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      this.webConsoleFrame.handleConsoleAPICall(packet.message);
++    }
++  },
++
++  /**
++   * The "lastPrivateContextExited" message type handler. When this message is
++   * received the Web Console UI is cleared.
++   *
++   * @private
++   * @param string type
++   *        Message type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onLastPrivateContextExited: function (type, packet) {
++    if (this.webConsoleFrame && packet.from == this._consoleActor) {
++      this.webConsoleFrame.jsterm.clearPrivateMessages();
++    }
++  },
++
++  /**
++   * The "will-navigate" and "navigate" event handlers. We redirect any message
++   * to the UI for displaying.
++   *
++   * @private
++   * @param string event
++   *        Event type.
++   * @param object packet
++   *        The message received from the server.
++   */
++  _onTabNavigated: function (event, packet) {
++    if (!this.webConsoleFrame) {
++      return;
++    }
++
++    this.webConsoleFrame.handleTabNavigated(event, packet);
++  },
++
++  /**
++   * Release an object actor.
++   *
++   * @param string actor
++   *        The actor ID to send the request to.
++   */
++  releaseActor: function (actor) {
++    if (this.client) {
++      this.client.release(actor);
++    }
++  },
++
++  /**
++   * Disconnect the Web Console from the remote server.
++   *
++   * @return object
++   *         A promise object that is resolved when disconnect completes.
++   */
++  disconnect: function () {
++    if (this._disconnecter) {
++      return this._disconnecter.promise;
++    }
++
++    this._disconnecter = defer();
++
++    if (!this.client) {
++      this._disconnecter.resolve(null);
++      return this._disconnecter.promise;
++    }
++
++    this.client.removeListener("logMessage", this._onLogMessage);
++    this.client.removeListener("pageError", this._onPageError);
++    this.client.removeListener("consoleAPICall", this._onConsoleAPICall);
++    this.client.removeListener("fileActivity", this._onFileActivity);
++    this.client.removeListener("reflowActivity", this._onReflowActivity);
++    this.client.removeListener("serverLogCall", this._onServerLogCall);
++    this.client.removeListener("lastPrivateContextExited",
++                               this._onLastPrivateContextExited);
++    this.webConsoleClient.off("networkEvent", this._onNetworkEvent);
++    this.webConsoleClient.off("networkEventUpdate", this._onNetworkEventUpdate);
++    this.target.off("will-navigate", this._onTabNavigated);
++    this.target.off("navigate", this._onTabNavigated);
++
++    this.client = null;
++    this.webConsoleClient = null;
++    this.target = null;
++    this.connected = false;
++    this.webConsoleFrame = null;
++    this._disconnecter.resolve(null);
++
++    return this._disconnecter.promise;
++  },
++};
++
++
++exports.WebConsoleConnectionProxy = WebConsoleConnectionProxy;
++module.exports.WebConsoleConnectionProxy = WebConsoleConnectionProxy;
+diff --git a/devtools/client/webconsole/new-console-output/store.js b/devtools/client/webconsole/new-console-output/store.js
+--- a/devtools/client/webconsole/new-console-output/store.js
++++ b/devtools/client/webconsole/new-console-output/store.js
+@@ -18,17 +18,17 @@ const {
+   PREFS,
+ } = require("devtools/client/webconsole/new-console-output/constants");
+ const { reducers } = require("./reducers/index");
+ const Services = require("Services");
+ 
+ function configureStore() {
+   const initialState = {
+     prefs: new PrefState({
+-      logLimit: Math.max(Services.prefs.getIntPref("devtools.hud.loglimit"), 1),
++      logLimit: 1000,// TODO: Math.max(Services.prefs.getIntPref("devtools.hud.loglimit"), 1),
+     }),
+     filters: new FilterState({
+       error: Services.prefs.getBoolPref(PREFS.FILTER.ERROR),
+       warn: Services.prefs.getBoolPref(PREFS.FILTER.WARN),
+       info: Services.prefs.getBoolPref(PREFS.FILTER.INFO),
+       debug: Services.prefs.getBoolPref(PREFS.FILTER.DEBUG),
+       log: Services.prefs.getBoolPref(PREFS.FILTER.LOG),
+       css: Services.prefs.getBoolPref(PREFS.FILTER.CSS),
+diff --git a/devtools/client/webconsole/package.json b/devtools/client/webconsole/package.json
+--- a/devtools/client/webconsole/package.json
++++ b/devtools/client/webconsole/package.json
+@@ -1,21 +1,31 @@
+ {
+   "name": "webconsole",
+   "version": "0.0.1",
++  "engines": {
++    "node": ">=6.9.0"
++  },
+   "devDependencies": {
+-    "amd-loader": "0.0.5",
+     "babel-preset-es2015": "^6.6.0",
+-    "babel-register": "^6.7.2",
+-    "cross-env": "^3.1.3",
+-    "enzyme": "^2.4.1",
+-    "expect": "^1.16.0",
+-    "jsdom": "^9.4.1",
+-    "jsdom-global": "^2.0.0",
+-    "mocha": "^2.5.3",
+-    "require-hacker": "^2.1.4",
+-    "sinon": "^1.17.5"
++    "babel-register": "^6.24.0",
++    "file-loader": "^0.10.1"
+   },
+   "scripts": {
++    "start": "node bin/dev-server",
+     "postinstall": "cd ../ && npm install && cd webconsole",
+     "test": "cross-env NODE_PATH=../../../ mocha new-console-output/test/**/*.test.js --compilers js:babel-register -r jsdom-global/register -r ./new-console-output/test/require-helper.js"
++  },
++  "dependencies": {
++    "codemirror": "^5.24.2",
++    "devtools-config": "=0.0.12",
++    "devtools-launchpad": "=0.0.67",
++    "devtools-modules": "=0.0.24",
++    "devtools-source-editor": "=0.0.3",
++    "immutable": "^3.8.1",
++    "jszip": "^3.1.3",
++    "react": "=15.3.2",
++    "react-dom": "=15.3.2",
++    "react-redux": "=5.0.3",
++    "redux": "^3.6.0",
++    "reselect": "^2.5.4"
+   }
+ }
+diff --git a/devtools/client/webconsole/webpack.config.js b/devtools/client/webconsole/webpack.config.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/webpack.config.js
+@@ -0,0 +1,120 @@
++// /* This Source Code Form is subject to the terms of the Mozilla Public
++//  * License, v. 2.0. If a copy of the MPL was not distributed with this
++//  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++const {toolboxConfig} = require("./node_modules/devtools-launchpad/index");
++const { NormalModuleReplacementPlugin } = require("webpack");
++const {getConfig} = require("./bin/configure");
++
++const path = require("path");
++const projectPath = path.join(__dirname, "local-dev");
++
++function buildConfig(envConfig) {
++  let webpackConfig = {
++    entry: {
++      console: [path.join(projectPath, "toolbox.js")],
++    },
++
++    output: {
++      path: path.join(__dirname, "assets/build"),
++      filename: "[name].js",
++      publicPath: "/assets/build",
++    },
++  };
++
++  webpackConfig.resolve = {
++    alias: {
++      "devtools/client/webconsole/new-console-output": path.join(__dirname, "new-console-output"),
++      "react": path.join(__dirname, "node_modules/react"),
++      "devtools/client/framework/devtools": path.join(__dirname, "../../client/shims/devtools"),
++      "devtools/client/framework/menu": "devtools-modules/client/framework/menu",
++      "devtools/client/framework/menu-item": path.join(__dirname, "../../client/framework/menu-item"),
++      "devtools/client/locales": path.join(__dirname, "../../client/locales/en-US"),
++      "devtools/client/shared/components/reps/reps": path.join(__dirname, "../../client/shared/components/reps/reps"),
++      "devtools/client/shared/components/stack-trace": path.join(__dirname, "../../client/shared/components/stack-trace"),
++      "devtools/client/shared/curl": path.join(__dirname, "../../client/shared/curl"),
++      "devtools/client/shared/file-saver": path.join(__dirname, "../../client/shared/file-saver"),
++      "devtools/client/shared/keycodes": path.join(__dirname, "../../client/shared/keycodes"),
++      "devtools/client/shared/key-shortcuts": path.join(__dirname, "../../client/shared/key-shortcuts"),
++      "devtools/client/shared/prefs": path.join(__dirname, "../../client/shared/prefs"),
++      "devtools/client/shared/scroll": path.join(__dirname, "../../client/shared/scroll"),
++      "devtools/client/shared/source-utils": path.join(__dirname, "../../client/shared/source-utils"),
++      "devtools/client/shared/vendor/immutable": "immutable",
++      "devtools/client/shared/vendor/react": "react",
++      "devtools/client/shared/vendor/react-dom": "react-dom",
++      "devtools/client/shared/vendor/react-redux": "react-redux",
++      "devtools/client/shared/vendor/redux": "redux",
++      "devtools/client/shared/vendor/reselect": "reselect",
++      "devtools/client/shared/vendor/jszip": "jszip",
++      "devtools/client/shared/widgets/tooltip/HTMLTooltip": path.join(__dirname, "../../client/shared/widgets/tooltip/HTMLTooltip"),
++      "devtools/client/shared/widgets/tooltip/ImageTooltipHelper": path.join(__dirname, "../../client/shared/widgets/tooltip/ImageTooltipHelper"),
++      "devtools/client/shared/widgets/tooltip/TooltipToggle": path.join(__dirname, "../../client/shared/widgets/tooltip/TooltipToggle"),
++      "devtools/client/shared/widgets/Chart": path.join(__dirname, "../../client/shared/widgets/Chart"),
++      "devtools/client/sourceeditor/editor": "devtools-source-editor/src/source-editor",
++      "devtools/shared/async-utils": path.join(__dirname, "../../shared/async-utils"),
++      "devtools/shared/defer": path.join(__dirname, "../../shared/defer"),
++      "devtools/shared/event-emitter": "devtools-modules/shared/event-emitter",
++      "devtools/shared/fronts/timeline": path.join(__dirname, "../../shared/shims/fronts/timeline"),
++      "devtools/shared/l10n": path.join(__dirname, "../../shared/l10n"),
++      "devtools/shared/locales": path.join(__dirname, "../../shared/locales/en-US"),
++      "devtools/shared/platform/clipboard": path.join(__dirname, "../../shared/platform/content/clipboard"),
++      "devtools/shared/plural-form": path.join(__dirname, "../../shared/plural-form"),
++      "devtools/shared/task": path.join(__dirname, "../../shared/task"),
++      "toolkit/locales": path.join(__dirname, "../../../toolkit/locales/en-US"),
++      "Services": "devtools-modules/client/shared/shim/Services",
++      "devtools/client/shared/components/reps/reps": path.join(__dirname, "../../client/shared/components/reps/reps"),
++      "devtools/client/shared/components/frame": path.join(__dirname, "../../client/shared/components/frame"),
++      //
++      // // these path aliases are incredibly stupid and WILL be replaced soon
++      "devtools/client/shared/redux/middleware/thunk": path.join(projectPath, "thunk.js"),
++      "devtools/client/webconsole/utils": path.join(__dirname, "new-console-output/test/fixtures/WebConsoleUtils"),
++      // "devtools/shared/client/main": path.join(projectPath, "lib/main.js"),
++      "devtools/shared/client/main": path.join(__dirname, "new-console-output/test/fixtures/ObjectClient"),
++      "devtools/client/locales/components.properties": path.join(__dirname, "../../client/locales/components.properties"),
++      // "devtools/client/shared/source-utils": path.join(projectPath, "lib/source-utils"),
++    }
++  };
++
++
++  const mappings = [
++    [
++      /utils\/menu/, "devtools-launchpad/src/components/shared/menu"
++    ],
++    [
++      /chrome:\/\/devtools\/skin/,
++      (result) => {
++        result.request = result.request
++          .replace("./chrome://devtools/skin", path.join(__dirname, "../themes"));
++      }
++    ],
++    [
++      /chrome:\/\/devtools\/content/,
++      (result) => {
++        result.request = result.request
++          .replace("./chrome://devtools/content", path.join(__dirname, ".."));
++      }
++    ],
++    [
++      /resource:\/\/devtools/,
++      (result) => {
++        result.request = result.request
++          .replace("./resource://devtools/client", path.join(__dirname, ".."));
++      }
++    ],
++  ];
++
++  webpackConfig.plugins = mappings.map(([regex, res]) =>
++    new NormalModuleReplacementPlugin(regex, res));
++
++  // Exclude to transpile all scripts in devtools/ but not for this folder
++  const basePath = path.join(__dirname, "../../").replace(/\\/g, "\\\\");
++  const baseName = path.basename(__dirname);
++  webpackConfig.babelExcludes = new RegExp(`^${basePath}(.(?!${baseName}))*$`);
++
++  return toolboxConfig(webpackConfig, envConfig);
++}
++
++
++const envConfig = getConfig();
++module.exports = buildConfig(envConfig)
++
+diff --git a/devtools/shared/l10n.js b/devtools/shared/l10n.js
+--- a/devtools/shared/l10n.js
++++ b/devtools/shared/l10n.js
+@@ -83,17 +83,18 @@ LocalizationHelper.prototype = {
+    * @return string
+    */
+   getStr: function (name) {
+     let properties = getProperties(this.stringBundleName);
+     if (name in properties) {
+       return properties[name];
+     }
+ 
+-    throw new Error("No localization found for [" + name + "]");
++    return "TODO FIX THIS";
++    //throw new Error("No localization found for [" + name + "]");
+   },
+ 
+   /**
+    * L10N shortcut function.
+    *
+    * @param string name
+    * @param array args
+    * @return string
