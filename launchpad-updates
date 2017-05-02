@@ -1,0 +1,298 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  bfc7b187005cabbc828ed9f5b61daf139c3cfd90
+Bug 1361537 - Add a simple jsterm implementation to console launchpad;r=Honza
+
+diff --git a/devtools/client/themes/new-webconsole.css b/devtools/client/themes/new-webconsole.css
+--- a/devtools/client/themes/new-webconsole.css
++++ b/devtools/client/themes/new-webconsole.css
+@@ -468,16 +468,20 @@ body {
+   background-image: var(--theme-command-line-image-focus);
+   box-shadow: none;
+ }
+ 
+ .jsterm-complete-node {
+   color: var(--theme-comment);
+ }
+ 
++.jsterm-input-node-html {
++  width: 100%;
++}
++
+ .jsterm-input-node {
+   /* Always allow scrolling on input - it auto expands in js by setting height,
+      but don't want it to get bigger than the window. 24px = toolbar height. */
+   max-height: calc(90vh - 24px);
+   background-image: var(--theme-command-line-image);
+   background-repeat: no-repeat;
+   background-size: 16px 16px;
+   background-position: 4px 50%;
+diff --git a/devtools/client/webconsole/local-dev/index.js b/devtools/client/webconsole/local-dev/index.js
+--- a/devtools/client/webconsole/local-dev/index.js
++++ b/devtools/client/webconsole/local-dev/index.js
+@@ -70,16 +70,18 @@ function onConnect(connection) {
+     return;
+   }
+ 
+   // Stub out properties that are received from hudservice
+   const owner = {
+     iframeWindow: window,
+     chromeWindow: window,
+     hudId: "hud_0",
++    getDebuggerFrames: () => { },
++    getInspectorSelection: () => { },
+     target: connection.tabConnection.tabTarget,
+     _browserConsole: false,
+     NewConsoleOutputWrapper,
+   };
+   consoleFrame = new NewWebConsoleFrame(owner);
+   consoleFrame.init().then(function () {
+     console.log("NewWebConsoleFrame initialized");
+   });
+diff --git a/devtools/client/webconsole/local-dev/jsterm-stub.js b/devtools/client/webconsole/local-dev/jsterm-stub.js
+--- a/devtools/client/webconsole/local-dev/jsterm-stub.js
++++ b/devtools/client/webconsole/local-dev/jsterm-stub.js
+@@ -1,17 +1,176 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
++const { ConsoleCommand } = require("devtools/client/webconsole/new-console-output/types");
++
+ function JSTerm(webConsoleFrame) {
+   this.hud = webConsoleFrame;
+   this.hudId = this.hud.hudId;
+   this.historyLoaded = new Promise(r => {
+     r();
+   });
+-  this.openVariablesView = () => { };
+-  this.init = () => { };
+ }
+ 
++JSTerm.prototype = {
++  SELECTED_FRAME: -1,
++
++  get webConsoleClient() {
++    return this.hud.webConsoleClient;
++  },
++
++  openVariablesView() { },
++  clearOutput() { },
++
++  init() {
++    this.doc = this.hud.window.document;
++    this.root = this.doc.createElement("div");
++    this.root.className = "jsterm-input-container";
++    this.inputNode = this.doc.createElement("input");
++    this.inputNode.className = "jsterm-input-node jsterm-input-node-html";
++    this.root.appendChild(this.inputNode);
++    this.doc.querySelector("#app-wrapper").appendChild(this.root);
++
++    this.inputNode.onkeypress = (e) => {
++      if (e.key === "Enter") {
++        this.execute();
++      }
++    };
++  },
++
++  /**
++   * Sets the value of the input field (command line), and resizes the field to
++   * fit its contents. This method is preferred over setting "inputNode.value"
++   * directly, because it correctly resizes the field.
++   *
++   * @param string newValue
++   *        The new value to set.
++   * @returns void
++   */
++  setInputValue(newValue) {
++    this.inputNode.value = newValue;
++    // this.resizeInput();
++  },
++
++  /**
++   * Gets the value from the input field
++   * @returns string
++   */
++  getInputValue() {
++    return this.inputNode.value || "";
++  },
++
++  execute(executeString) {
++    return new Promise(resolve => {
++      // attempt to execute the content of the inputNode
++      executeString = executeString || this.getInputValue();
++      if (!executeString) {
++        return;
++      }
++
++      let message = new ConsoleCommand({
++        messageText: executeString,
++      });
++      this.hud.proxy.dispatchMessageAdd(message);
++
++      let selectedNodeActor = null;
++      let inspectorSelection = this.hud.owner.getInspectorSelection();
++      if (inspectorSelection && inspectorSelection.nodeFront) {
++        selectedNodeActor = inspectorSelection.nodeFront.actorID;
++      }
++
++      let onResult = (response) => {
++        if (response.error) {
++          console.error("Evaluation error " + response.error + ": " +
++                        response.message);
++          return;
++        }
++        this.hud.newConsoleOutput.dispatchMessageAdd(response, true).then(resolve);
++      };
++
++      let options = {
++        frame: this.SELECTED_FRAME,
++        selectedNodeActor: selectedNodeActor,
++      };
++
++      this.requestEvaluation(executeString, options).then(onResult, onResult);
++      this.setInputValue("");
++    });
++  },
++
++  /**
++   * Request a JavaScript string evaluation from the server.
++   *
++   * @param string str
++   *        String to execute.
++   * @param object [options]
++   *        Options for evaluation:
++   *        - bindObjectActor: tells the ObjectActor ID for which you want to do
++   *        the evaluation. The Debugger.Object of the OA will be bound to
++   *        |_self| during evaluation, such that it's usable in the string you
++   *        execute.
++   *        - frame: tells the stackframe depth to evaluate the string in. If
++   *        the jsdebugger is paused, you can pick the stackframe to be used for
++   *        evaluation. Use |this.SELECTED_FRAME| to always pick the
++   *        user-selected stackframe.
++   *        If you do not provide a |frame| the string will be evaluated in the
++   *        global content window.
++   *        - selectedNodeActor: tells the NodeActor ID of the current selection
++   *        in the Inspector, if such a selection exists. This is used by
++   *        helper functions that can evaluate on the current selection.
++   * @return object
++   *         A promise object that is resolved when the server response is
++   *         received.
++   */
++  requestEvaluation(str, options = {}) {
++    return new Promise((resolve, reject) => {
++      let frameActor = null;
++      if ("frame" in options) {
++        frameActor = this.getFrameActor(options.frame);
++      }
++      let evalOptions = {
++        bindObjectActor: options.bindObjectActor,
++        frameActor: frameActor,
++        selectedNodeActor: options.selectedNodeActor,
++        selectedObjectActor: options.selectedObjectActor,
++      };
++      let onResponse = response => {
++        if (!response.error) {
++          resolve(response);
++        } else {
++          reject(response);
++        }
++      };
++
++      this.webConsoleClient.evaluateJSAsync(str, onResponse, evalOptions);
++    });
++  },
++
++  /**
++   * Retrieve the FrameActor ID given a frame depth.
++   *
++   * @param number frame
++   *        Frame depth.
++   * @return string|null
++   *         The FrameActor ID for the given frame depth.
++   */
++  getFrameActor(frame) {
++    let state = this.hud.owner.getDebuggerFrames();
++    if (!state) {
++      return null;
++    }
++
++    let grip;
++    if (frame == this.SELECTED_FRAME) {
++      grip = state.frames[state.selected];
++    } else {
++      grip = state.frames[frame];
++    }
++
++    return grip ? grip.actor : null;
++  },
++};
++
+ module.exports.JSTerm = JSTerm;
+diff --git a/devtools/client/webconsole/new-webconsole.js b/devtools/client/webconsole/new-webconsole.js
+--- a/devtools/client/webconsole/new-webconsole.js
++++ b/devtools/client/webconsole/new-webconsole.js
+@@ -109,23 +109,27 @@ NewWebConsoleFrame.prototype = {
+   _onUpdateListeners() {
+ 
+   },
+ 
+   logWarningAboutReplacedAPI() {
+ 
+   },
+ 
++  handleNetworkEventUpdate() {
++
++  },
++
+   /**
+    * Setter for saving of network request and response bodies.
+    *
+    * @param boolean value
+    *        The new value you want to set.
+    */
+-  setSaveRequestAndResponseBodies: function (value) {
++  setSaveRequestAndResponseBodies(value) {
+     if (!this.webConsoleClient) {
+       // Don't continue if the webconsole disconnected.
+       return promise.resolve(null);
+     }
+ 
+     let deferred = defer();
+     let newValue = !!value;
+     let toSet = {
+@@ -247,23 +251,31 @@ NewWebConsoleFrame.prototype = {
+    */
+   handleTabNavigated: function (event, packet) {
+     if (event == "will-navigate") {
+       if (this.persistLog) {
+         // Add a _type to hit convertCachedPacket.
+         packet._type = true;
+         this.newConsoleOutput.dispatchMessageAdd(packet);
+       } else {
+-        this.jsterm.clearOutput();
++        this.clearOutput(false);
+       }
+     }
+ 
+     if (packet.url) {
+       this.onLocationChange(packet.url, packet.title);
+     }
+ 
+     if (event == "navigate" && !packet.nativeConsoleAPI) {
+       this.logWarningAboutReplacedAPI();
+     }
+   },
++
++  clearOutput(clearStorage) {
++    this.newConsoleOutput.dispatchMessagesClear();
++    this.webConsoleClient.clearNetworkRequests();
++    if (clearStorage) {
++      this.webConsoleClient.clearMessagesCache();
++    }
++  },
+ };
+ 
+ exports.NewWebConsoleFrame = NewWebConsoleFrame;
