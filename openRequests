@@ -1,12 +1,90 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  ff83fde8be946eabcf27ea97d4676f601c122194
-Bug 1361140 - Key openRequests by channel instead of id for faster lookups;r=Honza
+# Parent  37a5b7f6f101df2eb292b1b6baaf1540c9920e20
+Bug 1361140 - Key openRequests and openResponses by channel instead of id for faster lookups;r=Honza
+
+MozReview-Commit-ID: LKpy7SCYcZj
 
 diff --git a/devtools/shared/webconsole/network-monitor.js b/devtools/shared/webconsole/network-monitor.js
 --- a/devtools/shared/webconsole/network-monitor.js
 +++ b/devtools/shared/webconsole/network-monitor.js
-@@ -1173,23 +1173,17 @@ NetworkMonitor.prototype = {
+@@ -532,32 +532,24 @@ NetworkResponseListener.prototype = {
+    *
+    * @private
+    */
+   _findOpenResponse: function () {
+     if (!this.owner || this._foundOpenResponse) {
+       return;
+     }
+ 
+-    let openResponse = null;
+-
+-    for (let id in this.owner.openResponses) {
+-      let item = this.owner.openResponses[id];
+-      if (item.channel === this.httpActivity.channel) {
+-        openResponse = item;
+-        break;
+-      }
+-    }
+-
++    let channel = this.httpActivity.channel;
++    let openResponse = this.owner.openResponses.get(channel.channelId);
+     if (!openResponse) {
+       return;
+     }
+     this._foundOpenResponse = true;
+ 
+-    delete this.owner.openResponses[openResponse.id];
++    this.owner.openResponses.delete(channel.channelId);
+ 
+     this.httpActivity.owner.addResponseHeaders(openResponse.headers);
+     this.httpActivity.owner.addResponseCookies(openResponse.cookies);
+   },
+ 
+   /**
+    * Clean up the response listener once the response input stream is closed.
+    * This is called from onStopRequest() or from onInputStreamReady() when the
+@@ -704,18 +696,18 @@ NetworkResponseListener.prototype = {
+  *          methods which are used to add further network request/response information.
+  *        - stackTraceCollector
+  *          If the owner has this optional property, it will be used as a
+  *          StackTraceCollector by the NetworkMonitor.
+  */
+ function NetworkMonitor(filters, owner) {
+   this.filters = filters;
+   this.owner = owner;
+-  this.openRequests = {};
+-  this.openResponses = {};
++  this.openRequests = new Map();
++  this.openResponses = new Map();
+   this._httpResponseExaminer =
+     DevToolsUtils.makeInfallible(this._httpResponseExaminer).bind(this);
+   this._httpModifyExaminer =
+     DevToolsUtils.makeInfallible(this._httpModifyExaminer).bind(this);
+   this._serviceWorkerRequest = this._serviceWorkerRequest.bind(this);
+   this._throttleData = null;
+   this._throttler = null;
+ }
+@@ -889,17 +881,17 @@ NetworkMonitor.prototype = {
+     channel.QueryInterface(Ci.nsIHttpChannelInternal);
+     channel.getResponseVersion(httpVersionMaj, httpVersionMin);
+ 
+     response.status = channel.responseStatus;
+     response.statusText = channel.responseStatusText;
+     response.httpVersion = "HTTP/" + httpVersionMaj.value + "." +
+                                      httpVersionMin.value;
+ 
+-    this.openResponses[response.id] = response;
++    this.openResponses.set(channel.channelId, response);
+ 
+     if (topic === "http-on-examine-cached-response") {
+       // Service worker requests emits cached-reponse notification on non-e10s,
+       // and we fake one on e10s.
+       let fromServiceWorker = this.interceptedChannels.has(channel);
+       this.interceptedChannels.delete(channel);
+ 
+       // If this is a cached response, there never was a request event
+@@ -1173,23 +1165,17 @@ NetworkMonitor.prototype = {
     * Find an HTTP activity object for the channel.
     *
     * @param nsIHttpChannel channel
@@ -22,7 +100,7 @@ diff --git a/devtools/shared/webconsole/network-monitor.js b/devtools/shared/web
 -      }
 -    }
 -    return null;
-+    return this.openRequests[channel] || null;
++    return this.openRequests.get(channel.channelId) || null;
    },
  
    /**
@@ -31,7 +109,7 @@ diff --git a/devtools/shared/webconsole/network-monitor.js b/devtools/shared/web
     * information.
     *
     * This is a HAR-like object. Conformance to the spec is not guaranteed at
-@@ -1221,17 +1215,17 @@ NetworkMonitor.prototype = {
+@@ -1221,17 +1207,17 @@ NetworkMonitor.prototype = {
          // internal timing information, see observeActivity()
          timings: {},
          // see _onResponseHeader()
@@ -41,7 +119,7 @@ diff --git a/devtools/shared/webconsole/network-monitor.js b/devtools/shared/web
        };
  
 -      this.openRequests[httpActivity.id] = httpActivity;
-+      this.openRequests[channel] = httpActivity;
++      this.openRequests.set(channel.channelId, httpActivity);
      }
  
      return httpActivity;
@@ -50,7 +128,7 @@ diff --git a/devtools/shared/webconsole/network-monitor.js b/devtools/shared/web
    /**
     * Setup the network response listener for the given HTTP activity. The
     * NetworkResponseListener is responsible for storing the response body.
-@@ -1372,17 +1366,17 @@ NetworkMonitor.prototype = {
+@@ -1372,17 +1358,17 @@ NetworkMonitor.prototype = {
     *
     * @private
     * @param object httpActivity
@@ -60,7 +138,7 @@ diff --git a/devtools/shared/webconsole/network-monitor.js b/devtools/shared/web
      let result = this._setupHarTimings(httpActivity);
      httpActivity.owner.addEventTimings(result.total, result.timings);
 -    delete this.openRequests[httpActivity.id];
-+    delete this.openRequests[httpActivity.channel];
++    this.openRequests.delete(httpActivity.channel.channelId);
    },
  
    /**
@@ -69,3 +147,24 @@ diff --git a/devtools/shared/webconsole/network-monitor.js b/devtools/shared/web
     * |timings| - these are timings stored for each activity notification. The
     * HAR timing information is constructed based on these lower level
     * data.
+@@ -1491,18 +1477,18 @@ NetworkMonitor.prototype = {
+       Services.obs.removeObserver(this._httpModifyExaminer,
+                                   "http-on-modify-request");
+     }
+ 
+     Services.obs.removeObserver(this._serviceWorkerRequest,
+                                 "service-worker-synthesized-response");
+ 
+     this.interceptedChannels.clear();
+-    this.openRequests = {};
+-    this.openResponses = {};
++    this.openRequests.clear();
++    this.openResponses.clear();
+     this.owner = null;
+     this.filters = null;
+     this._throttler = null;
+   },
+ };
+ 
+ /**
+  * The NetworkMonitorChild is used to proxy all of the network activity of the
