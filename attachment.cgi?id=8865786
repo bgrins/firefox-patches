@@ -1,0 +1,429 @@
+# HG changeset patch
+# User Andrea Marchesini <amarchesini@mozilla.com>
+# Parent  15780b5143fc23444bf7d74df6a1abd4a9a0f304
+Bug 1363307 - Console.timeEnd(label) should warn if 'label' in an unknwon timer, r?bgrins
+
+diff --git a/devtools/client/locales/en-US/webconsole.properties b/devtools/client/locales/en-US/webconsole.properties
+--- a/devtools/client/locales/en-US/webconsole.properties
++++ b/devtools/client/locales/en-US/webconsole.properties
+@@ -91,16 +91,17 @@ noCounterLabel=<no label>
+ noGroupLabel=<no group label>
+ 
+ # LOCALIZATION NOTE (Autocomplete.blank): this string is used when inputnode
+ # string containing anchor doesn't matches to any property in the content.
+ Autocomplete.blank=  <- no result
+ 
+ maxTimersExceeded=The maximum allowed number of timers in this page was exceeded.
+ timerAlreadyExists=Timer %S already exists.
++timerDoesntExist=Timer %S doen't exist.
+ timerJSError=Failed to process the timer name.
+ 
+ # LOCALIZATION NOTE (maxCountersExceeded): Error message shown when the maximum
+ # number of console.count()-counters was exceeded.
+ maxCountersExceeded=The maximum allowed number of counters in this page was exceeded.
+ 
+ # LOCALIZATION NOTE (longStringEllipsis): the string displayed after a long
+ # string. This string is clickable such that the rest of the string is
+diff --git a/devtools/client/webconsole/new-console-output/utils/messages.js b/devtools/client/webconsole/new-console-output/utils/messages.js
+--- a/devtools/client/webconsole/new-console-output/utils/messages.js
++++ b/devtools/client/webconsole/new-console-output/utils/messages.js
+@@ -71,17 +71,20 @@ function transformPacket(packet) {
+             level = MESSAGE_LEVEL.WARN;
+           } else {
+             // We don't show anything for console.time calls to match Chrome's behaviour.
+             type = MESSAGE_TYPE.NULL_MESSAGE;
+           }
+           break;
+         case "timeEnd":
+           parameters = null;
+-          if (timer) {
++          if (timer && timer.error) {
++            messageText = l10n.getFormatStr(timer.error, [timer.name]);
++            level = MESSAGE_LEVEL.WARN;
++          } else if (timer) {
+             // We show the duration to users when calls console.timeEnd() is called,
+             // if corresponding console.time() was called before.
+             let duration = Math.round(timer.duration * 100) / 100;
+             messageText = l10n.getFormatStr("timeEnd", [timer.name, duration]);
+           } else {
+             // If the `timer` property does not exists, we don't output anything.
+             type = MESSAGE_TYPE.NULL_MESSAGE;
+           }
+diff --git a/devtools/client/webconsole/webconsole.js b/devtools/client/webconsole/webconsole.js
+--- a/devtools/client/webconsole/webconsole.js
++++ b/devtools/client/webconsole/webconsole.js
+@@ -1358,16 +1358,21 @@ WebConsoleFrame.prototype = {
+         break;
+       }
+ 
+       case "timeEnd": {
+         let timer = message.timer;
+         if (!timer) {
+           return null;
+         }
++        if (timer.error) {
++          console.error(new Error(l10n.getFormatStr(timer.error,
++                                                    [timer.name])));
++          return null;
++        }
+         let duration = Math.round(timer.duration * 100) / 100;
+         body = l10n.getFormatStr("timeEnd", [timer.name, duration]);
+         clipboardText = body;
+         break;
+       }
+ 
+       case "count": {
+         let counter = message.counter;
+diff --git a/dom/console/Console.cpp b/dom/console/Console.cpp
+--- a/dom/console/Console.cpp
++++ b/dom/console/Console.cpp
+@@ -87,17 +87,17 @@ public:
+   NS_INLINE_DECL_REFCOUNTING(ConsoleCallData)
+ 
+   ConsoleCallData()
+     : mMethodName(Console::MethodLog)
+     , mTimeStamp(JS_Now() / PR_USEC_PER_MSEC)
+     , mStartTimerValue(0)
+     , mStartTimerStatus(Console::eTimerUnknown)
+     , mStopTimerDuration(0)
+-    , mStopTimerStatus(false)
++    , mStopTimerStatus(Console::eTimerUnknown)
+     , mCountValue(MAX_PAGE_COUNTERS)
+     , mIDType(eUnknown)
+     , mOuterIDNumber(0)
+     , mInnerIDNumber(0)
+     , mStatus(eUnused)
+   {}
+ 
+   bool
+@@ -212,27 +212,27 @@ public:
+   // creation of it. If status is false, something went wrong. User
+   // DOMHighResTimeStamp instead mozilla::TimeStamp because we use
+   // monotonicTimer from Performance.now();
+   // They will be set on the owning thread and never touched again on that
+   // thread. They will be used in order to create a ConsoleTimerStart dictionary
+   // when console.time() is used.
+   DOMHighResTimeStamp mStartTimerValue;
+   nsString mStartTimerLabel;
+-  Console::StartTimerStatus mStartTimerStatus;
++  Console::TimerStatus mStartTimerStatus;
+ 
+   // These values are set in the owning thread and they contain the duration,
+   // the name and the status of the StopTimer method. If status is false,
+   // something went wrong. They will be set on the owning thread and never
+   // touched again on that thread. They will be used in order to create a
+   // ConsoleTimerEnd dictionary. This members are set when
+   // console.timeEnd() is called.
+   double mStopTimerDuration;
+   nsString mStopTimerLabel;
+-  bool mStopTimerStatus;
++  Console::TimerStatus mStopTimerStatus;
+ 
+   // These 2 values are set by IncreaseCounter on the owning thread and they are
+   // used CreateCounterValue. These members are set when console.count() is
+   // called.
+   nsString mCountLabel;
+   uint32_t mCountValue;
+ 
+   // The concept of outerID and innerID is misleading because when a
+@@ -2001,17 +2001,17 @@ Console::UnstoreGroupName(nsAString& aNa
+   }
+ 
+   uint32_t pos = mGroupStack.Length() - 1;
+   aName = mGroupStack[pos];
+   mGroupStack.RemoveElementAt(pos);
+   return true;
+ }
+ 
+-Console::StartTimerStatus
++Console::TimerStatus
+ Console::StartTimer(JSContext* aCx, const JS::Value& aName,
+                     DOMHighResTimeStamp aTimestamp,
+                     nsAString& aTimerLabel,
+                     DOMHighResTimeStamp* aTimerValue)
+ {
+   AssertIsOnOwningThread();
+   MOZ_ASSERT(aTimerValue);
+ 
+@@ -2037,128 +2037,136 @@ Console::StartTimer(JSContext* aCx, cons
+   DOMHighResTimeStamp entry = 0;
+   if (mTimerRegistry.Get(label, &entry)) {
+     return eTimerAlreadyExists;
+   }
+ 
+   mTimerRegistry.Put(label, aTimestamp);
+ 
+   *aTimerValue = aTimestamp;
+-  return eTimerStarted;
+-}
+-
+-void
+-Console::StartTimerStatusToError(StartTimerStatus aStatus,
+-                                 ConsoleTimerError& aError) const
+-{
+-  switch (aStatus) {
+-  case eTimerAlreadyExists:
+-    aError.mError.AssignLiteral("timerAlreadyExists");
+-    break;
+-
+-  case eTimerJSException:
+-    aError.mError.AssignLiteral("timerJSError");
+-    break;
+-
+-  case eTimerMaxReached:
+-    aError.mError.AssignLiteral("maxTimersExceeded");
+-    break;
+-
+-  default:
+-    MOZ_CRASH("Unsupported status");
+-    break;
+-  }
++  return eTimerDone;
+ }
+ 
+ JS::Value
+ Console::CreateStartTimerValue(JSContext* aCx, const nsAString& aTimerLabel,
+-                               StartTimerStatus aTimerStatus) const
++                               TimerStatus aTimerStatus) const
+ {
+   MOZ_ASSERT(aTimerStatus != eTimerUnknown);
+ 
+-  if (aTimerStatus != eTimerStarted) {
+-    RootedDictionary<ConsoleTimerError> error(aCx);
+-
+-    error.mName = aTimerLabel;
+-    StartTimerStatusToError(aTimerStatus, error);
+-
+-    JS::Rooted<JS::Value> value(aCx);
+-    if (!ToJSValue(aCx, error, &value)) {
+-      return JS::UndefinedValue();
+-    }
+-
+-    return value;
++  if (aTimerStatus != eTimerDone) {
++    return CreateTimerError(aCx, aTimerLabel, aTimerStatus);
+   }
+ 
+   RootedDictionary<ConsoleTimerStart> timer(aCx);
+ 
+   timer.mName = aTimerLabel;
+ 
+   JS::Rooted<JS::Value> value(aCx);
+   if (!ToJSValue(aCx, timer, &value)) {
+     return JS::UndefinedValue();
+   }
+ 
+   return value;
+ }
+ 
+-bool
++Console::TimerStatus
+ Console::StopTimer(JSContext* aCx, const JS::Value& aName,
+                    DOMHighResTimeStamp aTimestamp,
+                    nsAString& aTimerLabel,
+                    double* aTimerDuration)
+ {
+   AssertIsOnOwningThread();
+   MOZ_ASSERT(aTimerDuration);
+ 
+   *aTimerDuration = 0;
+ 
+   JS::Rooted<JS::Value> name(aCx, aName);
+   JS::Rooted<JSString*> jsString(aCx, JS::ToString(aCx, name));
+   if (NS_WARN_IF(!jsString)) {
+-    return false;
++    return eTimerJSException;
+   }
+ 
+   nsAutoJSString key;
+   if (NS_WARN_IF(!key.init(aCx, jsString))) {
+-    return false;
++    return eTimerJSException;
+   }
+ 
++  aTimerLabel = key;
++
+   DOMHighResTimeStamp entry = 0;
+   if (NS_WARN_IF(!mTimerRegistry.Get(key, &entry))) {
+-    return false;
++    return eTimerDoesntExist;
+   }
+ 
+   mTimerRegistry.Remove(key);
+ 
+-  aTimerLabel = key;
+   *aTimerDuration = aTimestamp - entry;
+-  return true;
++  return eTimerDone;
+ }
+ 
+ JS::Value
+ Console::CreateStopTimerValue(JSContext* aCx, const nsAString& aLabel,
+-                              double aDuration, bool aStatus) const
++                              double aDuration, TimerStatus aStatus) const
+ {
+-  if (!aStatus) {
+-    return JS::UndefinedValue();
++  if (aStatus != eTimerDone) {
++    return CreateTimerError(aCx, aLabel, aStatus);
+   }
+ 
+   RootedDictionary<ConsoleTimerEnd> timer(aCx);
+   timer.mName = aLabel;
+   timer.mDuration = aDuration;
+ 
+   JS::Rooted<JS::Value> value(aCx);
+   if (!ToJSValue(aCx, timer, &value)) {
+     return JS::UndefinedValue();
+   }
+ 
+   return value;
+ }
+ 
++JS::Value
++Console::CreateTimerError(JSContext* aCx, const nsAString& aLabel,
++                          TimerStatus aStatus) const
++{
++  MOZ_ASSERT(aStatus != eTimerUnknown && aStatus != eTimerDone);
++
++  RootedDictionary<ConsoleTimerError> error(aCx);
++
++  error.mName = aLabel;
++
++  switch (aStatus) {
++  case eTimerAlreadyExists:
++    error.mError.AssignLiteral("timerAlreadyExists");
++    break;
++
++  case eTimerDoesntExist:
++    error.mError.AssignLiteral("timerDoesntExist");
++    break;
++
++  case eTimerJSException:
++    error.mError.AssignLiteral("timerJSError");
++    break;
++
++  case eTimerMaxReached:
++    error.mError.AssignLiteral("maxTimersExceeded");
++    break;
++
++  default:
++    MOZ_CRASH("Unsupported status");
++    break;
++  }
++
++  JS::Rooted<JS::Value> value(aCx);
++  if (!ToJSValue(aCx, error, &value)) {
++    return JS::UndefinedValue();
++  }
++
++  return value;
++}
++
+ bool
+ Console::ArgumentsToValueList(const Sequence<JS::Value>& aData,
+                               Sequence<JS::Value>& aSequence) const
+ {
+   for (uint32_t i = 0; i < aData.Length(); ++i) {
+     if (NS_WARN_IF(!aSequence.AppendElement(aData[i], fallible))) {
+       return false;
+     }
+diff --git a/dom/console/Console.h b/dom/console/Console.h
+--- a/dom/console/Console.h
++++ b/dom/console/Console.h
+@@ -258,83 +258,83 @@ private:
+   ComposeAndStoreGroupName(JSContext* aCx, const Sequence<JS::Value>& aData,
+                            nsAString& aName);
+ 
+   // Remove the last group name and return that name. It returns false if
+   // mGroupStack is empty.
+   bool
+   UnstoreGroupName(nsAString& aName);
+ 
+-  enum StartTimerStatus {
++  enum TimerStatus {
+     eTimerUnknown,
+-    eTimerStarted,
++    eTimerDone,
+     eTimerAlreadyExists,
++    eTimerDoesntExist,
+     eTimerJSException,
+     eTimerMaxReached,
+   };
+ 
++  JS::Value
++  CreateTimerError(JSContext* aCx, const nsAString& aTimerLabel,
++                   TimerStatus aStatus) const;
++
+   // StartTimer is called on the owning thread and populates aTimerLabel and
+   // aTimerValue.
+   // * aCx - the JSContext rooting aName.
+   // * aName - this is (should be) the name of the timer as JS::Value.
+   // * aTimestamp - the monotonicTimer for this context taken from
+   //                performance.now().
+   // * aTimerLabel - This label will be populated with the aName converted to a
+   //                 string.
+   // * aTimerValue - the StartTimer value stored into (or taken from)
+   //                 mTimerRegistry.
+-  StartTimerStatus
++  TimerStatus
+   StartTimer(JSContext* aCx, const JS::Value& aName,
+              DOMHighResTimeStamp aTimestamp,
+              nsAString& aTimerLabel,
+              DOMHighResTimeStamp* aTimerValue);
+ 
+   // CreateStartTimerValue generates a ConsoleTimerStart dictionary exposed as
+   // JS::Value. If aTimerStatus is false, it generates a ConsoleTimerError
+   // instead. It's called only after the execution StartTimer on the owning
+   // thread.
+   // * aCx - this is the context that will root the returned value.
+   // * aTimerLabel - this label must be what StartTimer received as aTimerLabel.
+   // * aTimerStatus - the return value of StartTimer.
+   JS::Value
+   CreateStartTimerValue(JSContext* aCx, const nsAString& aTimerLabel,
+-                        StartTimerStatus aTimerStatus) const;
+-
+-  void
+-  StartTimerStatusToError(StartTimerStatus aStatus,
+-                          ConsoleTimerError& aError) const;
++                        TimerStatus aTimerStatus) const;
+ 
+   // StopTimer follows the same pattern as StartTimer: it runs on the
+   // owning thread and populates aTimerLabel and aTimerDuration, used by
+-  // CreateStopTimerValue. It returns false if a JS exception is thrown or if
+-  // the aName timer doesn't exist in the mTimerRegistry.
++  // CreateStopTimerValue.
+   // * aCx - the JSContext rooting aName.
+   // * aName - this is (should be) the name of the timer as JS::Value.
+   // * aTimestamp - the monotonicTimer for this context taken from
+   //                performance.now().
+   // * aTimerLabel - This label will be populated with the aName converted to a
+   //                 string.
+   // * aTimerDuration - the difference between aTimestamp and when the timer
+   //                    started (see StartTimer).
+-  bool
++  TimerStatus
+   StopTimer(JSContext* aCx, const JS::Value& aName,
+             DOMHighResTimeStamp aTimestamp,
+             nsAString& aTimerLabel,
+             double* aTimerDuration);
+ 
+   // This method generates a ConsoleTimerEnd dictionary exposed as JS::Value, or
+   // a ConsoleTimerError dictionary if aTimerStatus is false. See StopTimer.
+   // * aCx - this is the context that will root the returned value.
+   // * aTimerLabel - this label must be what StopTimer received as aTimerLabel.
+   // * aTimerDuration - this is what StopTimer received as aTimerDuration
+   // * aTimerStatus - the return value of StopTimer.
+   JS::Value
+   CreateStopTimerValue(JSContext* aCx, const nsAString& aTimerLabel,
+                        double aTimerDuration,
+-                       bool aTimerStatus) const;
++                       TimerStatus aTimerStatus) const;
+ 
+   // The method populates a Sequence from an array of JS::Value.
+   bool
+   ArgumentsToValueList(const Sequence<JS::Value>& aData,
+                        Sequence<JS::Value>& aSequence) const;
+ 
+   // This method follows the same pattern as StartTimer: its runs on the owning
+   // thread and populate aCountLabel, used by CreateCounterValue. Returns
