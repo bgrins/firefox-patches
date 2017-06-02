@@ -1,0 +1,230 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  b19deb51ea3abc06ae12d69752c11113c069ea0d
+Track duplicate usages for XulCounter
+
+diff --git a/browser/tools/xulcount/XulCounter.jsm b/browser/tools/xulcount/XulCounter.jsm
+--- a/browser/tools/xulcount/XulCounter.jsm
++++ b/browser/tools/xulcount/XulCounter.jsm
+@@ -17,21 +17,23 @@ const SVG_NS = "http://www.w3.org/2000/s
+ const ELEMENT_NODE = 1;
+ const DOCUMENT_NODE = 9;
+ 
+ function XulCounter() {
+   this.xblBindingsMap = new Map();
+   this.xulTagMap = new Map();
+   this.htmlTagMap = new Map();
+   this.unknownTagMap = new Map();
++  this.duplicateNodeSet = new Map();
+ }
+ 
+ XulCounter.prototype = {
+ 
+   numElementsTraversed: 0,
++  numDuplicateElements: 0,
+ 
+   get numXblElements() {
+     return [...this.xblBindingsMap.values()].reduce((a, v) => {
+       return a + v;
+     }, 0);
+   },
+   get numXulElements() {
+     return [...this.xulTagMap.values()].reduce((a, v) => {
+@@ -62,37 +64,44 @@ XulCounter.prototype = {
+     var win = element.ownerGlobal;
+     var dw = new DocumentWalker(element,
+                                 win,
+                                 Ci.nsIDOMNodeFilter.SHOW_ELEMENT,
+                                 this.nodeFilter);
+     var node = element.nodeType === DOCUMENT_NODE ? dw.nextNode() : dw.currentNode;
+     while (node) {
+       this.numElementsTraversed++;
++      var cssPath = getCssPath(node);
+       var style = node.ownerGlobal.getComputedStyle(node);
+       var binding = style && style.getPropertyValue("-moz-binding");
+       var isXBL = binding && binding != "none";
+       var isXUL = node.namespaceURI === XUL_NS;
+       var isHTML = node.namespaceURI === HTML_NS || node.namespaceURI === SVG_NS;
+ 
+-      if (isXBL) {
+-        this.xblBindingsMap.set(binding, (this.xblBindingsMap.get(binding) || 0) + 1);
+-      }
++      if (!this.duplicateNodeSet.has(cssPath)) {
++        this.duplicateNodeSet.set(cssPath, node);
++
++        if (isXBL) {
++          this.xblBindingsMap.set(binding, (this.xblBindingsMap.get(binding) || 0) + 1);
++        }
+ 
+-      if (isXUL) {
+-        this.xulTagMap.set(node.nodeName, (this.xulTagMap.get(node.nodeName) || 0) + 1);
+-      } else if (isHTML) {
+-        // Explicitly don't count HTML elements inside a xbl binding like
+-        //   <html:span anonid="accessKeyParens">
+-        if (!isXBLAnonymous(node)) {
+-          this.htmlTagMap.set(node.nodeName, (this.htmlTagMap.get(node.nodeName) || 0) + 1);
++        if (isXUL) {
++          this.xulTagMap.set(node.nodeName, (this.xulTagMap.get(node.nodeName) || 0) + 1);
++        } else if (isHTML) {
++          // Explicitly don't count HTML elements inside a xbl binding like
++          //   <html:span anonid="accessKeyParens">
++          if (!isXBLAnonymous(node)) {
++            this.htmlTagMap.set(node.nodeName, (this.htmlTagMap.get(node.nodeName) || 0) + 1);
++          }
++        } else if (!isNativeAnonymous(node)) {
++          console.warn("Unknown node detected", node);
++          this.unknownTagMap.set(node.nodeName, (this.unknownTagMap.get(node.nodeName) || 0) + 1);
+         }
+-      } else if (!isNativeAnonymous(node)) {
+-        console.warn("Unknown node detected", node);
+-        this.unknownTagMap.set(node.nodeName, (this.unknownTagMap.get(node.nodeName) || 0) + 1);
++      } else {
++        this.numDuplicateElements++;
+       }
+ 
+       node = dw.nextNode();
+     }
+   }
+ }
+ 
+ function getBindingParent(node) {
+@@ -170,16 +179,99 @@ function isShadowAnonymous(node) {
+   }
+ 
+   // If there is a shadowRoot and this is part of it then this
+   // is not native anonymous
+   return parent.shadowRoot && parent.shadowRoot.contains(node);
+ }
+ 
+ /**
++ * Traverse getBindingParent until arriving upon the bound element
++ * responsible for the generation of the specified node.
++ * See https://developer.mozilla.org/en-US/docs/XBL/XBL_1.0_Reference/DOM_Interfaces#getBindingParent.
++ *
++ * @param {DOMNode} node
++ * @return {DOMNode}
++ *         If node is not anonymous, this will return node. Otherwise,
++ *         it will return the bound element
++ *
++ */
++function getRootBindingParent(node) {
++  let parent;
++  while ((parent = getBindingParent(node))) {
++    node = parent;
++  }
++  return node;
++}
++
++/**
++ * Find the position of [element] in [nodeList].
++ * @returns an index of the match, or -1 if there is no match
++ */
++function positionInNodeList(element, nodeList) {
++  for (let i = 0; i < nodeList.length; i++) {
++    if (element === nodeList[i]) {
++      return i;
++    }
++  }
++  return -1;
++}
++
++/**
++ * Get the full CSS path for a given element.
++ * @returns a string that can be used as a CSS selector for the element
++ */
++function getCssPath(ele) {
++  var parent = getRootBindingParent(ele);
++  const document = ele.ownerDocument;
++  if (!document || !document.contains(parent)) {
++    throw new Error("getCssPath received element not inside document");
++  }
++
++  const getElementSelector = element => {
++    if (!element.localName) {
++      return "";
++    }
++
++    let label = element.nodeName == element.nodeName.toUpperCase()
++                ? element.localName.toLowerCase()
++                : element.localName;
++
++    if (element.id) {
++      label += "#" + element.id;
++    } else {
++      let index = positionInNodeList(element, element.parentNode.children)
++      if (index == -1) {
++       // XBL anon.  This seems to miss on scrollbars (hence the || []) but that's fine for now
++       index = positionInNodeList(element, element.ownerDocument.getAnonymousNodes(element.parentNode) || []);
++      }
++      label += ":nth-child(" + (index + 1) + ")";
++    }
++
++    return label;
++  };
++
++  let paths = [];
++
++  while (ele) {
++    if (!ele || ele.nodeType !== ELEMENT_NODE) {
++      break;
++    }
++
++    paths.splice(0, 0, getElementSelector(ele));
++    ele = ele.parentNode;
++    if (!ele) {
++      ele = document.getBindingParent(ele);
++    }
++  }
++
++  return paths.length ? paths.join(" ") : "";
++}
++
++/**
+  * Wrapper for inDeepTreeWalker.  Adds filtering to the traversal methods.
+  * See inDeepTreeWalker for more information about the methods.
+  *
+  * @param {DOMNode} node
+  * @param {Window} rootWin
+  * @param {Number} whatToShow
+  *        See Ci.nsIDOMNodeFilter / inIDeepTreeWalker for options.
+  * @param {Function} filter
+diff --git a/browser/tools/xulcount/test/browser_count_elements.js b/browser/tools/xulcount/test/browser_count_elements.js
+--- a/browser/tools/xulcount/test/browser_count_elements.js
++++ b/browser/tools/xulcount/test/browser_count_elements.js
+@@ -1,24 +1,36 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const {XulCounter} = Components.utils.import("resource:///modules/XulCounter.jsm", {});
+ 
++add_task(async function test_unique() {
++  const counter = new XulCounter();
++  counter.countNodes(document);
++  const numXblElements = counter.numXblElements;
++  counter.countNodes(document.querySelector("#sidebar-box"));
++  is(counter.numXblElements, numXblElements,
++    "Re-running the counter on a child doesn't increase the number of elements detected");
++  ok(counter.numDuplicateElements > 0,
++    "Some duplicate elements have been detected");
++});
++
+ add_task(async function test_print_count() {
+   const counter = new XulCounter();
+   counter.countNodes(document);
+   ok(counter.numElementsTraversed > 0, "some nodes have been traversed");
+   const bindings = counter.bindingsList;
+ 
+   info(`${counter.numElementsTraversed} elements traversed`);
+   info(`There are ${counter.numXblElements} elements with xbl bindings`);
+   info(`There are ${counter.numXulElements} xul elements`);
+   info(`There are ${counter.numHtmlElements} html elements`);
+   info(`There are ${counter.numUnknownElements} unknown elements`);
++  info(`${counter.numDuplicateElements} duplicate elements with xbl bindings detected`);
+   info(`${bindings.length} unique bindings`);
+   info("Sorted list of bindings:\n" + bindings.map(b => {
+     return b[1] + "\t" + b[0];
+   }).join("\n"));
+ });
