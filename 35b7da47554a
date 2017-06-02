@@ -1,0 +1,359 @@
+
+# HG changeset patch
+# User Gijs Kruitbosch <gijskruitbosch@gmail.com>
+# Date 1496158225 -3600
+# Node ID 35b7da47554a81dbd97fd259e2debfb2c9066ea1
+# Parent  7b8937970f9ca85db88cb2496f2112175fd847c8
+Bug 1354155 - use photon panelmultiview for individual subviews, r?mikedeboer
+
+MozReview-Commit-ID: 9iEHcGDLbJt
+
+diff --git a/browser/base/content/browser.css b/browser/base/content/browser.css
+--- a/browser/base/content/browser.css
++++ b/browser/base/content/browser.css
+@@ -108,17 +108,17 @@
+   transition: transform var(--panelui-subview-transition-duration);
+ }
+ 
+ panelview:not([mainview]):not([current]) {
+   transition: visibility 0s linear var(--panelui-subview-transition-duration);
+   visibility: collapse;
+ }
+ 
+-panelview:not([title]) > .panel-header {
++panelview[mainview] > .panel-header {
+   display: none;
+ }
+ 
+ tabbrowser {
+   -moz-binding: url("chrome://browser/content/tabbrowser.xml#tabbrowser");
+ }
+ 
+ .tabbrowser-tabs {
+diff --git a/browser/base/content/browser.xul b/browser/base/content/browser.xul
+--- a/browser/base/content/browser.xul
++++ b/browser/base/content/browser.xul
+@@ -606,16 +606,17 @@
+                 accesskey="&selectAllCmd.accesskey;"
+                 cmd="cmd_selectAll"/>
+       <menuseparator/>
+       <menuitem label="&syncSyncNowItem.label;"
+                 accesskey="&syncSyncNowItem.accesskey;"
+                 id="syncedTabsRefreshFilter"/>
+     </menupopup>
+   </popupset>
++  <box id="appMenu-viewCache" hidden="true"/>
+ 
+ #ifdef CAN_DRAW_IN_TITLEBAR
+ <vbox id="titlebar">
+   <hbox id="titlebar-content">
+     <spacer id="titlebar-spacer" flex="1"/>
+     <hbox id="titlebar-buttonbox-container">
+ #ifdef XP_WIN
+       <hbox id="private-browsing-indicator-titlebar">
+diff --git a/browser/components/customizableui/PanelMultiView.jsm b/browser/components/customizableui/PanelMultiView.jsm
+--- a/browser/components/customizableui/PanelMultiView.jsm
++++ b/browser/components/customizableui/PanelMultiView.jsm
+@@ -242,16 +242,21 @@
+       document.getAnonymousElementByAttribute(this.node, "anonid", "viewContainer");
+     this._mainViewContainer =
+       document.getAnonymousElementByAttribute(this.node, "anonid", "mainViewContainer");
+     this._subViews =
+       document.getAnonymousElementByAttribute(this.node, "anonid", "subViews");
+     this._viewStack =
+       document.getAnonymousElementByAttribute(this.node, "anonid", "viewStack");
+ 
++    XPCOMUtils.defineLazyGetter(this, "_panelViewCache", () => {
++      let viewCacheId = this.node.getAttribute("viewCacheId");
++      return viewCacheId ? document.getElementById(viewCacheId) : null;
++    });
++
+     this._panel.addEventListener("popupshowing", this);
+     this._panel.addEventListener("popuphidden", this);
+     this._panel.addEventListener("popupshown", this);
+     if (this.panelViews) {
+       let cs = window.getComputedStyle(document.documentElement);
+       // Set CSS-determined attributes now to prevent a layout flush when we do
+       // it when transitioning between panels.
+       this._dir = cs.direction;
+@@ -283,47 +288,70 @@
+       Object.defineProperty(this.node, method, {
+         enumerable: true,
+         value: (...args) => this[method](...args)
+       });
+     });
+   }
+ 
+   destructor() {
++    // Guard against re-entrancy.
++    if (!this.node)
++      return;
++
+     if (this._mainView) {
+-      this._mainView.removeAttribute("mainview");
++      let mainView = this._mainView;
++      if (this._panelViewCache)
++        this._panelViewCache.appendChild(mainView);
++      mainView.removeAttribute("mainview");
+     }
++    if (this._subViews)
++      this._moveOutKids(this._subViews);
++
+     if (this.panelViews) {
++      this._moveOutKids(this._viewStack);
+       this.panelViews.clear();
+     } else {
+       this._clickCapturer.removeEventListener("click", this);
+     }
+     this._panel.removeEventListener("popupshowing", this);
+     this._panel.removeEventListener("popupshown", this);
+     this._panel.removeEventListener("popuphidden", this);
+     this.node = this._clickCapturer = this._viewContainer = this._mainViewContainer =
+-      this._subViews = this._viewStack = this.__dwu = null;
++      this._subViews = this._viewStack = this.__dwu = this._panelViewCache = null;
++  }
++
++  _moveOutKids(viewNodeContainer) {
++    if (!this._panelViewCache)
++      return;
++
++    // Node.children and Node.childNodes is live to DOM changes like the
++    // ones we're about to do, so iterate over a static copy:
++    let subviews = Array.from(viewNodeContainer.childNodes);
++    for (let subview of subviews) {
++      // XBL lists the 'children' XBL element explicitly. :-(
++      if (subview.nodeName != "children")
++        this._panelViewCache.appendChild(subview);
++    }
+   }
+ 
+   goBack(target) {
+     let [current, previous] = this.panelViews.back();
+     return this.showSubView(current, target, previous);
+   }
+ 
+   /**
+-   * Checks whether it is possible to navigate backwards currently.
+-   * Since the visibility of the back button is dependent - right now - on the
+-   * fact that there's a view title set, we use that heuristic to determine this
+-   * capability.
++   * Checks whether it is possible to navigate backwards currently. Returns
++   * false if this is the panelmultiview's mainview, true otherwise.
+    *
+    * @param  {panelview} view View to check, defaults to the currently active view.
+    * @return {Boolean}
+    */
+   _canGoBack(view = this._currentSubView) {
+-    return !!view.getAttribute("title");
++    return view != this._mainView;
+   }
+ 
+   setMainView(aNewMainView) {
+     if (this._mainView) {
+       if (!this.panelViews)
+         this._subViews.appendChild(this._mainView);
+       this._mainView.removeAttribute("mainview");
+     }
+@@ -355,17 +383,17 @@
+           this.node.setAttribute("viewtype", "main");
+         });
+       }
+ 
+       this._shiftMainView();
+     }
+   }
+ 
+-  showSubView(aViewId, aAnchor, aPreviousView, aAdopted = false) {
++  showSubView(aViewId, aAnchor, aPreviousView) {
+     const {document, window} = this;
+     return (async () => {
+       // Support passing in the node directly.
+       let viewNode = typeof aViewId == "string" ? this.node.querySelector("#" + aViewId) : aViewId;
+       if (!viewNode) {
+         viewNode = document.getElementById(aViewId);
+         if (viewNode) {
+           if (this.panelViews) {
+@@ -410,17 +438,17 @@
+       let detail = {
+         blockers: new Set(),
+         addBlocker(aPromise) {
+           this.blockers.add(aPromise);
+         },
+       };
+ 
+       // Make sure that new panels always have a title set.
+-      if (this.panelViews && aAdopted && aAnchor) {
++      if (this.panelViews && aAnchor) {
+         if (aAnchor && !viewNode.hasAttribute("title"))
+           viewNode.setAttribute("title", aAnchor.getAttribute("label"));
+         viewNode.classList.add("PanelUI-subView");
+         let custWidget = CustomizableWidgets.find(widget => widget.viewId == viewNode.id);
+         if (custWidget) {
+           if (custWidget.onInit)
+             custWidget.onInit(aAnchor);
+           custWidget.onViewShowing({ target: aAnchor, detail });
+diff --git a/browser/components/customizableui/content/panelUI.inc.xul b/browser/components/customizableui/content/panelUI.inc.xul
+--- a/browser/components/customizableui/content/panelUI.inc.xul
++++ b/browser/components/customizableui/content/panelUI.inc.xul
+@@ -4,17 +4,18 @@
+ 
+ <panel id="PanelUI-popup"
+        role="group"
+        type="arrow"
+        hidden="true"
+        flip="slide"
+        position="bottomcenter topright"
+        noautofocus="true">
+-  <panelmultiview id="PanelUI-multiView" mainViewId="PanelUI-mainView">
++  <panelmultiview id="PanelUI-multiView" mainViewId="PanelUI-mainView"
++                  viewCacheId="appMenu-viewCache">
+     <panelview id="PanelUI-mainView" context="customizationPanelContextMenu">
+       <vbox id="PanelUI-contents-scroller">
+         <vbox id="PanelUI-contents" class="panelUI-grid"/>
+       </vbox>
+ 
+       <footer id="PanelUI-footer">
+         <vbox id="PanelUI-footer-addons"></vbox>
+         <toolbarbutton class="panel-banner-item"
+@@ -498,17 +499,19 @@
+ <panel id="appMenu-popup"
+        class="cui-widget-panel"
+        role="group"
+        type="arrow"
+        hidden="true"
+        flip="slide"
+        position="bottomcenter topright"
+        noautofocus="true">
+-  <photonpanelmultiview id="appMenu-multiView" mainViewId="appMenu-mainView" descriptionheightworkaround="true">
++  <photonpanelmultiview id="appMenu-multiView" mainViewId="appMenu-mainView"
++                        descriptionheightworkaround="true"
++                        viewCacheId="appMenu-viewCache">
+     <panelview id="appMenu-mainView" class="PanelUI-subView">
+       <vbox class="panel-subview-body">
+         <vbox id="appMenu-addon-banners"/>
+         <toolbarbutton class="panel-banner-item"
+                        label-update-available="&updateAvailable.panelUI.label;"
+                        label-update-manual="&updateManual.panelUI.label;"
+                        label-update-restart="&updateRestart.panelUI.label2;"
+                        oncommand="PanelUI._onBannerItemSelected(event)"
+@@ -632,31 +635,31 @@
+                        class="subviewbutton subviewbutton-nav"
+                        label="&moreMenu.label;"
+                        closemenu="none"
+                        oncommand="PanelUI.showSubView('appMenu-moreView', this)"/>
+         <toolbarbutton id="appMenu-developer-button"
+                        class="subviewbutton subviewbutton-nav"
+                        label="&webDeveloperMenu.label;"
+                        closemenu="none"
+-                       oncommand="PanelUI.showSubView('PanelUI-developer', this, null, true)"/>
++                       oncommand="PanelUI.showSubView('PanelUI-developer', this)"/>
+         <toolbarbutton id="appMenu-help-button"
+                        class="subviewbutton subviewbutton-iconic subviewbutton-nav"
+                        label="&appMenuHelp.label;"
+                        closemenu="none"
+-                       oncommand="PanelUI.showSubView('PanelUI-helpView', this, null, true)"/>
++                       oncommand="PanelUI.showSubView('PanelUI-helpView', this)"/>
+       </vbox>
+     </panelview>
+     <panelview id="appMenu-moreView" title="&moreMenu.label;" class="PanelUI-subView">
+       <vbox class="panel-subview-body">
+         <toolbarbutton id="appMenu-characterencoding-button"
+                        class="subviewbutton subviewbutton-nav"
+                        label="&charsetMenu2.label;"
+                        closemenu="none"
+-                       oncommand="PanelUI.showSubView('PanelUI-characterEncodingView', this, null, true)"/>
++                       oncommand="PanelUI.showSubView('PanelUI-characterEncodingView', this)"/>
+         <toolbarbutton id="appMenu-workoffline-button"
+                        class="subviewbutton"
+                        label="&goOfflineCmd.label;"
+                        type="checkbox"
+                        observes="workOfflineMenuitemState"
+                        oncommand="BrowserOffline.toggleOfflineStatus();"/>
+       </vbox>
+     </panelview>
+diff --git a/browser/components/customizableui/content/panelUI.js b/browser/components/customizableui/content/panelUI.js
+--- a/browser/components/customizableui/content/panelUI.js
++++ b/browser/components/customizableui/content/panelUI.js
+@@ -439,32 +439,32 @@
+ 
+   /**
+    * Shows a subview in the panel with a given ID.
+    *
+    * @param aViewId the ID of the subview to show.
+    * @param aAnchor the element that spawned the subview.
+    * @param aPlacementArea the CustomizableUI area that aAnchor is in.
+    */
+-  async showSubView(aViewId, aAnchor, aPlacementArea, aAdopted = false) {
++  async showSubView(aViewId, aAnchor, aPlacementArea) {
+     this._ensureEventListenersAdded();
+     let viewNode = document.getElementById(aViewId);
+     if (!viewNode) {
+       Cu.reportError("Could not show panel subview with id: " + aViewId);
+       return;
+     }
+ 
+     if (!aAnchor) {
+       Cu.reportError("Expected an anchor when opening subview with id: " + aViewId);
+       return;
+     }
+ 
+     let container = aAnchor.closest("panelmultiview,photonpanelmultiview");
+     if (container) {
+-      container.showSubView(aViewId, aAnchor, null, aAdopted);
++      container.showSubView(aViewId, aAnchor);
+     } else if (!aAnchor.open) {
+       aAnchor.open = true;
+ 
+       let tempPanel = document.createElement("panel");
+       tempPanel.setAttribute("type", "arrow");
+       tempPanel.setAttribute("id", "customizationui-widget-panel");
+       tempPanel.setAttribute("class", "cui-widget-panel");
+       tempPanel.setAttribute("viewId", aViewId);
+@@ -475,19 +475,24 @@
+         tempPanel.setAttribute("animate", "false");
+       }
+       tempPanel.setAttribute("context", "");
+       document.getElementById(CustomizableUI.AREA_NAVBAR).appendChild(tempPanel);
+       // If the view has a footer, set a convenience class on the panel.
+       tempPanel.classList.toggle("cui-widget-panelWithFooter",
+                                  viewNode.querySelector(".panel-subview-footer"));
+ 
+-      let multiView = document.createElement("panelmultiview");
++      let multiView = document.createElement(gPhotonStructure ? "photonpanelmultiview" : "panelmultiview");
+       multiView.setAttribute("id", "customizationui-widget-multiview");
+       multiView.setAttribute("nosubviews", "true");
++      multiView.setAttribute("viewCacheId", "appMenu-viewCache");
++      if (gPhotonStructure) {
++        multiView.setAttribute("mainViewId", viewNode.id);
++        multiView.appendChild(viewNode);
++      }
+       tempPanel.appendChild(multiView);
+       multiView.setAttribute("mainViewIsSubView", "true");
+       multiView.setMainView(viewNode);
+       viewNode.classList.add("cui-widget-panelview");
+ 
+       let viewShown = false;
+       let panelRemover = () => {
+         viewNode.classList.remove("cui-widget-panelview");
+@@ -495,17 +500,19 @@
+           CustomizableUI.removePanelCloseListeners(tempPanel);
+           tempPanel.removeEventListener("popuphidden", panelRemover);
+ 
+           let evt = new CustomEvent("ViewHiding", {detail: viewNode});
+           viewNode.dispatchEvent(evt);
+         }
+         aAnchor.open = false;
+ 
+-        this.multiView.appendChild(viewNode);
++        // Ensure we run the destructor:
++        multiView.instance.destructor();
++
+         tempPanel.remove();
+       };
+ 
+       // Emit the ViewShowing event so that the widget definition has a chance
+       // to lazily populate the subview with things.
+       let detail = {
+         blockers: new Set(),
+         addBlocker(aPromise) {
+
