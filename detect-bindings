@@ -1,19 +1,93 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  b138d2f271fdb598bf8a66c2dcb7fe391ca2a96f
+# Parent  87c745019518b1d6cd782534f2553721e5735657
+Add a test to detect which xbl bindings are being used in the ui
 
-diff --git a/testing/mochitest/browser-test.js b/testing/mochitest/browser-test.js
---- a/testing/mochitest/browser-test.js
-+++ b/testing/mochitest/browser-test.js
-@@ -20,16 +20,366 @@ if (Services.appinfo.OS == 'Android') {
-     window.addEventListener("MozAfterPaint", function() {
-       setTimeout(testInit, 0);
-     }, {once: true});
-   }, {once: true});
- } else {
-   setTimeout(testInit, 0);
- }
+diff --git a/browser/moz.build b/browser/moz.build
+--- a/browser/moz.build
++++ b/browser/moz.build
+@@ -23,16 +23,17 @@ DIRS += [
+     'app',
+ ]
  
+ if CONFIG['MAKENSISU']:
+     DIRS += ['installer/windows']
+ 
+ TEST_DIRS += [
+     'tools/mozscreenshots',
++    'tools/xblcount',
+ ]
+ 
+ DIST_SUBDIR = 'browser'
+ export('DIST_SUBDIR')
+ 
+ if CONFIG['MOZ_ARTIFACT_BUILDS']:
+     # Ensure a pre-built interfaces.xpt installed to the objdir by the artifact
+     # code is included by the top-level chrome.manifest.
+diff --git a/browser/tools/xblcount/XblCounter.jsm b/browser/tools/xblcount/XblCounter.jsm
+new file mode 100644
+--- /dev/null
++++ b/browser/tools/xblcount/XblCounter.jsm
+@@ -0,0 +1,217 @@
++
++this.EXPORTED_SYMBOLS = ["XblCounter"];
++
++const {classes: Cc, interfaces: Ci, utils: Cu, results: Cr} = Components;
++const {console} = Cu.import("resource://gre/modules/Console.jsm", {});
++
++// The `Node` global is not available here
++const ELEMENT_NODE = 1;
++const DOCUMENT_NODE = 9;
++
++function XblCounter() {
++  this.bindingsMap = new Map();
++  this.duplicateNodeSet = new Map();
++}
++
++XblCounter.prototype = {
++
++  numElementsTraversed: 0,
++  numDuplicateXblElements: 0,
++  get numXblElements() {
++    return [...this.bindingsMap.values()].reduce((a, v)=> {
++      return a+v;
++    });
++  },
++  get bindingsList() {
++    return [...this.bindingsMap.entries()].sort((a, b) => {
++      return b[1] - a[1];
++    });
++  },
++
++  nodeFilter(node) {
++    return node.nodeType == ELEMENT_NODE ? Ci.nsIDOMNodeFilter.FILTER_ACCEPT : Ci.nsIDOMNodeFilter.FILTER_SKIP;
++  },
++
++
++  countNodes(element) {
++    var win = element.ownerGlobal;
++    var dw = new DocumentWalker(element,
++                                win,
++                                Ci.nsIDOMNodeFilter.SHOW_ELEMENT,
++                                this.nodeFilter);
++    var node = element.nodeType === DOCUMENT_NODE ? dw.nextNode() : dw.currentNode;
++    do {
++      this.numElementsTraversed++;
++      var style = node.ownerGlobal.getComputedStyle(node, null);
++      var binding = style && style.getPropertyValue("-moz-binding");
++      if (binding && binding != "none") {
++        var cssPath = getCssPath(node);
++        if (!this.duplicateNodeSet.has(cssPath)) {
++          this.bindingsMap.set(binding, (this.bindingsMap.get(binding) || 0) + 1);
++          this.duplicateNodeSet.set(cssPath, node);
++        } else {
++          this.numDuplicateXblElements++;
++        }
++      }
++    } while (node = dw.nextNode())
++  }
++}
++
 +/**
 + * Traverse getBindingParent until arriving upon the bound element
 + * responsible for the generation of the specified node.
@@ -87,7 +161,7 @@ diff --git a/testing/mochitest/browser-test.js b/testing/mochitest/browser-test.
 +  let paths = [];
 +
 +  while (ele) {
-+    if (!ele || ele.nodeType !== Node.ELEMENT_NODE) {
++    if (!ele || ele.nodeType !== ELEMENT_NODE) {
 +      break;
 +    }
 +
@@ -101,31 +175,6 @@ diff --git a/testing/mochitest/browser-test.js b/testing/mochitest/browser-test.
 +  return paths.length ? paths.join(" ") : "";
 +}
 +
-+var nodeFilterConstants = {
-+  FILTER_ACCEPT: 1,
-+  FILTER_REJECT: 2,
-+  FILTER_SKIP: 3,
-+
-+  SHOW_ALL: 0xFFFFFFFF,
-+  SHOW_ELEMENT: 0x00000001,
-+  SHOW_ATTRIBUTE: 0x00000002,
-+  SHOW_TEXT: 0x00000004,
-+  SHOW_CDATA_SECTION: 0x00000008,
-+  SHOW_ENTITY_REFERENCE: 0x00000010,
-+  SHOW_ENTITY: 0x00000020,
-+  SHOW_PROCESSING_INSTRUCTION: 0x00000040,
-+  SHOW_COMMENT: 0x00000080,
-+  SHOW_DOCUMENT: 0x00000100,
-+  SHOW_DOCUMENT_TYPE: 0x00000200,
-+  SHOW_DOCUMENT_FRAGMENT: 0x00000400,
-+  SHOW_NOTATION: 0x00000800
-+};
-+
-+// SKIP_TO_* arguments are used with the DocumentWalker, driving the strategy to use if
-+// the starting node is incompatible with the filter function of the walker.
-+var SKIP_TO_PARENT = "SKIP_TO_PARENT";
-+var SKIP_TO_SIBLING = "SKIP_TO_SIBLING";
-+
 +/**
 + * Wrapper for inDeepTreeWalker.  Adds filtering to the traversal methods.
 + * See inDeepTreeWalker for more information about the methods.
@@ -133,19 +182,14 @@ diff --git a/testing/mochitest/browser-test.js b/testing/mochitest/browser-test.
 + * @param {DOMNode} node
 + * @param {Window} rootWin
 + * @param {Number} whatToShow
-+ *        See nodeFilterConstants / inIDeepTreeWalker for options.
++ *        See Ci.nsIDOMNodeFilter / inIDeepTreeWalker for options.
 + * @param {Function} filter
 + *        A custom filter function Taking in a DOMNode and returning an Int. See
 + *        WalkerActor.nodeFilter for an example.
-+ * @param {String} skipTo
-+ *        Either SKIP_TO_PARENT or SKIP_TO_SIBLING. If the provided node is not compatible
-+ *        with the filter function for this walker, try to find a compatible one either
-+ *        in the parents or in the siblings of the node.
 + */
 +function DocumentWalker(node, rootWin,
-+    whatToShow = nodeFilterConstants.SHOW_ALL,
-+    filter = nodeFilter,
-+    skipTo = SKIP_TO_PARENT) {
++    whatToShow = Ci.nsIDOMNodeFilter.SHOW_ALL,
++    filter = nodeFilter) {
 +  if (Cu.isDeadWrapper(rootWin) || !rootWin.location) {
 +    throw new Error("Got an invalid root window in DocumentWalker");
 +  }
@@ -160,7 +204,7 @@ diff --git a/testing/mochitest/browser-test.js b/testing/mochitest/browser-test.
 +
 +  // Make sure that the walker knows about the initial node (which could
 +  // be skipped due to a filter).
-+  this.walker.currentNode = this.getStartingNode(node, skipTo);
++  this.walker.currentNode = this.getStartingNode(node);
 +}
 +
 +DocumentWalker.prototype = {
@@ -173,11 +217,6 @@ diff --git a/testing/mochitest/browser-test.js b/testing/mochitest/browser-test.
 +  set currentNode(val) {
 +    this.walker.currentNode = val;
 +  },
-+
-+  parentNode: function () {
-+    return this.walker.parentNode();
-+  },
-+
 +  nextNode: function () {
 +    let node = this.walker.currentNode;
 +    if (!node) {
@@ -191,218 +230,76 @@ diff --git a/testing/mochitest/browser-test.js b/testing/mochitest/browser-test.
 +
 +    return nextNode;
 +  },
-+
-+  firstChild: function () {
-+    let node = this.walker.currentNode;
-+    if (!node) {
-+      return null;
-+    }
-+
-+    let firstChild = this.walker.firstChild();
-+    while (firstChild && this.isSkippedNode(firstChild)) {
-+      firstChild = this.walker.nextSibling();
-+    }
-+
-+    return firstChild;
-+  },
-+
-+  lastChild: function () {
-+    let node = this.walker.currentNode;
-+    if (!node) {
-+      return null;
-+    }
-+
-+    let lastChild = this.walker.lastChild();
-+    while (lastChild && this.isSkippedNode(lastChild)) {
-+      lastChild = this.walker.previousSibling();
-+    }
-+
-+    return lastChild;
-+  },
-+
-+  previousSibling: function () {
-+    let node = this.walker.previousSibling();
-+    while (node && this.isSkippedNode(node)) {
-+      node = this.walker.previousSibling();
-+    }
-+    return node;
-+  },
-+
-+  nextSibling: function () {
-+    let node = this.walker.nextSibling();
-+    while (node && this.isSkippedNode(node)) {
-+      node = this.walker.nextSibling();
-+    }
-+    return node;
-+  },
-+
 +  getStartingNode: function (node, skipTo) {
 +    // Keep a reference on the starting node in case we can't find a node compatible with
 +    // the filter.
 +    let startingNode = node;
 +
-+    if (skipTo === SKIP_TO_PARENT) {
-+      while (node && this.isSkippedNode(node)) {
-+        node = node.parentNode;
-+      }
-+    } else if (skipTo === SKIP_TO_SIBLING) {
-+      node = this.getClosestAcceptedSibling(node);
++    while (node && this.isSkippedNode(node)) {
++      node = node.parentNode;
 +    }
 +
 +    return node || startingNode;
 +  },
 +
-+  /**
-+   * Loop on all of the provided node siblings until finding one that is compliant with
-+   * the filter function.
-+   */
-+  getClosestAcceptedSibling: function (node) {
-+    if (this.filter(node) === nodeFilterConstants.FILTER_ACCEPT) {
-+      // node is already valid, return immediately.
-+      return node;
-+    }
-+
-+    // Loop on starting node siblings.
-+    let previous = node;
-+    let next = node;
-+    while (previous || next) {
-+      previous = previous && previous.previousSibling;
-+      next = next && next.nextSibling;
-+
-+      if (previous && this.filter(previous) === nodeFilterConstants.FILTER_ACCEPT) {
-+        // A valid node was found in the previous siblings of the node.
-+        return previous;
-+      }
-+
-+      if (next && this.filter(next) === nodeFilterConstants.FILTER_ACCEPT) {
-+        // A valid node was found in the next siblings of the node.
-+        return next;
-+      }
-+    }
-+
-+    return null;
-+  },
-+
 +  isSkippedNode: function (node) {
-+    return this.filter(node) === nodeFilterConstants.FILTER_SKIP;
++    return this.filter(node) === Ci.nsIDOMNodeFilter.FILTER_SKIP;
 +  },
 +};
+diff --git a/browser/tools/xblcount/moz.build b/browser/tools/xblcount/moz.build
+new file mode 100644
+--- /dev/null
++++ b/browser/tools/xblcount/moz.build
+@@ -0,0 +1,11 @@
++# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
 +
-+function nodeFilter(node) {
-+  return node.nodeType == 1 ? nodeFilterConstants.FILTER_ACCEPT : nodeFilterConstants.FILTER_SKIP;
-+}
++BROWSER_CHROME_MANIFESTS += ['test/browser.ini']
 +
-+var bindingsMap = new Map();
-+var duplicateNodeSet = new Map();
++EXTRA_JS_MODULES += [
++  'XblCounter.jsm',
++]
+diff --git a/browser/tools/xblcount/test/browser.ini b/browser/tools/xblcount/test/browser.ini
+new file mode 100644
+--- /dev/null
++++ b/browser/tools/xblcount/test/browser.ini
+@@ -0,0 +1,3 @@
++[DEFAULT]
 +
-+function addObserver(win) {
-+  let observer = new MutationObserver(mutations => {
-+    console.log("Observed changes", mutations);
-+    countNodes(win);
-+  });
-+  observer.observe(document.documentElement, {
-+    childList: true,
-+    subtree: true,
-+  });
++[browser_count_xbl.js]
+diff --git a/browser/tools/xblcount/test/browser_count_xbl.js b/browser/tools/xblcount/test/browser_count_xbl.js
+new file mode 100644
+--- /dev/null
++++ b/browser/tools/xblcount/test/browser_count_xbl.js
+@@ -0,0 +1,28 @@
 +
-+}
-+function countNodes(win) {
-+  var dw = new DocumentWalker(document,
-+                              win,
-+                              nodeFilterConstants.SHOW_ELEMENT,
-+                              nodeFilter);
-+  var node;
-+  var count = 0;
-+  while (node = dw.nextNode()) {
-+    count++;
-+    var style = node.ownerDocument.defaultView.getComputedStyle(node, null);
-+    var binding = style && style.getPropertyValue("-moz-binding");
-+    if (!binding || binding == "none") {
-+      continue;
-+    }
++const {XblCounter} = Components.utils.import("resource:///modules/XblCounter.jsm", {});
 +
-+    var cssPath = getCssPath(node);
-+    if (duplicateNodeSet.has(cssPath)) {
-+      // console.log(getCssPath(node), node, binding, duplicateNodeSet.get(cssPath), node == duplicateNodeSet.get(getCssPath));
-+    }
-+    if (!duplicateNodeSet.has(cssPath)) {
-+      bindingsMap.set(binding, (bindingsMap.get(binding) || 0) + 1);
-+      duplicateNodeSet.set(cssPath, node);
-+    }
-+  }
++add_task(async function test_unique() {
++  const counter = new XblCounter();
++  counter.countNodes(document);
++  const numXblElements = counter.numXblElements;
++  counter.countNodes(document.querySelector("#sidebar-box"));
++  is(counter.numXblElements, numXblElements,
++    "Re-running the counter on a child doesn't increase the number of elements detected");
++  ok(counter.numDuplicateXblElements > 0,
++    "Some duplicate elements have been detected");
++});
 +
-+  // var totalBindings = [...bindingsMap.values()].reduce((a, v)=> {
-+  //   return a+v;
-+  // });
-+  // var sortedBindings = [...bindingsMap.entries()].sort((a, b) => {
-+  //   return b[1] - a[1];
-+  // });
++add_task(async function test_print_count() {
++  const counter = new XblCounter();
++  counter.countNodes(document);
++  ok(counter.numElementsTraversed > 0, "some nodes have been traversed");
++  const bindings = counter.bindingsList;
 +
-+  // console.log("Counting for window: " + window.location.toString());
-+  // console.log(count + " element nodes traversed");
-+  // console.log(sortedBindings.length + " unique bindings detected");
-+  // console.log(totalBindings + " total bindings detected");
-+
-+  // console.log(sortedBindings.map(b => {
-+  //   return b[1] + "\t" + b[0];
-+  // }).join("\n"));
-+}
-+
-+// addObserver(window);
-+// countNodes(window);
-+
-+
-+function MyWindowObserver() {
-+  this.observe=function(aSubject, aTopic, aData) {
-+    if (aTopic == "domwindowopened") {
-+      addObserver(aSubject);
-+      countNodes(aSubject);
-+    }
-+  }
-+}
-+var ww = Components.classes["@mozilla.org/embedcomp/window-watcher;1"]
-+              .getService(Components.interfaces.nsIWindowWatcher);
-+ww.registerNotification(new MyWindowObserver())
-+
- var TabDestroyObserver = {
-   outstanding: new Set(),
-   promiseResolver: null,
- 
-   init: function() {
-     Services.obs.addObserver(this, "message-manager-close");
-     Services.obs.addObserver(this, "message-manager-disconnect");
-   },
-@@ -659,16 +1009,33 @@ Tester.prototype = {
-           "ShutdownLeaks: Wait for cleanup to be finished before checking for leaks");
-         Services.obs.notifyObservers({wrappedJSObject: barrier},
-           "shutdown-leaks-before-check");
- 
-         barrier.client.addBlocker("ShutdownLeaks: Wait for tabs to finish closing",
-                                   TabDestroyObserver.wait());
- 
-         barrier.wait().then(() => {
-+
-+
-+  var totalBindings = [...bindingsMap.values()].reduce((a, v)=> {
-+    return a+v;
-+  });
-+  var sortedBindings = [...bindingsMap.entries()].sort((a, b) => {
-+    return b[1] - a[1];
-+  });
-+
-+  console.log("Counting for window: " + window.location.toString());
-+  console.log(sortedBindings.length + " unique bindings detected");
-+  console.log(totalBindings + " total bindings detected");
-+
-+  console.log(sortedBindings.map(b => {
++  info(`${counter.numElementsTraversed} elements traversed`);
++  info(`${counter.numXblElements} elements with xbl bindings`);
++  info(`${counter.numDuplicateXblElements} duplicate elements with xbl bindings detected`);
++  info(`${bindings.length} unique bindings`);
++  info("Sorted list of bindings:\n" + bindings.map(b => {
 +    return b[1] + "\t" + b[0];
 +  }).join("\n"));
-+
-           // Simulate memory pressure so that we're forced to free more resources
-           // and thus get rid of more false leaks like already terminated workers.
-           Services.obs.notifyObservers(null, "memory-pressure", "heap-minimize");
- 
-           Services.ppmm.broadcastAsyncMessage("browser-test:collect-request");
- 
-           shutdownCleanup(() => {
-             setTimeout(() => {
++});
