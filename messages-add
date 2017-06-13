@@ -1,12 +1,12 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  a8f8e440d627d686fa8898483aa9c5da928a8fa4
+# Parent  91134c95d68cbcfe984211fa3cbd28d610361ef1
 Bug 1371721 - Create a MESSAGES_ADD action to add batches of messages at once
 
 diff --git a/devtools/client/webconsole/new-console-output/actions/messages.js b/devtools/client/webconsole/new-console-output/actions/messages.js
 --- a/devtools/client/webconsole/new-console-output/actions/messages.js
 +++ b/devtools/client/webconsole/new-console-output/actions/messages.js
-@@ -8,26 +8,40 @@
+@@ -8,26 +8,51 @@
  
  const {
    prepareMessage
@@ -31,8 +31,19 @@ diff --git a/devtools/client/webconsole/new-console-output/actions/messages.js b
 +    idGenerator = defaultIdGenerator;
 +  }
 +  let messages = packets.map(packet => prepareMessage(packet, idGenerator));
-+  console.log("Got a group", packets.length);
-+  // When this is used for non-cached messages, then handle clear message and split up into batches
++  for (let i = messages.length - 1; i >= 0; i--) {
++    if (messages[i].type === MESSAGE_TYPE.CLEAR) {
++      return batchActions([
++        messagesClear(),
++        {
++          type: MESSAGES_ADD,
++          messages: messages.slice(i),
++        }
++      ]);
++    }
++  }
++
++  // When this is used for non-cached messages then handle clear message and split up into batches
 +  return {
 +    type: MESSAGES_ADD,
 +    messages
@@ -47,7 +58,7 @@ diff --git a/devtools/client/webconsole/new-console-output/actions/messages.js b
    const addMessageAction = {
      type: MESSAGE_ADD,
      message
-@@ -101,15 +115,16 @@ function networkMessageUpdate(packet, id
+@@ -101,15 +126,16 @@ function networkMessageUpdate(packet, id
    return {
      type: NETWORK_MESSAGE_UPDATE,
      message,
@@ -88,7 +99,7 @@ diff --git a/devtools/client/webconsole/new-console-output/constants.js b/devtoo
 diff --git a/devtools/client/webconsole/new-console-output/new-console-output-wrapper.js b/devtools/client/webconsole/new-console-output/new-console-output-wrapper.js
 --- a/devtools/client/webconsole/new-console-output/new-console-output-wrapper.js
 +++ b/devtools/client/webconsole/new-console-output/new-console-output-wrapper.js
-@@ -12,16 +12,17 @@ const actions = require("devtools/client
+@@ -12,17 +12,18 @@ const actions = require("devtools/client
  const { createContextMenu } = require("devtools/client/webconsole/new-console-output/utils/context-menu");
  const { configureStore } = require("devtools/client/webconsole/new-console-output/store");
  
@@ -97,8 +108,9 @@ diff --git a/devtools/client/webconsole/new-console-output/new-console-output-wr
  const FilterBar = React.createFactory(require("devtools/client/webconsole/new-console-output/components/filter-bar"));
  
  let store = null;
-+let queuedMessages = [];
- let queuedActions = [];
+-let queuedActions = [];
++let queuedMessageAdds = [];
++let queuedMessageUpdates = [];
  let throttledDispatchTimeout = false;
  
  function NewConsoleOutputWrapper(parentNode, jsterm, toolbox, owner, document) {
@@ -106,7 +118,8 @@ diff --git a/devtools/client/webconsole/new-console-output/new-console-output-wr
  
    this.parentNode = parentNode;
    this.jsterm = jsterm;
-@@ -139,45 +140,47 @@ NewConsoleOutputWrapper.prototype = {
+   this.toolbox = toolbox;
+@@ -139,75 +140,86 @@ NewConsoleOutputWrapper.prototype = {
          filterBar,
          childComponent
      ));
@@ -118,8 +131,6 @@ diff --git a/devtools/client/webconsole/new-console-output/new-console-output-wr
 -    let action = actions.messageAdd(message);
 -    batchedMessageAdd(action);
 +    batchedMessagesAdd(message);
-+    // let action = actions.messageAdd(message);
-+    // batchedMessageAdd(action);
  
      // Wait for the message to render to resolve with the DOM node.
      // This is just for backwards compatibility with old tests, and should
@@ -151,8 +162,6 @@ diff --git a/devtools/client/webconsole/new-console-output/new-console-output-wr
 -    const batchedActions = messages.map(message => actions.messageAdd(message));
 -    store.dispatch(actions.batchActions(batchedActions));
 +    store.dispatch(actions.messagesAdd(messages));
-+    // const batchedActions = messages.map(message => actions.messageAdd(message));
-+    // store.dispatch(actions.batchActions(batchedActions));
    },
  
    dispatchMessagesClear: function () {
@@ -161,7 +170,16 @@ diff --git a/devtools/client/webconsole/new-console-output/new-console-output-wr
  
    dispatchTimestampsToggle: function (enabled) {
      store.dispatch(actions.timestampsToggle(enabled));
-@@ -193,21 +196,32 @@ NewConsoleOutputWrapper.prototype = {
+   },
+ 
+   dispatchMessageUpdate: function (message, res) {
+     // network-message-updated will emit when eventTimings message arrives
+     // which is the last one of 8 updates happening on network message update.
+     if (res.packet.updateType === "eventTimings") {
+-      batchedMessageAdd(actions.networkMessageUpdate(message));
++      batchedMessageUpdates(message);
+       this.jsterm.hud.emit("network-message-updated", res);
+     }
    },
  
    // Should be used for test purpose only.
@@ -172,28 +190,30 @@ diff --git a/devtools/client/webconsole/new-console-output/new-console-output-wr
  
 -function batchedMessageAdd(action) {
 -  queuedActions.push(action);
-+function batchedMessagesAdd(message) {
-+  queuedMessages.push(message);
++function setTimeoutIfNeeded() {
    if (!throttledDispatchTimeout) {
      throttledDispatchTimeout = setTimeout(() => {
 -      store.dispatch(actions.batchActions(queuedActions));
 -      queuedActions = [];
-+      store.dispatch(actions.messagesAdd(queuedMessages));
-+      queuedMessages = [];
++      store.dispatch(actions.messagesAdd(queuedMessageAdds));
++      queuedMessageUpdates.forEach(message => {
++        actions.networkMessageUpdate(message);
++      });
++      queuedMessageAdds = [];
++      queuedMessageUpdates = [];
        throttledDispatchTimeout = null;
      }, 50);
    }
  }
  
-+function batchedMessageAdd(action) {
-+  // queuedActions.push(action);
-+  // if (!throttledDispatchTimeout) {
-+  //   throttledDispatchTimeout = setTimeout(() => {
-+  //     store.dispatch(actions.batchActions(queuedActions));
-+  //     queuedActions = [];
-+  //     throttledDispatchTimeout = null;
-+  //   }, 50);
-+  // }
++function batchedMessageUpdates(message) {
++  queuedMessageUpdates.push(message);
++  setTimeoutIfNeeded();
++}
++
++function batchedMessagesAdd(message) {
++  queuedMessageAdds.push(message);
++  setTimeoutIfNeeded();
 +}
 +
  // Exports from this module
@@ -201,7 +221,7 @@ diff --git a/devtools/client/webconsole/new-console-output/new-console-output-wr
 diff --git a/devtools/client/webconsole/new-console-output/reducers/messages.js b/devtools/client/webconsole/new-console-output/reducers/messages.js
 --- a/devtools/client/webconsole/new-console-output/reducers/messages.js
 +++ b/devtools/client/webconsole/new-console-output/reducers/messages.js
-@@ -37,94 +37,153 @@ const MessageState = Immutable.Record({
+@@ -37,94 +37,128 @@ const MessageState = Immutable.Record({
    removedMessages: [],
    // Map of the form {messageId : numberOfRepeat}
    repeatById: {},
@@ -277,8 +297,6 @@ diff --git a/devtools/client/webconsole/new-console-output/reducers/messages.js 
 +    }
 +  });
 +}
-+
-+var totalTimeInMessagesAdd = 0;
 +
  function messages(state = new MessageState(), action, filtersState, prefsState) {
    const {
@@ -360,7 +378,8 @@ diff --git a/devtools/client/webconsole/new-console-output/reducers/messages.js 
 -        } else if (isGroupType(newMessage.type)) {
 -          record.set("currentGroup", newMessage.id);
 -          record.set("groupsById", groupsById.set(newMessage.id, parentGroups));
--
++      return limitTopLevelMessageCount(newState, logLimit);
+ 
 -          if (newMessage.type === constants.MESSAGE_TYPE.START_GROUP) {
 -            // We want the group to be open by default.
 -            record.set("messagesUiById", messagesUiById.push(newMessage.id));
@@ -371,34 +390,15 @@ diff --git a/devtools/client/webconsole/new-console-output/reducers/messages.js 
 -          record.set("visibleMessages", [...visibleMessages, newMessage.id]);
 -        }
 -
-+      console.log("Messages add", action, action.messages.length, messages.length);
-+      console.time("Messages add");
-+      newState = newState.withMutations(function (record) {
-         // Remove top level message if the total count of top level messages
-         // exceeds the current limit.
-         if (record.messagesById.size > logLimit) {
-           limitTopLevelMessageCount(state, record, logLimit);
-         }
-       });
-+      console.timeEnd("Messages add");
-+      return newState;
-+
+-        // Remove top level message if the total count of top level messages
+-        // exceeds the current limit.
+-        if (record.messagesById.size > logLimit) {
+-          limitTopLevelMessageCount(state, record, logLimit);
+-        }
+-      });
 +    case constants.MESSAGE_ADD:
-+      console.time("Message add");
-+      var start = performance.now();
 +      var newState = addMessage(state, filtersState, prefsState, action.message);
-+
-+      newState = newState.withMutations(function (record) {
-+        // Remove top level message if the total count of top level messages
-+        // exceeds the current limit.
-+        if (record.messagesById.size > logLimit) {
-+          limitTopLevelMessageCount(state, record, logLimit);
-+        }
-+      });
-+      totalTimeInMessagesAdd += (performance.now() - start);
-+      console.timeEnd("Message add");
-+      console.log(totalTimeInMessagesAdd);
-+      return newState;
++      return limitTopLevelMessageCount(newState, logLimit);
  
      case constants.MESSAGES_CLEAR:
        return new MessageState({
@@ -407,3 +407,201 @@ diff --git a/devtools/client/webconsole/new-console-output/reducers/messages.js 
          // all related backend actors.
          "removedMessages": [...state.messagesById].reduce((res, [id, msg]) => {
            if (msg.parameters) {
+@@ -248,111 +282,111 @@ function getParentGroups(currentGroup, g
+   return groups;
+ }
+ 
+ /**
+  * Remove all top level messages that exceeds message limit.
+  * Also populate an array of all backend actors associated with these
+  * messages so they can be released.
+  */
+-function limitTopLevelMessageCount(state, record, logLimit) {
+-  let topLevelCount = record.groupsById.size === 0
+-    ? record.messagesById.size
+-    : getToplevelMessageCount(record);
+-
+-  if (topLevelCount <= logLimit) {
+-    return record;
+-  }
+-
+-  const removedMessagesId = [];
+-  const removedMessages = [];
+-  let visibleMessages = [...record.visibleMessages];
+-
+-  let cleaningGroup = false;
+-  record.messagesById.forEach((message, id) => {
+-    // If we were cleaning a group and the current message does not have
+-    // a groupId, we're done cleaning.
+-    if (cleaningGroup === true && !message.groupId) {
+-      cleaningGroup = false;
+-    }
++function limitTopLevelMessageCount(state, logLimit) {
++  return state.withMutations(function (record) {
++    let topLevelCount = record.groupsById.size === 0
++      ? record.messagesById.size
++      : getToplevelMessageCount(record);
+ 
+-    // If we're not cleaning a group and the message count is below the logLimit,
+-    // we exit the forEach iteration.
+-    if (cleaningGroup === false && topLevelCount <= logLimit) {
+-      return false;
+-    }
+-
+-    // If we're not currently cleaning a group, and the current message is identified
+-    // as a group, set the cleaning flag to true.
+-    if (cleaningGroup === false && record.groupsById.has(id)) {
+-      cleaningGroup = true;
+-    }
+-
+-    if (!message.groupId) {
+-      topLevelCount--;
+-    }
+-
+-    removedMessagesId.push(id);
+-
+-    // Filter out messages with no arguments. Only actual arguments
+-    // can be associated with backend actors.
+-    if (message && message.parameters) {
+-      removedMessages.push(message);
++    if (topLevelCount <= logLimit) {
++      return;
+     }
+ 
+-    const index = visibleMessages.indexOf(id);
+-    if (index > -1) {
+-      visibleMessages.splice(index, 1);
++    const removedMessagesId = [];
++    const removedMessages = [];
++    let visibleMessages = [...record.visibleMessages];
++
++    let cleaningGroup = false;
++    record.messagesById.forEach((message, id) => {
++      // If we were cleaning a group and the current message does not have
++      // a groupId, we're done cleaning.
++      if (cleaningGroup === true && !message.groupId) {
++        cleaningGroup = false;
++      }
++
++      // If we're not cleaning a group and the message count is below the logLimit,
++      // we exit the forEach iteration.
++      if (cleaningGroup === false && topLevelCount <= logLimit) {
++        return false;
++      }
++
++      // If we're not currently cleaning a group, and the current message is identified
++      // as a group, set the cleaning flag to true.
++      if (cleaningGroup === false && record.groupsById.has(id)) {
++        cleaningGroup = true;
++      }
++
++      if (!message.groupId) {
++        topLevelCount--;
++      }
++
++      removedMessagesId.push(id);
++
++      // Filter out messages with no arguments. Only actual arguments
++      // can be associated with backend actors.
++      if (message && message.parameters) {
++        removedMessages.push(message);
++      }
++
++      const index = visibleMessages.indexOf(id);
++      if (index > -1) {
++        visibleMessages.splice(index, 1);
++      }
++
++      return true;
++    });
++
++    if (removedMessages.length > 0) {
++      record.set("removedMessages", record.removedMessages.concat(removedMessages));
+     }
+ 
+-    return true;
+-  });
+-
+-  if (removedMessages.length > 0) {
+-    record.set("removedMessages", record.removedMessages.concat(removedMessages));
+-  }
+-
+-  if (record.visibleMessages.length > visibleMessages.length) {
+-    record.set("visibleMessages", visibleMessages);
+-  }
++    if (record.visibleMessages.length > visibleMessages.length) {
++      record.set("visibleMessages", visibleMessages);
++    }
+ 
+-  const isInRemovedId = id => removedMessagesId.includes(id);
+-  const mapHasRemovedIdKey = map => map.findKey((value, id) => isInRemovedId(id));
+-  const cleanUpCollection = map => removedMessagesId.forEach(id => map.remove(id));
+-  const cleanUpObject = object => [...Object.entries(object)]
+-    .reduce((res, [id, value]) => {
+-      if (!isInRemovedId(id)) {
+-        res[id] = value;
+-      }
+-      return res;
+-    }, {});
++    const isInRemovedId = id => removedMessagesId.includes(id);
++    const mapHasRemovedIdKey = map => map.findKey((value, id) => isInRemovedId(id));
++    const cleanUpCollection = map => removedMessagesId.forEach(id => map.remove(id));
++    const cleanUpObject = object => [...Object.entries(object)]
++      .reduce((res, [id, value]) => {
++        if (!isInRemovedId(id)) {
++          res[id] = value;
++        }
++        return res;
++      }, {});
++
++    record.set("messagesById", record.messagesById.withMutations(cleanUpCollection));
+ 
+-  record.set("messagesById", record.messagesById.withMutations(cleanUpCollection));
++    if (record.messagesUiById.find(isInRemovedId)) {
++      record.set("messagesUiById", record.messagesUiById.withMutations(cleanUpCollection));
++    }
++    if (mapHasRemovedIdKey(record.messagesTableDataById)) {
++      record.set("messagesTableDataById",
++        record.messagesTableDataById.withMutations(cleanUpCollection));
++    }
++    if (mapHasRemovedIdKey(record.groupsById)) {
++      record.set("groupsById", record.groupsById.withMutations(cleanUpCollection));
++    }
+ 
+-  if (record.messagesUiById.find(isInRemovedId)) {
+-    record.set("messagesUiById", record.messagesUiById.withMutations(cleanUpCollection));
+-  }
+-  if (mapHasRemovedIdKey(record.messagesTableDataById)) {
+-    record.set("messagesTableDataById",
+-      record.messagesTableDataById.withMutations(cleanUpCollection));
+-  }
+-  if (mapHasRemovedIdKey(record.groupsById)) {
+-    record.set("groupsById", record.groupsById.withMutations(cleanUpCollection));
+-  }
++    if (Object.keys(record.repeatById).includes(removedMessagesId)) {
++      record.set("repeatById", cleanUpObject(record.repeatById));
++    }
+ 
+-  if (Object.keys(record.repeatById).includes(removedMessagesId)) {
+-    record.set("repeatById", cleanUpObject(record.repeatById));
+-  }
+-
+-  if (Object.keys(record.networkMessagesUpdateById).includes(removedMessagesId)) {
+-    record.set("networkMessagesUpdateById",
+-      cleanUpObject(record.networkMessagesUpdateById));
+-  }
+-
+-  return record;
++    if (Object.keys(record.networkMessagesUpdateById).includes(removedMessagesId)) {
++      record.set("networkMessagesUpdateById",
++        cleanUpObject(record.networkMessagesUpdateById));
++    }
++  });
+ }
+ 
+ /**
+  * Returns total count of top level messages (those which are not
+  * within a group).
+  */
+ function getToplevelMessageCount(record) {
+   return record.messagesById.count(message => !message.groupId);
