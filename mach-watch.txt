@@ -1,0 +1,466 @@
+# HG changeset patch
+# User Nick Alexander <nalexander@mozilla.com>
+# Date 1499793856 25200
+#      Tue Jul 11 10:24:16 2017 -0700
+# Node ID 9e1b90c00ace27d0ab64a1035bf34fb412dbf347
+# Parent  213a58a8aef73db4d39c58270176766540590392
+Add |mach watch|: pywatchman based |mach build faster| daemon.
+
+MozReview-Commit-ID: AdDlEOUcJPr
+
+diff --git a/python/mozbuild/mozbuild/faster_daemon.py b/python/mozbuild/mozbuild/faster_daemon.py
+new file mode 100644
+--- /dev/null
++++ b/python/mozbuild/mozbuild/faster_daemon.py
+@@ -0,0 +1,244 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++'''
++XXX
++'''
++
++from __future__ import absolute_import, print_function, unicode_literals
++
++import collections
++import os
++import sys
++import time
++
++import mozpack.path as mozpath
++from mozpack.manifests import (
++    InstallManifest,
++)
++from mozpack.copier import (
++    FileCopier,
++    FileRegistrySubtree,
++)
++from mozpack.files import (
++    AbsoluteSymlinkFile,
++    File,
++    PreprocessedFile,
++    FileFinder,
++)
++from mozbuild import shellutil
++
++# Watchman integration cribbed entirely from
++# https://github.com/facebook/watchman/blob/19aebfebb0b5b0b5174b3914a879370ffc5dac37/python/bin/watchman-wait
++import pywatchman
++
++
++def print_copy_result(elapsed, destdir, result, verbose=True):
++    COMPLETE = 'Elapsed: {elapsed:.2f}s; From {dest}: Kept {existing} existing; ' \
++        'Added/updated {updated}; ' \
++        'Removed {rm_files} files and {rm_dirs} directories.'
++
++    print(COMPLETE.format(
++        elapsed=elapsed,
++        dest=destdir,
++        existing=result.existing_files_count,
++        updated=result.updated_files_count,
++        rm_files=result.removed_files_count,
++        rm_dirs=result.removed_directories_count))
++
++    if verbose:
++        if result.updated_files:
++            print("Updated files:")
++            for file in result.updated_files:
++                print("  {}".format(file))
++
++
++class Daemon(object):
++    def __init__(self, config_environment):
++        self.config_environment = config_environment
++        self._file_copier = None
++        self._client = None
++        self._subscriptions = []
++
++    @property
++    def defines(self):
++        defines = dict((name, self.config_environment.defines[name]) \
++                       for name in self.config_environment.defines \
++                       if not name in self.config_environment.non_global_defines)
++        defines.update({
++            'AB_CD': 'en-US',
++            'BUILD_FASTER': 1,
++        })
++        defines.update({
++            'BOOKMARKS_INCLUDE_DIR': mozpath.join(self.config_environment.topsrcdir,
++                                                  'browser', 'locales', 'en-US', 'profile'),
++        })
++        return defines
++
++    @property
++    def file_copier(self):
++        if self._file_copier is None:
++            file_copier = FileCopier()
++
++            finder = FileFinder(mozpath.join(self.config_environment.topobjdir, 'faster'))
++            for path, f in finder.find('*.track'):
++                manifest = InstallManifest(fileobj=f.open())
++
++                # Turn 'install_dist_bin_browser.track' into ['browser'].
++                parts = os.path.basename(os.path.splitext(path)[0]).split('_')
++                parts = parts[3:] # Drop leading install_dist_bin.
++
++                if not parts:
++                    # XXX: maybe we need to handle the top-level dist/bin manifest?
++                    continue
++                manifest.populate_registry(FileRegistrySubtree(mozpath.join(*parts), file_copier),
++                                           defines_override=self.defines)
++
++            self._file_copier = file_copier
++
++        return self._file_copier
++
++    def watch_set(self, depth=2):
++        file_copier = self.file_copier
++
++        # We want the set of watches to be "reasonable", so we watch
++        # (by default) $TOPSRCDIR/two/levels or $TOPSRCDIR/onelevel.
++        # Many folks root $TOPOBJDIR in $TOPSRCDIR, so we handle that
++        # situation specially.  We definitely don't want to watch
++        # $TOPOBJDIR by mistake!
++        watches = set()
++        for input in file_copier.input_to_outputs_tree().keys():
++            rel = mozpath.commonprefix((input, self.config_environment.topobjdir))
++            if rel.startswith(self.config_environment.topobjdir):
++                continue
++
++            rel = mozpath.relpath(input, self.config_environment.topsrcdir)
++            if rel:
++                partial_paths = file_copier._partial_paths(rel)
++                if len(partial_paths) >= 2:
++                    watches.add(partial_paths[-2])
++                elif len(partial_paths) >= 1:
++                    watches.add(partial_paths[-1])
++            else:
++                raise Exception("Refusing to watch input ({}) not rooted in topsrcdir ({})"
++                                .format(input, self.config_environment.topsrcdir))
++
++        return watches
++
++    def subscribe_to_dir(self, name, dir_to_watch):
++        query = {
++            'expression': ['true'],
++            'fields': ['name'],
++        }
++        watch = self.client.query('watch-project', dir_to_watch)
++        if 'warning' in watch:
++            print('WARNING: ', watch['warning'], file=sys.stderr)
++
++        root = watch['watch']
++        if 'relative_path' in watch:
++            query['relative_root'] = watch['relative_path']
++
++        # Get the initial clock value so that we only get updates.
++        query['since'] = self.client.query('clock', root)['clock']
++
++        return self.client.query('subscribe', root, name, query)
++
++    def changed_files(self, verbose=True):
++        # in theory we can parse just the result variable here, but
++        # the client object will accumulate all subscription results
++        # over time, so we ask it to remove and return those values
++        # for each of the subscriptions
++
++        files = set()
++        for sub in self._subscriptions:
++            name = sub['subscribe']
++            data = self.client.getSubscription(name)
++            if data is None:
++                continue
++
++            for dat in data:
++                files |= set([mozpath.join(self.config_environment.topsrcdir, name, f)
++                              for f in dat.get('files', [])])
++
++            files = set([f for f in files if os.path.isfile(f)])
++
++        return files
++
++    def incremental_copy(self, copier, force=False, verbose=True):
++        # Just like the 'repackage' target in browser/app/Makefile.in.
++        if 'cocoa' == self.config_environment.substs['MOZ_WIDGET_TOOLKIT']:
++            bundledir = mozpath.join(self.config_environment.topobjdir, 'dist',
++                                     self.config_environment.substs['MOZ_MACBUNDLE_NAME'],
++                                     'Contents', 'Resources')
++            start = time.time()
++            result = copier.copy(bundledir,
++                                 skip_if_older=not force,
++                                 remove_unaccounted=False,
++                                 remove_all_directory_symlinks=False,
++                                 remove_empty_directories=False)
++            print_copy_result(time.time() - start, bundledir, result, verbose=verbose)
++
++        destdir = mozpath.join(self.config_environment.topobjdir, 'dist', 'bin')
++        start = time.time()
++        result = copier.copy(destdir,
++                             skip_if_older=not force,
++                             remove_unaccounted=False,
++                             remove_all_directory_symlinks=False,
++                             remove_empty_directories=False)
++        print_copy_result(time.time() - start, destdir, result, verbose=verbose)
++
++    def watch(self, verbose=True):
++        self.client = pywatchman.client()
++        try:
++            self.client.capabilityCheck(required=['term-dirname', 'cmd-watch-project', 'wildmatch'])
++
++            for watch in sorted(self.watch_set()):
++                name = watch
++                path = mozpath.join(self.config_environment.topsrcdir, watch)
++                sub = self.subscribe_to_dir(name, path)
++                self._subscriptions.append(sub)
++                if verbose:
++                    print("Watching srcdir {}".format(path))
++
++        except pywatchman.CommandError as ex:
++            print('watchman:', ex.msg, file=sys.stderr)
++            return 1
++
++        input_to_outputs = self.file_copier.input_to_outputs_tree()
++
++        while True:
++            try:
++                result = self.client.receive()
++
++                all_outputs = set()
++                inputs = self.changed_files(verbose=verbose)
++                if inputs:
++                    print("Changed inputs:")
++                    for input in inputs:
++                        print("  {}".format(input))
++                        outputs = set(input_to_outputs[input])
++                        for output in outputs:
++                            print("    {}".format(output))
++                        all_outputs |= outputs
++
++                if all_outputs:
++                    partial_copier = FileCopier()
++                    for output in all_outputs:
++                        partial_copier.add(output, self.file_copier[output])
++
++                    self.incremental_copy(partial_copier, force=True, verbose=verbose)
++
++            except pywatchman.SocketTimeout as ex:
++                # Let's check to see if we're still functional.
++                try:
++                    vers = self.client.query('version')
++                except Exception as ex:
++                    print('watchman:', str(ex), file=sys.stderr)
++                    sys.exit(1)
++
++            except KeyboardInterrupt:
++                # Suppress ugly stack trace when user hits Ctrl-C.
++                sys.exit(3)
++
++        return 0
+diff --git a/python/mozbuild/mozbuild/mach_commands.py b/python/mozbuild/mozbuild/mach_commands.py
+--- a/python/mozbuild/mozbuild/mach_commands.py
++++ b/python/mozbuild/mozbuild/mach_commands.py
+@@ -275,16 +275,31 @@ class BuildOutputManager(LoggingMixin):
+ class StoreDebugParamsAndWarnAction(argparse.Action):
+     def __call__(self, parser, namespace, values, option_string=None):
+         sys.stderr.write('The --debugparams argument is deprecated. Please ' +
+                          'use --debugger-args instead.\n\n')
+         setattr(namespace, self.dest, values)
+ 
+ 
+ @CommandProvider
++class Watch(MachCommandBase):
++    """Interface to watch and re-build the tree."""
++
++    @Command('watch', category='build', description='Watch and re-build the tree.')
++    def watch(self):
++        """Watch and re-build the source tree."""
++        self._activate_virtualenv()
++        self.virtualenv_manager.install_pip_package('pywatchman==1.3.0')
++
++        from mozbuild.faster_daemon import Daemon
++        daemon = Daemon(self.config_environment)
++        return daemon.watch()
++
++
++@CommandProvider
+ class Build(MachCommandBase):
+     """Interface to build the tree."""
+ 
+     @Command('build', category='build', description='Build the tree.')
+     @CommandArgument('--jobs', '-j', default='0', metavar='jobs', type=int,
+         help='Number of concurrent jobs to run. Default is the number of CPUs.')
+     @CommandArgument('-C', '--directory', default=None,
+         help='Change to a subdirectory of the build directory first.')
+diff --git a/python/mozbuild/mozpack/copier.py b/python/mozbuild/mozpack/copier.py
+--- a/python/mozbuild/mozpack/copier.py
++++ b/python/mozbuild/mozpack/copier.py
+@@ -11,16 +11,17 @@ import sys
+ from mozpack.errors import errors
+ from mozpack.files import (
+     BaseFile,
+     Dest,
+ )
+ import mozpack.path as mozpath
+ import errno
+ from collections import (
++    defaultdict,
+     Counter,
+     OrderedDict,
+ )
+ import concurrent.futures as futures
+ 
+ 
+ class FileRegistry(object):
+     '''
+@@ -148,16 +149,37 @@ class FileRegistry(object):
+         '''
+         Return the set of directories required by the paths in the container,
+         in no particular order.  The returned directories are relative to an
+         unspecified (virtual) root directory (and do not include said root
+         directory).
+         '''
+         return set(k for k, v in self._required_directories.items() if v > 0)
+ 
++    def output_to_inputs_tree(self):
++        '''
++        Return a dictionary mapping each output path to the set of its
++        required input paths.
++        '''
++        tree = {}
++        for output, file in self:
++            tree[output] = set(file.inputs())
++        return tree
++
++    def input_to_outputs_tree(self):
++        '''
++        Return a dictionary mapping each input path to the set of
++        impacted output paths.
++        '''
++        tree = defaultdict(set)
++        for output, file in self:
++            for input in file.inputs():
++                tree[input].add(output)
++        return tree
++
+ 
+ class FileRegistrySubtree(object):
+     '''A proxy class to give access to a subtree of an existing FileRegistry.
+ 
+     Note this doesn't implement the whole FileRegistry interface.'''
+     def __new__(cls, base, registry):
+         if not base:
+             return registry
+diff --git a/python/mozbuild/mozpack/files.py b/python/mozbuild/mozpack/files.py
+--- a/python/mozbuild/mozpack/files.py
++++ b/python/mozbuild/mozpack/files.py
+@@ -229,16 +229,22 @@ class BaseFile(object):
+ 
+     @property
+     def mode(self):
+         '''
+         Return the file's unix mode, or None if it has no meaning.
+         '''
+         return None
+ 
++    def inputs(self):
++        '''
++        Return an iterator of the input file paths that impact this output file.
++        '''
++        raise NotImplementedError('BaseFile.inputs() not implemented. Bug XXX.')
++
+ 
+ class File(BaseFile):
+     '''
+     File class for plain files.
+     '''
+     def __init__(self, path):
+         self.path = path
+ 
+@@ -256,16 +262,19 @@ class File(BaseFile):
+     def read(self):
+         '''Return the contents of the file.'''
+         with open(self.path, 'rb') as fh:
+             return fh.read()
+ 
+     def size(self):
+         return os.stat(self.path).st_size
+ 
++    def inputs(self):
++        yield self.path
++
+ 
+ class ExecutableFile(File):
+     '''
+     File class for executable and library files on OS/2, OS/X and ELF systems.
+     (see mozpack.executables.is_executable documentation).
+     '''
+     def copy(self, dest, skip_if_older=True):
+         real_dest = dest
+@@ -418,32 +427,46 @@ class ExistingFile(BaseFile):
+ 
+         if not self.required:
+             return
+ 
+         if not dest.exists():
+             errors.fatal("Required existing file doesn't exist: %s" %
+                 dest.path)
+ 
++    def inputs(self):
++        return iter(())
++
+ 
+ class PreprocessedFile(BaseFile):
+     '''
+     File class for a file that is preprocessed. PreprocessedFile.copy() runs
+     the preprocessor on the file to create the output.
+     '''
+     def __init__(self, path, depfile_path, marker, defines, extra_depends=None,
+                  silence_missing_directive_warnings=False):
+         self.path = path
+         self.depfile = depfile_path
+         self.marker = marker
+         self.defines = defines
+         self.extra_depends = list(extra_depends or [])
+         self.silence_missing_directive_warnings = \
+             silence_missing_directive_warnings
+ 
++    def inputs(self):
++        pp = Preprocessor(defines=self.defines, marker=self.marker)
++        pp.setSilenceDirectiveWarnings(self.silence_missing_directive_warnings)
++
++        with open(self.path, 'rU') as input:
++            with open(os.devnull, 'w') as output:
++                pp.processFile(input=input, output=output)
++
++        # This always yields at least self.path.
++        return iter(pp.includes)
++
+     def copy(self, dest, skip_if_older=True):
+         '''
+         Invokes the preprocessor to create the destination file.
+         '''
+         if isinstance(dest, basestring):
+             dest = Dest(dest)
+         else:
+             assert isinstance(dest, Dest)
+@@ -509,16 +532,19 @@ class GeneratedFile(BaseFile):
+         return BytesIO(self.content)
+ 
+     def read(self):
+         return self.content
+ 
+     def size(self):
+         return len(self.content)
+ 
++    def inputs(self):
++        return iter(())
++
+ 
+ class DeflatedFile(BaseFile):
+     '''
+     File class for members of a jar archive. DeflatedFile.copy() effectively
+     extracts the file from the jar archive.
+     '''
+     def __init__(self, file):
+         from mozpack.mozjar import JarFileReader
