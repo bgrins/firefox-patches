@@ -1,0 +1,513 @@
+
+# HG changeset patch
+# User Nicolas Chevobbe <nchevobbe@mozilla.com>
+# Date 1499773859 -7200
+# Node ID 2b9b2530bfa8aca929dc98e998c5beaf32c5f132
+# Parent  5c3e7cb5a35e1e56c7eb24ca392d22309f7af9f5
+Bug 1379570 - Adapt the inspect command to the new console frontend. r=bgrins
+
+MozReview-Commit-ID: LsT12pOJhvV
+
+diff --git a/devtools/client/webconsole/jsterm.js b/devtools/client/webconsole/jsterm.js
+--- a/devtools/client/webconsole/jsterm.js
++++ b/devtools/client/webconsole/jsterm.js
+@@ -337,17 +337,19 @@
+       switch (helperResult.type) {
+         case "clearOutput":
+           this.clearOutput();
+           break;
+         case "clearHistory":
+           this.clearHistory();
+           break;
+         case "inspectObject":
+-          this.inspectObjectActor(helperResult.object);
++          if (!this.hud.NEW_CONSOLE_OUTPUT_ENABLED) {
++            this.inspectObjectActor(helperResult.object);
++          }
+           break;
+         case "error":
+           try {
+             errorMessage = l10n.getStr(helperResult.message);
+           } catch (ex) {
+             errorMessage = helperResult.message;
+           }
+           break;
+@@ -356,19 +358,24 @@
+           break;
+         case "copyValueToClipboard":
+           clipboardHelper.copyString(helperResult.value);
+           break;
+       }
+     }
+ 
+     // Hide undefined results coming from JSTerm helper functions.
+-    if (!errorMessage && result && typeof result == "object" &&
+-        result.type == "undefined" &&
+-        helperResult && !helperHasRawOutput) {
++    if (!errorMessage
++        && result
++        && typeof result == "object"
++        && result.type == "undefined"
++        && helperResult
++        && !helperHasRawOutput
++        && !(this.hud.NEW_CONSOLE_OUTPUT_ENABLED && helperResult.type === "inspectObject")
++    ) {
+       callback && callback();
+       return;
+     }
+ 
+     if (this.hud.NEW_CONSOLE_OUTPUT_ENABLED) {
+       this.hud.newConsoleOutput.dispatchMessageAdd(response, true).then(callback);
+       return;
+     }
+diff --git a/devtools/client/webconsole/new-console-output/components/grip-message-body.js b/devtools/client/webconsole/new-console-output/components/grip-message-body.js
+--- a/devtools/client/webconsole/new-console-output/components/grip-message-body.js
++++ b/devtools/client/webconsole/new-console-output/components/grip-message-body.js
+@@ -84,17 +84,17 @@
+         e.stopPropagation();
+         serviceContainer.openNodeInInspector(object);
+       }
+       : null;
+   }
+ 
+   const objectInspectorProps = {
+     // Auto-expand the ObjectInspector when the message is a console.dir one.
+-    autoExpandDepth: type === MESSAGE_TYPE.DIR ? 1 : 0,
++    autoExpandDepth: type === MESSAGE_TYPE.DIR || type === "inspectObject" ? 1 : 0,
+     mode,
+     // TODO: we disable focus since it's not currently working well in ObjectInspector.
+     // Let's remove the property below when problem are fixed in OI.
+     disabledFocus: true,
+     roots: [{
+       path: grip.actor || JSON.stringify(grip),
+       contents: {
+         value: grip
+diff --git a/devtools/client/webconsole/new-console-output/components/message-types/evaluation-result.js b/devtools/client/webconsole/new-console-output/components/message-types/evaluation-result.js
+--- a/devtools/client/webconsole/new-console-output/components/message-types/evaluation-result.js
++++ b/devtools/client/webconsole/new-console-output/components/message-types/evaluation-result.js
+@@ -46,35 +46,38 @@
+     id: messageId,
+     exceptionDocURL,
+     frame,
+     timeStamp,
+     parameters,
+     notes,
+   } = message;
+ 
++  const isInspectCommandResult = parameters && parameters.type === "inspectObject";
++
+   let messageBody;
+   if (message.messageText) {
+     if (typeof message.messageText === "string") {
+       messageBody = message.messageText;
+     } else if (
+       typeof message.messageText === "object"
+       && message.messageText.type === "longString"
+     ) {
+       messageBody = `${message.messageText.initial}…`;
+     }
+   } else {
+     messageBody = GripMessageBody({
+       dispatch,
+       messageId,
+-      grip: parameters,
++      grip: isInspectCommandResult ? parameters.object : parameters,
+       serviceContainer,
+       useQuotes: true,
+       escapeWhitespace: false,
+       loadedObjectProperties,
++      type: isInspectCommandResult ? parameters.type : type,
+     });
+   }
+ 
+   const topLevelClasses = ["cm-s-mozilla"];
+ 
+   return Message({
+     source,
+     type,
+diff --git a/devtools/client/webconsole/new-console-output/test/components/evaluation-result.test.js b/devtools/client/webconsole/new-console-output/test/components/evaluation-result.test.js
+--- a/devtools/client/webconsole/new-console-output/test/components/evaluation-result.test.js
++++ b/devtools/client/webconsole/new-console-output/test/components/evaluation-result.test.js
+@@ -44,16 +44,23 @@
+     const message = stubPreparedMessages.get("longString message Error");
+     const wrapper = render(EvaluationResult({ message }));
+ 
+     const text = wrapper.find(".message-body").text();
+     expect(text.startsWith("Error: Long error Long error")).toBe(true);
+     expect(wrapper.find(".message.error").length).toBe(1);
+   });
+ 
++  it("renders an inspect command result", () => {
++    const message = stubPreparedMessages.get("inspect({a: 1})");
++    const wrapper = render(EvaluationResult({ message }));
++
++    expect(wrapper.find(".message-body").text()).toBe("Object { a: 1 }");
++  });
++
+   it("displays a [Learn more] link", () => {
+     const store = setupStore([]);
+ 
+     const message = stubPreparedMessages.get("asdf()");
+ 
+     serviceContainer.openLink = sinon.spy();
+     const wrapper = mount(Provider({store},
+       EvaluationResult({message, serviceContainer})
+diff --git a/devtools/client/webconsole/new-console-output/test/fixtures/stub-generators/stub-snippets.js b/devtools/client/webconsole/new-console-output/test/fixtures/stub-generators/stub-snippets.js
+--- a/devtools/client/webconsole/new-console-output/test/fixtures/stub-generators/stub-snippets.js
++++ b/devtools/client/webconsole/new-console-output/test/fixtures/stub-generators/stub-snippets.js
+@@ -140,17 +140,18 @@
+   padding-top: invalid value;
+ }
+ `);
+ 
+ // Evaluation Result
+ const evaluationResultCommands = [
+   "new Date(0)",
+   "asdf()",
+-  "1 + @"
++  "1 + @",
++  "inspect({a: 1})"
+ ];
+ 
+ let evaluationResult = new Map(evaluationResultCommands.map(cmd => [cmd, cmd]));
+ evaluationResult.set("longString message Error",
+   `throw new Error("Long error ".repeat(10000))`);
+ 
+ // Network Event
+ 
+diff --git a/devtools/client/webconsole/new-console-output/test/fixtures/stubs/evaluationResult.js b/devtools/client/webconsole/new-console-output/test/fixtures/stubs/evaluationResult.js
+--- a/devtools/client/webconsole/new-console-output/test/fixtures/stubs/evaluationResult.js
++++ b/devtools/client/webconsole/new-console-output/test/fixtures/stubs/evaluationResult.js
+@@ -86,16 +86,58 @@
+   },
+   "groupId": null,
+   "exceptionDocURL": "https://developer.mozilla.org/docs/Web/JavaScript/Reference/Errors/Illegal_character?utm_source=mozilla&utm_medium=firefox-console-errors&utm_campaign=default",
+   "userProvidedStyles": null,
+   "notes": null,
+   "indent": 0
+ }));
+ 
++stubPreparedMessages.set("inspect({a: 1})", new ConsoleMessage({
++  "id": "1",
++  "allowRepeating": true,
++  "source": "javascript",
++  "timeStamp": 1499776070751,
++  "type": "result",
++  "level": "log",
++  "parameters": {
++    "type": "inspectObject",
++    "input": "inspect({a: 1})",
++    "object": {
++      "type": "object",
++      "actor": "server1.conn0.child1/obj35",
++      "class": "Object",
++      "extensible": true,
++      "frozen": false,
++      "sealed": false,
++      "ownPropertyLength": 1,
++      "preview": {
++        "kind": "Object",
++        "ownProperties": {
++          "a": {
++            "configurable": true,
++            "enumerable": true,
++            "writable": true,
++            "value": 1
++          }
++        },
++        "ownPropertiesLength": 1,
++        "safeGetterValues": {}
++      }
++    }
++  },
++  "repeatId": "{\"frame\":null,\"groupId\":null,\"indent\":0,\"level\":\"log\",\"parameters\":{\"type\":\"inspectObject\",\"input\":\"inspect({a: 1})\",\"object\":{\"type\":\"object\",\"actor\":\"server1.conn0.child1/obj35\",\"class\":\"Object\",\"extensible\":true,\"frozen\":false,\"sealed\":false,\"ownPropertyLength\":1,\"preview\":{\"kind\":\"Object\",\"ownProperties\":{\"a\":{\"configurable\":true,\"enumerable\":true,\"writable\":true,\"value\":1}},\"ownPropertiesLength\":1,\"safeGetterValues\":{}}}},\"source\":\"javascript\",\"type\":\"result\",\"userProvidedStyles\":null}",
++  "stacktrace": null,
++  "frame": null,
++  "groupId": null,
++  "userProvidedStyles": null,
++  "notes": null,
++  "indent": 0
++}));
++
+ stubPreparedMessages.set("longString message Error", new ConsoleMessage({
+   "id": "1",
+   "allowRepeating": true,
+   "source": "javascript",
+   "timeStamp": 1493108241073,
+   "type": "result",
+   "level": "error",
+   "messageText": {
+@@ -205,16 +247,54 @@
+     "source": "debugger eval code",
+     "line": 1,
+     "column": 4
+   },
+   "helperResult": null,
+   "notes": null
+ });
+ 
++stubPackets.set("inspect({a: 1})", {
++  "from": "server1.conn0.child1/consoleActor2",
++  "input": "inspect({a: 1})",
++  "result": {
++    "type": "undefined"
++  },
++  "timestamp": 1499776070751,
++  "exception": null,
++  "frame": null,
++  "helperResult": {
++    "type": "inspectObject",
++    "input": "inspect({a: 1})",
++    "object": {
++      "type": "object",
++      "actor": "server1.conn0.child1/obj35",
++      "class": "Object",
++      "extensible": true,
++      "frozen": false,
++      "sealed": false,
++      "ownPropertyLength": 1,
++      "preview": {
++        "kind": "Object",
++        "ownProperties": {
++          "a": {
++            "configurable": true,
++            "enumerable": true,
++            "writable": true,
++            "value": 1
++          }
++        },
++        "ownPropertiesLength": 1,
++        "safeGetterValues": {}
++      }
++    }
++  },
++  "notes": null
++});
++
+ stubPackets.set("longString message Error", {
+   "from": "server1.conn0.child1/consoleActor2",
+   "input": "throw new Error(\"Long error \".repeat(10000))",
+   "result": {
+     "type": "undefined"
+   },
+   "timestamp": 1493108241073,
+   "exception": {
+diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/browser.ini b/devtools/client/webconsole/new-console-output/test/mochitest/browser.ini
+--- a/devtools/client/webconsole/new-console-output/test/mochitest/browser.ini
++++ b/devtools/client/webconsole/new-console-output/test/mochitest/browser.ini
+@@ -13,16 +13,17 @@
+   test-location-debugger-link.html
+   test-location-styleeditor-link-1.css
+   test-location-styleeditor-link-2.css
+   test-location-styleeditor-link.html
+   test-network-request.html
+   test-stacktrace-location-debugger-link.html
+   !/devtools/client/framework/test/shared-head.js
+ 
++[browser_jsterm_inspect.js]
+ [browser_netmonitor_shows_reqs_in_webconsole.js]
+ [browser_webconsole_batching.js]
+ [browser_webconsole_console_dir.js]
+ [browser_webconsole_console_group.js]
+ [browser_webconsole_console_table.js]
+ [browser_webconsole_context_menu_copy_entire_message.js]
+ subsuite = clipboard
+ skip-if = (os == 'linux' && bits == 32 && debug) # bug 1328915, disable linux32 debug devtools for timeouts
+diff --git a/devtools/client/webconsole/test/browser_jsterm_inspect.js b/devtools/client/webconsole/new-console-output/test/mochitest/browser_jsterm_inspect.js
+copy from devtools/client/webconsole/test/browser_jsterm_inspect.js
+copy to devtools/client/webconsole/new-console-output/test/mochitest/browser_jsterm_inspect.js
+--- a/devtools/client/webconsole/test/browser_jsterm_inspect.js
++++ b/devtools/client/webconsole/new-console-output/test/mochitest/browser_jsterm_inspect.js
+@@ -2,46 +2,61 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* Any copyright is dedicated to the Public Domain.
+  * http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ // Check that the inspect() jsterm helper function works.
+ 
+ "use strict";
+ 
+-const TEST_URI = "data:text/html;charset=utf8,<p>hello bug 869981";
++const TEST_URI = "data:text/html;charset=utf8,<p>test inspect() command";
+ 
+-add_task(function* () {
+-  yield loadTab(TEST_URI);
++add_task(async function () {
++  let toolbox = await openNewTabAndToolbox(TEST_URI, "webconsole");
++  let hud = toolbox.getCurrentPanel().hud;
+ 
+-  let hud = yield openConsole();
+   let jsterm = hud.jsterm;
+ 
+-  /* Check that the window object is inspected */
+-  jsterm.execute("testProp = 'testValue'");
++  info("Test `inspect(window)`");
++  // Add a global value so we can check it later.
++  await jsterm.execute("testProp = 'testValue'");
++  await jsterm.execute("inspect(window)");
+ 
+-  let updated = jsterm.once("variablesview-updated");
+-  jsterm.execute("inspect(window)");
+-  let view = yield updated;
+-  ok(view, "variables view object");
++  const inspectWindowNode = await waitFor(() =>
++    findInspectResultMessage(hud.ui.experimentalOutputNode, 1));
++
++  let objectInspectors = [...inspectWindowNode.querySelectorAll(".tree")];
++  is(objectInspectors.length, 1, "There is the expected number of object inspectors");
++
++  const [windowOi] = objectInspectors;
++  let windowOiNodes = windowOi.querySelectorAll(".node");
+ 
+-  // The single variable view contains a scope with the variable name
+-  // and unnamed subitem that contains the properties
+-  let variable = view.getScopeAtIndex(0).get(undefined);
+-  ok(variable, "variable object");
++  // The tree can be collapsed since the properties are fetched asynchronously.
++  if (windowOiNodes.length === 1) {
++    // If this is the case, we wait for the properties to be fetched and displayed.
++    await waitForNodeMutation(windowOi, {
++      childList: true
++    });
++    windowOiNodes = windowOi.querySelectorAll(".node");
++  }
+ 
+-  yield findVariableViewProperties(variable, [
+-    { name: "testProp", value: "testValue" },
+-    { name: "document", value: /HTMLDocument \u2192 data:/ },
+-  ], { webconsole: hud });
++  let propertiesNodes = [...windowOi.querySelectorAll(".object-label")];
++  const testPropertyLabelNode = propertiesNodes.find(el => el.textContent === "testProp");
++  ok(testPropertyLabelNode , "The testProp property label is displayed as expected");
++
++  const testPropertyValueNode = testPropertyLabelNode
++    .closest(".node")
++    .querySelector(".objectBox");
++  is(testPropertyValueNode.textContent , '"testValue"',
++    "The testProp property value is displayed as expected");
+ 
+   /* Check that a primitive value can be inspected, too */
+-  let updated2 = jsterm.once("variablesview-updated");
+-  jsterm.execute("inspect(1)");
+-  let view2 = yield updated2;
+-  ok(view2, "variables view object");
++  info("Test `inspect(1)`");
++  await jsterm.execute("inspect(1)");
+ 
+-  // Check the label of the scope - it should contain the value
+-  let scope = view.getScopeAtIndex(0);
+-  ok(scope, "variable object");
++  const inspectPrimitiveNode = await waitFor(() =>
++    findInspectResultMessage(hud.ui.experimentalOutputNode, 2));
++  is(inspectPrimitiveNode.textContent, 1, "The primitive is displayed as expected");
++});
+ 
+-  is(scope.name, "1", "The value of the primitive var is correct");
+-});
++function findInspectResultMessage(node, index) {
++  return node.querySelectorAll(".message.result")[index];
++}
+diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_console_dir.js b/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_console_dir.js
+--- a/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_console_dir.js
++++ b/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_console_dir.js
+@@ -88,18 +88,8 @@
+   propertiesNodes = [...objectOi.querySelectorAll(".object-label")]
+     .map(el => el.textContent);
+   is(JSON.stringify(propertiesNodes), JSON.stringify(objectPropertiesNames));
+ });
+ 
+ function findConsoleDir(node, index) {
+   return node.querySelectorAll(".dir.message")[index];
+ }
+-
+-function waitForNodeMutation(node, observeConfig = {}) {
+-  return new Promise(resolve => {
+-    const observer = new MutationObserver(mutations => {
+-      resolve(mutations);
+-      observer.disconnect();
+-    });
+-    observer.observe(node, observeConfig);
+-  });
+-}
+diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_object_inspector.js b/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_object_inspector.js
+--- a/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_object_inspector.js
++++ b/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_object_inspector.js
+@@ -94,18 +94,8 @@
+ 
+   arrayOiNodes = arrayOi.querySelectorAll(".node");
+   arrayOiNestedObject = arrayOiNodes[3];
+   ok(arrayOiNestedObject.querySelector(".arrow").classList.contains("expanded"),
+     "The object tree is still expanded");
+ 
+   is(arrayOiNodes.length, 9, "There is the expected number of nodes in the tree");
+ });
+-
+-function waitForNodeMutation(node, observeConfig = {}) {
+-  return new Promise(resolve => {
+-    const observer = new MutationObserver(mutations => {
+-      resolve(mutations);
+-      observer.disconnect();
+-    });
+-    observer.observe(node, observeConfig);
+-  });
+-}
+diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/head.js b/devtools/client/webconsole/new-console-output/test/mochitest/head.js
+--- a/devtools/client/webconsole/new-console-output/test/mochitest/head.js
++++ b/devtools/client/webconsole/new-console-output/test/mochitest/head.js
+@@ -181,8 +181,26 @@
+ }
+ 
+ function loadDocument(browser, url) {
+   return new Promise(resolve => {
+     browser.addEventListener("load", resolve, {capture: true, once: true});
+     BrowserTestUtils.loadURI(gBrowser.selectedBrowser, url);
+   });
+ }
++
++/**
++* Returns a promise that resolves when the node passed as an argument mutate
++* according to the passed configuration.
++*
++* @param {Node} node - The node to observe mutations on.
++* @param {Object} observeConfig - A configuration object for MutationObserver.observe.
++* @returns {Promise}
++*/
++function waitForNodeMutation(node, observeConfig = {}) {
++  return new Promise(resolve => {
++    const observer = new MutationObserver(mutations => {
++      resolve(mutations);
++      observer.disconnect();
++    });
++    observer.observe(node, observeConfig);
++  });
++}
+diff --git a/devtools/client/webconsole/new-console-output/utils/messages.js b/devtools/client/webconsole/new-console-output/utils/messages.js
+--- a/devtools/client/webconsole/new-console-output/utils/messages.js
++++ b/devtools/client/webconsole/new-console-output/utils/messages.js
+@@ -209,21 +209,24 @@
+     }
+ 
+     case "evaluationResult":
+     default: {
+       let {
+         exceptionMessage: messageText,
+         exceptionDocURL,
+         frame,
+-        result: parameters,
++        result,
++        helperResult,
+         timestamp: timeStamp,
+         notes,
+       } = packet;
+ 
++      let parameters = helperResult || result;
++
+       const level = messageText ? MESSAGE_LEVEL.ERROR : MESSAGE_LEVEL.LOG;
+       return new ConsoleMessage({
+         source: MESSAGE_SOURCE.JAVASCRIPT,
+         type: MESSAGE_TYPE.RESULT,
+         level,
+         messageText,
+         parameters,
+         exceptionDocURL,
+
