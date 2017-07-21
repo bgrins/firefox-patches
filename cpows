@@ -1,0 +1,114 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  e99e3e62cfa8bbc7d430f64d4fbdf77ffb81e979
+Bug 1382833 - Don't throw when dealing with CPOWs in the Object Actor;r=jimb
+
+diff --git a/devtools/server/actors/object.js b/devtools/server/actors/object.js
+--- a/devtools/server/actors/object.js
++++ b/devtools/server/actors/object.js
+@@ -86,20 +86,27 @@ ObjectActor.prototype = {
+ 
+     // If it's a proxy, lie and tell that it belongs to an invented
+     // "Proxy" class, and avoid calling the [[IsExtensible]] trap
+     if (this.obj.isProxy) {
+       g.class = "Proxy";
+       g.proxyTarget = this.hooks.createValueGrip(this.obj.proxyTarget);
+       g.proxyHandler = this.hooks.createValueGrip(this.obj.proxyHandler);
+     } else {
+-      g.class = this.obj.class;
+-      g.extensible = this.obj.isExtensible();
+-      g.frozen = this.obj.isFrozen();
+-      g.sealed = this.obj.isSealed();
++      try {
++        g.class = DevToolsUtils.isCPOW(this.obj) ? ("CPOW: " + this.obj.class) : this.obj.class;
++        g.extensible = this.obj.isExtensible();
++        g.frozen = this.obj.isFrozen();
++        g.sealed = this.obj.isSealed();
++      } catch(e) {
++        // Handle cases where the underlying object's calls to isExtensible, etc throw.
++        // This is possible with ProxyObjects like CPOWs. Note these are different from
++        // scripted Proxies created via `new Proxy`, which match this.obj.isProxy above.
++        return g;
++      }
+     }
+ 
+     if (g.class != "DeadObject") {
+       if (g.class == "Promise") {
+         g.promiseState = this._createPromiseState();
+       }
+ 
+       // FF40+: Allow to know how many properties an object has
+@@ -286,16 +293,17 @@ ObjectActor.prototype = {
+    * @param number [limit=0]
+    *        Optional limit of getter values to find.
+    * @return object
+    *         An object that maps property names to safe getter descriptors as
+    *         defined by the remote debugging protocol.
+    */
+   _findSafeGetterValues: function (ownProperties, limit = 0) {
+     let safeGetterValues = Object.create(null);
++
+     let obj = this.obj;
+     let level = 0, i = 0;
+ 
+     // Most objects don't have any safe getters but inherit some from their
+     // prototype. Avoid calling getOwnPropertyNames on objects that may have
+     // many properties like Array, strings or js objects. That to avoid
+     // freezing firefox when doing so.
+     if (TYPED_ARRAY_CLASSES.includes(this.obj.class) ||
+diff --git a/devtools/shared/DevToolsUtils.js b/devtools/shared/DevToolsUtils.js
+--- a/devtools/shared/DevToolsUtils.js
++++ b/devtools/shared/DevToolsUtils.js
+@@ -24,16 +24,24 @@ var DevToolsUtils = exports;
+ 
+ // Re-export the thread-safe utils.
+ const ThreadSafeDevToolsUtils = require("./ThreadSafeDevToolsUtils.js");
+ for (let key of Object.keys(ThreadSafeDevToolsUtils)) {
+   exports[key] = ThreadSafeDevToolsUtils[key];
+ }
+ 
+ /**
++ * XXX
++ */
++exports.isCPOW = function (debuggerObject) {
++  return Cu.isCrossProcessWrapper(debuggerObject.unsafeDereference());
++};
++
++
++/**
+  * Waits for the next tick in the event loop to execute a callback.
+  */
+ exports.executeSoon = function (fn) {
+   if (isWorker) {
+     setImmediate(fn);
+   } else {
+     let executor;
+     // Only enable async stack reporting when DEBUG_JS_MODULES is set
+diff --git a/devtools/shared/ThreadSafeDevToolsUtils.js b/devtools/shared/ThreadSafeDevToolsUtils.js
+--- a/devtools/shared/ThreadSafeDevToolsUtils.js
++++ b/devtools/shared/ThreadSafeDevToolsUtils.js
+@@ -65,16 +65,24 @@ exports.update = function update(target,
+  * @param object Object
+  *        The object to iterate over
+  */
+ exports.values = function values(object) {
+   return Object.keys(object).map(k => object[k]);
+ };
+ 
+ /**
++ * This is overridden in DevToolsUtils for main thread, where we have the
++ * Cu object available.
++ */
++exports.isCPOW = function () {
++  return false;
++};
++
++/**
+  * Report that |who| threw an exception, |exception|.
+  */
+ exports.reportException = function reportException(who, exception) {
+   const msg = `${who} threw an exception: ${exports.safeErrorString(exception)}`;
+   dump(msg + "\n");
+ 
+   if (typeof console !== "undefined" && console && console.error) {
+     console.error(msg);
