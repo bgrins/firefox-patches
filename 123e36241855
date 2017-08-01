@@ -1,0 +1,616 @@
+
+# HG changeset patch
+# User Nicolas Chevobbe <nchevobbe@mozilla.com>
+# Date 1501597020 -7200
+# Node ID 123e36241855fdd02626878d5839c43c3a75182a
+# Parent  3c5ff1d92541c66d949f39b11eecc0f67cce7f02
+Bug 1380709 - Fetch Map/Set entries when expanding the Object Inspector. r=bgrins
+
+Add getObjectEntries and loadObjectEntries as props for the ObjectInspector so
+we can display entries on Maps and Sets.
+
+MozReview-Commit-ID: Cy6SjxwclHI
+
+diff --git a/devtools/client/webconsole/new-console-output/actions/messages.js b/devtools/client/webconsole/new-console-output/actions/messages.js
+--- a/devtools/client/webconsole/new-console-output/actions/messages.js
++++ b/devtools/client/webconsole/new-console-output/actions/messages.js
+@@ -16,16 +16,17 @@
+   MESSAGE_ADD,
+   NETWORK_MESSAGE_UPDATE,
+   MESSAGES_CLEAR,
+   MESSAGE_OPEN,
+   MESSAGE_CLOSE,
+   MESSAGE_TYPE,
+   MESSAGE_TABLE_RECEIVE,
+   MESSAGE_OBJECT_PROPERTIES_RECEIVE,
++  MESSAGE_OBJECT_ENTRIES_RECEIVE,
+ } = require("../constants");
+ 
+ const defaultIdGenerator = new IdGenerator();
+ 
+ function messageAdd(packet, idGenerator = null) {
+   if (idGenerator == null) {
+     idGenerator = defaultIdGenerator;
+   }
+@@ -121,16 +122,27 @@
+  */
+ function messageObjectPropertiesLoad(id, client, grip) {
+   return async (dispatch) => {
+     const response = await client.getPrototypeAndProperties();
+     dispatch(messageObjectPropertiesReceive(id, grip.actor, response));
+   };
+ }
+ 
++function messageObjectEntriesLoad(id, client, grip) {
++  return (dispatch) => {
++    client.enumEntries(enumResponse => {
++      const {iterator} = enumResponse;
++      iterator.slice(0, iterator.count, sliceResponse => {
++        dispatch(messageObjectEntriesReceive(id, grip.actor, sliceResponse));
++      });
++    });
++  };
++}
++
+ /**
+  * This action is dispatched when properties of a grip are loaded.
+  *
+  * @param {string} id - The message id the grip is in.
+  * @param {string} actor - The actor id of the grip the properties were loaded from.
+  * @param {object} properties - A RDP packet that contains the properties of the grip.
+  * @returns {object}
+  */
+@@ -138,21 +150,40 @@
+   return {
+     type: MESSAGE_OBJECT_PROPERTIES_RECEIVE,
+     id,
+     actor,
+     properties
+   };
+ }
+ 
++/**
++ * This action is dispatched when entries of a grip are loaded.
++ *
++ * @param {string} id - The message id the grip is in.
++ * @param {string} actor - The actor id of the grip the properties were loaded from.
++ * @param {object} entries - A RDP packet that contains the entries of the grip.
++ * @returns {object}
++ */
++function messageObjectEntriesReceive(id, actor, entries) {
++  return {
++    type: MESSAGE_OBJECT_ENTRIES_RECEIVE,
++    id,
++    actor,
++    entries
++  };
++}
++
+ module.exports = {
+   messageAdd,
+   messagesClear,
+   messageOpen,
+   messageClose,
+   messageTableDataGet,
+   networkMessageUpdate,
+   messageObjectPropertiesLoad,
++  messageObjectEntriesLoad,
+   // for test purpose only.
+   messageTableDataReceive,
+   messageObjectPropertiesReceive,
++  messageObjectEntriesReceive,
+ };
+ 
+diff --git a/devtools/client/webconsole/new-console-output/components/console-output.js b/devtools/client/webconsole/new-console-output/components/console-output.js
+--- a/devtools/client/webconsole/new-console-output/components/console-output.js
++++ b/devtools/client/webconsole/new-console-output/components/console-output.js
+@@ -11,16 +11,17 @@
+ } = require("devtools/client/shared/vendor/react");
+ const { connect } = require("devtools/client/shared/vendor/react-redux");
+ 
+ const {
+   getAllMessagesById,
+   getAllMessagesUiById,
+   getAllMessagesTableDataById,
+   getAllMessagesObjectPropertiesById,
++  getAllMessagesObjectEntriesById,
+   getAllNetworkMessagesUpdateById,
+   getVisibleMessages,
+   getAllRepeatById,
+ } = require("devtools/client/webconsole/new-console-output/selectors/messages");
+ const MessageContainer = createFactory(require("devtools/client/webconsole/new-console-output/components/message-container").MessageContainer);
+ 
+ const ConsoleOutput = createClass({
+ 
+@@ -33,16 +34,17 @@
+       attachRefToHud: PropTypes.func.isRequired,
+       openContextMenu: PropTypes.func.isRequired,
+       sourceMapService: PropTypes.object,
+     }),
+     dispatch: PropTypes.func.isRequired,
+     timestampsVisible: PropTypes.bool,
+     messagesTableData: PropTypes.object.isRequired,
+     messagesObjectProperties: PropTypes.object.isRequired,
++    messagesObjectEntries: PropTypes.object.isRequired,
+     messagesRepeat: PropTypes.object.isRequired,
+     networkMessagesUpdate: PropTypes.object.isRequired,
+     visibleMessages: PropTypes.array.isRequired,
+   },
+ 
+   componentDidMount() {
+     // Do the scrolling in the nextTick since this could hit console startup performances.
+     // See https://bugzilla.mozilla.org/show_bug.cgi?id=1355869
+@@ -80,16 +82,17 @@
+   render() {
+     let {
+       dispatch,
+       visibleMessages,
+       messages,
+       messagesUi,
+       messagesTableData,
+       messagesObjectProperties,
++      messagesObjectEntries,
+       messagesRepeat,
+       networkMessagesUpdate,
+       serviceContainer,
+       timestampsVisible,
+     } = this.props;
+ 
+     let messageNodes = visibleMessages.map((messageId) => MessageContainer({
+       dispatch,
+@@ -98,16 +101,17 @@
+       serviceContainer,
+       open: messagesUi.includes(messageId),
+       tableData: messagesTableData.get(messageId),
+       timestampsVisible,
+       repeat: messagesRepeat[messageId],
+       networkMessageUpdate: networkMessagesUpdate[messageId],
+       getMessage: () => messages.get(messageId),
+       loadedObjectProperties: messagesObjectProperties.get(messageId),
++      loadedObjectEntries: messagesObjectEntries.get(messageId),
+     }));
+ 
+     return (
+       dom.div({
+         className: "webconsole-output",
+         onContextMenu: this.onContextMenu,
+         ref: node => {
+           this.outputNode = node;
+@@ -131,15 +135,16 @@
+ 
+ function mapStateToProps(state, props) {
+   return {
+     messages: getAllMessagesById(state),
+     visibleMessages: getVisibleMessages(state),
+     messagesUi: getAllMessagesUiById(state),
+     messagesTableData: getAllMessagesTableDataById(state),
+     messagesObjectProperties: getAllMessagesObjectPropertiesById(state),
++    messagesObjectEntries: getAllMessagesObjectEntriesById(state),
+     messagesRepeat: getAllRepeatById(state),
+     networkMessagesUpdate: getAllNetworkMessagesUpdateById(state),
+     timestampsVisible: state.ui.timestampsVisible,
+   };
+ }
+ 
+ module.exports = connect(mapStateToProps)(ConsoleOutput);
+diff --git a/devtools/client/webconsole/new-console-output/components/grip-message-body.js b/devtools/client/webconsole/new-console-output/components/grip-message-body.js
+--- a/devtools/client/webconsole/new-console-output/components/grip-message-body.js
++++ b/devtools/client/webconsole/new-console-output/components/grip-message-body.js
+@@ -40,16 +40,17 @@
+   serviceContainer: PropTypes.shape({
+     createElement: PropTypes.func.isRequired,
+     hudProxyClient: PropTypes.object.isRequired,
+   }),
+   userProvidedStyle: PropTypes.string,
+   useQuotes: PropTypes.bool,
+   escapeWhitespace: PropTypes.bool,
+   loadedObjectProperties: PropTypes.object,
++  loadedObjectEntries: PropTypes.object,
+   type: PropTypes.string,
+   helperType: PropTypes.string,
+ };
+ 
+ GripMessageBody.defaultProps = {
+   mode: MODE.LONG,
+ };
+ 
+@@ -59,16 +60,17 @@
+     messageId,
+     grip,
+     userProvidedStyle,
+     serviceContainer,
+     useQuotes,
+     escapeWhitespace,
+     mode = MODE.LONG,
+     loadedObjectProperties,
++    loadedObjectEntries,
+   } = props;
+ 
+   let styleObject;
+   if (userProvidedStyle && userProvidedStyle !== "") {
+     styleObject = cleanupStyle(userProvidedStyle, serviceContainer.createElement);
+   }
+ 
+   let onDOMNodeMouseOver;
+@@ -101,16 +103,21 @@
+         value: grip
+       }
+     }],
+     getObjectProperties: actor => loadedObjectProperties && loadedObjectProperties[actor],
+     loadObjectProperties: object => {
+       const client = new ObjectClient(serviceContainer.hudProxyClient, object);
+       dispatch(actions.messageObjectPropertiesLoad(messageId, client, object));
+     },
++    getObjectEntries: actor => loadedObjectEntries && loadedObjectEntries[actor],
++    loadObjectEntries: object => {
++      const client = new ObjectClient(serviceContainer.hudProxyClient, object);
++      dispatch(actions.messageObjectEntriesLoad(messageId, client, object));
++    },
+   };
+ 
+   if (typeof grip === "string" || grip.type === "longString") {
+     Object.assign(objectInspectorProps, {
+       useQuotes,
+       escapeWhitespace,
+       style: styleObject
+     });
+diff --git a/devtools/client/webconsole/new-console-output/components/message-container.js b/devtools/client/webconsole/new-console-output/components/message-container.js
+--- a/devtools/client/webconsole/new-console-output/components/message-container.js
++++ b/devtools/client/webconsole/new-console-output/components/message-container.js
+@@ -34,16 +34,17 @@
+     open: PropTypes.bool.isRequired,
+     serviceContainer: PropTypes.object.isRequired,
+     tableData: PropTypes.object,
+     timestampsVisible: PropTypes.bool.isRequired,
+     repeat: PropTypes.number,
+     networkMessageUpdate: PropTypes.object,
+     getMessage: PropTypes.func.isRequired,
+     loadedObjectProperties: PropTypes.object,
++    loadedObjectEntries: PropTypes.object,
+   },
+ 
+   getDefaultProps: function () {
+     return {
+       open: false,
+     };
+   },
+ 
+@@ -52,23 +53,26 @@
+     const openChanged = this.props.open !== nextProps.open;
+     const tableDataChanged = this.props.tableData !== nextProps.tableData;
+     const timestampVisibleChanged =
+       this.props.timestampsVisible !== nextProps.timestampsVisible;
+     const networkMessageUpdateChanged =
+       this.props.networkMessageUpdate !== nextProps.networkMessageUpdate;
+     const loadedObjectPropertiesChanged =
+       this.props.loadedObjectProperties !== nextProps.loadedObjectProperties;
++    const loadedObjectEntriesChanged =
++      this.props.loadedObjectEntries !== nextProps.loadedObjectEntries;
+ 
+     return repeatChanged
+       || openChanged
+       || tableDataChanged
+       || timestampVisibleChanged
+       || networkMessageUpdateChanged
+-      || loadedObjectPropertiesChanged;
++      || loadedObjectPropertiesChanged
++      || loadedObjectEntriesChanged;
+   },
+ 
+   render() {
+     const message = this.props.getMessage();
+ 
+     let MessageComponent = getMessageComponent(message);
+     return MessageComponent(Object.assign({message}, this.props));
+   }
+diff --git a/devtools/client/webconsole/new-console-output/components/message-types/console-api-call.js b/devtools/client/webconsole/new-console-output/components/message-types/console-api-call.js
+--- a/devtools/client/webconsole/new-console-output/components/message-types/console-api-call.js
++++ b/devtools/client/webconsole/new-console-output/components/message-types/console-api-call.js
+@@ -22,32 +22,34 @@
+ 
+ ConsoleApiCall.propTypes = {
+   dispatch: PropTypes.func.isRequired,
+   message: PropTypes.object.isRequired,
+   open: PropTypes.bool,
+   serviceContainer: PropTypes.object.isRequired,
+   timestampsVisible: PropTypes.bool.isRequired,
+   loadedObjectProperties: PropTypes.object,
++  loadedObjectEntries: PropTypes.object,
+ };
+ 
+ ConsoleApiCall.defaultProps = {
+   open: false,
+ };
+ 
+ function ConsoleApiCall(props) {
+   const {
+     dispatch,
+     message,
+     open,
+     tableData,
+     serviceContainer,
+     timestampsVisible,
+     repeat,
+     loadedObjectProperties,
++    loadedObjectEntries,
+   } = props;
+   const {
+     id: messageId,
+     indent,
+     source,
+     type,
+     level,
+     stacktrace,
+@@ -57,16 +59,17 @@
+     messageText,
+     userProvidedStyles,
+   } = message;
+ 
+   let messageBody;
+   const messageBodyConfig = {
+     dispatch,
+     loadedObjectProperties,
++    loadedObjectEntries,
+     messageId,
+     parameters,
+     userProvidedStyles,
+     serviceContainer,
+     type,
+   };
+ 
+   if (type === "trace") {
+@@ -124,16 +127,17 @@
+     timestampsVisible,
+   });
+ }
+ 
+ function formatReps(options = {}) {
+   const {
+     dispatch,
+     loadedObjectProperties,
++    loadedObjectEntries,
+     messageId,
+     parameters,
+     serviceContainer,
+     userProvidedStyles,
+     type,
+   } = options;
+ 
+   return (
+@@ -143,16 +147,17 @@
+         dispatch,
+         messageId,
+         grip,
+         key,
+         userProvidedStyle: userProvidedStyles ? userProvidedStyles[key] : null,
+         serviceContainer,
+         useQuotes: false,
+         loadedObjectProperties,
++        loadedObjectEntries,
+         type,
+       }))
+       // Interleave spaces.
+       .reduce((arr, v, i) => {
+         return i + 1 < parameters.length
+           ? arr.concat(v, dom.span({}, " "))
+           : arr.concat(v);
+       }, [])
+diff --git a/devtools/client/webconsole/new-console-output/components/message-types/evaluation-result.js b/devtools/client/webconsole/new-console-output/components/message-types/evaluation-result.js
+--- a/devtools/client/webconsole/new-console-output/components/message-types/evaluation-result.js
++++ b/devtools/client/webconsole/new-console-output/components/message-types/evaluation-result.js
+@@ -17,25 +17,27 @@
+ EvaluationResult.displayName = "EvaluationResult";
+ 
+ EvaluationResult.propTypes = {
+   dispatch: PropTypes.func.isRequired,
+   message: PropTypes.object.isRequired,
+   timestampsVisible: PropTypes.bool.isRequired,
+   serviceContainer: PropTypes.object,
+   loadedObjectProperties: PropTypes.object,
++  loadedObjectEntries: PropTypes.object,
+ };
+ 
+ function EvaluationResult(props) {
+   const {
+     dispatch,
+     message,
+     serviceContainer,
+     timestampsVisible,
+     loadedObjectProperties,
++    loadedObjectEntries,
+   } = props;
+ 
+   const {
+     source,
+     type,
+     helperType,
+     level,
+     id: messageId,
+@@ -61,16 +63,17 @@
+     messageBody = GripMessageBody({
+       dispatch,
+       messageId,
+       grip: parameters,
+       serviceContainer,
+       useQuotes: true,
+       escapeWhitespace: false,
+       loadedObjectProperties,
++      loadedObjectEntries,
+       type,
+       helperType,
+     });
+   }
+ 
+   const topLevelClasses = ["cm-s-mozilla"];
+ 
+   return Message({
+diff --git a/devtools/client/webconsole/new-console-output/constants.js b/devtools/client/webconsole/new-console-output/constants.js
+--- a/devtools/client/webconsole/new-console-output/constants.js
++++ b/devtools/client/webconsole/new-console-output/constants.js
+@@ -9,16 +9,17 @@
+   BATCH_ACTIONS: "BATCH_ACTIONS",
+   MESSAGE_ADD: "MESSAGE_ADD",
+   MESSAGES_CLEAR: "MESSAGES_CLEAR",
+   MESSAGE_OPEN: "MESSAGE_OPEN",
+   MESSAGE_CLOSE: "MESSAGE_CLOSE",
+   NETWORK_MESSAGE_UPDATE: "NETWORK_MESSAGE_UPDATE",
+   MESSAGE_TABLE_RECEIVE: "MESSAGE_TABLE_RECEIVE",
+   MESSAGE_OBJECT_PROPERTIES_RECEIVE: "MESSAGE_OBJECT_PROPERTIES_RECEIVE",
++  MESSAGE_OBJECT_ENTRIES_RECEIVE: "MESSAGE_OBJECT_ENTRIES_RECEIVE",
+   REMOVED_ACTORS_CLEAR: "REMOVED_ACTORS_CLEAR",
+   TIMESTAMPS_TOGGLE: "TIMESTAMPS_TOGGLE",
+   FILTER_TOGGLE: "FILTER_TOGGLE",
+   FILTER_TEXT_SET: "FILTER_TEXT_SET",
+   FILTERS_CLEAR: "FILTERS_CLEAR",
+   FILTER_BAR_TOGGLE: "FILTER_BAR_TOGGLE",
+ };
+ 
+diff --git a/devtools/client/webconsole/new-console-output/reducers/messages.js b/devtools/client/webconsole/new-console-output/reducers/messages.js
+--- a/devtools/client/webconsole/new-console-output/reducers/messages.js
++++ b/devtools/client/webconsole/new-console-output/reducers/messages.js
+@@ -27,16 +27,21 @@
+   // Map of the form {messageId : tableData}, which represent the data passed
+   // as an argument in console.table calls.
+   messagesTableDataById: Immutable.Map(),
+   // Map of the form {messageId : {[actor]: properties}}, where `properties` is
+   // a RDP packet containing the properties of the ${actor} grip.
+   // This map is consumed by the ObjectInspector so we only load properties once,
+   // when needed (when an ObjectInspector node is expanded), and then caches them.
+   messagesObjectPropertiesById: Immutable.Map(),
++  // Map of the form {messageId : {[actor]: entries}}, where `entries` is
++  // a RDP packet containing the entries of the ${actor} grip.
++  // This map is consumed by the ObjectInspector so we only load entries once,
++  // when needed (when an ObjectInspector node is expanded), and then caches them.
++  messagesObjectEntriesById: Immutable.Map(),
+   // Map of the form {groupMessageId : groupArray},
+   // where groupArray is the list of of all the parent groups' ids of the groupMessageId.
+   groupsById: Immutable.Map(),
+   // Message id of the current group (no corresponding console.groupEnd yet).
+   currentGroup: null,
+   // Array of removed actors (i.e. actors logged in removed messages) we keep track of
+   // in order to properly release them.
+   // This array is not supposed to be consumed by any UI component.
+@@ -49,16 +54,17 @@
+ });
+ 
+ function messages(state = new MessageState(), action, filtersState, prefsState) {
+   const {
+     messagesById,
+     messagesUiById,
+     messagesTableDataById,
+     messagesObjectPropertiesById,
++    messagesObjectEntriesById,
+     networkMessagesUpdateById,
+     groupsById,
+     currentGroup,
+     repeatById,
+     visibleMessages,
+   } = state;
+ 
+   const {logLimit} = prefsState;
+@@ -202,16 +208,26 @@
+         "messagesObjectPropertiesById",
+         messagesObjectPropertiesById.set(
+           action.id,
+           Object.assign({
+             [action.actor]: action.properties
+           }, messagesObjectPropertiesById.get(action.id))
+         )
+       );
++    case constants.MESSAGE_OBJECT_ENTRIES_RECEIVE:
++      return state.set(
++        "messagesObjectEntriesById",
++        messagesObjectEntriesById.set(
++          action.id,
++          Object.assign({
++            [action.actor]: action.entries
++          }, messagesObjectEntriesById.get(action.id))
++        )
++      );
+ 
+     case constants.NETWORK_MESSAGE_UPDATE:
+       return state.set(
+         "networkMessagesUpdateById",
+         Object.assign({}, networkMessagesUpdateById, {
+           [action.message.id]: action.message
+         })
+       );
+@@ -351,16 +367,20 @@
+   }
+   if (mapHasRemovedIdKey(record.groupsById)) {
+     record.set("groupsById", record.groupsById.withMutations(cleanUpCollection));
+   }
+   if (mapHasRemovedIdKey(record.messagesObjectPropertiesById)) {
+     record.set("messagesObjectPropertiesById",
+       record.messagesObjectPropertiesById.withMutations(cleanUpCollection));
+   }
++  if (mapHasRemovedIdKey(record.messagesObjectEntriesById)) {
++    record.set("messagesObjectEntriesById",
++      record.messagesObjectEntriesById.withMutations(cleanUpCollection));
++  }
+   if (objectHasRemovedIdKey(record.repeatById)) {
+     record.set("repeatById", cleanUpObject(record.repeatById));
+   }
+ 
+   if (objectHasRemovedIdKey(record.networkMessagesUpdateById)) {
+     record.set("networkMessagesUpdateById",
+       cleanUpObject(record.networkMessagesUpdateById));
+   }
+@@ -390,16 +410,21 @@
+     return res;
+   }, [])];
+ 
+   const loadedProperties = state.messagesObjectPropertiesById.get(message.id);
+   if (loadedProperties) {
+     actors.push(...Object.keys(loadedProperties));
+   }
+ 
++  const loadedEntries = state.messagesObjectEntriesById.get(message.id);
++  if (loadedEntries) {
++    actors.push(...Object.keys(loadedEntries));
++  }
++
+   return actors;
+ }
+ 
+ /**
+  * Returns total count of top level messages (those which are not
+  * within a group).
+  */
+ function getToplevelMessageCount(record) {
+diff --git a/devtools/client/webconsole/new-console-output/selectors/messages.js b/devtools/client/webconsole/new-console-output/selectors/messages.js
+--- a/devtools/client/webconsole/new-console-output/selectors/messages.js
++++ b/devtools/client/webconsole/new-console-output/selectors/messages.js
+@@ -20,16 +20,20 @@
+ function getAllMessagesTableDataById(state) {
+   return state.messages.messagesTableDataById;
+ }
+ 
+ function getAllMessagesObjectPropertiesById(state) {
+   return state.messages.messagesObjectPropertiesById;
+ }
+ 
++function getAllMessagesObjectEntriesById(state) {
++  return state.messages.messagesObjectEntriesById;
++}
++
+ function getAllGroupsById(state) {
+   return state.messages.groupsById;
+ }
+ 
+ function getCurrentGroup(state) {
+   return state.messages.currentGroup;
+ }
+ 
+@@ -51,9 +55,10 @@
+   getAllMessagesUiById,
+   getAllMessagesTableDataById,
+   getAllGroupsById,
+   getCurrentGroup,
+   getVisibleMessages,
+   getAllRepeatById,
+   getAllNetworkMessagesUpdateById,
+   getAllMessagesObjectPropertiesById,
++  getAllMessagesObjectEntriesById,
+ };
+
