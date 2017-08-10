@@ -1,0 +1,345 @@
+
+# HG changeset patch
+# User Dave Townsend <dtownsend@oxymoronical.com>
+# Date 1497394173 25200
+# Node ID 621a7d115de8543132b07c65878e86327dbf8151
+# Parent  8a73a88c8a3dd35883ffd2dc3192c9e431436348
+Bug 1376546: Add instrumentation to browser-chrome tests to output the total set of elements in use in tests. try: -b o -p linux,linux64,macosx64,win32,win64 -u mochitest-bc,mochitest-e10s-bc -t none
+
+MozReview-Commit-ID: DOpig6v4mtt
+
+diff --git a/browser/tools/xulcount/xulcount.js b/browser/tools/xulcount/xulcount.js
+new file mode 100644
+--- /dev/null
++++ b/browser/tools/xulcount/xulcount.js
+@@ -0,0 +1,74 @@
++/* eslint-env node */
++
++const fs = require("fs");
++
++function pad(str, length) {
++  if (str.length >= length)
++    return str;
++
++  return str + " ".repeat(length - str.length);
++}
++
++function byCount(a, b) {
++  return b[1] - a[1];
++}
++
++if (process.argv.length < 3) {
++  process.exit(0);
++}
++
++let allData = {};
++
++for (let i = 2; i < process.argv.length; i++) {
++  let filename = process.argv[i];
++  let data = JSON.parse(fs.readFileSync(filename, {
++    encoding: "utf8",
++  }));
++  for (let selector of Object.keys(data.elements)) {
++    allData[selector] = data.elements[selector];
++  }
++}
++
++let selectors = Object.keys(allData);
++let elements = selectors.map(s => allData[s]);
++
++let namespaceMap = new Map();
++let bindingMap = new Map();
++
++for (let element of elements) {
++  if (!bindingMap.has(element.binding)) {
++    bindingMap.set(element.binding, 1);
++  } else {
++    bindingMap.set(element.binding, bindingMap.get(element.binding) + 1);
++  }
++
++  if (!namespaceMap.has(element.namespaceURI)) {
++    namespaceMap.set(element.namespaceURI, new Map());
++  }
++
++  let localNameMap = namespaceMap.get(element.namespaceURI);
++  if (!localNameMap.has(element.localName)) {
++    localNameMap.set(element.localName, 1);
++  } else {
++    localNameMap.set(element.localName, localNameMap.get(element.localName) + 1);
++  }
++}
++
++for (let [namespace, localNameMap] of namespaceMap) {
++  console.log("Elements in namespace", namespace);
++
++  let entries = Array.from(localNameMap);
++  entries.sort(byCount);
++  for (let entry of entries) {
++    console.log("  ", pad(entry[1] + "", 5), entry[0]);
++  }
++
++  console.log();
++}
++
++console.log("XBL bindings");
++let bindings = Array.from(bindingMap);
++bindings.sort(byCount);
++for (let binding of bindings) {
++  console.log("  ", pad(binding[1] + "", 5), binding[0]);
++}
+diff --git a/testing/mochitest/browser-test.js b/testing/mochitest/browser-test.js
+--- a/testing/mochitest/browser-test.js
++++ b/testing/mochitest/browser-test.js
+@@ -56,16 +56,196 @@ var TabDestroyObserver = {
+     }
+ 
+     return new Promise((resolve) => {
+       this.promiseResolver = resolve;
+     });
+   },
+ };
+ 
++let gInstrumentData = null;
++
++// Loads instrumantation data
++function loadData() {
++  let path = Cc["@mozilla.org/process/environment;1"].
++             getService(Ci.nsIEnvironment).
++             get("MOZ_UPLOAD_DIR");
++  path = OS.Path.join(path, "xulinstrument.json");
++
++  try {
++    let file = Cc["@mozilla.org/file/local;1"].
++               createInstance(Ci.nsILocalFile);
++    file.initWithPath(path);
++
++    let fileInStream = Cc["@mozilla.org/network/file-input-stream;1"].
++                       createInstance(Ci.nsIFileInputStream);
++    fileInStream.init(file, -1, 0, 0);
++
++    let str = NetUtil.readInputStreamToString(fileInStream, fileInStream.available(), {
++      charset: "UTF-8",
++    });
++    fileInStream.close();
++    gInstrumentData = JSON.parse(str);
++    if (("elements" in gInstrumentData) && (typeof gInstrumentData.elements == "object")) {
++      return;
++    }
++  } catch (e) {
++    console.error(e);
++  }
++
++  gInstrumentData = {
++    elements: {}
++  };
++}
++
++// Saves instrumantation data
++function saveData() {
++  let path = Cc["@mozilla.org/process/environment;1"].
++             getService(Ci.nsIEnvironment).
++             get("MOZ_UPLOAD_DIR");
++  path = OS.Path.join(path, "xulinstrument.json");
++
++  let encoder = new TextEncoder();
++  let array = encoder.encode(JSON.stringify(gInstrumentData, null, 2));
++  OS.File.writeAtomic(path, array);
++}
++
++// An iterator over an element and its ancestors
++function* elementPath(element) {
++  yield element;
++  while ((element = element.parentNode) && (element instanceof Element)) {
++    yield element;
++  }
++}
++
++// Returns the information we care about for an element
++function getElementInfo(element) {
++  let style = element.ownerGlobal.getComputedStyle(element);
++  let binding = style && style.getPropertyValue("-moz-binding");
++
++  return {
++    namespaceURI: element.namespaceURI,
++    localName: element.localName,
++    binding: (binding && binding != "none") ? binding : null,
++  }
++}
++
++// The selector for just this element
++function immediateSelector(element) {
++  if (element.localName == "notificationbox" && element.parentNode &&
++      element.parentNode.classList.contains("tabbrowser-tabpanels")) {
++    // Don't do a full selector for a tabpanel's notificationbox
++    return element.localName;
++  }
++
++  if (element.localName == "tab" && element.classList.contains("tabbrowser-tab")) {
++    // Don't do a full selector for a tab
++    return element.localName;
++  }
++
++  if (element.id) {
++    return `#${element.id}`;
++  }
++
++  let selector = element.localName;
++
++  if (element.classList.length) {
++    selector += `.${Array.from(element.classList).join(".")}`;
++  }
++
++  for (let attr of ["src", "label"]) {
++    if (element.hasAttribute(attr)) {
++      selector += `[${attr}=${JSON.stringify(element.getAttribute(attr))}]`;
++    }
++  }
++
++  return selector;
++}
++
++// The selector chain for the element
++function elementSelector(element) {
++  return Array.from(elementPath(element)).reverse().map(immediateSelector).join(" > ");
++}
++
++// An iterator over all elements in the window
++function* windowElements(win) {
++  yield* elementDescendants(win.document.documentElement);
++}
++
++// An iterator over an element and all of its descendants
++function* elementDescendants(element) {
++  let walker = Cc["@mozilla.org/inspector/deep-tree-walker;1"].
++               createInstance(Ci.inIDeepTreeWalker);
++  walker.showAnonymousContent = true;
++  walker.showSubDocuments = false;
++  walker.showDocumentsAsNodes = false;
++  walker.init(element, Ci.nsIDOMNodeFilter.SHOW_ELEMENT);
++
++  yield element;
++  while (walker.nextNode()) {
++    if (walker.currentNode instanceof Element) {
++      yield walker.currentNode;
++    }
++  }
++}
++
++// Checks if we've seen an element and if not adds it to the instrumentation data
++function instrumentElement(element) {
++  if (element.__instrumentSeen) {
++    return;
++  }
++
++  let selector = elementSelector(element);
++  element.__instrumentSeen = true;
++
++  if (selector in gInstrumentData.elements) {
++    return;
++  }
++
++  gInstrumentData.elements[selector] = getElementInfo(element);
++}
++
++// Instruments every element in a window
++function scanWindow(win) {
++  Array.from(windowElements(win)).forEach(instrumentElement);
++}
++
++// Instruments every element in an element's descendants
++function scanElement(win) {
++  Array.from(elementDescendants(win)).forEach(instrumentElement);
++}
++
++function handleMutation(mutation) {
++  if (mutation.type != "childList") {
++    return;
++  }
++
++  for (let node of mutation.addedNodes) {
++    if (node instanceof Element) {
++      scanElement(node);
++    }
++  }
++}
++
++// Watches a window for new elements to instrument
++function observeWindow(win) {
++  let observer = new MutationObserver((mutations) => {
++    mutations.forEach(handleMutation);
++  });
++
++  observer.observe(win.document, {
++    childList: true,
++    subtree: true,
++  });
++
++  win.addEventListener("unload", () => {
++    observer.takeRecords().forEach(handleMutation);
++  }, { once: true });
++}
++
+ function testInit() {
+   gConfig = readConfig();
+   if (gConfig.testRoot == "browser") {
+     // Make sure to launch the test harness for the first opened window only
+     var prefs = Services.prefs;
+     if (prefs.prefHasUserValue("testing.browserTestHarness.running"))
+       return;
+ 
+@@ -112,16 +292,35 @@ function testInit() {
+     globalMM.loadFrameScript("chrome://mochikit/content/shutdown-leaks-collector.js", true);
+   } else {
+     // In non-e10s, only run the ShutdownLeaksCollector in the parent process.
+     Components.utils.import("chrome://mochikit/content/ShutdownLeaksCollector.jsm");
+   }
+ 
+   let gmm = Cc["@mozilla.org/globalmessagemanager;1"].getService(Ci.nsIMessageListenerManager);
+   gmm.loadFrameScript("chrome://mochikit/content/tests/SimpleTest/AsyncUtilsContent.js", true);
++
++  loadData();
++  scanWindow(window);
++  observeWindow(window);
++
++  Services.ww.registerNotification((win, topic, data) => {
++    if (topic != "domwindowopened") {
++      return;
++    }
++
++    win.addEventListener("load", () => {
++      if (win.location.href != "chrome://browser/content/browser.xul") {
++        return;
++      }
++
++      scanWindow(win);
++      observeWindow(win);
++    }, { once: true });
++  });
+ }
+ 
+ function Tester(aTests, structuredLogger, aCallback) {
+   this.structuredLogger = structuredLogger;
+   this.tests = aTests;
+   this.callback = aCallback;
+ 
+   this._scriptLoader = Services.scriptloader;
+@@ -357,16 +556,18 @@ Tester.prototype = {
+         this.structuredLogger.error("browser-test.js | No tests to run. Did you pass invalid test_paths?");
+       }
+       this.structuredLogger.info("*** End BrowserChrome Test Results ***");
+ 
+       // Tests complete, notify the callback and return
+       this.callback(this.tests);
+       this.callback = null;
+       this.tests = null;
++
++      saveData();
+     }
+   },
+ 
+   haltTests: function Tester_haltTests() {
+     // Do not run any further tests
+     this.currentTestIndex = this.tests.length - 1;
+     this.repeat = 0;
+   },
+
