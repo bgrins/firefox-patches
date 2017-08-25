@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  4fc5d9cd8f5bb1bb9378f53d86feb34d7486b0c1
+# Parent  fc1e57aad58bb0a9316d1ea0ff7ab0ce16ee88ee
 Bug 1392352 - Part 4 - Scriptify the tabbrowser binding
 
 MozReview-Commit-ID: LhmY9ZfS0rh
@@ -9,7 +9,7 @@ diff --git a/browser/base/content/TabBrowser.js b/browser/base/content/TabBrowse
 new file mode 100644
 --- /dev/null
 +++ b/browser/base/content/TabBrowser.js
-@@ -0,0 +1,6034 @@
+@@ -0,0 +1,6167 @@
 +// TODO:
 +// * This is in a js file for now to make it easier to setup (so it can access window globals),
 +//   but perf should be better if this was in a JSM instead.
@@ -22,7 +22,6 @@ new file mode 100644
 +// Remove customElements.define(...);
 +// Remove the Object.defineProperty("") for mCurrentBrowser, mStringBundle, mPanelContainer, mTabBox
 +// Remove the try/catch from constructor and disconnectedCallback
-+// Replace instances of 'this' in the getSwitcher object initializer with gBrowser (i.e. `tabbrowser: this` -> `tabbrowser: gBrowser`)
 +// Add: /* eslint-disable complexity */ before `  addTab(`
 +
 +class TabBrowser {
@@ -147,9 +146,9 @@ new file mode 100644
 +    notificationbox.setAttribute("notificationside", "top");
 +    notificationbox.appendChild(browserSidebarContainer);
 +
-+    this.mPanelContainer.appendChild(notificationbox);
-+
 +    // For upgrading, replace below here:
++
++    this.mPanelContainer.appendChild(notificationbox);
 +
 +    Object.defineProperty(this, "tabContainer", {
 +      configurable: true,
@@ -1656,6 +1655,18 @@ new file mode 100644
 +        ) {
 +          if (this.mTab.hasAttribute("busy")) {
 +            this.mTab.removeAttribute("busy");
++
++            // Only animate the "burst" indicating the page has loaded if
++            // the top-level page is the one that finished loading.
++            if (
++              aWebProgress.isTopLevel &&
++              !aWebProgress.isLoadingDocument &&
++              !this.mTabBrowser.tabAnimationsInProgress &&
++              Services.prefs.getBoolPref("toolkit.cosmeticAnimations.enabled")
++            ) {
++              this.mTab.setAttribute("bursting", "true");
++            }
++
 +            this.mTabBrowser._tabAttrModified(this.mTab, ["busy"]);
 +            if (!this.mTab.selected) this.mTab.setAttribute("unread", "true");
 +          }
@@ -2967,6 +2978,10 @@ new file mode 100644
 +
 +    browser.loadURI(BROWSER_NEW_TAB_URL);
 +    browser.docShellIsActive = false;
++
++    // Make sure the preloaded browser is loaded with desired zoom level
++    let tabURI = Services.io.newURI(BROWSER_NEW_TAB_URL);
++    FullZoom.onLocationChange(tabURI, false, browser);
 +  }
 +  _createBrowser(aParams) {
 +    // Supported parameters:
@@ -3006,9 +3021,7 @@ new file mode 100644
 +      if (aParams.remoteType) {
 +        throw new Error("Cannot set opener window on a remote browser!");
 +      }
-+      b
-+        .QueryInterface(Ci.nsIFrameLoaderOwner)
-+        .presetOpenerWindow(aParams.openerWindow);
++      b.presetOpenerWindow(aParams.openerWindow);
 +    }
 +
 +    if (!aParams.isPreloadBrowser && this.hasAttribute("autocompletepopup")) {
@@ -3771,6 +3784,7 @@ new file mode 100644
 +
 +    aTab.style.maxWidth = ""; // ensure that fade-out transition happens
 +    aTab.removeAttribute("fadein");
++    aTab.removeAttribute("bursting");
 +
 +    setTimeout(
 +      function(tab, tabbrowser) {
@@ -4667,22 +4681,22 @@ new file mode 100644
 +      // See the assertions in postActions for their invariants.
 +
 +      // Tab the user requested most recently.
-+      requestedTab: gBrowser.selectedTab,
++      requestedTab: this.selectedTab,
 +
 +      // Tab we're currently trying to load.
 +      loadingTab: null,
 +
 +      // We show this tab in case the requestedTab hasn't loaded yet.
-+      lastVisibleTab: gBrowser.selectedTab,
++      lastVisibleTab: this.selectedTab,
 +
 +      // Auxilliary state variables:
 +
-+      visibleTab: gBrowser.selectedTab, // Tab that's on screen.
++      visibleTab: this.selectedTab, // Tab that's on screen.
 +      spinnerTab: null, // Tab showing a spinner.
 +      blankTab: null, // Tab showing blank.
-+      originalTab: gBrowser.selectedTab, // Tab that we started on.
++      originalTab: this.selectedTab, // Tab that we started on.
 +
-+      tabbrowser: gBrowser, // Reference to gBrowser.
++      tabbrowser: this, // Reference to gBrowser.
 +      loadTimer: null, // TAB_SWITCH_TIMEOUT nsITimer instance.
 +      unloadTimer: null, // UNLOAD_DELAY nsITimer instance.
 +
@@ -4702,7 +4716,13 @@ new file mode 100644
 +      // drawn. A tab is added to this set when we ask to make it
 +      // visible. All tabs but the most recently shown tab are
 +      // removed from the set upon MozAfterPaint.
-+      maybeVisibleTabs: new Set([gBrowser.selectedTab]),
++      maybeVisibleTabs: new Set([this.selectedTab]),
++
++      // This holds onto the set of tabs that we've been asked to warm up.
++      // This is used only for Telemetry and logging, and (in order to not
++      // over-complicate the async tab switcher any further) has nothing to do
++      // with how warmed tabs are loaded and unloaded.
++      warmingTabs: new WeakSet(),
 +
 +      STATE_UNLOADED: 0,
 +      STATE_LOADING: 1,
@@ -4751,9 +4771,7 @@ new file mode 100644
 +        this.setTabStateNoAction(tab, state);
 +
 +        let browser = tab.linkedBrowser;
-+        let { tabParent } = browser.QueryInterface(
-+          Ci.nsIFrameLoaderOwner
-+        ).frameLoader;
++        let { tabParent } = browser.frameLoader;
 +        if (state == this.STATE_LOADING) {
 +          this.assert(!this.minimizedOrFullyOccluded);
 +          browser.docShellIsActive = true;
@@ -4761,6 +4779,7 @@ new file mode 100644
 +            this.onLayersReady(browser);
 +          }
 +        } else if (state == this.STATE_UNLOADING) {
++          this.unwarmTab(tab);
 +          browser.docShellIsActive = false;
 +          if (!tabParent) {
 +            this.onLayersCleared(browser);
@@ -4791,6 +4810,25 @@ new file mode 100644
 +
 +      init() {
 +        this.log("START");
++
++        XPCOMUtils.defineLazyPreferenceGetter(
++          this,
++          "WARMING_ENABLED",
++          "browser.tabs.remote.warmup.enabled",
++          false
++        );
++        XPCOMUtils.defineLazyPreferenceGetter(
++          this,
++          "MAX_WARMING_TABS",
++          "browser.tabs.remote.warmup.maxTabs",
++          3
++        );
++        XPCOMUtils.defineLazyPreferenceGetter(
++          this,
++          "WARMING_UNLOAD_DELAY" /* ms */,
++          "browser.tabs.remote.warmup.unloadDelayMs",
++          2000
++        );
 +
 +        // If we minimized the window before the switcher was activated,
 +        // we might have set  the preserveLayers flag for the current
@@ -5061,6 +5099,7 @@ new file mode 100644
 +        for (let [tab] of this.tabState) {
 +          if (!tab.linkedBrowser) {
 +            this.tabState.delete(tab);
++            this.unwarmTab(tab);
 +          }
 +        }
 +
@@ -5123,6 +5162,7 @@ new file mode 100644
 +
 +        // See how many tabs still have work to do.
 +        let numPending = 0;
++        let numWarming = 0;
 +        for (let [tab, state] of this.tabState) {
 +          // Skip print preview browsers since they shouldn't affect tab switching.
 +          if (this.tabbrowser._printPreviewBrowsers.has(tab.linkedBrowser)) {
@@ -5131,6 +5171,10 @@ new file mode 100644
 +
 +          if (state == this.STATE_LOADED && tab !== this.requestedTab) {
 +            numPending++;
++
++            if (tab !== this.visibleTab) {
++              numWarming++;
++            }
 +          }
 +          if (state == this.STATE_LOADING || state == this.STATE_UNLOADING) {
 +            numPending++;
@@ -5146,8 +5190,14 @@ new file mode 100644
 +          return;
 +        }
 +
-+        if (this.blankTab) {
-+          this.maybeFinishTabSwitch();
++        this.maybeFinishTabSwitch();
++
++        if (numWarming > this.MAX_WARMING_TABS) {
++          this.logState("Hit MAX_WARMING_TABS");
++          if (this.unloadTimer) {
++            this.clearTimer(this.unloadTimer);
++          }
++          this.unloadNonRequiredTabs();
 +        }
 +
 +        if (numPending == 0) {
@@ -5160,9 +5210,20 @@ new file mode 100644
 +      // Fires when we're ready to unload unused tabs.
 +      onUnloadTimeout() {
 +        this.logState("onUnloadTimeout");
-+        this.unloadTimer = null;
 +        this.preActions();
++        this.unloadTimer = null;
 +
++        this.unloadNonRequiredTabs();
++
++        this.postActions();
++      },
++
++      // If there are any non-visible and non-requested tabs in
++      // STATE_LOADED, sets them to STATE_UNLOADING. Also queues
++      // up the unloadTimer to run onUnloadTimeout if there are still
++      // tabs in the process of unloading.
++      unloadNonRequiredTabs() {
++        this.warmingTabs = new WeakSet();
 +        let numPending = 0;
 +
 +        // Unload any tabs that can be unloaded.
@@ -5193,8 +5254,6 @@ new file mode 100644
 +            this.UNLOAD_DELAY
 +          );
 +        }
-+
-+        this.postActions();
 +      },
 +
 +      // Fires when an ongoing load has taken too long.
@@ -5219,8 +5278,6 @@ new file mode 100644
 +        );
 +        this.setTabState(tab, this.STATE_LOADED);
 +
-+        this.maybeFinishTabSwitch();
-+
 +        if (this.loadingTab === tab) {
 +          this.clearTimer(this.loadTimer);
 +          this.loadTimer = null;
@@ -5233,7 +5290,6 @@ new file mode 100644
 +      // around.
 +      onPaint() {
 +        this.maybeVisibleTabs.clear();
-+        this.maybeFinishTabSwitch();
 +      },
 +
 +      // Called when we're done clearing the layers for a tab.
@@ -5369,10 +5425,76 @@ new file mode 100644
 +        this.setTabState(tab, this.STATE_LOADING);
 +      },
 +
++      canWarmTab(tab) {
++        if (!this.WARMING_ENABLED) {
++          return false;
++        }
++
++        // If the tab is not yet inserted, closing, not remote,
++        // crashed, already visible, or already requested, warming
++        // up the tab makes no sense.
++        if (
++          this.minimizedOrFullyOccluded ||
++          !tab.linkedPanel ||
++          tab.closing ||
++          !tab.linkedBrowser.isRemoteBrowser ||
++          !tab.linkedBrowser.frameLoader.tabParent
++        ) {
++          return false;
++        }
++
++        // Similarly, if the tab is already in STATE_LOADING or
++        // STATE_LOADED somehow, there's no point in trying to
++        // warm it up.
++        let state = this.getTabState(tab);
++        if (state === this.STATE_LOADING || state === this.STATE_LOADED) {
++          return false;
++        }
++
++        return true;
++      },
++
++      unwarmTab(tab) {
++        this.warmingTabs.delete(tab);
++      },
++
++      warmupTab(tab) {
++        if (!this.canWarmTab(tab)) {
++          return;
++        }
++
++        this.logState("warmupTab " + this.tinfo(tab));
++
++        this.warmingTabs.add(tab);
++        this.setTabState(tab, this.STATE_LOADING);
++        this.suppressDisplayPortAndQueueUnload(tab, this.WARMING_UNLOAD_DELAY);
++      },
++
 +      // Called when the user asks to switch to a given tab.
 +      requestTab(tab) {
 +        if (tab === this.requestedTab) {
 +          return;
++        }
++
++        if (this.WARMING_ENABLED) {
++          let warmingState = "disqualified";
++
++          if (this.warmingTabs.has(tab)) {
++            let tabState = this.getTabState(tab);
++            if (tabState == this.STATE_LOADING) {
++              warmingState = "stillLoading";
++            } else if (tabState == this.STATE_LOADED) {
++              warmingState = "loaded";
++            }
++          } else if (this.canWarmTab(tab)) {
++            warmingState = "notWarmed";
++          }
++
++          Services.telemetry
++            .getHistogramById("FX_TAB_SWITCH_REQUEST_TAB_WARMING_STATE")
++            .add(warmingState);
++
++          this.unwarmTab(tab);
 +        }
 +
 +        this._requestingTab = true;
@@ -5381,8 +5503,16 @@ new file mode 100644
 +
 +        this.requestedTab = tab;
 +
-+        let browser = this.requestedTab.linkedBrowser;
-+        let fl = browser.QueryInterface(Ci.nsIFrameLoaderOwner).frameLoader;
++        this.suppressDisplayPortAndQueueUnload(
++          this.requestedTab,
++          this.UNLOAD_DELAY
++        );
++        this._requestingTab = false;
++      },
++
++      suppressDisplayPortAndQueueUnload(tab, unloadTimeout) {
++        let browser = tab.linkedBrowser;
++        let fl = browser.frameLoader;
 +
 +        if (
 +          fl &&
@@ -5400,11 +5530,10 @@ new file mode 100644
 +        }
 +        this.unloadTimer = this.setTimer(
 +          () => this.onUnloadTimeout(),
-+          this.UNLOAD_DELAY
++          unloadTimeout
 +        );
 +
 +        this.postActions();
-+        this._requestingTab = false;
 +      },
 +
 +      handleEvent(event, delayed = false) {
@@ -5514,7 +5643,6 @@ new file mode 100644
 +        );
 +        this.addMarker("AsyncTabSwitch:SpinnerHidden");
 +        // we do not get a onPaint after displaying the spinner
-+        this.maybeFinishTabSwitch();
 +      },
 +
 +      addMarker(marker) {
@@ -5565,12 +5693,14 @@ new file mode 100644
 +        for (let i = 0; i < this.tabbrowser.tabs.length; i++) {
 +          let tab = this.tabbrowser.tabs[i];
 +          let state = this.getTabState(tab);
++          let isWarming = this.warmingTabs.has(tab);
 +
 +          accum += i + ":";
 +          if (tab === this.lastVisibleTab) accum += "V";
 +          if (tab === this.loadingTab) accum += "L";
 +          if (tab === this.requestedTab) accum += "R";
 +          if (tab === this.blankTab) accum += "B";
++          if (isWarming) accum += "(W)";
 +          if (state == this.STATE_LOADED) accum += "(+)";
 +          if (state == this.STATE_LOADING) accum += "(+?)";
 +          if (state == this.STATE_UNLOADED) accum += "(-)";
@@ -5587,6 +5717,9 @@ new file mode 100644
 +    this._switcher = switcher;
 +    switcher.init();
 +    return switcher;
++  }
++  warmupTab(aTab) {
++    this._getSwitcher().warmupTab(aTab);
 +  }
 +  goBack() {
 +    return this.mCurrentBrowser.goBack();
@@ -6181,7 +6314,7 @@ new mode 100644
  
      SidebarUI.init();
  
-@@ -1905,16 +1921,19 @@ var gBrowserInit = {
+@@ -1905,16 +1921,18 @@ var gBrowserInit = {
          MenuTouchModeObserver.uninit();
        }
        BrowserOffline.uninit();
@@ -6191,7 +6324,6 @@ new mode 100644
      }
  
 +    gBrowser.disconnectedCallback();
-+    gBrowser = null;
 +
      // Final window teardown, do this last.
      window.XULBrowserWindow = null;
@@ -6201,7 +6333,7 @@ new mode 100644
            .QueryInterface(Ci.nsIInterfaceRequestor)
            .getInterface(Ci.nsIXULWindow)
            .XULBrowserWindow = null;
-@@ -4455,24 +4474,22 @@ var XULBrowserWindow = {
+@@ -4455,24 +4473,22 @@ var XULBrowserWindow = {
      return this.canViewSource = document.getElementById("canViewSource");
    },
  
@@ -6314,6 +6446,50 @@ diff --git a/browser/base/content/tabbrowser.css b/browser/base/content/tabbrows
    background-color: #f9f9f9 !important;
    background-size: 30px;
  }
+diff --git a/browser/base/content/test/performance/browser_tabopen_squeeze_reflows.js b/browser/base/content/test/performance/browser_tabopen_squeeze_reflows.js
+--- a/browser/base/content/test/performance/browser_tabopen_squeeze_reflows.js
++++ b/browser/base/content/test/performance/browser_tabopen_squeeze_reflows.js
+@@ -9,17 +9,17 @@
+  * See https://developer.mozilla.org/en-US/Firefox/Performance_best_practices_for_Firefox_fe_engineers
+  * for tips on how to do that.
+  */
+ const EXPECTED_REFLOWS = [
+   {
+     stack: [
+       "select@chrome://global/content/bindings/textbox.xml",
+       "focusAndSelectUrlBar@chrome://browser/content/browser.js",
+-      "_adjustFocusAfterTabSwitch@chrome://browser/content/tabbrowser.xml",
++      "_adjustFocusAfterTabSwitch@chrome://browser/content/TabBrowser.js",
+     ],
+   }
+ ];
+ 
+ /*
+  * This test ensures that there are no unexpected
+  * uninterruptible reflows when opening a new tab that will
+  * cause the existing tabs to squeeze smaller.
+diff --git a/browser/base/content/test/performance/browser_tabstrip_overflow_underflow_reflows.js b/browser/base/content/test/performance/browser_tabstrip_overflow_underflow_reflows.js
+--- a/browser/base/content/test/performance/browser_tabstrip_overflow_underflow_reflows.js
++++ b/browser/base/content/test/performance/browser_tabstrip_overflow_underflow_reflows.js
+@@ -9,17 +9,17 @@
+  * See https://developer.mozilla.org/en-US/Firefox/Performance_best_practices_for_Firefox_fe_engineers
+  * for tips on how to do that.
+  */
+ const EXPECTED_OVERFLOW_REFLOWS = [
+   {
+     stack: [
+       "select@chrome://global/content/bindings/textbox.xml",
+       "focusAndSelectUrlBar@chrome://browser/content/browser.js",
+-      "_adjustFocusAfterTabSwitch@chrome://browser/content/tabbrowser.xml",
++      "_adjustFocusAfterTabSwitch@chrome://browser/content/TabBrowser.js",
+     ]
+   },
+ ];
+ 
+ const EXPECTED_UNDERFLOW_REFLOWS = [
+   /**
+    * Nothing here! Please don't add anything new!
+    */
 diff --git a/browser/base/jar.mn b/browser/base/jar.mn
 --- a/browser/base/jar.mn
 +++ b/browser/base/jar.mn
