@@ -1,0 +1,480 @@
+
+# HG changeset patch
+# User Tom Tromey <tom@tromey.com>
+# Date 1502829176 21600
+# Node ID 1d2d676931f233bc3e8d2979b91212612e00e6ba
+# Parent  2c284ff4354aa075579a85d4dd13ca1bf7d41f86
+Bug 1388497 - apply source maps to CSS warnings in the console; r?bgrins
+
+MozReview-Commit-ID: 8ObL0uwENrM
+
+
+diff --git a/devtools/client/framework/source-map-url-service.js b/devtools/client/framework/source-map-url-service.js
+--- a/devtools/client/framework/source-map-url-service.js
++++ b/devtools/client/framework/source-map-url-service.js
+@@ -7,52 +7,73 @@
+ const SOURCE_MAP_PREF = "devtools.source-map.client-service.enabled";
+ 
+ /**
+  * A simple service to track source actors and keep a mapping between
+  * original URLs and objects holding the source actor's ID (which is
+  * used as a cookie by the devtools-source-map service) and the source
+  * map URL.
+  *
+- * @param {object} target
+- *        The object the toolbox is debugging.
+- * @param {object} threadClient
+- *        The toolbox's thread client
++ * @param {object} toolbox
++ *        The toolbox.
+  * @param {SourceMapService} sourceMapService
+  *        The devtools-source-map functions
+  */
+-function SourceMapURLService(target, threadClient, sourceMapService) {
+-  this._target = target;
++function SourceMapURLService(toolbox, sourceMapService) {
++  this._toolbox = toolbox;
++  this._target = toolbox.target;
+   this._sourceMapService = sourceMapService;
+   this._urls = new Map();
+   this._subscriptions = new Map();
+ 
+   this._onSourceUpdated = this._onSourceUpdated.bind(this);
+   this.reset = this.reset.bind(this);
+   this._prefValue = Services.prefs.getBoolPref(SOURCE_MAP_PREF);
+   this._onPrefChanged = this._onPrefChanged.bind(this);
++  this._onNewStyleSheet = this._onNewStyleSheet.bind(this);
+ 
+-  target.on("source-updated", this._onSourceUpdated);
+-  target.on("will-navigate", this.reset);
++  this._target.on("source-updated", this._onSourceUpdated);
++  this._target.on("will-navigate", this.reset);
+ 
+   Services.prefs.addObserver(SOURCE_MAP_PREF, this._onPrefChanged);
+ 
+-  // Start fetching the sources now.
+-  this._loadingPromise = threadClient.getSources().then(({sources}) => {
+-    // Ignore errors.  Register the sources we got; we can't rely on
+-    // an event to arrive if the source actor already existed.
+-    for (let source of sources) {
+-      this._onSourceUpdated(null, {source});
+-    }
+-  }, e => {
+-    // Also ignore any protocol-based errors.
+-  });
++  this._stylesheetsFront = null;
++  this._loadingPromise = null;
+ }
+ 
+ /**
++ * Lazy initialization.  Returns a promise that will resolve when all
++ * the relevant URLs have been registered.
++ */
++SourceMapURLService.prototype._getLoadingPromise = function () {
++  if (!this._loadingPromise) {
++    this._stylesheetsFront = this._toolbox.initStyleSheetsFront();
++    this._stylesheetsFront.on("stylesheet-added", this._onNewStyleSheet);
++    let styleSheetsLoadingPromise =
++        this._stylesheetsFront.getStyleSheets().then(sheets => {
++          sheets.forEach(this._onNewStyleSheet);
++        });
++
++    // Start fetching the sources now.
++    let loadingPromise = this._toolbox.threadClient.getSources().then(({sources}) => {
++      // Ignore errors.  Register the sources we got; we can't rely on
++      // an event to arrive if the source actor already existed.
++      for (let source of sources) {
++        this._onSourceUpdated(null, {source});
++      }
++    }, e => {
++      // Also ignore any protocol-based errors.
++    });
++
++    this._loadingPromise = Promise.all([styleSheetsLoadingPromise, loadingPromise]);
++  }
++  return this._loadingPromise;
++};
++
++/**
+  * Reset the service.  This flushes the internal cache.
+  */
+ SourceMapURLService.prototype.reset = function () {
+   this._sourceMapService.clearSourceMaps();
+   this._urls.clear();
+   this._subscriptions.clear();
+ };
+ 
+@@ -60,16 +81,19 @@
+  * Shut down the service, unregistering its event listeners and
+  * flushing the cache.  After this call the service will no longer
+  * function.
+  */
+ SourceMapURLService.prototype.destroy = function () {
+   this.reset();
+   this._target.off("source-updated", this._onSourceUpdated);
+   this._target.off("will-navigate", this.reset);
++  if (this._stylesheetsFront) {
++    this._stylesheetsFront.off("stylesheet-added", this._onNewStyleSheet);
++  }
+   Services.prefs.removeObserver(SOURCE_MAP_PREF, this._onPrefChanged);
+   this._target = this._urls = this._subscriptions = null;
+ };
+ 
+ /**
+  * A helper function that is called when a new source is available.
+  */
+ SourceMapURLService.prototype._onSourceUpdated = function (_, sourceEvent) {
+@@ -83,33 +107,49 @@
+ 
+   // |generatedUrl| comes from the actor and is extracted from the
+   // source code by SpiderMonkey.
+   let seenUrl = generatedUrl || url;
+   this._urls.set(seenUrl, { id, url: seenUrl, sourceMapURL });
+ };
+ 
+ /**
++ * A helper function that is called when a new style sheet is
++ * available.
++ * @param {StyleSheetActor} sheet
++ *        The new style sheet's actor.
++ */
++SourceMapURLService.prototype._onNewStyleSheet = function (sheet) {
++  // Maybe we were shut down while waiting.
++  if (!this._urls) {
++    return;
++  }
++
++  let {href: url, sourceMapURL, actor: id} = sheet._form;
++  this._urls.set(url, { id, url, sourceMapURL});
++};
++
++/**
+  * Look up the original position for a given location.  This returns a
+  * promise resolving to either the original location, or null if the
+  * given location is not source-mapped.  If a location is returned, it
+  * is of the same form as devtools-source-map's |getOriginalLocation|.
+  *
+  * @param {String} url
+  *        The URL to map.
+  * @param {number} line
+  *        The line number to map.
+  * @param {number} column
+  *        The column number to map.
+  * @return Promise
+  *        A promise resolving either to the original location, or null.
+  */
+ SourceMapURLService.prototype.originalPositionFor = async function (url, line, column) {
+   // Ensure the sources are loaded before replying.
+-  await this._loadingPromise;
++  await this._getLoadingPromise();
+ 
+   // Maybe we were shut down while waiting.
+   if (!this._urls) {
+     return null;
+   }
+ 
+   const urlInfo = this._urls.get(url);
+   if (!urlInfo) {
+diff --git a/devtools/client/framework/toolbox.js b/devtools/client/framework/toolbox.js
+--- a/devtools/client/framework/toolbox.js
++++ b/devtools/client/framework/toolbox.js
+@@ -61,16 +61,18 @@
+ loader.lazyRequireGetter(this, "ToolboxButtons",
+   "devtools/client/definitions", true);
+ loader.lazyRequireGetter(this, "SourceMapURLService",
+   "devtools/client/framework/source-map-url-service", true);
+ loader.lazyRequireGetter(this, "HUDService",
+   "devtools/client/webconsole/hudservice", true);
+ loader.lazyRequireGetter(this, "viewSource",
+   "devtools/client/shared/view-source");
++loader.lazyRequireGetter(this, "StyleSheetsFront",
++  "devtools/shared/fronts/stylesheets", true);
+ 
+ loader.lazyGetter(this, "domNodeConstants", () => {
+   return require("devtools/shared/dom-node-constants");
+ });
+ 
+ loader.lazyGetter(this, "registerHarOverlay", () => {
+   return require("devtools/client/netmonitor/src/har/toolbox-overlay").register;
+ });
+@@ -613,28 +615,27 @@
+     if (!Services.prefs.getBoolPref("devtools.source-map.client-service.enabled")) {
+       return null;
+     }
+     return this._createSourceMapService();
+   },
+ 
+   /**
+    * Clients wishing to use source maps but that want the toolbox to
+-   * track the source actor mapping can use this source map service.
+-   * This is a higher-level service than the one returned by
+-   * |sourceMapService|, in that it automatically tracks source actor
+-   * IDs.
++   * track the source and style sheet actor mapping can use this
++   * source map service.  This is a higher-level service than the one
++   * returned by |sourceMapService|, in that it automatically tracks
++   * source and style sheet actor IDs.
+    */
+   get sourceMapURLService() {
+     if (this._sourceMapURLService) {
+       return this._sourceMapURLService;
+     }
+     let sourceMaps = this._createSourceMapService();
+-    this._sourceMapURLService = new SourceMapURLService(this._target, this.threadClient,
+-                                                        sourceMaps);
++    this._sourceMapURLService = new SourceMapURLService(this, sourceMaps);
+     return this._sourceMapURLService;
+   },
+ 
+   // Return HostType id for telemetry
+   _getTelemetryHostId: function () {
+     switch (this.hostType) {
+       case Toolbox.HostType.BOTTOM: return 0;
+       case Toolbox.HostType.SIDE: return 1;
+@@ -2535,16 +2536,22 @@
+     outstanding.push(this.destroyInspector());
+ 
+     // Destroy the profiler connection
+     outstanding.push(this.destroyPerformance());
+ 
+     // Destroy the preference front
+     outstanding.push(this.destroyPreference());
+ 
++    // Destroy the style sheet front.
++    if (this._styleSheets) {
++      this._styleSheets.destroy();
++      this._styleSheets = null;
++    }
++
+     // Detach the thread
+     detachThread(this._threadClient);
+     this._threadClient = null;
+ 
+     // Unregister buttons listeners
+     this.toolbarButtons.forEach(button => {
+       if (typeof button.teardown == "function") {
+         // teardown arguments have already been bound in _createButtonState
+@@ -2706,16 +2713,26 @@
+       yield this._performanceFrontConnection.promise;
+     }
+     this.performance.off("*", this._onPerformanceFrontEvent);
+     yield this.performance.destroy();
+     this._performance = null;
+   }),
+ 
+   /**
++   * Return the style sheets front, creating it if necessary.
++   */
++  initStyleSheetsFront: function () {
++    if (!this._styleSheets) {
++      this._styleSheets = StyleSheetsFront(this.target.client, this.target.form);
++    }
++    return this._styleSheets;
++  },
++
++  /**
+    * Destroy the preferences actor when the toolbox is unloaded.
+    */
+   destroyPreference: Task.async(function* () {
+     if (!this._preferenceFront) {
+       return;
+     }
+ 
+     // Only reset the autohide pref in the Browser Toolbox if it's been toggled
+diff --git a/devtools/client/styleeditor/styleeditor-panel.js b/devtools/client/styleeditor/styleeditor-panel.js
+--- a/devtools/client/styleeditor/styleeditor-panel.js
++++ b/devtools/client/styleeditor/styleeditor-panel.js
+@@ -9,19 +9,16 @@
+ var {Task} = require("devtools/shared/task");
+ var {XPCOMUtils} = require("resource://gre/modules/XPCOMUtils.jsm");
+ var EventEmitter = require("devtools/shared/old-event-emitter");
+ 
+ var {StyleEditorUI} = require("resource://devtools/client/styleeditor/StyleEditorUI.jsm");
+ var {getString} = require("resource://devtools/client/styleeditor/StyleEditorUtil.jsm");
+ var {initCssProperties} = require("devtools/shared/fronts/css-properties");
+ 
+-loader.lazyGetter(this, "StyleSheetsFront",
+-  () => require("devtools/shared/fronts/stylesheets").StyleSheetsFront);
+-
+ var StyleEditorPanel = function StyleEditorPanel(panelWin, toolbox) {
+   EventEmitter.decorate(this);
+ 
+   this._toolbox = toolbox;
+   this._target = toolbox.target;
+   this._panelWin = panelWin;
+   this._panelDoc = panelWin.document;
+ 
+@@ -46,17 +43,17 @@
+   open: Task.async(function* () {
+     // We always interact with the target as if it were remote
+     if (!this.target.isRemote) {
+       yield this.target.makeRemote();
+     }
+ 
+     this.target.on("close", this.destroy);
+ 
+-    this._debuggee = StyleSheetsFront(this.target.client, this.target.form);
++    this._debuggee = this._toolbox.initStyleSheetsFront();
+ 
+     // Initialize the CSS properties database.
+     const {cssProperties} = yield initCssProperties(this._toolbox);
+ 
+     // Initialize the UI
+     this.UI = new StyleEditorUI(this._debuggee, this.target, this._panelDoc,
+                                 cssProperties);
+     this.UI.on("error", this._showError);
+diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/browser.ini b/devtools/client/webconsole/new-console-output/test/mochitest/browser.ini
+--- a/devtools/client/webconsole/new-console-output/test/mochitest/browser.ini
++++ b/devtools/client/webconsole/new-console-output/test/mochitest/browser.ini
+@@ -2,16 +2,19 @@
+ tags = devtools
+ subsuite = devtools
+ support-files =
+   code_bundle_invalidmap.js
+   code_bundle_invalidmap.js.map
+   code_bundle_nosource.js
+   code_bundle_nosource.js.map
+   head.js
++  source-mapped.css
++  source-mapped.css.map
++  source-mapped.scss
+   test-batching.html
+   test-console.html
+   test-console-filters.html
+   test-console-group.html
+   test-console-table.html
+   test-location-debugger-link-console-log.js
+   test-location-debugger-link-errors.js
+   test-location-debugger-link.html
+@@ -55,16 +58,17 @@
+ [browser_webconsole_nodes_highlight.js]
+ [browser_webconsole_nodes_select.js]
+ [browser_webconsole_object_inspector_entries.js]
+ [browser_webconsole_object_inspector.js]
+ [browser_webconsole_observer_notifications.js]
+ [browser_webconsole_persist.js]
+ [browser_webconsole_scroll.js]
+ [browser_webconsole_shows_reqs_in_netmonitor.js]
++[browser_webconsole_sourcemap_css.js]
+ [browser_webconsole_sourcemap_error.js]
+ [browser_webconsole_sourcemap_invalid.js]
+ [browser_webconsole_sourcemap_nosource.js]
+ [browser_webconsole_stacktrace_location_debugger_link.js]
+ [browser_webconsole_stacktrace_location_scratchpad_link.js]
+ [browser_webconsole_string.js]
+ [browser_webconsole_timestamps.js]
+ [browser_webconsole_warn_about_replaced_api.js]
+diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_sourcemap_css.js b/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_sourcemap_css.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/new-console-output/test/mochitest/browser_webconsole_sourcemap_css.js
+@@ -0,0 +1,48 @@
++/* -*- indent-tabs-mode: nil; js-indent-level: 2 -*- */
++/* vim: set ft=javascript ts=2 et sw=2 tw=80: */
++/* Any copyright is dedicated to the Public Domain.
++ * http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++// Test that a missing original source is reported.
++
++const CSS_URL = URL_ROOT + "source-mapped.css";
++
++const PAGE_URL = `data:text/html,
++<!doctype html>
++
++<html>
++  <head>
++    <meta charset="utf-8"/>
++    <title>Empty test page to test source map and css</title>
++  </head>
++
++  <link href="${CSS_URL}" rel="stylesheet" type="text/css">
++  <body>
++    <div>
++    There should be a source-mapped CSS warning in the console.
++    </div>
++  </body>
++
++</html>`;
++
++add_task(function* () {
++  yield pushPref("devtools.source-map.client-service.enabled", true);
++  yield pushPref("devtools.webconsole.filter.css", true);
++
++  const hud = yield openNewTabAndConsole(PAGE_URL);
++
++  info("Waiting for css warning");
++  let node = yield waitFor(() => findMessage(hud, "octopus"));
++  ok(!!node, "css warning seen");
++
++  info("Waiting for source map to be applied");
++  let found = yield waitFor(() => {
++    let frameLinkNode = node.querySelector(".message-location .frame-link");
++    let url = frameLinkNode.getAttribute("data-url");
++    return url.includes("scss");
++  });
++
++  ok(found, "css warning is source mapped in web console");
++});
+diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/source-mapped.css b/devtools/client/webconsole/new-console-output/test/mochitest/source-mapped.css
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/new-console-output/test/mochitest/source-mapped.css
+@@ -0,0 +1,7 @@
++body {
++  background-image: linear-gradient(45deg, rgba(255, 255, 255, 0.2) 25%, transparent 25%, transparent 50%, rgba(255, 255, 255, 0.2) 50%, rgba(255, 255, 255, 0.2) 75%, transparent 75%, transparent); }
++  body div {
++    color: orange;
++    color: octopus; }
++
++/*# sourceMappingURL=source-mapped.css.map */
+diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/source-mapped.css.map b/devtools/client/webconsole/new-console-output/test/mochitest/source-mapped.css.map
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/new-console-output/test/mochitest/source-mapped.css.map
+@@ -0,0 +1,7 @@
++{
++"version": 3,
++"mappings": "AAAA,IAAK;EAMH,gBAAgB,EAAE,gLAAuK;EALzL,QAAI;IACF,KAAK,EAAE,MAAM;IACb,KAAK,EAAE,OAAO",
++"sources": ["source-mapped.scss"],
++"names": [],
++"file": "source-mapped.css"
++}
+diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/source-mapped.scss b/devtools/client/webconsole/new-console-output/test/mochitest/source-mapped.scss
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/new-console-output/test/mochitest/source-mapped.scss
+@@ -0,0 +1,8 @@
++body {
++  div {
++    color: orange;
++    color: octopus;
++  }
++
++  background-image: linear-gradient(45deg, rgba(255,255,255,0.2) 25%, transparent 25%, transparent 50%, rgba(255,255,255,0.2) 50%, rgba(255,255,255,0.2) 75%, transparent 75%, transparent);
++}
+diff --git a/devtools/server/actors/stylesheets.js b/devtools/server/actors/stylesheets.js
+--- a/devtools/server/actors/stylesheets.js
++++ b/devtools/server/actors/stylesheets.js
+@@ -358,17 +358,18 @@
+ 
+     let form = {
+       actor: this.actorID,  // actorID is set when this actor is added to a pool
+       href: this.href,
+       nodeHref: docHref,
+       disabled: this.rawSheet.disabled,
+       title: this.rawSheet.title,
+       system: !CssLogic.isContentStylesheet(this.rawSheet),
+-      styleSheetIndex: this.styleSheetIndex
++      styleSheetIndex: this.styleSheetIndex,
++      sourceMapURL: this.rawSheet.sourceMapURL,
+     };
+ 
+     try {
+       form.ruleCount = this.rawSheet.cssRules.length;
+     } catch (e) {
+       // stylesheet had an @import rule that wasn't loaded yet
+       this.getCSSRules().then(() => {
+         this._notifyPropertyChanged("ruleCount");
+
