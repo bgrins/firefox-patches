@@ -1,0 +1,120 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  42151fcd6cfc216d147730d0f2c6a2acd52d22fd
+Bug 1397295 - Use environment variables instead of query string for params to Browser Toolbox;r=jryans
+
+This allows data like screen position to be persisted in the xul store for the document
+
+MozReview-Commit-ID: 4vdbkneckXh
+
+diff --git a/devtools/client/framework/ToolboxProcess.jsm b/devtools/client/framework/ToolboxProcess.jsm
+--- a/devtools/client/framework/ToolboxProcess.jsm
++++ b/devtools/client/framework/ToolboxProcess.jsm
+@@ -244,28 +244,32 @@ BrowserToolboxProcess.prototype = {
+   /**
+    * Creates and initializes the profile & process for the remote debugger.
+    */
+   _create: function () {
+     dumpn("Initializing chrome debugging process.");
+ 
+     let command = Services.dirsvc.get("XREExeF", Ci.nsIFile).path;
+ 
+-    let xulURI = `${DBG_XUL}?port=${this.port}`;
+-    if (this._options.addonID) {
+-      xulURI += `&addonID=${this._options.addonID}`;
+-    }
+-
+     dumpn("Running chrome debugging process.");
+     let args = [
+       "-no-remote",
+       "-foreground",
+       "-profile", this._dbgProfilePath,
+-      "-chrome", xulURI
++      "-chrome", DBG_XUL
+     ];
++    let environment = {
++      // Disable safe mode for the new process in case this was opened via the
++      // keyboard shortcut.
++      MOZ_DISABLE_SAFE_MODE_KEY: "1",
++      MOZ_BROWSER_TOOLBOX_PORT: String(this.port),
++    };
++    if (this._options.addonID) {
++      environment.MOZ_BROWSER_TOOLBOX_ADDONID = String(this._options.addonID);
++    }
+ 
+     // During local development, incremental builds can trigger the main process
+     // to clear its startup cache with the "flag file" .purgecaches, but this
+     // file is removed during app startup time, so we aren't able to know if it
+     // was present in order to also clear the child profile's startup cache as
+     // well.
+     //
+     // As an approximation of "isLocalBuild", check for an unofficial build.
+@@ -273,21 +277,17 @@ BrowserToolboxProcess.prototype = {
+       args.push("-purgecaches");
+     }
+ 
+     this._dbgProcessPromise = Subprocess.call({
+       command,
+       arguments: args,
+       environmentAppend: true,
+       stderr: "stdout",
+-      environment: {
+-        // Disable safe mode for the new process in case this was opened via the
+-        // keyboard shortcut.
+-        MOZ_DISABLE_SAFE_MODE_KEY: "1",
+-      },
++      environment,
+     }).then(proc => {
+       this._dbgProcess = proc;
+ 
+       this._telemetry.toolOpened("jsbrowserdebugger");
+ 
+       dumpn("Chrome toolbox is now running...");
+       this.emit("run", this);
+ 
+diff --git a/devtools/client/framework/toolbox-process-window.js b/devtools/client/framework/toolbox-process-window.js
+--- a/devtools/client/framework/toolbox-process-window.js
++++ b/devtools/client/framework/toolbox-process-window.js
+@@ -29,32 +29,35 @@ var Prefs = new PrefsHelper("devtools.de
+ });
+ 
+ var gToolbox, gClient;
+ 
+ var connect = Task.async(function* () {
+   window.removeEventListener("load", connect);
+ 
+   // Initiate the connection
+-  const params = new URLSearchParams(window.location.search);
++  let env = Components.classes["@mozilla.org/process/environment;1"]
++    .getService(Components.interfaces.nsIEnvironment);
++  let port = env.get("MOZ_BROWSER_TOOLBOX_PORT");
++  let addonID = env.get("MOZ_BROWSER_TOOLBOX_ADDONID");
+ 
+-  // A port needs to be passed in from the query string, for instance:
+-  // `./mach run -chrome chrome://devtools/content/framework/toolbox-process-window.xul?port=6080`
+-  if (!params.get("port")) {
+-    throw new Error("Must specify a port on the query string");
++  // A port needs to be passed in from the environment, for instance:
++  //    MOZ_BROWSER_TOOLBOX_PORT=6080 ./mach run -chrome \
++  //      chrome://devtools/content/framework/toolbox-process-window.xul
++  if (!port) {
++    throw new Error("Must pass a port in an env variable with MOZ_BROWSER_TOOLBOX_PORT");
+   }
+ 
+   let transport = yield DebuggerClient.socketConnect({
+     host: Prefs.chromeDebuggingHost,
+-    port: params.get("port"),
++    port,
+     webSocket: Prefs.chromeDebuggingWebSocket,
+   });
+   gClient = new DebuggerClient(transport);
+   yield gClient.connect();
+-  let addonID = params.get("addonID");
+ 
+   if (addonID) {
+     let { addons } = yield gClient.listAddons();
+     let addonActor = addons.filter(addon => addon.id === addonID).pop();
+     let isTabActor = addonActor.isWebExtension;
+     openToolbox({form: addonActor, chrome: true, isTabActor});
+   } else {
+     let response = yield gClient.getProcess();
