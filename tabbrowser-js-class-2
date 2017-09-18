@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  93b54008d447668e4896be2692becd8073c39d4f
+# Parent  282bd8c0371db3598a30360e7e4b56622d4b4a4d
 Bug 1392352 - Part 3 - Scriptify the tabbrowser binding
 
 This version keeps the XBL binding around and just uses <constructor> and <destructor>,
@@ -12,7 +12,7 @@ diff --git a/browser/base/content/TabBrowser.js b/browser/base/content/TabBrowse
 new file mode 100644
 --- /dev/null
 +++ b/browser/base/content/TabBrowser.js
-@@ -0,0 +1,6178 @@
+@@ -0,0 +1,6320 @@
 +// TODO:
 +// * This is in a js file for now to make it easier to setup (so it can access window globals),
 +//   but perf should be better if this was in a JSM instead.
@@ -53,7 +53,6 @@ new file mode 100644
 +    ]);
 +
 +    // For upgrading, replace below here:
-+
 +    Object.defineProperty(this, "tabContainer", {
 +      configurable: true,
 +      enumerable: true,
@@ -476,7 +475,8 @@ new file mode 100644
 +          "startScroll",
 +          "userTypedValue",
 +          "userTypedClear",
-+          "mediaBlocked"
++          "mediaBlocked",
++          "didStartLoadSinceLastUserTyping"
 +        ]);
 +      },
 +      set(val) {
@@ -643,11 +643,8 @@ new file mode 100644
 +    this._tabFilters.set(this.mCurrentTab, filter);
 +    this.webProgress.addProgressListener(filter, nsIWebProgress.NOTIFY_ALL);
 +
-+    this.style.backgroundColor = Services.prefs.getBoolPref(
-+      "browser.display.use_system_colors"
-+    )
-+      ? "-moz-default-background-color"
-+      : Services.prefs.getCharPref("browser.display.background_color");
++    if (Services.prefs.getBoolPref("browser.display.use_system_colors"))
++      this.style.backgroundColor = "-moz-default-background-color";
 +
 +    let messageManager = window.getGroupMessageManager("browsers");
 +
@@ -1484,6 +1481,64 @@ new file mode 100644
 +        return location == "about:blank";
 +      },
 +
++      _syncThrobberAnimations() {
++        const originalTab = this.mTab;
++        BrowserUtils.promiseLayoutFlushed(
++          this.mTab.ownerDocument,
++          "style",
++          () => {
++            if (!originalTab.parentNode) {
++              return;
++            }
++
++            const animations = Array.from(
++              originalTab.parentNode.getElementsByTagName("tab")
++            )
++              .map(tab => {
++                const throbber = document.getAnonymousElementByAttribute(
++                  tab,
++                  "anonid",
++                  "tab-throbber"
++                );
++                return throbber
++                  ? throbber.getAnimations({ subtree: true })
++                  : [];
++              })
++              .reduce((a, b) => a.concat(b))
++              .filter(
++                anim =>
++                  anim instanceof CSSAnimation &&
++                  (anim.animationName === "tab-throbber-animation" ||
++                    anim.animationName === "tab-throbber-animation-rtl") &&
++                  (anim.playState === "running" || anim.playState === "pending")
++              );
++
++            // Synchronize with the oldest running animation, if any.
++            const firstStartTime = Math.min(
++              ...animations.map(
++                anim => (anim.startTime === null ? Infinity : anim.startTime)
++              )
++            );
++            if (firstStartTime === Infinity) {
++              return;
++            }
++            requestAnimationFrame(() => {
++              for (let animation of animations) {
++                // If |animation| has been cancelled since this rAF callback
++                // was scheduled we don't want to set its startTime since
++                // that would restart it. We check for a cancelled animation
++                // by looking for a null currentTime rather than checking
++                // the playState, since reading the playState of
++                // a CSSAnimation object will flush style.
++                if (animation.currentTime !== null) {
++                  animation.startTime = firstStartTime;
++                }
++              }
++            });
++          }
++        );
++      },
++
 +      onProgressChange(
 +        aWebProgress,
 +        aRequest,
@@ -1498,7 +1553,8 @@ new file mode 100644
 +
 +        if (!this._shouldShowProgress(aRequest)) return;
 +
-+        if (this.mTotalProgress) this.mTab.setAttribute("progress", "true");
++        if (this.mTotalProgress && this.mTab.hasAttribute("busy"))
++          this.mTab.setAttribute("progress", "true");
 +
 +        this._callProgressListeners("onProgressChange", [
 +          aWebProgress,
@@ -1612,8 +1668,13 @@ new file mode 100644
 +          }
 +
 +          if (this._shouldShowProgress(aRequest)) {
-+            if (!(aStateFlags & nsIWebProgressListener.STATE_RESTORING)) {
++            if (
++              !(aStateFlags & nsIWebProgressListener.STATE_RESTORING) &&
++              aWebProgress &&
++              aWebProgress.isTopLevel
++            ) {
 +              this.mTab.setAttribute("busy", "true");
++              this._syncThrobberAnimations();
 +            }
 +
 +            if (this.mTab.selected) {
@@ -1892,6 +1953,16 @@ new file mode 100644
 +  getIcon(aTab) {
 +    let browser = aTab ? this.getBrowserForTab(aTab) : this.selectedBrowser;
 +    return browser.mIconURL;
++  }
++  setPageInfo(aURL, aDescription, aPreviewImage) {
++    if (aURL) {
++      let pageInfo = {
++        url: aURL,
++        description: aDescription,
++        previewImageURL: aPreviewImage
++      };
++      PlacesUtils.history.update(pageInfo).catch(Components.utils.reportError);
++    }
 +  }
 +  shouldLoadFavIcon(aURI) {
 +    return (
@@ -3090,6 +3161,9 @@ new file mode 100644
 +            return Services.io.newURI(url);
 +          };
 +          break;
++        case "didStartLoadSinceLastUserTyping":
++          getter = () => () => false;
++          break;
 +        case "fullZoom":
 +        case "textZoom":
 +          getter = () => 1;
@@ -3162,7 +3236,7 @@ new file mode 100644
 +      });
 +    }
 +  }
-+  _insertBrowser(aTab) {
++  _insertBrowser(aTab, aInsertedOnTabCreation) {
 +    "use strict";
 +    // If browser is already inserted or window is closed don't do anything.
 +    if (aTab.linkedPanel || window.closed) {
@@ -3235,9 +3309,56 @@ new file mode 100644
 +
 +    var evt = new CustomEvent("TabBrowserInserted", {
 +      bubbles: true,
-+      detail: {}
++      detail: { insertedOnTabCreation: aInsertedOnTabCreation }
 +    });
 +    aTab.dispatchEvent(evt);
++  }
++  discardBrowser(aBrowser) {
++    "use strict";
++    let tab = this.getTabForBrowser(aBrowser);
++
++    if (
++      !tab ||
++      tab.selected ||
++      tab.closing ||
++      this._windowIsClosing ||
++      !aBrowser.isConnected ||
++      !aBrowser.isRemoteBrowser ||
++      aBrowser.frameLoader.tabParent.hasBeforeUnload
++    ) {
++      return;
++    }
++
++    // Set browser parameters for when browser is restored.  Also remove
++    // listeners and set up lazy restore data in SessionStore. This must
++    // be done before aBrowser is destroyed and removed from the document.
++    tab._browserParams = {
++      uriIsAboutBlank: aBrowser.currentURI.spec == "about:blank",
++      remoteType: aBrowser.remoteType,
++      usingPreloadedContent: false
++    };
++
++    SessionStore.resetBrowserToLazyState(tab);
++
++    this._outerWindowIDBrowserMap.delete(aBrowser.outerWindowID);
++
++    // Remove the tab's filter and progress listener.
++    let filter = this._tabFilters.get(tab);
++    let listener = this._tabListeners.get(tab);
++    aBrowser.webProgress.removeProgressListener(filter);
++    filter.removeProgressListener(listener);
++    listener.destroy();
++
++    this._tabListeners.delete(tab);
++    this._tabFilters.delete(tab);
++
++    aBrowser.destroy();
++
++    let notificationbox = this.getNotificationBox(aBrowser);
++    this.mPanelContainer.removeChild(notificationbox);
++    tab.removeAttribute("linkedpanel");
++
++    this._createLazyBrowser(tab);
 +  }
 +  /* eslint-disable complexity */
 +  addTab(
@@ -3507,7 +3628,7 @@ new file mode 100644
 +        b.registeredOpenURI = lazyBrowserURI;
 +      }
 +    } else {
-+      this._insertBrowser(t);
++      this._insertBrowser(t, true);
 +    }
 +
 +    // Dispatch a new tab notification.  We do this once we're
@@ -3667,27 +3788,44 @@ new file mode 100644
 +    for (let i = tabs.length - 1; tabs[i] != aTab && i >= 0; --i) {
 +      tabsToEnd.push(tabs[i]);
 +    }
-+    return tabsToEnd.reverse();
++    return tabsToEnd;
 +  }
 +  removeTabsToTheEndFrom(aTab, aParams) {
-+    if (this.warnAboutClosingTabs(this.closingTabsEnum.TO_END, aTab)) {
-+      let tabs = this.getTabsToTheEndFrom(aTab);
-+      for (let i = tabs.length - 1; i >= 0; --i) {
-+        this.removeTab(tabs[i], aParams);
-+      }
++    if (!this.warnAboutClosingTabs(this.closingTabsEnum.TO_END, aTab)) return;
++
++    let removeTab = tab => {
++      // Avoid changing the selected browser several times.
++      if (tab.selected) this.selectedTab = aTab;
++
++      this.removeTab(tab, aParams);
++    };
++
++    let tabs = this.getTabsToTheEndFrom(aTab);
++    let tabsWithBeforeUnload = [];
++    for (let i = tabs.length - 1; i >= 0; --i) {
++      let tab = tabs[i];
++      if (this._hasBeforeUnload(tab)) tabsWithBeforeUnload.push(tab);
++      else removeTab(tab);
 +    }
++    tabsWithBeforeUnload.forEach(removeTab);
 +  }
 +  removeAllTabsBut(aTab) {
-+    if (aTab.pinned) return;
++    if (aTab.pinned || !this.warnAboutClosingTabs(this.closingTabsEnum.OTHER))
++      return;
 +
-+    if (this.warnAboutClosingTabs(this.closingTabsEnum.OTHER)) {
-+      let tabs = this.visibleTabs;
-+      this.selectedTab = aTab;
++    let tabs = this.visibleTabs.reverse();
++    this.selectedTab = aTab;
 +
-+      for (let i = tabs.length - 1; i >= 0; --i) {
-+        if (tabs[i] != aTab && !tabs[i].pinned)
-+          this.removeTab(tabs[i], { animate: true });
++    let tabsWithBeforeUnload = [];
++    for (let i = tabs.length - 1; i >= 0; --i) {
++      let tab = tabs[i];
++      if (tab != aTab && !tab.pinned) {
++        if (this._hasBeforeUnload(tab)) tabsWithBeforeUnload.push(tab);
++        else this.removeTab(tab, { animate: true });
 +      }
++    }
++    for (let tab of tabsWithBeforeUnload) {
++      this.removeTab(tab, { animate: true });
 +    }
 +  }
 +  removeCurrentTab(aParams) {
@@ -3776,6 +3914,15 @@ new file mode 100644
 +      this
 +    );
 +  }
++  _hasBeforeUnload(aTab) {
++    let browser = aTab.linkedBrowser;
++    return (
++      browser.isRemoteBrowser &&
++      browser.frameLoader &&
++      browser.frameLoader.tabParent &&
++      browser.frameLoader.tabParent.hasBeforeUnload
++    );
++  }
 +  _beginRemoveTab(
 +    aTab,
 +    aAdoptedByTab,
@@ -3786,20 +3933,13 @@ new file mode 100644
 +    if (aTab.closing || this._windowIsClosing) return false;
 +
 +    var browser = this.getBrowserForTab(aTab);
-+
-+    let checkPermitUnload =
++    if (
 +      !aSkipPermitUnload &&
 +      !aAdoptedByTab &&
 +      aTab.linkedPanel &&
-+      !aTab._pendingPermitUnload;
-+
-+    if (checkPermitUnload && browser.isRemoteBrowser) {
-+      checkPermitUnload =
-+        browser.frameLoader.tabParent &&
-+        browser.frameLoader.tabParent.hasBeforeUnload;
-+    }
-+
-+    if (checkPermitUnload) {
++      !aTab._pendingPermitUnload &&
++      (!browser.isRemoteBrowser || this._hasBeforeUnload(aTab))
++    ) {
 +      TelemetryStopwatch.start("FX_TAB_CLOSE_PERMIT_UNLOAD_TIME_MS", aTab);
 +
 +      // We need to block while calling permitUnload() because it
@@ -5733,7 +5873,9 @@ new file mode 100644
 +    return switcher;
 +  }
 +  warmupTab(aTab) {
-+    this._getSwitcher().warmupTab(aTab);
++    if (gMultiProcessBrowser) {
++      this._getSwitcher().warmupTab(aTab);
++    }
 +  }
 +  goBack() {
 +    return this.mCurrentBrowser.goBack();
@@ -6245,7 +6387,7 @@ new mode 100644
    Object.defineProperty(window, name, {
      configurable: true,
      enumerable: true,
-@@ -1227,18 +1226,17 @@ var gBrowserInit = {
+@@ -1231,18 +1230,17 @@ var gBrowserInit = {
            .getInterface(nsIWebNavigation)
            .QueryInterface(Ci.nsIDocShellTreeItem).treeOwner
            .QueryInterface(Ci.nsIInterfaceRequestor)
@@ -6265,7 +6407,7 @@ new mode 100644
      let isRemote = gMultiProcessBrowser;
      let remoteType;
      let sameProcessAsFrameLoader;
-@@ -1307,17 +1305,17 @@ var gBrowserInit = {
+@@ -1300,17 +1298,17 @@ var gBrowserInit = {
      mm.loadFrameScript("chrome://global/content/manifestMessages.js", true);
  
      window.messageManager.addMessageListener("Browser:LoadURI", RedirectLoad);
@@ -6284,7 +6426,7 @@ new mode 100644
  
      SidebarUI.init();
  
-@@ -4420,24 +4418,22 @@ var XULBrowserWindow = {
+@@ -4428,24 +4426,22 @@ var XULBrowserWindow = {
      return this.canViewSource = document.getElementById("canViewSource");
    },
  
@@ -6410,7 +6552,7 @@ diff --git a/browser/base/content/tabbrowser.xml b/browser/base/content/tabbrows
                <xul:vbox flex="1" class="browserContainer">
                  <xul:stack flex="1" class="browserStack" anonid="browserStack">
                    <xul:browser anonid="initialBrowser" type="content" message="true" messagemanagergroup="browsers"
-                                primary="true"
+                                primary="true" blank="true"
 diff --git a/browser/base/content/test/performance/browser_tabopen_squeeze_reflows.js b/browser/base/content/test/performance/browser_tabopen_squeeze_reflows.js
 --- a/browser/base/content/test/performance/browser_tabopen_squeeze_reflows.js
 +++ b/browser/base/content/test/performance/browser_tabopen_squeeze_reflows.js
@@ -6476,28 +6618,6 @@ diff --git a/browser/base/jar.mn b/browser/base/jar.mn
          content/browser/browser-data-submission-info-bar.js (content/browser-data-submission-info-bar.js)
          content/browser/browser-compacttheme.js       (content/browser-compacttheme.js)
  #ifndef MOZILLA_OFFICIAL
-diff --git a/devtools/client/responsivedesign/responsivedesign.jsm b/devtools/client/responsivedesign/responsivedesign.jsm
---- a/devtools/client/responsivedesign/responsivedesign.jsm
-+++ b/devtools/client/responsivedesign/responsivedesign.jsm
-@@ -747,17 +747,17 @@ ResponsiveUI.prototype = {
-       "responsive-ui-new-version-e10s-disabled",
-       null,
-       nbox.PRIORITY_INFO_LOW,
-       buttons
-     );
-   },
- 
-   hideNewUINotification() {
--    if (!this.mainWindow.gBrowser || !this.mainWindow.gBrowser.getNotificationBox) {
-+    if (!this.mainWindow.gBrowser) {
-       return;
-     }
-     let nbox = this.mainWindow.gBrowser.getNotificationBox(this.browser);
-     let n = nbox.getNotificationWithValue("responsive-ui-new-version-user-disabled");
-     if (n) {
-       n.close();
-     }
-     n = nbox.getNotificationWithValue("responsive-ui-new-version-e10s-disabled");
 diff --git a/devtools/client/scratchpad/test/browser_scratchpad_contexts.js b/devtools/client/scratchpad/test/browser_scratchpad_contexts.js
 --- a/devtools/client/scratchpad/test/browser_scratchpad_contexts.js
 +++ b/devtools/client/scratchpad/test/browser_scratchpad_contexts.js
