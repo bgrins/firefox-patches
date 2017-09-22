@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  282bd8c0371db3598a30360e7e4b56622d4b4a4d
+# Parent  46b34efb397f526488dffa49919951f86e9fe31b
 Bug 1392352 - Part 3 - Scriptify the tabbrowser binding
 
 This version keeps the XBL binding around and just uses <constructor> and <destructor>,
@@ -12,7 +12,7 @@ diff --git a/browser/base/content/TabBrowser.js b/browser/base/content/TabBrowse
 new file mode 100644
 --- /dev/null
 +++ b/browser/base/content/TabBrowser.js
-@@ -0,0 +1,6320 @@
+@@ -0,0 +1,6336 @@
 +// TODO:
 +// * This is in a js file for now to make it easier to setup (so it can access window globals),
 +//   but perf should be better if this was in a JSM instead.
@@ -21,10 +21,8 @@ new file mode 100644
 +
 +// STEPS TO BUILD:
 +// Generate the class with `npm run elements` from https://github.com/bgrins/xbl-analysis
-+// Remove `this.mCurrentBrowser = ...` in the constructor
 +// Remove customElements.define(...);
-+// Remove the Object.defineProperty("") for mCurrentBrowser, mStringBundle, mPanelContainer, mTabBox
-+// Remove the try/catch from constructor and disconnectedCallback
++// Replace document.getAnonymousElementByAttribute(this, ..) with document.getAnonymousElementByAttribute(this.container)
 +// Add: /* eslint-disable complexity */ before `  addTab(`
 +
 +class TabBrowser {
@@ -53,6 +51,7 @@ new file mode 100644
 +    ]);
 +
 +    // For upgrading, replace below here:
++
 +    Object.defineProperty(this, "tabContainer", {
 +      configurable: true,
 +      enumerable: true,
@@ -203,20 +202,16 @@ new file mode 100644
 +        return (this._lastRelatedTabMap = val);
 +      }
 +    });
-+    Object.defineProperty(this, "initialBrowser", {
++    Object.defineProperty(this, "mCurrentBrowser", {
 +      configurable: true,
 +      enumerable: true,
 +      get() {
-+        delete this.initialBrowser;
-+        return (this.initialBrowser = document.getAnonymousElementByAttribute(
-+          this.container,
-+          "anonid",
-+          "initialBrowser"
-+        ));
++        delete this.mCurrentBrowser;
++        return (this.mCurrentBrowser = null);
 +      },
 +      set(val) {
-+        delete this.initialBrowser;
-+        return (this.initialBrowser = val);
++        delete this.mCurrentBrowser;
++        return (this.mCurrentBrowser = val);
 +      }
 +    });
 +    Object.defineProperty(this, "mProgressListeners", {
@@ -590,7 +585,11 @@ new file mode 100644
 +      }
 +    });
 +
-+    this.mCurrentBrowser = this.initialBrowser;
++    this.mCurrentBrowser = document.getAnonymousElementByAttribute(
++      this.container,
++      "anonid",
++      "initialBrowser"
++    );
 +    this.mCurrentBrowser.permanentKey = {};
 +
 +    Services.obs.addObserver(this, "contextual-identity-updated");
@@ -689,6 +688,24 @@ new file mode 100644
 +      "animationsEnabled",
 +      "toolkit.cosmeticAnimations.enabled",
 +      true
++    );
++    XPCOMUtils.defineLazyPreferenceGetter(
++      this,
++      "tabWarmingEnabled",
++      "browser.tabs.remote.warmup.enabled",
++      false
++    );
++    XPCOMUtils.defineLazyPreferenceGetter(
++      this,
++      "tabWarmingMax",
++      "browser.tabs.remote.warmup.maxTabs",
++      3
++    );
++    XPCOMUtils.defineLazyPreferenceGetter(
++      this,
++      "tabWarmingUnloadDelay" /* ms */,
++      "browser.tabs.remote.warmup.unloadDelayMs",
++      2000
 +    );
 +
 +    this.addEventListener(
@@ -829,7 +846,12 @@ new file mode 100644
 +      }
 +
 +      tab.removeAttribute("soundplaying");
-+      this.setIcon(tab, icon, browser.contentPrincipal);
++      this.setIcon(
++        tab,
++        icon,
++        browser.contentPrincipal,
++        browser.contentRequestContextID
++      );
 +    });
 +
 +    this.addEventListener("DOMAudioPlaybackStarted", event => {
@@ -1910,18 +1932,24 @@ new file mode 100644
 +      }
 +    };
 +  }
-+  setIcon(aTab, aURI, aLoadingPrincipal) {
++  setIcon(aTab, aURI, aLoadingPrincipal, aRequestContextID) {
 +    let browser = this.getBrowserForTab(aTab);
 +    browser.mIconURL = aURI instanceof Ci.nsIURI ? aURI.spec : aURI;
 +    let loadingPrincipal = aLoadingPrincipal
 +      ? aLoadingPrincipal
 +      : Services.scriptSecurityManager.getSystemPrincipal();
++    let requestContextID = aRequestContextID || 0;
 +
 +    if (aURI) {
 +      if (!(aURI instanceof Ci.nsIURI)) {
 +        aURI = makeURI(aURI);
 +      }
-+      PlacesUIUtils.loadFavicon(browser, loadingPrincipal, aURI);
++      PlacesUIUtils.loadFavicon(
++        browser,
++        loadingPrincipal,
++        aURI,
++        requestContextID
++      );
 +    }
 +
 +    let sizedIconUrl = browser.mIconURL || "";
@@ -1935,6 +1963,7 @@ new file mode 100644
 +            "iconLoadingPrincipal",
 +            this.serializationHelper.serializeToString(loadingPrincipal)
 +          );
++          aTab.setAttribute("requestcontextid", requestContextID);
 +          browser.mIconLoadingPrincipal = loadingPrincipal;
 +        }
 +        aTab.setAttribute("image", sizedIconUrl);
@@ -1998,7 +2027,12 @@ new file mode 100644
 +      let url = documentURI.prePath + "/favicon.ico";
 +      if (!this.isFailedIcon(url)) icon = url;
 +    }
-+    this.setIcon(aTab, icon, browser.contentPrincipal);
++    this.setIcon(
++      aTab,
++      icon,
++      browser.contentPrincipal,
++      browser.contentRequestContextID
++    );
 +  }
 +  isFailedIcon(aURI) {
 +    if (!(aURI instanceof Ci.nsIURI)) aURI = makeURI(aURI);
@@ -2743,11 +2777,8 @@ new file mode 100644
 +      if (targetTabIndex !== -1) this.moveTabTo(tab, ++tabNum);
 +    }
 +
-+    if (!aLoadInBackground) {
-+      if (firstTabAdded) {
-+        // .selectedTab setter focuses the content area
-+        this.selectedTab = firstTabAdded;
-+      } else this.selectedBrowser.focus();
++    if (firstTabAdded && !aLoadInBackground) {
++      this.selectedTab = firstTabAdded;
 +    }
 +  }
 +  updateBrowserRemoteness(aBrowser, aShouldBeRemote, aOptions) {
@@ -4348,7 +4379,8 @@ new file mode 100644
 +        this.setIcon(
 +          aOurTab,
 +          otherBrowser.mIconURL,
-+          otherBrowser.contentPrincipal
++          otherBrowser.contentPrincipal,
++          otherBrowser.contentRequestContextID
 +        );
 +      var isBusy = aOtherTab.hasAttribute("busy");
 +      if (isBusy) {
@@ -4965,25 +4997,6 @@ new file mode 100644
 +      init() {
 +        this.log("START");
 +
-+        XPCOMUtils.defineLazyPreferenceGetter(
-+          this,
-+          "WARMING_ENABLED",
-+          "browser.tabs.remote.warmup.enabled",
-+          false
-+        );
-+        XPCOMUtils.defineLazyPreferenceGetter(
-+          this,
-+          "MAX_WARMING_TABS",
-+          "browser.tabs.remote.warmup.maxTabs",
-+          3
-+        );
-+        XPCOMUtils.defineLazyPreferenceGetter(
-+          this,
-+          "WARMING_UNLOAD_DELAY" /* ms */,
-+          "browser.tabs.remote.warmup.unloadDelayMs",
-+          2000
-+        );
-+
 +        // If we minimized the window before the switcher was activated,
 +        // we might have set  the preserveLayers flag for the current
 +        // browser. Let's clear it.
@@ -5346,8 +5359,8 @@ new file mode 100644
 +
 +        this.maybeFinishTabSwitch();
 +
-+        if (numWarming > this.MAX_WARMING_TABS) {
-+          this.logState("Hit MAX_WARMING_TABS");
++        if (numWarming > this.tabbrowser.tabWarmingMax) {
++          this.logState("Hit tabWarmingMax");
 +          if (this.unloadTimer) {
 +            this.clearTimer(this.unloadTimer);
 +          }
@@ -5580,7 +5593,7 @@ new file mode 100644
 +      },
 +
 +      canWarmTab(tab) {
-+        if (!this.WARMING_ENABLED) {
++        if (!this.tabbrowser.tabWarmingEnabled) {
 +          return false;
 +        }
 +
@@ -5621,7 +5634,10 @@ new file mode 100644
 +
 +        this.warmingTabs.add(tab);
 +        this.setTabState(tab, this.STATE_LOADING);
-+        this.suppressDisplayPortAndQueueUnload(tab, this.WARMING_UNLOAD_DELAY);
++        this.suppressDisplayPortAndQueueUnload(
++          tab,
++          this.tabbrowser.tabWarmingUnloadDelay
++        );
 +      },
 +
 +      // Called when the user asks to switch to a given tab.
@@ -5630,7 +5646,7 @@ new file mode 100644
 +          return;
 +        }
 +
-+        if (this.WARMING_ENABLED) {
++        if (this.tabbrowser.tabWarmingEnabled) {
 +          let warmingState = "disqualified";
 +
 +          if (this.warmingTabs.has(tab)) {
@@ -6426,7 +6442,7 @@ new mode 100644
  
      SidebarUI.init();
  
-@@ -4428,24 +4426,22 @@ var XULBrowserWindow = {
+@@ -4423,24 +4421,22 @@ var XULBrowserWindow = {
      return this.canViewSource = document.getElementById("canViewSource");
    },
  
@@ -6600,7 +6616,7 @@ diff --git a/browser/base/content/test/performance/browser_tabstrip_overflow_und
 diff --git a/browser/base/jar.mn b/browser/base/jar.mn
 --- a/browser/base/jar.mn
 +++ b/browser/base/jar.mn
-@@ -55,16 +55,17 @@ browser.jar:
+@@ -58,16 +58,17 @@ browser.jar:
  
          content/browser/aboutRobots-icon.png          (content/aboutRobots-icon.png)
          content/browser/aboutRobots-widget-left.png   (content/aboutRobots-widget-left.png)
