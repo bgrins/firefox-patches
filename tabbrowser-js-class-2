@@ -1,6 +1,6 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  787fdd53a9d4ebb9e8cf6848665c43ec8856ddcc
+# Parent  eac2d475bb55ef70187ec41a72c1aabc37f3f730
 Bug 1392352 - Part 3 - Scriptify the tabbrowser binding
 
 This version keeps the XBL binding around and just uses <constructor> and <destructor>,
@@ -12,7 +12,7 @@ diff --git a/browser/base/content/TabBrowser.js b/browser/base/content/TabBrowse
 new file mode 100644
 --- /dev/null
 +++ b/browser/base/content/TabBrowser.js
-@@ -0,0 +1,6302 @@
+@@ -0,0 +1,6387 @@
 +// TODO:
 +// * This is in a js file for now to make it easier to setup (so it can access window globals),
 +//   but perf should be better if this was in a JSM instead.
@@ -58,6 +58,7 @@ new file mode 100644
 +    // ]);
 +
 +    // For upgrading, replace below here:
++
 +    Object.defineProperty(this, "tabContainer", {
 +      configurable: true,
 +      enumerable: true,
@@ -526,6 +527,18 @@ new file mode 100644
 +        return (this._switcher = val);
 +      }
 +    });
++    Object.defineProperty(this, "_tabMinWidthLimit", {
++      configurable: true,
++      enumerable: true,
++      get() {
++        delete this._tabMinWidthLimit;
++        return (this._tabMinWidthLimit = 50);
++      },
++      set(val) {
++        delete this._tabMinWidthLimit;
++        return (this._tabMinWidthLimit = val);
++      }
++    });
 +    Object.defineProperty(this, "_soundPlayingAttrRemovalTimer", {
 +      configurable: true,
 +      enumerable: true,
@@ -551,12 +564,11 @@ new file mode 100644
 +      }
 +    });
 +
-+    this.mCurrentBrowser = document.getAnonymousElementByAttribute(
-+      this.container,
-+      "anonid",
-+      "initialBrowser"
-+    );
++    this.mCurrentBrowser = this.initialBrowser;
 +    this.mCurrentBrowser.permanentKey = {};
++
++    CustomizableUI.addListener(this);
++    this._updateNewTabVisibility();
 +
 +    Services.obs.addObserver(this, "contextual-identity-updated");
 +
@@ -673,6 +685,16 @@ new file mode 100644
 +      "browser.tabs.remote.warmup.unloadDelayMs",
 +      2000
 +    );
++    XPCOMUtils.defineLazyPreferenceGetter(
++      this,
++      "tabMinWidthPref",
++      "browser.tabs.tabMinWidth",
++      this._tabMinWidthLimit,
++      (pref, prevValue, newValue) => (this.tabMinWidth = newValue),
++      newValue => Math.max(newValue, this._tabMinWidthLimit)
++    );
++
++    this.tabMinWidth = this.tabMinWidthPref;
 +
 +    this.addEventListener(
 +      "DOMWindowClose",
@@ -911,6 +933,8 @@ new file mode 100644
 +  disconnectedCallback() {
 +    Services.obs.removeObserver(this, "contextual-identity-updated");
 +
++    CustomizableUI.removeListener(this);
++
 +    for (let tab of this.tabs) {
 +      let browser = tab.linkedBrowser;
 +      if (browser.registeredOpenURI) {
@@ -1123,6 +1147,12 @@ new file mode 100644
 +
 +  get userTypedValue() {
 +    return this.mCurrentBrowser.userTypedValue;
++  }
++
++  set tabMinWidth(val) {
++    let root = document.documentElement;
++    root.style.setProperty("--tab-min-width", val + "px");
++    return val;
 +  }
 +  isFindBarInitialized(aTab) {
 +    return (aTab || this.selectedTab)._findBar != undefined;
@@ -1662,6 +1692,7 @@ new file mode 100644
 +              aWebProgress.isTopLevel
 +            ) {
 +              this.mTab.setAttribute("busy", "true");
++              this.mTab._notselectedsinceload = !this.mTab.selected;
 +              this._syncThrobberAnimations();
 +            }
 +
@@ -1685,6 +1716,12 @@ new file mode 100644
 +              !this.mTabBrowser.tabAnimationsInProgress &&
 +              Services.prefs.getBoolPref("toolkit.cosmeticAnimations.enabled")
 +            ) {
++              if (this.mTab._notselectedsinceload) {
++                this.mTab.setAttribute("notselectedsinceload", "true");
++              } else {
++                this.mTab.removeAttribute("notselectedsinceload");
++              }
++
 +              this.mTab.setAttribute("bursting", "true");
 +            }
 +
@@ -1898,26 +1935,27 @@ new file mode 100644
 +      }
 +    };
 +  }
-+  setIcon(aTab, aURI, aLoadingPrincipal, aRequestContextID) {
-+    let browser = this.getBrowserForTab(aTab);
-+    browser.mIconURL = aURI instanceof Ci.nsIURI ? aURI.spec : aURI;
-+    let loadingPrincipal = aLoadingPrincipal
-+      ? aLoadingPrincipal
-+      : Services.scriptSecurityManager.getSystemPrincipal();
-+    let requestContextID = aRequestContextID || 0;
-+
-+    if (aURI) {
++  storeIcon(aBrowser, aURI, aLoadingPrincipal, aRequestContextID) {
++    try {
 +      if (!(aURI instanceof Ci.nsIURI)) {
 +        aURI = makeURI(aURI);
 +      }
 +      PlacesUIUtils.loadFavicon(
-+        browser,
-+        loadingPrincipal,
++        aBrowser,
++        aLoadingPrincipal,
 +        aURI,
-+        requestContextID
++        aRequestContextID
 +      );
++    } catch (ex) {
++      Components.utils.reportError(ex);
 +    }
-+
++  }
++  setIcon(aTab, aURI, aLoadingPrincipal, aRequestContextID) {
++    let browser = this.getBrowserForTab(aTab);
++    browser.mIconURL = aURI instanceof Ci.nsIURI ? aURI.spec : aURI;
++    let loadingPrincipal =
++      aLoadingPrincipal || Services.scriptSecurityManager.getSystemPrincipal();
++    let requestContextID = aRequestContextID || 0;
 +    let sizedIconUrl = browser.mIconURL || "";
 +    if (sizedIconUrl != aTab.getAttribute("image")) {
 +      if (sizedIconUrl) {
@@ -1969,9 +2007,11 @@ new file mode 100644
 +    );
 +  }
 +  useDefaultIcon(aTab) {
-+    var browser = this.getBrowserForTab(aTab);
-+    var documentURI = browser.documentURI;
-+    var icon = null;
++    let browser = this.getBrowserForTab(aTab);
++    let documentURI = browser.documentURI;
++    let requestContextID = browser.contentRequestContextID;
++    let loadingPrincipal = browser.contentPrincipal;
++    let icon = null;
 +
 +    if (browser.imageDocument) {
 +      if (Services.prefs.getBoolPref("browser.chrome.site_icons")) {
@@ -1982,6 +2022,8 @@ new file mode 100644
 +          browser.imageDocument.width <= sz &&
 +          browser.imageDocument.height <= sz
 +        ) {
++          // Don't try to store the icon in Places, regardless it would
++          // be skipped (see Bug 403651).
 +          icon = browser.currentURI;
 +        }
 +      }
@@ -1991,14 +2033,13 @@ new file mode 100644
 +    // do the right thing with about:-style error pages.  Bug 453442
 +    if (!icon && this.shouldLoadFavIcon(documentURI)) {
 +      let url = documentURI.prePath + "/favicon.ico";
-+      if (!this.isFailedIcon(url)) icon = url;
++      if (!this.isFailedIcon(url)) {
++        icon = url;
++        this.storeIcon(browser, icon, loadingPrincipal, requestContextID);
++      }
 +    }
-+    this.setIcon(
-+      aTab,
-+      icon,
-+      browser.contentPrincipal,
-+      browser.contentRequestContextID
-+    );
++
++    this.setIcon(aTab, icon, loadingPrincipal, requestContextID);
 +  }
 +  isFailedIcon(aURI) {
 +    if (!(aURI instanceof Ci.nsIURI)) aURI = makeURI(aURI);
@@ -3535,97 +3576,113 @@ new file mode 100644
 +
 +    this.tabContainer.appendChild(t);
 +
-+    // If this new tab is owned by another, assert that relationship
-+    if (aOwner) t.owner = aOwner;
-+
-+    var position = this.tabs.length - 1;
-+    t._tPos = position;
-+    this.tabContainer._setPositionalAttributes();
-+
-+    this.tabContainer.updateVisibility();
-+
-+    // If we don't have a preferred remote type, and we have a remote
-+    // opener, use the opener's remote type.
-+    if (!aPreferredRemoteType && aOpenerBrowser) {
-+      aPreferredRemoteType = aOpenerBrowser.remoteType;
-+    }
-+
-+    // If URI is about:blank and we don't have a preferred remote type,
-+    // then we need to use the referrer, if we have one, to get the
-+    // correct remote type for the new tab.
-+    if (uriIsAboutBlank && !aPreferredRemoteType && aReferrerURI) {
-+      aPreferredRemoteType = E10SUtils.getRemoteTypeForURI(
-+        aReferrerURI.spec,
-+        gMultiProcessBrowser
-+      );
-+    }
-+
-+    let remoteType = aForceNotRemote
-+      ? E10SUtils.NOT_REMOTE
-+      : E10SUtils.getRemoteTypeForURI(
-+          aURI,
-+          gMultiProcessBrowser,
-+          aPreferredRemoteType
-+        );
-+
-+    let b;
 +    let usingPreloadedContent = false;
++    let b;
 +
-+    // If we open a new tab with the newtab URL in the default
-+    // userContext, check if there is a preloaded browser ready.
-+    // Private windows are not included because both the label and the
-+    // icon for the tab would be set incorrectly (see bug 1195981).
-+    if (
-+      aURI == BROWSER_NEW_TAB_URL &&
-+      !aUserContextId &&
-+      !PrivateBrowsingUtils.isWindowPrivate(window)
-+    ) {
-+      b = this._getPreloadedBrowser();
-+      if (b) {
-+        usingPreloadedContent = true;
++    try {
++      // If this new tab is owned by another, assert that relationship
++      if (aOwner) t.owner = aOwner;
++
++      var position = this.tabs.length - 1;
++      t._tPos = position;
++      this.tabContainer._setPositionalAttributes();
++
++      this.tabContainer.updateVisibility();
++
++      // If we don't have a preferred remote type, and we have a remote
++      // opener, use the opener's remote type.
++      if (!aPreferredRemoteType && aOpenerBrowser) {
++        aPreferredRemoteType = aOpenerBrowser.remoteType;
 +      }
-+    }
 +
-+    if (!b) {
-+      // No preloaded browser found, create one.
-+      b = this._createBrowser({
-+        remoteType,
++      // If URI is about:blank and we don't have a preferred remote type,
++      // then we need to use the referrer, if we have one, to get the
++      // correct remote type for the new tab.
++      if (uriIsAboutBlank && !aPreferredRemoteType && aReferrerURI) {
++        aPreferredRemoteType = E10SUtils.getRemoteTypeForURI(
++          aReferrerURI.spec,
++          gMultiProcessBrowser
++        );
++      }
++
++      let remoteType = aForceNotRemote
++        ? E10SUtils.NOT_REMOTE
++        : E10SUtils.getRemoteTypeForURI(
++            aURI,
++            gMultiProcessBrowser,
++            aPreferredRemoteType
++          );
++
++      // If we open a new tab with the newtab URL in the default
++      // userContext, check if there is a preloaded browser ready.
++      // Private windows are not included because both the label and the
++      // icon for the tab would be set incorrectly (see bug 1195981).
++      if (
++        aURI == BROWSER_NEW_TAB_URL &&
++        !aUserContextId &&
++        !PrivateBrowsingUtils.isWindowPrivate(window)
++      ) {
++        b = this._getPreloadedBrowser();
++        if (b) {
++          usingPreloadedContent = true;
++        }
++      }
++
++      if (!b) {
++        // No preloaded browser found, create one.
++        b = this._createBrowser({
++          remoteType,
++          uriIsAboutBlank,
++          userContextId: aUserContextId,
++          sameProcessAsFrameLoader: aSameProcessAsFrameLoader,
++          openerWindow: aOpener,
++          isPrerendered: aIsPrerendered,
++          nextTabParentId: aNextTabParentId,
++          name: aName
++        });
++      }
++
++      t.linkedBrowser = b;
++
++      if (aFocusUrlBar) {
++        b._urlbarFocused = true;
++      }
++
++      this._tabForBrowser.set(b, t);
++      t.permanentKey = b.permanentKey;
++      t._browserParams = {
 +        uriIsAboutBlank,
-+        userContextId: aUserContextId,
-+        sameProcessAsFrameLoader: aSameProcessAsFrameLoader,
-+        openerWindow: aOpener,
-+        isPrerendered: aIsPrerendered,
-+        nextTabParentId: aNextTabParentId,
-+        name: aName
-+      });
-+    }
++        remoteType,
++        usingPreloadedContent
++      };
 +
-+    t.linkedBrowser = b;
++      // If the caller opts in, create a lazy browser.
++      if (aCreateLazyBrowser) {
++        this._createLazyBrowser(t);
 +
-+    if (aFocusUrlBar) {
-+      b._urlbarFocused = true;
-+    }
-+
-+    this._tabForBrowser.set(b, t);
-+    t.permanentKey = b.permanentKey;
-+    t._browserParams = {
-+      uriIsAboutBlank,
-+      remoteType,
-+      usingPreloadedContent
-+    };
-+
-+    // If the caller opts in, create a lazy browser.
-+    if (aCreateLazyBrowser) {
-+      this._createLazyBrowser(t);
-+
-+      if (lazyBrowserURI) {
-+        // Lazy browser must be explicitly registered so tab will appear as
-+        // a switch-to-tab candidate in autocomplete.
-+        this._unifiedComplete.registerOpenPage(lazyBrowserURI, aUserContextId);
-+        b.registeredOpenURI = lazyBrowserURI;
++        if (lazyBrowserURI) {
++          // Lazy browser must be explicitly registered so tab will appear as
++          // a switch-to-tab candidate in autocomplete.
++          this._unifiedComplete.registerOpenPage(
++            lazyBrowserURI,
++            aUserContextId
++          );
++          b.registeredOpenURI = lazyBrowserURI;
++        }
++      } else {
++        this._insertBrowser(t, true);
 +      }
-+    } else {
-+      this._insertBrowser(t, true);
++    } catch (e) {
++      Cu.reportError("Failed to create tab");
++      Cu.reportError(e);
++      t.remove();
++      if (t.linkedBrowser) {
++        this._tabFilters.delete(t);
++        this._tabListeners.delete(t);
++        let notificationbox = this.getNotificationBox(t.linkedBrowser);
++        notificationbox.remove();
++      }
++      throw e;
 +    }
 +
 +    // Dispatch a new tab notification.  We do this once we're
@@ -6300,6 +6357,34 @@ new file mode 100644
 +      }
 +    }
 +  }
++  _updateNewTabVisibility() {
++    let sib = this.tabContainer.nextElementSibling;
++    while (sib && sib.hidden) {
++      sib = sib.nextElementSibling;
++    }
++    const kAttr = "hasadjacentnewtabbutton";
++    if (sib && sib.id == "new-tab-button") {
++      this.tabContainer.setAttribute(kAttr, "true");
++    } else {
++      this.tabContainer.removeAttribute(kAttr);
++    }
++  }
++  onWidgetAfterDOMChange(aNode, aNextNode, aContainer) {
++    if (
++      aContainer.ownerDocument == document &&
++      aContainer.id == "TabsToolbar"
++    ) {
++      this._updateNewTabVisibility();
++    }
++  }
++  onAreaNodeRegistered(aArea, aContainer) {
++    if (aContainer.ownerDocument == document && aArea == "TabsToolbar") {
++      this._updateNewTabVisibility();
++    }
++  }
++  onAreaReset(aArea, aContainer) {
++    this.onAreaNodeRegistered(aArea, aContainer);
++  }
 +  _generateUniquePanelID() {
 +    if (!this._uniquePanelIDCounter) {
 +      this._uniquePanelIDCounter = 0;
@@ -6547,7 +6632,7 @@ diff --git a/browser/base/content/tabbrowser.xml b/browser/base/content/tabbrows
                  <xul:stack flex="1" class="browserStack" anonid="browserStack">
                    <xul:browser anonid="initialBrowser" type="content" message="true" messagemanagergroup="browsers"
                                 primary="true" blank="true"
-@@ -6341,20 +6377,16 @@
+@@ -6390,20 +6426,16 @@
        </constructor>
  
        <destructor>
@@ -6568,7 +6653,7 @@ diff --git a/browser/base/content/tabbrowser.xml b/browser/base/content/tabbrows
          document.getElementById("tabContextMenu");
        </field>
  
-@@ -6373,16 +6405,22 @@
+@@ -6422,16 +6454,22 @@
        <field name="restoreTabsButton">
          document.getAnonymousElementByAttribute(this, "anonid", "restore-tabs-button");
        </field>
@@ -6778,33 +6863,6 @@ diff --git a/toolkit/components/addoncompat/multiprocessShims.js b/toolkit/compo
  
      if (target instanceof Ci.nsIDOMEventTarget) {
        return "EventTarget";
-diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/browser.xml
---- a/toolkit/content/widgets/browser.xml
-+++ b/toolkit/content/widgets/browser.xml
-@@ -384,20 +384,20 @@
-           return this._webBrowserFind;
-         ]]>
-         </getter>
-       </property>
- 
-       <method name="getTabBrowser">
-         <body>
-           <![CDATA[
--            for (let node = this.parentNode; node instanceof Element; node = node.parentNode) {
--              if (node.localName == "tabbrowser")
--                return node;
-+            if (this.ownerGlobal.gBrowser && this.ownerGlobal.gBrowser.getTabForBrowser(this)) {
-+              return this.ownerGlobal.gBrowser;
-             }
-+
-             return null;
-           ]]>
-         </body>
-       </method>
- 
-       <field name="_finder">null</field>
- 
-       <property name="finder" readonly="true">
 diff --git a/toolkit/modules/PopupNotifications.jsm b/toolkit/modules/PopupNotifications.jsm
 --- a/toolkit/modules/PopupNotifications.jsm
 +++ b/toolkit/modules/PopupNotifications.jsm
@@ -6846,30 +6904,3 @@ diff --git a/toolkit/modules/PopupNotifications.jsm b/toolkit/modules/PopupNotif
  
    this._shouldSuppress = options.shouldSuppress || (() => false);
    this._suppress = this._shouldSuppress();
-diff --git a/toolkit/mozapps/extensions/test/browser/browser_bug562797.js b/toolkit/mozapps/extensions/test/browser/browser_bug562797.js
---- a/toolkit/mozapps/extensions/test/browser/browser_bug562797.js
-+++ b/toolkit/mozapps/extensions/test/browser/browser_bug562797.js
-@@ -391,20 +391,21 @@ add_test(function() {
- // previous view
- add_test(function() {
- 
-   open_manager("addons://list/plugin", function(aManager) {
-     info("Part 1");
-     is_in_list(aManager, "addons://list/plugin", false, false);
- 
-     gBrowser.loadURI("http://example.com/");
--    gBrowser.addEventListener("pageshow", function listener(event) {
-+    gBrowser.container.addEventListener("pageshow", function listener(event) {
-+      info("pageshow");
-       if (event.target.location != "http://example.com/")
-         return;
--      gBrowser.removeEventListener("pageshow", listener);
-+      gBrowser.container.removeEventListener("pageshow", listener);
-       info("Part 2");
- 
-       executeSoon(function() {
-         ok(gBrowser.canGoBack, "Should be able to go back");
-         ok(!gBrowser.canGoForward, "Should not be able to go forward");
- 
-         go_back();
- 
