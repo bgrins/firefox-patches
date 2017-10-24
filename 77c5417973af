@@ -1,0 +1,345 @@
+
+# HG changeset patch
+# User Nicolas Chevobbe <nchevobbe@mozilla.com>
+# Date 1508853240 -7200
+# Node ID 77c5417973af7d3ab5eeb147d1e3f0e3e1a6d03b
+# Parent  9056f2ee492fa481aa86146aba236c074628e9fd
+Bug 1391688 - Show only messages that fit the viewport on first console render; r=bgrins.
+
+This allow us to have a faster first meaningful render for the user.
+The other messages get rendered after ConsoleOutput mounting.
+
+MozReview-Commit-ID: KIptXsLmTiA
+
+diff --git a/devtools/client/webconsole/new-console-output/actions/ui.js b/devtools/client/webconsole/new-console-output/actions/ui.js
+--- a/devtools/client/webconsole/new-console-output/actions/ui.js
++++ b/devtools/client/webconsole/new-console-output/actions/ui.js
+@@ -6,20 +6,21 @@
+ 
+ "use strict";
+ 
+ const { getAllUi } = require("devtools/client/webconsole/new-console-output/selectors/ui");
+ const Services = require("Services");
+ 
+ const {
+   FILTER_BAR_TOGGLE,
++  INITIALIZE,
+   PERSIST_TOGGLE,
+   PREFS,
++  SELECT_NETWORK_MESSAGE_TAB,
+   TIMESTAMPS_TOGGLE,
+-  SELECT_NETWORK_MESSAGE_TAB,
+ } = require("devtools/client/webconsole/new-console-output/constants");
+ 
+ function filterBarToggle(show) {
+   return (dispatch, getState) => {
+     dispatch({
+       type: FILTER_BAR_TOGGLE,
+     });
+     const uiState = getAllUi(getState());
+@@ -46,14 +47,21 @@
+ 
+ function selectNetworkMessageTab(id) {
+   return {
+     type: SELECT_NETWORK_MESSAGE_TAB,
+     id,
+   };
+ }
+ 
++function initialize() {
++  return {
++    type: INITIALIZE
++  };
++}
++
+ module.exports = {
+   filterBarToggle,
++  initialize,
+   persistToggle,
++  selectNetworkMessageTab,
+   timestampsToggle,
+-  selectNetworkMessageTab,
+ };
+diff --git a/devtools/client/webconsole/new-console-output/components/ConsoleOutput.js b/devtools/client/webconsole/new-console-output/components/ConsoleOutput.js
+--- a/devtools/client/webconsole/new-console-output/components/ConsoleOutput.js
++++ b/devtools/client/webconsole/new-console-output/components/ConsoleOutput.js
+@@ -5,16 +5,17 @@
+ 
+ const {
+   createClass,
+   createFactory,
+   DOM: dom,
+   PropTypes
+ } = require("devtools/client/shared/vendor/react");
+ const { connect } = require("devtools/client/shared/vendor/react-redux");
++const {initialize} = require("devtools/client/webconsole/new-console-output/actions/ui");
+ 
+ const {
+   getAllMessagesById,
+   getAllMessagesUiById,
+   getAllMessagesTableDataById,
+   getAllNetworkMessagesUpdateById,
+   getVisibleMessages,
+   getAllRepeatById,
+@@ -24,16 +25,17 @@
+   MESSAGE_TYPE,
+ } = require("devtools/client/webconsole/new-console-output/constants");
+ 
+ const ConsoleOutput = createClass({
+ 
+   displayName: "ConsoleOutput",
+ 
+   propTypes: {
++    initialized: PropTypes.bool.isRequired,
+     messages: PropTypes.object.isRequired,
+     messagesUi: PropTypes.object.isRequired,
+     serviceContainer: PropTypes.shape({
+       attachRefToHud: PropTypes.func.isRequired,
+       openContextMenu: PropTypes.func.isRequired,
+       sourceMapService: PropTypes.object,
+     }),
+     dispatch: PropTypes.func.isRequired,
+@@ -41,21 +43,20 @@
+     messagesTableData: PropTypes.object.isRequired,
+     messagesRepeat: PropTypes.object.isRequired,
+     networkMessagesUpdate: PropTypes.object.isRequired,
+     visibleMessages: PropTypes.array.isRequired,
+     networkMessageActiveTabId: PropTypes.string.isRequired,
+   },
+ 
+   componentDidMount() {
+-    // Do the scrolling in the nextTick since this could hit console startup performances.
+-    // See https://bugzilla.mozilla.org/show_bug.cgi?id=1355869
+-    setTimeout(() => {
+-      scrollToBottom(this.outputNode);
+-    }, 0);
++    requestAnimationFrame(() => {
++      this.props.dispatch(initialize());
++    });
++    scrollToBottom(this.outputNode);
+     this.props.serviceContainer.attachRefToHud("outputScroller", this.outputNode);
+   },
+ 
+   componentWillUpdate(nextProps, nextState) {
+     const outputNode = this.outputNode;
+     if (!outputNode || !outputNode.lastChild) {
+       // Force a scroll to bottom when messages are added to an empty console.
+       // This makes the console stay pinned to the bottom if a batch of messages
+@@ -71,16 +72,17 @@
+       nextProps.messages.size - this.props.messages.size;
+ 
+     // We need to scroll to the bottom if:
+     // - the number of messages displayed changed
+     //   and we are already scrolled to the bottom
+     // - the number of messages in the store changed
+     //   and the new message is an evaluation result.
+     this.shouldScrollBottom =
++      (this.props.initialized === false && nextProps.initialized === true) ||
+       (messagesDelta > 0 && nextProps.messages.last().type === MESSAGE_TYPE.RESULT) ||
+       (visibleMessagesDelta > 0 && isScrolledToBottom(lastChild, outputNode));
+   },
+ 
+   componentDidUpdate() {
+     if (this.shouldScrollBottom) {
+       scrollToBottom(this.outputNode);
+     }
+@@ -99,18 +101,28 @@
+       messages,
+       messagesUi,
+       messagesTableData,
+       messagesRepeat,
+       networkMessagesUpdate,
+       networkMessageActiveTabId,
+       serviceContainer,
+       timestampsVisible,
++      initialized,
+     } = this.props;
+ 
++    if (!initialized) {
++      const messageHeight = 20;
++      const numberMessagesFitViewport = Math.ceil(window.innerHeight / messageHeight);
++      if (numberMessagesFitViewport < visibleMessages.length) {
++        visibleMessages = visibleMessages.slice(
++          visibleMessages.length - numberMessagesFitViewport);
++      }
++    }
++
+     let messageNodes = visibleMessages.map((messageId) => MessageContainer({
+       dispatch,
+       key: messageId,
+       messageId,
+       serviceContainer,
+       open: messagesUi.includes(messageId),
+       tableData: messagesTableData.get(messageId),
+       timestampsVisible,
+@@ -141,16 +153,17 @@
+   let lastNodeHeight = outputNode.lastChild ?
+                        outputNode.lastChild.clientHeight : 0;
+   return scrollNode.scrollTop + scrollNode.clientHeight >=
+          scrollNode.scrollHeight - lastNodeHeight / 2;
+ }
+ 
+ function mapStateToProps(state, props) {
+   return {
++    initialized: state.ui.initialized,
+     messages: getAllMessagesById(state),
+     visibleMessages: getVisibleMessages(state),
+     messagesUi: getAllMessagesUiById(state),
+     messagesTableData: getAllMessagesTableDataById(state),
+     messagesRepeat: getAllRepeatById(state),
+     networkMessagesUpdate: getAllNetworkMessagesUpdateById(state),
+     timestampsVisible: state.ui.timestampsVisible,
+     networkMessageActiveTabId: state.ui.networkMessageActiveTabId,
+diff --git a/devtools/client/webconsole/new-console-output/constants.js b/devtools/client/webconsole/new-console-output/constants.js
+--- a/devtools/client/webconsole/new-console-output/constants.js
++++ b/devtools/client/webconsole/new-console-output/constants.js
+@@ -2,33 +2,34 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ "use strict";
+ 
+ const actionTypes = {
+   BATCH_ACTIONS: "BATCH_ACTIONS",
++  DEFAULT_FILTERS_RESET: "DEFAULT_FILTERS_RESET",
++  FILTER_BAR_TOGGLE: "FILTER_BAR_TOGGLE",
++  FILTER_TEXT_SET: "FILTER_TEXT_SET",
++  FILTER_TOGGLE: "FILTER_TOGGLE",
++  FILTERS_CLEAR: "FILTERS_CLEAR",
++  INITIALIZE: "INITIALIZE",
+   MESSAGE_ADD: "MESSAGE_ADD",
++  MESSAGE_CLOSE: "MESSAGE_CLOSE",
++  MESSAGE_OPEN: "MESSAGE_OPEN",
++  MESSAGE_TABLE_RECEIVE: "MESSAGE_TABLE_RECEIVE",
+   MESSAGES_ADD: "MESSAGES_ADD",
+   MESSAGES_CLEAR: "MESSAGES_CLEAR",
+-  MESSAGE_OPEN: "MESSAGE_OPEN",
+-  MESSAGE_CLOSE: "MESSAGE_CLOSE",
+   NETWORK_MESSAGE_UPDATE: "NETWORK_MESSAGE_UPDATE",
+   NETWORK_UPDATE_REQUEST: "NETWORK_UPDATE_REQUEST",
+-  MESSAGE_TABLE_RECEIVE: "MESSAGE_TABLE_RECEIVE",
++  PERSIST_TOGGLE: "PERSIST_TOGGLE",
+   REMOVED_ACTORS_CLEAR: "REMOVED_ACTORS_CLEAR",
++  SELECT_NETWORK_MESSAGE_TAB: "SELECT_NETWORK_MESSAGE_TAB",
+   TIMESTAMPS_TOGGLE: "TIMESTAMPS_TOGGLE",
+-  FILTER_TOGGLE: "FILTER_TOGGLE",
+-  FILTER_TEXT_SET: "FILTER_TEXT_SET",
+-  FILTERS_CLEAR: "FILTERS_CLEAR",
+-  DEFAULT_FILTERS_RESET: "DEFAULT_FILTERS_RESET",
+-  FILTER_BAR_TOGGLE: "FILTER_BAR_TOGGLE",
+-  SELECT_NETWORK_MESSAGE_TAB: "SELECT_NETWORK_MESSAGE_TAB",
+-  PERSIST_TOGGLE: "PERSIST_TOGGLE",
+ };
+ 
+ const prefs = {
+   PREFS: {
+     FILTER: {
+       ERROR: "devtools.webconsole.filter.error",
+       WARN: "devtools.webconsole.filter.warn",
+       INFO: "devtools.webconsole.filter.info",
+diff --git a/devtools/client/webconsole/new-console-output/reducers/ui.js b/devtools/client/webconsole/new-console-output/reducers/ui.js
+--- a/devtools/client/webconsole/new-console-output/reducers/ui.js
++++ b/devtools/client/webconsole/new-console-output/reducers/ui.js
+@@ -2,43 +2,47 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ "use strict";
+ 
+ const {
+   FILTER_BAR_TOGGLE,
++  INITIALIZE,
+   PERSIST_TOGGLE,
++  SELECT_NETWORK_MESSAGE_TAB,
+   TIMESTAMPS_TOGGLE,
+-  SELECT_NETWORK_MESSAGE_TAB,
+ } = require("devtools/client/webconsole/new-console-output/constants");
+ const Immutable = require("devtools/client/shared/vendor/immutable");
+ 
+ const {
+   PANELS,
+ } = require("devtools/client/netmonitor/src/constants");
+ 
+ const UiState = Immutable.Record({
+   filterBarVisible: false,
++  initialized: false,
++  networkMessageActiveTabId: PANELS.HEADERS,
+   persistLogs: false,
+   timestampsVisible: true,
+-  networkMessageActiveTabId: PANELS.HEADERS,
+ });
+ 
+ function ui(state = new UiState(), action) {
+   switch (action.type) {
+     case FILTER_BAR_TOGGLE:
+       return state.set("filterBarVisible", !state.filterBarVisible);
+     case PERSIST_TOGGLE:
+       return state.set("persistLogs", !state.persistLogs);
+     case TIMESTAMPS_TOGGLE:
+       return state.set("timestampsVisible", action.visible);
+     case SELECT_NETWORK_MESSAGE_TAB:
+       return state.set("networkMessageActiveTabId", action.id);
++    case INITIALIZE:
++      return state.set("initialized", true);
+   }
+ 
+   return state;
+ }
+ 
+ module.exports = {
+   UiState,
+   ui,
+diff --git a/devtools/client/webconsole/new-console-output/test/components/console-output.test.js b/devtools/client/webconsole/new-console-output/test/components/console-output.test.js
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/webconsole/new-console-output/test/components/console-output.test.js
+@@ -0,0 +1,46 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++"use strict";
++
++const {
++  createFactory,
++} = require("devtools/client/shared/vendor/react");
++// Test utils.
++const expect = require("expect");
++
++const ConsoleOutput = createFactory(require("devtools/client/webconsole/new-console-output/components/ConsoleOutput"));
++const serviceContainer = require("devtools/client/webconsole/new-console-output/test/fixtures/serviceContainer");
++const { setupStore } = require("devtools/client/webconsole/new-console-output/test/helpers");
++const {initialize} = require("devtools/client/webconsole/new-console-output/actions/ui");
++
++const { render } = require("enzyme");
++
++const MESSAGES_NUMBER = 100;
++function getDefaultProps(initialized) {
++  const store = setupStore(
++    Array.from({length: MESSAGES_NUMBER})
++      // Alternate message so we don't trigger the repeat mechanism.
++      .map((_, i) => i % 2 ? "new Date(0)" : "console.log(NaN)")
++  );
++
++  if (initialized) {
++    store.dispatch(initialize());
++  }
++
++  return {
++    store,
++    serviceContainer,
++  };
++}
++
++describe("ConsoleOutput component:", () => {
++  it("Render only the last messages that fits the viewport when non-initialized", () => {
++    const rendered = render(ConsoleOutput(getDefaultProps(false)));
++    expect(rendered.find(".message").length).toBe(Math.ceil(window.innerHeight / 20));
++  });
++
++  it("Render every message when initialized", () => {
++    const rendered = render(ConsoleOutput(getDefaultProps(true)));
++    expect(rendered.find(".message").length).toBe(MESSAGES_NUMBER);
++  });
++});
+
