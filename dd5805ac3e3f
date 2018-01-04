@@ -1,0 +1,330 @@
+
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Date 1508964673 25200
+# Node ID dd5805ac3e3f961ae9a2f292e76366ec721d3e15
+# Parent  ac93fdadf1022211eec62258ad22b42cb37a6d14
+Bug 1411707 - Migrate <stringbundle> from a XBL binding to a Custom Element
+
+MozReview-Commit-ID: 2XxU8K5e7oF
+
+diff --git a/dom/base/nsContentUtils.cpp b/dom/base/nsContentUtils.cpp
+--- a/dom/base/nsContentUtils.cpp
++++ b/dom/base/nsContentUtils.cpp
+@@ -3267,16 +3267,21 @@ nsContentUtils::NewURIWithDocumentCharse
+   }
+   return NS_NewURI(aResult, aSpec, nullptr, aBaseURI, sIOService);
+ }
+ 
+ // static
+ bool
+ nsContentUtils::IsCustomElementName(nsAtom* aName)
+ {
++  // For browser chrome allow non-dashed names
++  if (XRE_IsParentProcess()) {
++    return true;
++  }
++
+   // A valid custom element name is a sequence of characters name which
+   // must match the PotentialCustomElementName production:
+   // PotentialCustomElementName ::= [a-z] (PCENChar)* '-' (PCENChar)*
+   const char16_t* name = aName->GetUTF16String();
+   uint32_t len = aName->GetLength();
+   bool hasDash = false;
+ 
+   if (!len || name[0] < 'a' || name[0] > 'z') {
+diff --git a/modules/libpref/init/all.js b/modules/libpref/init/all.js
+--- a/modules/libpref/init/all.js
++++ b/modules/libpref/init/all.js
+@@ -1388,17 +1388,17 @@ pref("dom.event.clipboardevents.enabled"
+ pref("dom.event.highrestimestamp.enabled",  true);
+ #ifdef NIGHTLY_BUILD
+ pref("dom.event.coalesce_mouse_move",       true);
+ #else
+ pref("dom.event.coalesce_mouse_move",       false);
+ #endif
+ 
+ pref("dom.webcomponents.enabled",           false);
+-pref("dom.webcomponents.customelements.enabled", false);
++pref("dom.webcomponents.customelements.enabled", true);
+ 
+ pref("javascript.enabled",                  true);
+ pref("javascript.options.strict",           false);
+ #ifdef DEBUG
+ pref("javascript.options.strict.debug",     false);
+ #endif
+ pref("javascript.options.baselinejit",      true);
+ pref("javascript.options.ion",              true);
+diff --git a/toolkit/components/processsingleton/MainProcessSingleton.js b/toolkit/components/processsingleton/MainProcessSingleton.js
+--- a/toolkit/components/processsingleton/MainProcessSingleton.js
++++ b/toolkit/components/processsingleton/MainProcessSingleton.js
+@@ -57,26 +57,36 @@ MainProcessSingleton.prototype = {
+       Services.search.addEngine(engineURL.spec, null, iconURL ? iconURL.spec : null, true);
+     });
+   },
+ 
+   observe(subject, topic, data) {
+     switch (topic) {
+     case "app-startup": {
+       Services.obs.addObserver(this, "xpcom-shutdown");
++      Services.obs.addObserver(this, "chrome-document-global-created");
+ 
+       // Load this script early so that console.* is initialized
+       // before other frame scripts.
+       Services.mm.loadFrameScript("chrome://global/content/browser-content.js", true);
+       Services.ppmm.loadProcessScript("chrome://global/content/process-content.js", true);
+       Services.mm.addMessageListener("Search:AddEngine", this.addSearchEngine);
+       Services.ppmm.loadProcessScript("resource:///modules/ContentObservers.js", true);
+       break;
+     }
+ 
++    case "chrome-document-global-created":
++      for (let script of [
++        "chrome://global/content/bindings/stringbundle.js",
++      ]) {
++        Services.scriptloader.loadSubScript(script, subject.QueryInterface(Ci.nsIDOMWindow));
++      }
++      break;
++
+     case "xpcom-shutdown":
+       Services.mm.removeMessageListener("Search:AddEngine", this.addSearchEngine);
++      Services.obs.removeObserver(this, "chrome-document-global-created");
+       break;
+     }
+   },
+ };
+ 
+ this.NSGetFactory = XPCOMUtils.generateNSGetFactory([MainProcessSingleton]);
+diff --git a/toolkit/content/jar.mn b/toolkit/content/jar.mn
+--- a/toolkit/content/jar.mn
++++ b/toolkit/content/jar.mn
+@@ -97,17 +97,17 @@ toolkit.jar:
+    content/global/bindings/resizer.xml         (widgets/resizer.xml)
+    content/global/bindings/richlistbox.xml     (widgets/richlistbox.xml)
+    content/global/bindings/scale.xml           (widgets/scale.xml)
+    content/global/bindings/scrollbar.xml       (widgets/scrollbar.xml)
+    content/global/bindings/scrollbox.xml       (widgets/scrollbox.xml)
+    content/global/bindings/spinner.js          (widgets/spinner.js)
+    content/global/bindings/splitter.xml        (widgets/splitter.xml)
+    content/global/bindings/spinbuttons.xml     (widgets/spinbuttons.xml)
+-   content/global/bindings/stringbundle.xml    (widgets/stringbundle.xml)
++   content/global/bindings/stringbundle.js     (widgets/stringbundle.js)
+ *  content/global/bindings/tabbox.xml          (widgets/tabbox.xml)
+    content/global/bindings/text.xml            (widgets/text.xml)
+ *  content/global/bindings/textbox.xml         (widgets/textbox.xml)
+    content/global/bindings/timekeeper.js       (widgets/timekeeper.js)
+    content/global/bindings/timepicker.js       (widgets/timepicker.js)
+    content/global/bindings/toolbar.xml         (widgets/toolbar.xml)
+    content/global/bindings/toolbarbutton.xml   (widgets/toolbarbutton.xml)
+ *  content/global/bindings/tree.xml            (widgets/tree.xml)
+diff --git a/toolkit/content/widgets/stringbundle.js b/toolkit/content/widgets/stringbundle.js
+new file mode 100644
+--- /dev/null
++++ b/toolkit/content/widgets/stringbundle.js
+@@ -0,0 +1,82 @@
++class FirefoxStringbundle extends XULElement {
++  constructor() {
++    super();
++  }
++  connectedCallback() {
++    Object.defineProperty(this, "_bundle", {
++      configurable: true,
++      enumerable: true,
++      get() {
++        delete this._bundle;
++        return (this._bundle = null);
++      },
++      set(val) {
++        delete this._bundle;
++        return (this._bundle = val);
++      }
++    });
++  }
++  disconnectedCallback() {}
++
++  get stringBundle() {
++    if (!this._bundle) {
++      try {
++        this._bundle = Services.strings.createBundle(this.src);
++      } catch (e) {
++        dump("Failed to get stringbundle:\n");
++        dump(e + "\n");
++      }
++    }
++    return this._bundle;
++  }
++
++  set src(val) {
++    this._bundle = null;
++    this.setAttribute("src", val);
++    return val;
++  }
++
++  get src() {
++    return this.getAttribute("src");
++  }
++
++  get strings() {
++    // Note: this is a sucky method name! Should be:
++    //       readonly attribute nsISimpleEnumerator strings;
++    return this.stringBundle.getSimpleEnumeration();
++  }
++  getString(aStringKey) {
++    try {
++      return this.stringBundle.GetStringFromName(aStringKey);
++    } catch (e) {
++      dump(
++        "*** Failed to get string " +
++          aStringKey +
++          " in bundle: " +
++          this.src +
++          "\n"
++      );
++      throw e;
++    }
++  }
++  getFormattedString(aStringKey, aStringsArray) {
++    try {
++      return this.stringBundle.formatStringFromName(
++        aStringKey,
++        aStringsArray,
++        aStringsArray.length
++      );
++    } catch (e) {
++      dump(
++        "*** Failed to format string " +
++          aStringKey +
++          " in bundle: " +
++          this.src +
++          "\n"
++      );
++      throw e;
++    }
++  }
++}
++
++customElements.define("stringbundle", FirefoxStringbundle);
+diff --git a/toolkit/content/widgets/stringbundle.xml b/toolkit/content/widgets/stringbundle.xml
+deleted file mode 100644
+--- a/toolkit/content/widgets/stringbundle.xml
++++ /dev/null
+@@ -1,91 +0,0 @@
+-<?xml version="1.0"?>
+-<!-- This Source Code Form is subject to the terms of the Mozilla Public
+-   - License, v. 2.0. If a copy of the MPL was not distributed with this
+-   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-
+-
+-<bindings id="stringBundleBindings"
+-          xmlns="http://www.mozilla.org/xbl"
+-          xmlns:xul="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
+-
+-  <binding id="stringbundle" extends="xul:spacer">
+-    <implementation name="XStringBundle">
+-
+-      <method name="getString">
+-        <parameter name="aStringKey"/>
+-        <body>
+-          <![CDATA[
+-            try {
+-              return this.stringBundle.GetStringFromName(aStringKey);
+-            } catch (e) {
+-              dump("*** Failed to get string " + aStringKey + " in bundle: " + this.src + "\n");
+-              throw e;
+-            }
+-          ]]>
+-        </body>
+-      </method>
+-
+-      <method name="getFormattedString">
+-        <parameter name="aStringKey"/>
+-        <parameter name="aStringsArray"/>
+-        <body>
+-          <![CDATA[
+-            try {
+-              return this.stringBundle.formatStringFromName(aStringKey, aStringsArray, aStringsArray.length);
+-            } catch (e) {
+-              dump("*** Failed to format string " + aStringKey + " in bundle: " + this.src + "\n");
+-              throw e;
+-            }
+-          ]]>
+-        </body>
+-      </method>
+-
+-      <property name="stringBundle" readonly="true">
+-        <getter>
+-          <![CDATA[
+-            if (!this._bundle) {
+-              try {
+-                this._bundle = Components.classes["@mozilla.org/intl/stringbundle;1"]
+-                                         .getService(Components.interfaces.nsIStringBundleService)
+-                                         .createBundle(this.src);
+-              } catch (e) {
+-                dump("Failed to get stringbundle:\n");
+-                dump(e + "\n");
+-              }
+-            }
+-            return this._bundle;
+-          ]]>
+-        </getter>
+-      </property>
+-
+-      <property name="src">
+-        <getter>
+-          <![CDATA[
+-            return this.getAttribute("src");
+-          ]]>
+-        </getter>
+-        <setter>
+-          <![CDATA[
+-            this._bundle = null;
+-            this.setAttribute("src", val);
+-            return val;
+-          ]]>
+-        </setter>
+-      </property>
+-
+-      <property name="strings">
+-        <getter>
+-          <![CDATA[
+-            // Note: this is a sucky method name! Should be:
+-            //       readonly attribute nsISimpleEnumerator strings;
+-            return this.stringBundle.getSimpleEnumeration();
+-          ]]>
+-        </getter>
+-      </property>
+-
+-      <field name="_bundle">null</field>
+-
+-    </implementation>
+-  </binding>
+-
+-</bindings>
+diff --git a/toolkit/content/xul.css b/toolkit/content/xul.css
+--- a/toolkit/content/xul.css
++++ b/toolkit/content/xul.css
+@@ -964,22 +964,21 @@ spinbuttons {
+ 
+ .spinbuttons-button {
+   -moz-user-focus: ignore;
+ }
+ 
+ /********** stringbundle **********/
+ 
+ stringbundleset {
+-  visibility: collapse;
++  display: none;
+ }
+ 
+ stringbundle {
+-  -moz-binding: url("chrome://global/content/bindings/stringbundle.xml#stringbundle");
+-  visibility: collapse;
++  display: none;
+ }
+ 
+ /********** dialog **********/
+ 
+ dialog,
+ dialog:root /* override :root from above */ {
+   -moz-binding: url("chrome://global/content/bindings/dialog.xml#dialog");
+   -moz-box-orient: vertical;
