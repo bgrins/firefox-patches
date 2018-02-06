@@ -1,100 +1,53 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  d8aeb1f6915dc1b52571548b26f4b943b44dab1f
-Part 2 -
+# Parent  5f1c76fcfd9b5dfb9a0711e482f896e418a91dd9
+Bug 1436076 - Part 2 - Use async/await instead of defer in HUDService;r=nchevobbe
 
-diff --git a/devtools/client/framework/devtools.js b/devtools/client/framework/devtools.js
---- a/devtools/client/framework/devtools.js
-+++ b/devtools/client/framework/devtools.js
-@@ -409,17 +409,17 @@ DevTools.prototype = {
-    * Restore the devtools session state as provided by SessionStore.
-    */
-   restoreDevToolsSession: function ({scratchpads, browserConsole}) {
-     if (scratchpads) {
-       ScratchpadManager.restoreSession(scratchpads);
-     }
- 
-     if (browserConsole && !HUDService.getBrowserConsole()) {
--      HUDService.toggleBrowserConsole();
-+      HUDService.openBrowserConsoleOrFocus();
-     }
-   },
- 
-   /**
-    * Boolean, true, if we never opened a toolbox.
-    * Used to implement the telemetry tracking toolbox opening.
-    */
-   _firstShowToolbox: true,
-diff --git a/devtools/client/framework/toolbox.js b/devtools/client/framework/toolbox.js
---- a/devtools/client/framework/toolbox.js
-+++ b/devtools/client/framework/toolbox.js
-@@ -1014,17 +1014,17 @@ Toolbox.prototype = {
-       let key = doc.createElement("key");
-       key.id = "key_browserconsole";
- 
-       key.setAttribute("key", L10N.getStr("browserConsoleCmd.commandkey"));
-       key.setAttribute("modifiers", "accel,shift");
-       // needed. See bug 371900
-       key.setAttribute("oncommand", "void(0)");
-       key.addEventListener("command", () => {
--        HUDService.toggleBrowserConsole();
-+        HUDService.openBrowserConsoleOrFocus();
-       }, true);
-       doc.getElementById("toolbox-keyset").appendChild(key);
-     }
-   },
- 
-   /**
-    * Handle any custom key events.  Returns true if there was a custom key
-    * binding run.
-diff --git a/devtools/client/scratchpad/scratchpad.js b/devtools/client/scratchpad/scratchpad.js
---- a/devtools/client/scratchpad/scratchpad.js
-+++ b/devtools/client/scratchpad/scratchpad.js
-@@ -1571,17 +1571,17 @@ var Scratchpad = {
-     }
-   },
- 
-   /**
-    * Open the Error Console.
-    */
-   openErrorConsole: function SP_openErrorConsole()
-   {
--    HUDService.toggleBrowserConsole();
-+    HUDService.openBrowserConsoleOrFocus();
-   },
- 
-   /**
-    * Open the Web Console.
-    */
-   openWebConsole: function SP_openWebConsole()
-   {
-     let target = TargetFactory.forTab(this.gBrowser.selectedTab);
-diff --git a/devtools/client/scratchpad/test/browser_scratchpad_open_error_console.js b/devtools/client/scratchpad/test/browser_scratchpad_open_error_console.js
---- a/devtools/client/scratchpad/test/browser_scratchpad_open_error_console.js
-+++ b/devtools/client/scratchpad/test/browser_scratchpad_open_error_console.js
-@@ -22,17 +22,17 @@ function runTests()
-   Services.obs.addObserver(function observer(aSubject) {
-     Services.obs.removeObserver(observer, "web-console-created");
-     aSubject.QueryInterface(Ci.nsISupportsString);
- 
-     let hud = HUDService.getBrowserConsole();
-     ok(hud, "browser console is open");
-     is(aSubject.data, hud.hudId, "notification hudId is correct");
- 
--    HUDService.toggleBrowserConsole().then(finish);
-+    HUDService.openBrowserConsoleOrFocus().then(finish);
-   }, "web-console-created");
- 
-   let hud = HUDService.getBrowserConsole();
-   ok(!hud, "browser console is not open");
-   info("wait for the browser console to open from Scratchpad");
- 
-   gScratchpadWindow.Scratchpad.openErrorConsole();
- }
+MozReview-Commit-ID: KbLjHa8gUGK
+
 diff --git a/devtools/client/webconsole/hudservice.js b/devtools/client/webconsole/hudservice.js
 --- a/devtools/client/webconsole/hudservice.js
 +++ b/devtools/client/webconsole/hudservice.js
-@@ -158,52 +158,44 @@ HUD_SERVICE.prototype =
+@@ -4,19 +4,16 @@
+ 
+ "use strict";
+ 
+ var WebConsoleUtils = require("devtools/client/webconsole/utils").Utils;
+ const {extend} = require("devtools/shared/extend");
+ var {TargetFactory} = require("devtools/client/framework/target");
+ var {gDevToolsBrowser} = require("devtools/client/framework/devtools-browser");
+ var {Tools} = require("devtools/client/definitions");
+-const { Task } = require("devtools/shared/task");
+-var promise = require("promise");
+-const defer = require("devtools/shared/defer");
+ var Services = require("Services");
+ loader.lazyRequireGetter(this, "Telemetry", "devtools/client/shared/telemetry");
+ loader.lazyRequireGetter(this, "WebConsoleFrame", "devtools/client/webconsole/webconsole", true);
+ loader.lazyRequireGetter(this, "NewWebConsoleFrame", "devtools/client/webconsole/new-webconsole", true);
+ loader.lazyRequireGetter(this, "gDevTools", "devtools/client/framework/devtools", true);
+ loader.lazyRequireGetter(this, "DebuggerServer", "devtools/server/main", true);
+ loader.lazyRequireGetter(this, "DebuggerClient", "devtools/shared/client/debugger-client", true);
+ loader.lazyRequireGetter(this, "showDoorhanger", "devtools/client/shared/doorhanger", true);
+@@ -34,17 +31,17 @@ var gHudId = 0;
+ function HUD_SERVICE() {
+   this.consoles = new Map();
+   this.lastFinishedRequest = { callback: null };
+ }
+ 
+ HUD_SERVICE.prototype =
+ {
+   _browserConsoleID: null,
+-  _browserConsoleDefer: null,
++  _browserConsoleInitializing: null,
+ 
+   /**
+    * Keeps a reference for each Web Console / Browser Console that is created.
+    * @type Map
+    */
+   consoles: null,
+ 
+   _browerConsoleSessionState: false,
+@@ -158,88 +155,87 @@ HUD_SERVICE.prototype =
      let toolbox = gDevTools.getToolbox(target);
      let panel = toolbox ? toolbox.getPanel("webconsole") : null;
      return panel ? panel.hud : null;
@@ -112,14 +65,12 @@ diff --git a/devtools/client/webconsole/hudservice.js b/devtools/client/webconso
  
 -    if (this._browserConsoleDefer) {
 -      return this._browserConsoleDefer.promise;
--    }
-+    // if (this._browserConsoleDefer) {
-+    //   return this._browserConsoleDefer.promise;
-+    // }
++    if (this._browserConsoleInitializing) {
++      return this._browserConsoleInitializing;
+     }
  
 -    this._browserConsoleDefer = defer();
-+    // this._browserConsoleDefer = defer();
- 
+-
 -    function connect() {
 +    async function connect() {
        // Ensure that the root actor and the tab actors have been registered on the
@@ -145,26 +96,46 @@ diff --git a/devtools/client/webconsole/hudservice.js b/devtools/client/webconso
 -    let target;
 -    function getTarget(connection) {
 -      return TargetFactory.forRemoteTab(connection);
--    }
-     function openWindow(t) {
--      target = t;
-       return new Promise(resolve => {
-         let browserConsoleURL = Tools.webConsole.browserConsoleURL;
-         let win = Services.ww.openWindow(null, browserConsoleURL, "_blank",
-                                          BC_WINDOW_FEATURES, null);
-         win.addEventListener("DOMContentLoaded", () => {
-           win.document.title = l10n.getStr("browserConsole.title");
-           if (browserConsoleURL === Tools.webConsole.oldWebConsoleURL) {
-             resolve({iframeWindow: win, chromeWindow: win});
-@@ -211,25 +203,33 @@ HUD_SERVICE.prototype =
-             win.document.querySelector("iframe").addEventListener("DOMContentLoaded",
-               e => resolve({iframeWindow: e.target.defaultView, chromeWindow: win}),
-               { once: true }
-             );
-           }
-         }, {once: true});
-       });
++    async function openWindow(t) {
++      let browserConsoleURL = Tools.webConsole.browserConsoleURL;
++      let win = Services.ww.openWindow(null, browserConsoleURL, "_blank",
++                                       BC_WINDOW_FEATURES, null);
++      await new Promise(resolve => {
++        win.addEventListener("DOMContentLoaded", resolve, {once: true});
++      });
++
++      win.document.title = l10n.getStr("browserConsole.title");
++
++      if (browserConsoleURL === Tools.webConsole.oldWebConsoleURL) {
++        return {iframeWindow: win, chromeWindow: win};
++      }
++
++      let iframe = win.document.querySelector("iframe");
++      await new Promise(resolve => {
++        iframe.addEventListener("DOMContentLoaded", resolve, {once: true});
++      });
++
++      return {iframeWindow: iframe.contentWindow, chromeWindow: win};
      }
+-    function openWindow(t) {
+-      target = t;
+-      return new Promise(resolve => {
+-        let browserConsoleURL = Tools.webConsole.browserConsoleURL;
+-        let win = Services.ww.openWindow(null, browserConsoleURL, "_blank",
+-                                         BC_WINDOW_FEATURES, null);
+-        win.addEventListener("DOMContentLoaded", () => {
+-          win.document.title = l10n.getStr("browserConsole.title");
+-          if (browserConsoleURL === Tools.webConsole.oldWebConsoleURL) {
+-            resolve({iframeWindow: win, chromeWindow: win});
+-          } else {
+-            win.document.querySelector("iframe").addEventListener("DOMContentLoaded",
+-              e => resolve({iframeWindow: e.target.defaultView, chromeWindow: win}),
+-              { once: true }
+-            );
+-          }
+-        }, {once: true});
+-      });
+-    }
 -    connect().then(getTarget).then(openWindow).then(({iframeWindow, chromeWindow}) => {
 -      return this.openBrowserConsole(target, iframeWindow, chromeWindow)
 -        .then(browserConsole => {
@@ -172,24 +143,22 @@ diff --git a/devtools/client/webconsole/hudservice.js b/devtools/client/webconso
 -          this._browserConsoleDefer = null;
 -        });
 -    }, console.error.bind(console));
-+
-+    let connection = await connect();
-+    let target = await TargetFactory.forRemoteTab(connection);
-+    let {iframeWindow, chromeWindow} = await openWindow(target);
-+    let browserConsole =
-+      await this.openBrowserConsole(target, iframeWindow, chromeWindow);
-+    return browserConsole;
  
 -    return this._browserConsoleDefer.promise;
-+    // connect().then(getTarget).then(openWindow).then(({iframeWindow, chromeWindow}) => {
-+    //   return this.openBrowserConsole(target, iframeWindow, chromeWindow)
-+    //     .then(browserConsole => {
-+    //       this._browserConsoleDefer.resolve(browserConsole);
-+    //       this._browserConsoleDefer = null;
-+    //     });
-+    // }, console.error.bind(console));
++    // Temporarily cache the async startup sequence so that if toggleBrowserConsole
++    // gets called again we can return this console instead of opening another one.
++    this._browserConsoleInitializing = (async function () {
++      let connection = await connect();
++      let target = await TargetFactory.forRemoteTab(connection);
++      let {iframeWindow, chromeWindow} = await openWindow(target);
++      let browserConsole =
++        await this.openBrowserConsole(target, iframeWindow, chromeWindow);
++      return browserConsole;
++    }.bind(this))();
 +
-+    // return this._browserConsoleDefer.promise;
++    let browserConsole = await this._browserConsoleInitializing;
++    this._browserConsoleInitializing = null;
++    return browserConsole;
    },
  
    /**
@@ -198,81 +167,130 @@ diff --git a/devtools/client/webconsole/hudservice.js b/devtools/client/webconso
    openBrowserConsoleOrFocus() {
      let hud = this.getBrowserConsole();
      if (hud) {
-diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/browser_console_addonsdk_loader_exception.js b/devtools/client/webconsole/new-console-output/test/mochitest/browser_console_addonsdk_loader_exception.js
---- a/devtools/client/webconsole/new-console-output/test/mochitest/browser_console_addonsdk_loader_exception.js
-+++ b/devtools/client/webconsole/new-console-output/test/mochitest/browser_console_addonsdk_loader_exception.js
-@@ -18,17 +18,17 @@ function test() {
- 
-   Task.spawn(runner).then(finishTest);
- 
-   function* runner() {
-     let {tab} = yield loadTab(TEST_URI);
-     webconsole = yield openConsole(tab);
-     ok(webconsole, "web console opened");
- 
--    browserconsole = yield HUDService.toggleBrowserConsole();
-+    browserconsole = yield HUDService.openBrowserConsoleOrFocus();
-     ok(browserconsole, "browser console opened");
- 
-     // Cause an exception in a script loaded with the addon-sdk loader.
-     let toolbox = gDevTools.getToolbox(webconsole.target);
-     let oldPanels = toolbox._toolPanels;
-     // non-iterable
-     toolbox._toolPanels = {};
- 
-diff --git a/devtools/client/webconsole/new-console-output/test/mochitest/browser_console_clear_method.js b/devtools/client/webconsole/new-console-output/test/mochitest/browser_console_clear_method.js
---- a/devtools/client/webconsole/new-console-output/test/mochitest/browser_console_clear_method.js
-+++ b/devtools/client/webconsole/new-console-output/test/mochitest/browser_console_clear_method.js
-@@ -6,17 +6,17 @@
- // Check that console.clear() does not clear the output of the browser console.
- 
- "use strict";
- 
- const TEST_URI = "data:text/html;charset=utf8,<p>Bug 1296870";
- 
- add_task(function* () {
-   yield loadTab(TEST_URI);
--  let hud = yield HUDService.toggleBrowserConsole();
-+  let hud = yield HUDService.openBrowserConsoleOrFocus();
- 
-   info("Log a new message from the content page");
-   ContentTask.spawn(gBrowser.selectedBrowser, {}, function* () {
-     content.wrappedJSObject.console.log("msg");
-   });
-   yield waitForMessage("msg", hud);
- 
-   info("Send a console.clear() from the content page");
-diff --git a/devtools/shim/devtools-startup.js b/devtools/shim/devtools-startup.js
---- a/devtools/shim/devtools-startup.js
-+++ b/devtools/shim/devtools-startup.js
-@@ -652,26 +652,20 @@ DevToolsStartup.prototype = {
-       url += "?" + params.join("&");
+       hud.iframeWindow.focus();
+-      return promise.resolve(hud);
++      return new Promise(resolve => resolve(hud));
      }
  
-     // Set relatedToCurrent: true to open the tab next to the current one.
-     gBrowser.selectedTab = gBrowser.addTab(url, {relatedToCurrent: true});
+     return this.toggleBrowserConsole();
    },
  
-   handleConsoleFlag: function (cmdLine) {
--    let window = Services.wm.getMostRecentWindow("devtools:webconsole");
--    if (!window) {
--      let require = this.initDevTools("CommandLine");
--      let { HUDService } = require("devtools/client/webconsole/hudservice");
--      let { console } = Cu.import("resource://gre/modules/Console.jsm", {});
--      HUDService.toggleBrowserConsole().catch(console.error);
--    } else {
--      // the Browser Console was already open
--      window.focus();
+   /**
+    * Get the Browser Console instance, if open.
+    *
+@@ -534,55 +530,50 @@ WebConsole.prototype = {
+ 
+   /**
+    * Destroy the object. Call this method to avoid memory leaks when the Web
+    * Console is closed.
+    *
+    * @return object
+    *         A promise object that is resolved once the Web Console is closed.
+    */
+-  destroy() {
++  async destroy() {
+     if (this._destroyer) {
+-      return this._destroyer.promise;
++      return this._destroyer;
+     }
+ 
+-    HUDService.consoles.delete(this.hudId);
+-
+-    this._destroyer = defer();
++    this._destroyer = (async function () {
++      HUDService.consoles.delete(this.hudId);
+ 
+-    // The document may already be removed
+-    if (this.chromeUtilsWindow && this.mainPopupSet) {
+-      let popupset = this.mainPopupSet;
+-      let panels = popupset.querySelectorAll("panel[hudId=" + this.hudId + "]");
+-      for (let panel of panels) {
+-        panel.hidePopup();
++      // The document may already be removed
++      if (this.chromeUtilsWindow && this.mainPopupSet) {
++        let popupset = this.mainPopupSet;
++        let panels = popupset.querySelectorAll("panel[hudId=" + this.hudId + "]");
++        for (let panel of panels) {
++          panel.hidePopup();
++        }
+       }
 -    }
-+    let require = this.initDevTools("CommandLine");
-+    let { HUDService } = require("devtools/client/webconsole/hudservice");
-+    let { console } = Cu.import("resource://gre/modules/Console.jsm", {});
-+    HUDService.openBrowserConsoleOrFocus().catch(console.error);
  
-     if (cmdLine.state == Ci.nsICommandLine.STATE_REMOTE_AUTO) {
-       cmdLine.preventDefault = true;
-     }
+-    let onDestroy = Task.async(function* () {
++      if (this.ui) {
++        await this.ui.destroy();
++      }
++
+       if (!this._browserConsole) {
+         try {
+-          yield this.target.activeTab.focus();
++          await this.target.activeTab.focus();
+         } catch (ex) {
+           // Tab focus can fail if the tab or target is closed.
+         }
+       }
+ 
+       let id = WebConsoleUtils.supportsString(this.hudId);
+       Services.obs.notifyObservers(id, "web-console-destroyed");
+-      this._destroyer.resolve(null);
+-    }.bind(this));
++    }.bind(this))();
+ 
+-    if (this.ui) {
+-      this.ui.destroy().then(onDestroy);
+-    } else {
+-      onDestroy();
+-    }
+-
+-    return this._destroyer.promise;
++    return this._destroyer;
    },
+ };
  
-   // Open the toolbox on the selected tab once the browser starts up.
-   handleDevToolsFlag: function (window) {
+ /**
+  * A BrowserConsole instance is an interactive console initialized *per target*
+  * that displays console log data as well as provides an interactive terminal to
+  * manipulate the target's document content.
+  *
+@@ -654,32 +645,28 @@ BrowserConsole.prototype = extend(WebCon
+   /**
+    * Destroy the object.
+    *
+    * @return object
+    *         A promise object that is resolved once the Browser Console is closed.
+    */
+   destroy() {
+     if (this._bcDestroyer) {
+-      return this._bcDestroyer.promise;
++      return this._bcDestroyer;
+     }
+ 
+-    this._telemetry.toolClosed("browserconsole");
+-
+-    this._bcDestroyer = defer();
++    this._bcDestroyer = (async function () {
++      this._telemetry.toolClosed("browserconsole");
++      await this.$destroy();
++      await this.target.client.close();
++      HUDService._browserConsoleID = null;
++      this.chromeWindow.close();
++    }.bind(this))();
+ 
+-    let chromeWindow = this.chromeWindow;
+-    this.$destroy().then(() =>
+-      this.target.client.close().then(() => {
+-        HUDService._browserConsoleID = null;
+-        chromeWindow.close();
+-        this._bcDestroyer.resolve(null);
+-      }));
+-
+-    return this._bcDestroyer.promise;
++    return this._bcDestroyer;
+   },
+ });
+ 
+ const HUDService = new HUD_SERVICE();
+ exports.HUDService = HUDService;
+ 
+ /**
+  * The ShutdownObserver listens for app shutdown and saves the current state
