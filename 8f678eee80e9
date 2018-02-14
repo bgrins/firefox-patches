@@ -1,0 +1,2836 @@
+
+# HG changeset patch
+# User Brendan Dahl <brendan.dahl@gmail.com>
+# Date 1517866438 28800
+# Node ID 8f678eee80e947d3a17fa4a8841ad1fb35ce5bad
+# Parent  fe3bb8fb5c60de3a9dfd2cca0a3a171fa7ccbd58
+Bug 1418403 - Remove viewing source in a standalone window. r?jryans
+
+Along with removing the view source standalone windows and prefs this patch:
+1) Re-structures several of the view source tests that were only testing the old
+standalone windows to now test view source in tab.
+2) Adds support viewSourceUtils.viewSource() to open a browser window when there
+aren't any open (for browser toolbox view source).
+3) Cleans up some of the API for viewSourceUtils and removes the old deprecated
+ways of calling it.
+
+MozReview-Commit-ID: DI6sgZwbCf
+
+
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -1606,18 +1606,16 @@
+ 
+ // Don't limit how many nodes we care about on desktop:
+ pref("reader.parse-node-limit", 0);
+ 
+ // On desktop, we want the URLs to be included here for ease of debugging,
+ // and because (normally) these errors are not persisted anywhere.
+ pref("reader.errors.includeURLs", true);
+ 
+-pref("view_source.tab", true);
+-
+ pref("dom.serviceWorkers.enabled", true);
+ 
+ // Enable Push API.
+ pref("dom.push.enabled", true);
+ 
+ // These are the thumbnail width/height set in about:newtab.
+ // If you change this, ENSURE IT IS THE SAME SIZE SET
+ // by about:newtab. These values are in CSS pixels.
+diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+--- a/browser/base/content/browser.js
++++ b/browser/base/content/browser.js
+@@ -2569,68 +2569,63 @@
+                                  .outerWindowID;
+     let URL = browser.currentURI.spec;
+     args = { browser, outerWindowID, URL };
+   } else {
+     args = aArgsOrDocument;
+   }
+ 
+   let viewInternal = () => {
+-    let inTab = Services.prefs.getBoolPref("view_source.tab");
+-    if (inTab) {
+-      let tabBrowser = gBrowser;
+-      let preferredRemoteType;
+-      if (args.browser) {
+-        preferredRemoteType = args.browser.remoteType;
+-      } else {
+-        if (!tabBrowser) {
+-          throw new Error("BrowserViewSourceOfDocument should be passed the " +
+-                          "subject browser if called from a window without " +
+-                          "gBrowser defined.");
+-        }
+-        // Some internal URLs (such as specific chrome: and about: URLs that are
+-        // not yet remote ready) cannot be loaded in a remote browser.  View
+-        // source in tab expects the new view source browser's remoteness to match
+-        // that of the original URL, so disable remoteness if necessary for this
+-        // URL.
+-        preferredRemoteType =
+-          E10SUtils.getRemoteTypeForURI(args.URL, gMultiProcessBrowser);
+-      }
+-
+-      // In the case of popups, we need to find a non-popup browser window.
+-      if (!tabBrowser || !window.toolbar.visible) {
+-        // This returns only non-popup browser windows by default.
+-        let browserWindow = RecentWindow.getMostRecentBrowserWindow();
+-        tabBrowser = browserWindow.gBrowser;
+-      }
+-
+-      // `viewSourceInBrowser` will load the source content from the page
+-      // descriptor for the tab (when possible) or fallback to the network if
+-      // that fails.  Either way, the view source module will manage the tab's
+-      // location, so use "about:blank" here to avoid unnecessary redundant
+-      // requests.
+-      let tab = tabBrowser.loadOneTab("about:blank", {
+-        relatedToCurrent: true,
+-        inBackground: false,
+-        preferredRemoteType,
+-        sameProcessAsFrameLoader: args.browser ? args.browser.frameLoader : null,
+-        triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
+-      });
+-      args.viewSourceBrowser = tabBrowser.getBrowserForTab(tab);
+-      top.gViewSourceUtils.viewSourceInBrowser(args);
++    let tabBrowser = gBrowser;
++    let preferredRemoteType;
++    if (args.browser) {
++      preferredRemoteType = args.browser.remoteType;
+     } else {
+-      top.gViewSourceUtils.viewSource(args);
+-    }
++      if (!tabBrowser) {
++        throw new Error("BrowserViewSourceOfDocument should be passed the " +
++                        "subject browser if called from a window without " +
++                        "gBrowser defined.");
++      }
++      // Some internal URLs (such as specific chrome: and about: URLs that are
++      // not yet remote ready) cannot be loaded in a remote browser.  View
++      // source in tab expects the new view source browser's remoteness to match
++      // that of the original URL, so disable remoteness if necessary for this
++      // URL.
++      preferredRemoteType =
++        E10SUtils.getRemoteTypeForURI(args.URL, gMultiProcessBrowser);
++    }
++
++    // In the case of popups, we need to find a non-popup browser window.
++    if (!tabBrowser || !window.toolbar.visible) {
++      // This returns only non-popup browser windows by default.
++      let browserWindow = RecentWindow.getMostRecentBrowserWindow();
++      tabBrowser = browserWindow.gBrowser;
++    }
++
++    // `viewSourceInBrowser` will load the source content from the page
++    // descriptor for the tab (when possible) or fallback to the network if
++    // that fails.  Either way, the view source module will manage the tab's
++    // location, so use "about:blank" here to avoid unnecessary redundant
++    // requests.
++    let tab = tabBrowser.loadOneTab("about:blank", {
++      relatedToCurrent: true,
++      inBackground: false,
++      preferredRemoteType,
++      sameProcessAsFrameLoader: args.browser ? args.browser.frameLoader : null,
++      triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
++    });
++    args.viewSourceBrowser = tabBrowser.getBrowserForTab(tab);
++    top.gViewSourceUtils.viewSourceInBrowser(args);
+   };
+ 
+   // Check if external view source is enabled.  If so, try it.  If it fails,
+   // fallback to internal view source.
+   if (Services.prefs.getBoolPref("view_source.editor.external")) {
+     top.gViewSourceUtils
+-       .openInExternalEditor(args, null, null, null, result => {
++       .openInExternalEditor(args, result => {
+       if (!result) {
+         viewInternal();
+       }
+     });
+   } else {
+     // Display using internal view source
+     viewInternal();
+   }
+@@ -4480,18 +4475,17 @@
+         // Get the URI either from a channel or a pseudo-object
+         if (aRequest instanceof nsIChannel || "URI" in aRequest) {
+           location = aRequest.URI;
+ 
+           // For keyword URIs clear the user typed value since they will be changed into real URIs
+           if (location.scheme == "keyword" && aWebProgress.isTopLevel)
+             gBrowser.userTypedValue = null;
+ 
+-          canViewSource = !Services.prefs.getBoolPref("view_source.tab") ||
+-                          location.scheme != "view-source";
++          canViewSource = location.scheme != "view-source";
+ 
+           if (location.spec != "about:blank") {
+             switch (aStatus) {
+               case Components.results.NS_ERROR_NET_TIMEOUT:
+                 msg = gNavigatorBundle.getString("nv_timeout");
+                 break;
+             }
+           }
+diff --git a/browser/base/content/nsContextMenu.js b/browser/base/content/nsContextMenu.js
+--- a/browser/base/content/nsContextMenu.js
++++ b/browser/base/content/nsContextMenu.js
+@@ -861,19 +861,18 @@
+   },
+ 
+   reload(event) {
+     BrowserReloadOrDuplicate(event);
+   },
+ 
+   // View Partial Source
+   viewPartialSource(aContext) {
+-    let inWindow = !Services.prefs.getBoolPref("view_source.tab");
+     let {browser} = this;
+-    let openSelectionFn = inWindow ? null : function() {
++    let openSelectionFn = function() {
+       let tabBrowser = gBrowser;
+       // In the case of popups, we need to find a non-popup browser window.
+       // We might also not have a tabBrowser reference (if this isn't in a
+       // a tabbrowser scope) or might have a fake/stub tabbrowser reference
+       // (in the sidebar). Deal with those cases:
+       if (!tabBrowser || !tabBrowser.loadOneTab || !window.toolbar.visible) {
+         // This returns only non-popup browser windows by default.
+         let browserWindow = RecentWindow.getMostRecentBrowserWindow();
+diff --git a/browser/base/content/test/general/browser_viewSourceInTabOnViewSource.js b/browser/base/content/test/general/browser_viewSourceInTabOnViewSource.js
+--- a/browser/base/content/test/general/browser_viewSourceInTabOnViewSource.js
++++ b/browser/base/content/test/general/browser_viewSourceInTabOnViewSource.js
+@@ -17,22 +17,16 @@
+ var with_new_tab_opened = async function(options, taskFn) {
+   let busyPromise = wait_while_tab_is_busy();
+   let tab = await BrowserTestUtils.openNewForegroundTab(options.gBrowser, options.url, false);
+   await busyPromise;
+   await taskFn(tab.linkedBrowser);
+   gBrowser.removeTab(tab);
+ };
+ 
+-add_task(async function() {
+-  await SpecialPowers.pushPrefEnv({"set": [
+-                                    ["view_source.tab", true],
+-                                  ]});
+-});
+-
+ add_task(async function test_regular_page() {
+   function test_expect_view_source_enabled(browser) {
+     ok(!XULBrowserWindow.canViewSource.hasAttribute("disabled"),
+        "View Source should be enabled");
+   }
+ 
+   await with_new_tab_opened({
+     gBrowser,
+diff --git a/browser/base/content/viewSourceOverlay.xul b/browser/base/content/viewSourceOverlay.xul
+deleted file mode 100644
+--- a/browser/base/content/viewSourceOverlay.xul
++++ /dev/null
+@@ -1,26 +0,0 @@
+-<?xml version="1.0"?>
+-# This Source Code Form is subject to the terms of the Mozilla Public
+-# License, v. 2.0. If a copy of the MPL was not distributed with this
+-# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+-
+-<?xul-overlay href="chrome://browser/content/baseMenuOverlay.xul"?>
+-
+-<overlay id="viewSourceOverlay"
+-         xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+-         xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
+-
+-<window id="viewSource">
+-  <commandset id="baseMenuCommandSet"/>
+-  <keyset id="baseMenuKeyset"/>
+-  <stringbundleset id="stringbundleset"/>
+-</window>
+-
+-<menubar id="viewSource-main-menubar">
+-#ifdef XP_MACOSX
+-  <menu id="windowMenu"/>
+-  <menupopup id="menu_ToolsPopup"/>
+-#endif
+-  <menu id="helpMenu"/>
+-</menubar>
+-
+-</overlay>
+diff --git a/browser/base/jar.mn b/browser/base/jar.mn
+--- a/browser/base/jar.mn
++++ b/browser/base/jar.mn
+@@ -1,15 +1,13 @@
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ browser.jar:
+ %  content browser %content/browser/ contentaccessible=yes
+-%  overlay chrome://global/content/viewSource.xul chrome://browser/content/viewSourceOverlay.xul
+-%  overlay chrome://global/content/viewPartialSource.xul chrome://browser/content/viewSourceOverlay.xul
+ 
+         content/browser/aboutDialog-appUpdater.js     (content/aboutDialog-appUpdater.js)
+ *       content/browser/aboutDialog.xul               (content/aboutDialog.xul)
+         content/browser/aboutDialog.js                (content/aboutDialog.js)
+         content/browser/aboutDialog.css               (content/aboutDialog.css)
+         content/browser/aboutRobots.xhtml             (content/aboutRobots.xhtml)
+ *       content/browser/abouthome/aboutHome.xhtml     (content/abouthome/aboutHome.xhtml)
+         content/browser/abouthome/aboutHome.js        (content/abouthome/aboutHome.js)
+@@ -128,17 +126,16 @@
+ *       content/browser/webext-panels.xul             (content/webext-panels.xul)
+ *       content/browser/baseMenuOverlay.xul           (content/baseMenuOverlay.xul)
+         content/browser/nsContextMenu.js              (content/nsContextMenu.js)
+ # XXX: We should exclude this one as well (bug 71895)
+ *       content/browser/hiddenWindow.xul              (content/hiddenWindow.xul)
+ #ifdef XP_MACOSX
+ *       content/browser/macBrowserOverlay.xul         (content/macBrowserOverlay.xul)
+ #endif
+-*       content/browser/viewSourceOverlay.xul         (content/viewSourceOverlay.xul)
+ #ifndef XP_MACOSX
+ *       content/browser/webrtcIndicator.xul           (content/webrtcIndicator.xul)
+         content/browser/webrtcIndicator.js            (content/webrtcIndicator.js)
+ #endif
+ # the following files are browser-specific overrides
+ *       content/browser/license.html                  (/toolkit/content/license.html)
+ % override chrome://global/content/license.html chrome://browser/content/license.html
+         content/browser/blockedSite.xhtml               (content/blockedSite.xhtml)
+diff --git a/devtools/client/shared/view-source.js b/devtools/client/shared/view-source.js
+--- a/devtools/client/shared/view-source.js
++++ b/devtools/client/shared/view-source.js
+@@ -165,21 +165,14 @@
+  *
+  * @param {Toolbox} toolbox
+  * @param {string} sourceURL
+  * @param {number} sourceLine
+  *
+  * @return {Promise}
+  */
+ exports.viewSource = Task.async(function* (toolbox, sourceURL, sourceLine) {
+-  // Attempt to access view source via a browser first, which may display it in
+-  // a tab, if enabled.
+-  let browserWin = Services.wm.getMostRecentWindow(gDevTools.chromeWindowType);
+-  if (browserWin && browserWin.BrowserViewSourceOfDocument) {
+-    return browserWin.BrowserViewSourceOfDocument({
+-      URL: sourceURL,
+-      lineNumber: sourceLine
+-    });
+-  }
+   let utils = toolbox.gViewSourceUtils;
+-  utils.viewSource(sourceURL, null, toolbox.doc, sourceLine || 0);
+-  return null;
++  utils.viewSource({
++    URL: sourceURL,
++    lineNumber: sourceLine || 0,
++  });
+ });
+diff --git a/devtools/client/webconsole/hudservice.js b/devtools/client/webconsole/hudservice.js
+--- a/devtools/client/webconsole/hudservice.js
++++ b/devtools/client/webconsole/hudservice.js
+@@ -392,27 +392,17 @@
+    * Open a link in Firefox's view source.
+    *
+    * @param string sourceURL
+    *        The URL of the file.
+    * @param integer sourceLine
+    *        The line number which should be highlighted.
+    */
+   viewSource(sourceURL, sourceLine) {
+-    // Attempt to access view source via a browser first, which may display it in
+-    // a tab, if enabled.
+-    let browserWin = Services.wm.getMostRecentWindow(gDevTools.chromeWindowType);
+-    if (browserWin && browserWin.BrowserViewSourceOfDocument) {
+-      return browserWin.BrowserViewSourceOfDocument({
+-        URL: sourceURL,
+-        lineNumber: sourceLine
+-      });
+-    }
+-    return this.gViewSourceUtils.viewSource(
+-      sourceURL, null, this.iframeWindow.document, sourceLine || 0);
++    this.gViewSourceUtils.viewSource({ URL: sourceURL, lineNumber: sourceLine || 0 });
+   },
+ 
+   /**
+    * Tries to open a Stylesheet file related to the web page for the web console
+    * instance in the Style Editor. If the file is not found, it is opened in
+    * source view instead.
+    *
+    * Manually handle the case where toolbox does not exist (Browser Console).
+diff --git a/toolkit/components/viewsource/ViewSourceBrowser.jsm b/toolkit/components/viewsource/ViewSourceBrowser.jsm
+--- a/toolkit/components/viewsource/ViewSourceBrowser.jsm
++++ b/toolkit/components/viewsource/ViewSourceBrowser.jsm
+@@ -21,20 +21,16 @@
+ // needed into any new ones.
+ var gKnownBrowsers = new WeakSet();
+ 
+ /**
+  * ViewSourceBrowser manages the view source <browser> from the chrome side.
+  * It's companion frame script, viewSource-content.js, needs to be loaded as a
+  * frame script into the browser being managed.
+  *
+- * For a view source window using viewSource.xul, the script viewSource.js in
+- * the window extends an instance of this with more window specific functions.
+- * The page script takes care of loading the companion frame script.
+- *
+  * For a view source tab (or some other non-window case), an instance of this is
+  * created by viewSourceUtils.js to wrap the <browser>.  The frame script will
+  * be loaded by this module at construction time.
+  */
+ this.ViewSourceBrowser = function ViewSourceBrowser(aBrowser) {
+   this._browser = aBrowser;
+   this.init();
+ };
+@@ -72,23 +68,18 @@
+    * This should be called as soon as the script loads. When this function
+    * executes, we can assume the DOM content has not yet loaded.
+    */
+   init() {
+     this.messages.forEach((msgName) => {
+       this.mm.addMessageListener(msgName, this);
+     });
+ 
+-    // If we have a known <browser> already, load the frame script here.  This
+-    // is not true for the window case, as the element does not exist until the
+-    // XUL document loads.  For that case, the frame script is loaded by
+-    // viewSource.js.
+-    if (this._browser) {
+-      this.loadFrameScript();
+-    }
++    // If we have a known <browser> already, load the frame script here.
++    this.loadFrameScript();
+   },
+ 
+   /**
+    * This should be called when the window is closing. This function should
+    * clean up event and message listeners.
+    */
+   uninit() {
+     this.messages.forEach((msgName) => {
+@@ -155,17 +146,16 @@
+     }
+     return this._bundle = Services.strings.createBundle(BUNDLE_URL);
+   },
+ 
+   /**
+    * Loads the source for a URL while applying some optional features if
+    * enabled.
+    *
+-   * For the viewSource.xul window, this is called by onXULLoaded above.
+    * For view source in a specific browser, this is manually called after
+    * this object is constructed.
+    *
+    * This takes a single object argument containing:
+    *
+    *   URL (required):
+    *     A string URL for the page we'd like to view the source of.
+    *   browser:
+diff --git a/toolkit/components/viewsource/content/viewPartialSource.js b/toolkit/components/viewsource/content/viewPartialSource.js
+deleted file mode 100644
+--- a/toolkit/components/viewsource/content/viewPartialSource.js
++++ /dev/null
+@@ -1,24 +0,0 @@
+-// -*- indent-tabs-mode: nil; js-indent-level: 2 -*-
+-
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-/* import-globals-from viewSource.js */
+-
+-ChromeUtils.import("resource://gre/modules/Services.jsm");
+-
+-function onLoadViewPartialSource() {
+-  // check the view_source.wrap_long_lines pref
+-  // and set the menuitem's checked attribute accordingly
+-  let wrapLongLines = Services.prefs.getBoolPref("view_source.wrap_long_lines");
+-  document.getElementById("menu_wrapLongLines")
+-          .setAttribute("checked", wrapLongLines);
+-  document.getElementById("menu_highlightSyntax")
+-          .setAttribute("checked",
+-                        Services.prefs.getBoolPref("view_source.syntax_highlight"));
+-
+-  let args = window.arguments[0];
+-  viewSourceChrome.loadViewSourceFromSelection(args.URI, args.drawSelection, args.baseURI);
+-  window.content.focus();
+-}
+diff --git a/toolkit/components/viewsource/content/viewPartialSource.xul b/toolkit/components/viewsource/content/viewPartialSource.xul
+deleted file mode 100644
+--- a/toolkit/components/viewsource/content/viewPartialSource.xul
++++ /dev/null
+@@ -1,163 +0,0 @@
+-<?xml version="1.0"?>
+-# -*- Mode: HTML -*-
+-# This Source Code Form is subject to the terms of the Mozilla Public
+-# License, v. 2.0. If a copy of the MPL was not distributed with this
+-# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+-
+-<?xml-stylesheet href="chrome://global/skin/" type="text/css"?>
+-<?xml-stylesheet href="chrome://global/content/viewSource.css" type="text/css"?>
+-<?xml-stylesheet href="chrome://mozapps/skin/viewsource/viewsource.css" type="text/css"?>
+-<?xul-overlay href="chrome://global/content/editMenuOverlay.xul"?>
+-
+-<!DOCTYPE window [
+-<!ENTITY % brandDTD SYSTEM "chrome://branding/locale/brand.dtd" >
+-%brandDTD;
+-<!ENTITY % sourceDTD SYSTEM "chrome://global/locale/viewSource.dtd" >
+-%sourceDTD;
+-]>
+-
+-<window id="viewSource"
+-        xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+-        onload="onLoadViewPartialSource();"
+-        contenttitlesetting="true"
+-        title="&mainWindow.title;"
+-        titlemodifier="&mainWindow.titlemodifier;"
+-        titlepreface=""
+-        titlemenuseparator ="&mainWindow.titlemodifierseparator;"
+-        windowtype="navigator:view-source"
+-        width="500" height="300"
+-        screenX="10" screenY="10"
+-        persist="screenX screenY width height sizemode">
+-
+-  <script type="application/javascript" src="chrome://global/content/globalOverlay.js"/>
+-  <script type="application/javascript" src="chrome://global/content/printUtils.js"/>
+-  <script type="application/javascript" src="chrome://global/content/viewSource.js"/>
+-  <script type="application/javascript" src="chrome://global/content/viewPartialSource.js"/>
+-  <script type="application/javascript" src="chrome://global/content/viewZoomOverlay.js"/>
+-  <script type="application/javascript" src="chrome://global/content/contentAreaUtils.js"/>
+-
+-  <stringbundle id="viewSourceBundle" src="chrome://global/locale/viewSource.properties"/>
+-
+-  <command id="cmd_savePage" oncommand="ViewSourceSavePage();"/>
+-  <command id="cmd_print" oncommand="PrintUtils.printWindow(gBrowser.outerWindowID, gBrowser);"/>
+-  <command id="cmd_printpreview" oncommand="PrintUtils.printPreview(PrintPreviewListener);"/>
+-  <command id="cmd_pagesetup" oncommand="PrintUtils.showPageSetup();"/>
+-  <command id="cmd_close" oncommand="window.close();"/>
+-  <commandset id="editMenuCommands"/>
+-  <command id="cmd_find"
+-           oncommand="document.getElementById('FindToolbar').onFindCommand();"/>
+-  <command id="cmd_findAgain"
+-           oncommand="document.getElementById('FindToolbar').onFindAgainCommand(false);"/>
+-  <command id="cmd_findPrevious"
+-           oncommand="document.getElementById('FindToolbar').onFindAgainCommand(true);"/>
+-  <command id="cmd_goToLine" oncommand="viewSourceChrome.promptAndGoToLine();" disabled="true"/>
+-  <command id="cmd_highlightSyntax" oncommand="viewSourceChrome.toggleSyntaxHighlighting();"/>
+-  <command id="cmd_wrapLongLines" oncommand="viewSourceChrome.toggleWrapping();"/>
+-  <command id="cmd_textZoomReduce" oncommand="ZoomManager.reduce();"/>
+-  <command id="cmd_textZoomEnlarge" oncommand="ZoomManager.enlarge();"/>
+-  <command id="cmd_textZoomReset" oncommand="ZoomManager.reset();"/>
+-
+-  <keyset id="editMenuKeys"/>
+-  <keyset id="viewSourceKeys">
+-    <key id="key_savePage" key="&savePageCmd.commandkey;" modifiers="accel" command="cmd_savePage"/>
+-    <key id="key_print" key="&printCmd.commandkey;" modifiers="accel" command="cmd_print"/>
+-    <key id="key_close" key="&closeCmd.commandkey;" modifiers="accel" command="cmd_close"/>
+-    <key keycode="VK_ESCAPE" command="cmd_close"/>
+-
+-    <key id="key_textZoomEnlarge" key="&textEnlarge.commandkey;" command="cmd_textZoomEnlarge" modifiers="accel"/>
+-    <key id="key_textZoomEnlarge2" key="&textEnlarge.commandkey2;" command="cmd_textZoomEnlarge" modifiers="accel"/>
+-    <key id="key_textZoomEnlarge3" key="&textEnlarge.commandkey3;" command="cmd_textZoomEnlarge" modifiers="accel"/>
+-    <key id="key_textZoomReduce"  key="&textReduce.commandkey;" command="cmd_textZoomReduce" modifiers="accel"/>
+-    <key id="key_textZoomReduce2"  key="&textReduce.commandkey2;" command="cmd_textZoomReduce" modifiers="accel"/>
+-    <key id="key_textZoomReset" key="&textReset.commandkey;" command="cmd_textZoomReset" modifiers="accel"/>
+-    <key id="key_textZoomReset2" key="&textReset.commandkey2;" command="cmd_textZoomReset" modifiers="accel"/>
+-  </keyset>
+-
+-  <menupopup id="viewSourceContextMenu">
+-    <menuitem id="cMenu_findAgain"/>
+-    <menuseparator/>
+-    <menuitem id="cMenu_copy"/>
+-    <menuitem id="context-copyLink"
+-              label="&copyLinkCmd.label;"
+-              accesskey="&copyLinkCmd.accesskey;"
+-              oncommand="viewSourceChrome.onContextMenuCopyLinkOrEmail();"/>
+-    <menuitem id="context-copyEmail"
+-              label="&copyEmailCmd.label;"
+-              accesskey="&copyEmailCmd.accesskey;"
+-              oncommand="viewSourceChrome.onContextMenuCopyLinkOrEmail();"/>
+-    <menuseparator/>
+-    <menuitem id="cMenu_selectAll"/>
+-  </menupopup>
+-
+-  <!-- Menu -->
+-  <toolbox id="viewSource-toolbox">
+-    <menubar id="viewSource-main-menubar">
+-
+-      <menu id="menu_file" label="&fileMenu.label;" accesskey="&fileMenu.accesskey;">
+-        <menupopup id="menu_FilePopup">
+-          <menuitem key="key_savePage" command="cmd_savePage" id="menu_savePage"
+-                    label="&savePageCmd.label;" accesskey="&savePageCmd.accesskey;"/>
+-          <menuitem command="cmd_pagesetup" id="menu_pageSetup"
+-                    label="&pageSetupCmd.label;" accesskey="&pageSetupCmd.accesskey;"/>
+-#ifndef XP_MACOSX
+-          <menuitem command="cmd_printpreview" id="menu_printPreview"
+-                    label="&printPreviewCmd.label;" accesskey="&printPreviewCmd.accesskey;"/>
+-#endif
+-          <menuitem key="key_print" command="cmd_print" id="menu_print"
+-                    label="&printCmd.label;" accesskey="&printCmd.accesskey;"/>
+-          <menuseparator/>
+-          <menuitem key="key_close" command="cmd_close" id="menu_close"
+-                    label="&closeCmd.label;" accesskey="&closeCmd.accesskey;"/>
+-        </menupopup>
+-      </menu>
+-
+-      <menu id="menu_edit">
+-        <menupopup id="editmenu-popup">
+-          <menuitem id="menu_undo"/>
+-          <menuitem id="menu_redo"/>
+-          <menuseparator/>
+-          <menuitem id="menu_cut"/>
+-          <menuitem id="menu_copy"/>
+-          <menuitem id="menu_paste"/>
+-          <menuitem id="menu_delete"/>
+-          <menuseparator/>
+-          <menuitem id="menu_selectAll"/>
+-          <menuseparator/>
+-          <menuitem id="menu_find"/>
+-          <menuitem id="menu_findAgain"/>
+-        </menupopup>
+-      </menu>
+-
+-      <menu id="menu_view" label="&viewMenu.label;" accesskey="&viewMenu.accesskey;">
+-        <menupopup id="viewmenu-popup">
+-          <menu id="viewTextZoomMenu" label="&menu_textSize.label;" accesskey="&menu_textSize.accesskey;">
+-            <menupopup>
+-              <menuitem id="menu_textEnlarge" command="cmd_textZoomEnlarge"
+-                        label="&menu_textEnlarge.label;" accesskey="&menu_textEnlarge.accesskey;"
+-                        key="key_textZoomEnlarge"/>
+-              <menuitem id="menu_textReduce" command="cmd_textZoomReduce"
+-                        label="&menu_textReduce.label;" accesskey="&menu_textReduce.accesskey;"
+-                        key="key_textZoomReduce"/>
+-              <menuseparator/>
+-              <menuitem id="menu_textReset" command="cmd_textZoomReset"
+-                        label="&menu_textReset.label;" accesskey="&menu_textReset.accesskey;"
+-                        key="key_textZoomReset"/>
+-            </menupopup>
+-          </menu>
+-          <menuseparator/>
+-          <menuitem id="menu_wrapLongLines" type="checkbox" command="cmd_wrapLongLines"
+-                    label="&menu_wrapLongLines.title;" accesskey="&menu_wrapLongLines.accesskey;"/>
+-          <menuitem type="checkbox" id="menu_highlightSyntax" command="cmd_highlightSyntax"
+-                    label="&menu_highlightSyntax.label;" accesskey="&menu_highlightSyntax.accesskey;"/>
+-        </menupopup>
+-      </menu>
+-    </menubar>
+-  </toolbox>
+-
+-  <vbox id="appcontent" flex="1">
+-    <browser id="content" type="content" primary="true" name="content" src="about:blank" flex="1"
+-             disablehistory="true" context="viewSourceContextMenu" />
+-    <findbar id="FindToolbar" browserid="content"/>
+-  </vbox>
+-
+-</window>
+diff --git a/toolkit/components/viewsource/content/viewSource.css b/toolkit/components/viewsource/content/viewSource.css
+deleted file mode 100644
+--- a/toolkit/components/viewsource/content/viewSource.css
++++ /dev/null
+@@ -1,7 +0,0 @@
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-toolbar[printpreview="true"] {
+-  -moz-binding: url("chrome://global/content/printPreviewBindings.xml#printpreviewtoolbar");
+-}
+diff --git a/toolkit/components/viewsource/content/viewSource.js b/toolkit/components/viewsource/content/viewSource.js
+deleted file mode 100644
+--- a/toolkit/components/viewsource/content/viewSource.js
++++ /dev/null
+@@ -1,866 +0,0 @@
+-// -*- indent-tabs-mode: nil; js-indent-level: 2 -*-
+-
+-/* import-globals-from ../../../content/globalOverlay.js */
+-/* import-globals-from ../../printing/content/printUtils.js */
+-/* import-globals-from ../../../content/viewZoomOverlay.js */
+-/* import-globals-from ../../../content/contentAreaUtils.js */
+-
+-/* This Source Code Form is subject to the terms of the Mozilla Public
+- * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-ChromeUtils.import("resource://gre/modules/XPCOMUtils.jsm");
+-ChromeUtils.import("resource://gre/modules/ViewSourceBrowser.jsm");
+-
+-ChromeUtils.defineModuleGetter(this, "Services",
+-  "resource://gre/modules/Services.jsm");
+-ChromeUtils.defineModuleGetter(this, "CharsetMenu",
+-  "resource://gre/modules/CharsetMenu.jsm");
+-ChromeUtils.defineModuleGetter(this, "Deprecated",
+-  "resource://gre/modules/Deprecated.jsm");
+-
+-/* global gBrowser, gViewSourceBundle, gContextMenu */
+-[
+-  ["gBrowser",          "content"],
+-  ["gViewSourceBundle", "viewSourceBundle"],
+-  ["gContextMenu",      "viewSourceContextMenu"]
+-].forEach(function([name, id]) {
+-  Object.defineProperty(window, name, {
+-    configurable: true,
+-    enumerable: true,
+-    get() {
+-      var element = document.getElementById(id);
+-      if (!element)
+-        return null;
+-      delete window[name];
+-      return window[name] = element;
+-    },
+-  });
+-});
+-
+-/**
+- * ViewSourceChrome is the primary interface for interacting with
+- * the view source browser from a self-contained window.  It extends
+- * ViewSourceBrowser with additional things needed inside the special window.
+- *
+- * It initializes itself on script load.
+- */
+-function ViewSourceChrome() {
+-  ViewSourceBrowser.call(this);
+-}
+-
+-ViewSourceChrome.prototype = {
+-  __proto__: ViewSourceBrowser.prototype,
+-
+-  /**
+-   * The <browser> that will be displaying the view source content.
+-   */
+-  get browser() {
+-    return gBrowser;
+-  },
+-
+-  /**
+-   * The context menu, when opened from the content process, sends
+-   * up a chunk of serialized data describing the items that the
+-   * context menu is being opened on. This allows us to avoid using
+-   * CPOWs.
+-   */
+-  contextMenuData: {},
+-
+-  /**
+-   * These are the messages that ViewSourceChrome will listen for
+-   * from the frame script it injects. Any message names added here
+-   * will automatically have ViewSourceChrome listen for those messages,
+-   * and remove the listeners on teardown.
+-   */
+-  messages: ViewSourceBrowser.prototype.messages.concat([
+-    "ViewSource:SourceLoaded",
+-    "ViewSource:SourceUnloaded",
+-    "ViewSource:Close",
+-    "ViewSource:OpenURL",
+-    "ViewSource:ContextMenuOpening",
+-  ]),
+-
+-  /**
+-   * This called via ViewSourceBrowser's constructor.  This should be called as
+-   * soon as the script loads.  When this function executes, we can assume the
+-   * DOM content has not yet loaded.
+-   */
+-  init() {
+-    this.mm.loadFrameScript("chrome://global/content/viewSource-content.js", true);
+-
+-    this.shouldWrap = Services.prefs.getBoolPref("view_source.wrap_long_lines");
+-    this.shouldHighlight =
+-      Services.prefs.getBoolPref("view_source.syntax_highlight");
+-
+-    addEventListener("load", this);
+-    addEventListener("unload", this);
+-    addEventListener("AppCommand", this, true);
+-    addEventListener("MozSwipeGesture", this, true);
+-
+-    ViewSourceBrowser.prototype.init.call(this);
+-  },
+-
+-  /**
+-   * This should be called when the window is closing. This function should
+-   * clean up event and message listeners.
+-   */
+-  uninit() {
+-    ViewSourceBrowser.prototype.uninit.call(this);
+-
+-    // "load" event listener is removed in its handler, to
+-    // ensure we only fire it once.
+-    removeEventListener("unload", this);
+-    removeEventListener("AppCommand", this, true);
+-    removeEventListener("MozSwipeGesture", this, true);
+-    gContextMenu.removeEventListener("popupshowing", this);
+-    gContextMenu.removeEventListener("popuphidden", this);
+-    Services.els.removeSystemEventListener(this.browser, "dragover", this,
+-                                           true);
+-    Services.els.removeSystemEventListener(this.browser, "drop", this, true);
+-  },
+-
+-  /**
+-   * Anything added to the messages array will get handled here, and should
+-   * get dispatched to a specific function for the message name.
+-   */
+-  receiveMessage(message) {
+-    let data = message.data;
+-
+-    switch (message.name) {
+-      // Begin messages from super class
+-      case "ViewSource:PromptAndGoToLine":
+-        this.promptAndGoToLine();
+-        break;
+-      case "ViewSource:GoToLine:Success":
+-        this.onGoToLineSuccess(data.lineNumber);
+-        break;
+-      case "ViewSource:GoToLine:Failed":
+-        this.onGoToLineFailed();
+-        break;
+-      case "ViewSource:StoreWrapping":
+-        this.storeWrapping(data.state);
+-        break;
+-      case "ViewSource:StoreSyntaxHighlighting":
+-        this.storeSyntaxHighlighting(data.state);
+-        break;
+-      // End messages from super class
+-      case "ViewSource:SourceLoaded":
+-        this.onSourceLoaded();
+-        break;
+-      case "ViewSource:SourceUnloaded":
+-        this.onSourceUnloaded();
+-        break;
+-      case "ViewSource:Close":
+-        this.close();
+-        break;
+-      case "ViewSource:OpenURL":
+-        this.openURL(data.URL);
+-        break;
+-      case "ViewSource:ContextMenuOpening":
+-        this.onContextMenuOpening(data.isLink, data.isEmail, data.href);
+-        if (this.browser.isRemoteBrowser) {
+-          this.openContextMenu(data.screenX, data.screenY);
+-        }
+-        break;
+-    }
+-  },
+-
+-  /**
+-   * Any events should get handled here, and should get dispatched to
+-   * a specific function for the event type.
+-   */
+-  handleEvent(event) {
+-    switch (event.type) {
+-      case "unload":
+-        this.uninit();
+-        break;
+-      case "load":
+-        this.onXULLoaded();
+-        break;
+-      case "AppCommand":
+-        this.onAppCommand(event);
+-        break;
+-      case "MozSwipeGesture":
+-        this.onSwipeGesture(event);
+-        break;
+-      case "popupshowing":
+-        this.onContextMenuShowing(event);
+-        break;
+-      case "popuphidden":
+-        this.onContextMenuHidden(event);
+-        break;
+-      case "dragover":
+-        this.onDragOver(event);
+-        break;
+-      case "drop":
+-        this.onDrop(event);
+-        break;
+-    }
+-  },
+-
+-  /**
+-   * Getter that returns whether or not the view source browser
+-   * has history enabled on it.
+-   */
+-  get historyEnabled() {
+-    return !this.browser.hasAttribute("disablehistory");
+-  },
+-
+-  /**
+-   * Getter for the message manager used to communicate with the view source
+-   * browser.
+-   *
+-   * In this window version of view source, we use the window message manager
+-   * for loading scripts and listening for messages so that if we switch
+-   * remoteness of the browser (which we might do if we're attempting to load
+-   * the document source out of the network cache), we automatically re-load
+-   * the frame script.
+-   */
+-  get mm() {
+-    return window.messageManager;
+-  },
+-
+-  /**
+-   * Getter for the nsIWebNavigation of the view source browser.
+-   */
+-  get webNav() {
+-    return this.browser.webNavigation;
+-  },
+-
+-  /**
+-   * Send the browser forward in its history.
+-   */
+-  goForward() {
+-    this.browser.goForward();
+-  },
+-
+-  /**
+-   * Send the browser backward in its history.
+-   */
+-  goBack() {
+-    this.browser.goBack();
+-  },
+-
+-  /**
+-   * This should be called once when the DOM has finished loading. Here we
+-   * set the state of various menu items, and add event listeners to
+-   * DOM nodes.
+-   *
+-   * This is also the place where we handle any arguments that have been
+-   * passed to viewSource.xul.
+-   *
+-   * Modern consumers should pass a single object argument to viewSource.xul:
+-   *
+-   *   URL (required):
+-   *     A string URL for the page we'd like to view the source of.
+-   *   browser:
+-   *     The browser containing the document that we would like to view the
+-   *     source of. This argument is optional if outerWindowID is not passed.
+-   *   outerWindowID (optional):
+-   *     The outerWindowID of the content window containing the document that
+-   *     we want to view the source of. This is the only way of attempting to
+-   *     load the source out of the network cache.
+-   *   lineNumber (optional):
+-   *     The line number to focus on once the source is loaded.
+-   *
+-   * The deprecated API has the opener pass in a number of arguments:
+-   *
+-   * arg[0] - URL string.
+-   * arg[1] - Charset value string in the form 'charset=xxx'.
+-   * arg[2] - Page descriptor from nsIWebPageDescriptor used to load content
+-   *          from the cache.
+-   * arg[3] - Line number to go to.
+-   * arg[4] - Boolean for whether charset was forced by the user
+-   */
+-  onXULLoaded() {
+-    // This handler should only ever run the first time the XUL is loaded.
+-    removeEventListener("load", this);
+-
+-    let wrapMenuItem = document.getElementById("menu_wrapLongLines");
+-    if (this.shouldWrap) {
+-      wrapMenuItem.setAttribute("checked", "true");
+-    }
+-
+-    let highlightMenuItem = document.getElementById("menu_highlightSyntax");
+-    if (this.shouldHighlight) {
+-      highlightMenuItem.setAttribute("checked", "true");
+-    }
+-
+-    gContextMenu.addEventListener("popupshowing", this);
+-    gContextMenu.addEventListener("popuphidden", this);
+-
+-    Services.els.addSystemEventListener(this.browser, "dragover", this, true);
+-    Services.els.addSystemEventListener(this.browser, "drop", this, true);
+-
+-    if (!this.historyEnabled) {
+-      // Disable the BACK and FORWARD commands and hide the related menu items.
+-      let viewSourceNavigation = document.getElementById("viewSourceNavigation");
+-      if (viewSourceNavigation) {
+-        viewSourceNavigation.setAttribute("disabled", "true");
+-        viewSourceNavigation.setAttribute("hidden", "true");
+-      }
+-    }
+-
+-    // We require the first argument to do any loading of source.
+-    // otherwise, we're done.
+-    if (!window.arguments[0]) {
+-      return undefined;
+-    }
+-
+-    if (typeof window.arguments[0] == "string") {
+-      // We're using the deprecated API
+-      return this._loadViewSourceDeprecated(window.arguments);
+-    }
+-
+-    // We're using the modern API, which allows us to view the
+-    // source of documents from out of process browsers.
+-    let args = window.arguments[0];
+-
+-    // viewPartialSource.js will take care of loading the content in partial mode.
+-    if (!args.partial) {
+-      this.loadViewSource(args);
+-    }
+-
+-    return undefined;
+-  },
+-
+-  /**
+-   * This is the deprecated API for viewSource.xul, for old-timer consumers.
+-   * This API might eventually go away.
+-   */
+-  _loadViewSourceDeprecated(aArguments) {
+-    Deprecated.warning("The arguments you're passing to viewSource.xul " +
+-                       "are using an out-of-date API.",
+-                       "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-    // Parse the 'arguments' supplied with the dialog.
+-    //    arg[0] - URL string.
+-    //    arg[1] - Charset value in the form 'charset=xxx'.
+-    //    arg[2] - Page descriptor used to load content from the cache.
+-    //    arg[3] - Line number to go to.
+-    //    arg[4] - Whether charset was forced by the user
+-
+-    if (aArguments[2]) {
+-      let pageDescriptor = aArguments[2];
+-      if (Cu.isCrossProcessWrapper(pageDescriptor)) {
+-        throw new Error("Cannot pass a CPOW as the page descriptor to viewSource.xul.");
+-      }
+-    }
+-
+-    if (this.browser.isRemoteBrowser) {
+-      throw new Error("Deprecated view source API should not use a remote browser.");
+-    }
+-
+-    let forcedCharSet;
+-    if (aArguments[4] && aArguments[1].startsWith("charset=")) {
+-      forcedCharSet = aArguments[1].split("=")[1];
+-    }
+-
+-    this.sendAsyncMessage("ViewSource:LoadSourceDeprecated", {
+-      URL: aArguments[0],
+-      lineNumber: aArguments[3],
+-      forcedCharSet,
+-    }, {
+-      pageDescriptor: aArguments[2],
+-    });
+-  },
+-
+-  /**
+-   * Handler for the AppCommand event.
+-   *
+-   * @param event
+-   *        The AppCommand event being handled.
+-   */
+-  onAppCommand(event) {
+-    event.stopPropagation();
+-    switch (event.command) {
+-      case "Back":
+-        this.goBack();
+-        break;
+-      case "Forward":
+-        this.goForward();
+-        break;
+-    }
+-  },
+-
+-  /**
+-   * Handler for the MozSwipeGesture event.
+-   *
+-   * @param event
+-   *        The MozSwipeGesture event being handled.
+-   */
+-  onSwipeGesture(event) {
+-    event.stopPropagation();
+-    switch (event.direction) {
+-      case SimpleGestureEvent.DIRECTION_LEFT:
+-        this.goBack();
+-        break;
+-      case SimpleGestureEvent.DIRECTION_RIGHT:
+-        this.goForward();
+-        break;
+-      case SimpleGestureEvent.DIRECTION_UP:
+-        goDoCommand("cmd_scrollTop");
+-        break;
+-      case SimpleGestureEvent.DIRECTION_DOWN:
+-        goDoCommand("cmd_scrollBottom");
+-        break;
+-    }
+-  },
+-
+-  /**
+-   * Called as soon as the frame script reports that some source
+-   * code has been loaded in the browser.
+-   */
+-  onSourceLoaded() {
+-    document.getElementById("cmd_goToLine").removeAttribute("disabled");
+-
+-    if (this.historyEnabled) {
+-      this.updateCommands();
+-    }
+-
+-    this.browser.focus();
+-  },
+-
+-  /**
+-   * Called as soon as the frame script reports that some source
+-   * code has been unloaded from the browser.
+-   */
+-  onSourceUnloaded() {
+-    // Disable "go to line" while reloading due to e.g. change of charset
+-    // or toggling of syntax highlighting.
+-    document.getElementById("cmd_goToLine").setAttribute("disabled", "true");
+-  },
+-
+-  /**
+-   * Called by clicks on a menu populated by CharsetMenu.jsm to
+-   * change the selected character set.
+-   *
+-   * @param event
+-   *        The click event on a character set menuitem.
+-   */
+-  onSetCharacterSet(event) {
+-    if (event.target.hasAttribute("charset")) {
+-      let charset = event.target.getAttribute("charset");
+-
+-      // If we don't have history enabled, we have to do a reload in order to
+-      // show the character set change. See bug 136322.
+-      this.sendAsyncMessage("ViewSource:SetCharacterSet", {
+-        charset,
+-        doPageLoad: this.historyEnabled,
+-      });
+-
+-      if (!this.historyEnabled) {
+-        this.browser
+-            .reloadWithFlags(Ci.nsIWebNavigation.LOAD_FLAGS_CHARSET_CHANGE);
+-      }
+-    }
+-  },
+-
+-  /**
+-   * Called from the frame script when the context menu is about to
+-   * open. This tells ViewSourceChrome things about the item that
+-   * the context menu is being opened on. This should be called before
+-   * the popupshowing event handler fires.
+-   */
+-  onContextMenuOpening(isLink, isEmail, href) {
+-    this.contextMenuData = { isLink, isEmail, href, isOpen: true };
+-  },
+-
+-  /**
+-   * Event handler for the popupshowing event on the context menu.
+-   * This handler is responsible for setting the state on various
+-   * menu items in the context menu, and reads values that were sent
+-   * up from the frame script and stashed into this.contextMenuData.
+-   *
+-   * @param event
+-   *        The popupshowing event for the context menu.
+-   */
+-  onContextMenuShowing(event) {
+-    let copyLinkMenuItem = document.getElementById("context-copyLink");
+-    copyLinkMenuItem.hidden = !this.contextMenuData.isLink;
+-
+-    let copyEmailMenuItem = document.getElementById("context-copyEmail");
+-    copyEmailMenuItem.hidden = !this.contextMenuData.isEmail;
+-  },
+-
+-  /**
+-   * Called when the user chooses the "Copy Link" or "Copy Email"
+-   * menu items in the context menu. Copies the relevant selection
+-   * into the system clipboard.
+-   */
+-  onContextMenuCopyLinkOrEmail() {
+-    // It doesn't make any sense to call this if the context menu
+-    // isn't open...
+-    if (!this.contextMenuData.isOpen) {
+-      return;
+-    }
+-
+-    let clipboard = Cc["@mozilla.org/widget/clipboardhelper;1"]
+-                      .getService(Ci.nsIClipboardHelper);
+-    clipboard.copyString(this.contextMenuData.href);
+-  },
+-
+-  /**
+-   * Called when the context menu closes, and invalidates any data
+-   * that the frame script might have sent up about what the context
+-   * menu was opened on.
+-   */
+-  onContextMenuHidden(event) {
+-    this.contextMenuData = {
+-      isOpen: false,
+-    };
+-  },
+-
+-  /**
+-   * Called when the user drags something over the content browser.
+-   */
+-  onDragOver(event) {
+-    // For drags that appear to be internal text (for example, tab drags),
+-    // set the dropEffect to 'none'. This prevents the drop even if some
+-    // other listener cancelled the event.
+-    let types = event.dataTransfer.types;
+-    if (types.includes("text/x-moz-text-internal") && !types.includes("text/plain")) {
+-        event.dataTransfer.dropEffect = "none";
+-        event.stopPropagation();
+-        event.preventDefault();
+-    }
+-
+-    if (Services.droppedLinkHandler.canDropLink(event, false)) {
+-      event.preventDefault();
+-    }
+-  },
+-
+-  /**
+-   * Called twhen the user drops something onto the content browser.
+-   */
+-  onDrop(event) {
+-    if (event.defaultPrevented)
+-      return;
+-
+-    let name = { };
+-    let uri;
+-    try {
+-      // Pass true to prevent the dropping of javascript:/data: URIs
+-      uri = Services.droppedLinkHandler.dropLink(event, name, true);
+-    } catch (e) {
+-      return;
+-    }
+-
+-    if (uri) {
+-      this.loadURL(uri);
+-    }
+-  },
+-
+-  /**
+-   * For remote browsers, the contextmenu event is received in the
+-   * content process, and a message is sent up from the frame script
+-   * to ViewSourceChrome, but then it stops. The event does not bubble
+-   * up to the point that the popup is opened in the parent process.
+-   * ViewSourceChrome is responsible for opening up the context menu in
+-   * that case. This is called when we receive the contextmenu message
+-   * from the child, and we know that the browser is currently remote.
+-   *
+-   * @param screenX
+-   *        The screenX coordinate to open the popup at.
+-   * @param screenY
+-   *        The screenY coordinate to open the popup at.
+-   */
+-  openContextMenu(screenX, screenY) {
+-    gContextMenu.openPopupAtScreen(screenX, screenY, true);
+-  },
+-
+-  /**
+-   * Loads the source of a URL. This will probably end up hitting the
+-   * network.
+-   *
+-   * @param URL
+-   *        A URL string to be opened in the view source browser.
+-   */
+-  loadURL(URL) {
+-    this.sendAsyncMessage("ViewSource:LoadSource", { URL });
+-  },
+-
+-  /**
+-   * Updates any commands that are dependant on command broadcasters.
+-   */
+-  updateCommands() {
+-    let backBroadcaster = document.getElementById("Browser:Back");
+-    let forwardBroadcaster = document.getElementById("Browser:Forward");
+-
+-    if (this.webNav.canGoBack) {
+-      backBroadcaster.removeAttribute("disabled");
+-    } else {
+-      backBroadcaster.setAttribute("disabled", "true");
+-    }
+-    if (this.webNav.canGoForward) {
+-      forwardBroadcaster.removeAttribute("disabled");
+-    } else {
+-      forwardBroadcaster.setAttribute("disabled", "true");
+-    }
+-  },
+-
+-  /**
+-   * Reloads the browser, bypassing the network cache.
+-   */
+-  reload() {
+-    this.browser.reloadWithFlags(Ci.nsIWebNavigation.LOAD_FLAGS_BYPASS_PROXY |
+-                                 Ci.nsIWebNavigation.LOAD_FLAGS_BYPASS_CACHE);
+-  },
+-
+-  /**
+-   * Closes the view source window.
+-   */
+-  close() {
+-    window.close();
+-  },
+-
+-  /**
+-   * Called when the user clicks on the "Wrap Long Lines" menu item.
+-   */
+-  toggleWrapping() {
+-    this.shouldWrap = !this.shouldWrap;
+-    this.sendAsyncMessage("ViewSource:ToggleWrapping");
+-  },
+-
+-  /**
+-   * Called when the user clicks on the "Syntax Highlighting" menu item.
+-   */
+-  toggleSyntaxHighlighting() {
+-    this.shouldHighlight = !this.shouldHighlight;
+-    this.sendAsyncMessage("ViewSource:ToggleSyntaxHighlighting");
+-  },
+-
+-  /**
+-   * Updates the "remote" attribute of the view source browser. This
+-   * will remove the browser from the DOM, and then re-add it in the
+-   * same place it was taken from.
+-   *
+-   * @param shouldBeRemote
+-   *        True if the browser should be made remote. If the browsers
+-   *        remoteness already matches this value, this function does
+-   *        nothing.
+-   * @param remoteType
+-   *        The type of remote browser process.
+-   */
+-  updateBrowserRemoteness(shouldBeRemote, remoteType) {
+-    if (this.browser.isRemoteBrowser == shouldBeRemote &&
+-        this.browser.remoteType == remoteType) {
+-      return;
+-    }
+-
+-    let parentNode = this.browser.parentNode;
+-    let nextSibling = this.browser.nextSibling;
+-
+-    // Removing and re-adding the browser from and to the DOM strips its XBL
+-    // properties. Save and restore sameProcessAsFrameLoader. Note that when we
+-    // restore sameProcessAsFrameLoader, there won't yet be a binding or
+-    // setter. This works in conjunction with the hack in <xul:browser>'s
+-    // constructor to re-get the weak reference to it.
+-    let sameProcessAsFrameLoader = this.browser.sameProcessAsFrameLoader;
+-
+-    this.browser.remove();
+-    if (shouldBeRemote) {
+-      this.browser.setAttribute("remote", "true");
+-      this.browser.setAttribute("remoteType", remoteType);
+-    } else {
+-      this.browser.removeAttribute("remote");
+-      this.browser.removeAttribute("remoteType");
+-    }
+-
+-    this.browser.sameProcessAsFrameLoader = sameProcessAsFrameLoader;
+-
+-    // If nextSibling was null, this will put the browser at
+-    // the end of the list.
+-    parentNode.insertBefore(this.browser, nextSibling);
+-
+-    if (shouldBeRemote) {
+-      // We're going to send a message down to the remote browser
+-      // to load the source content - however, in order for the
+-      // contentWindowAsCPOW and contentDocumentAsCPOW values on
+-      // the remote browser to be set, we must set up the
+-      // RemoteWebProgress, which is lazily loaded. We only need
+-      // contentWindowAsCPOW for the printing support, and this
+-      // should go away once bug 1146454 is fixed, since we can
+-      // then just pass the outerWindowID of the this.browser to
+-      // PrintUtils.
+-      this.browser.webProgress;
+-    }
+-  },
+-};
+-
+-var viewSourceChrome = new ViewSourceChrome();
+-
+-/**
+- * PrintUtils uses this to make Print Preview work.
+- */
+-var PrintPreviewListener = {
+-  _ppBrowser: null,
+-
+-  getPrintPreviewBrowser() {
+-    if (!this._ppBrowser) {
+-      this._ppBrowser = document.createElement("browser");
+-      this._ppBrowser.setAttribute("flex", "1");
+-      this._ppBrowser.setAttribute("type", "content");
+-    }
+-
+-    if (gBrowser.isRemoteBrowser) {
+-      this._ppBrowser.setAttribute("remote", "true");
+-    } else {
+-      this._ppBrowser.removeAttribute("remote");
+-    }
+-
+-    let findBar = document.getElementById("FindToolbar");
+-    document.getElementById("appcontent")
+-            .insertBefore(this._ppBrowser, findBar);
+-
+-    return this._ppBrowser;
+-  },
+-
+-  getSourceBrowser() {
+-    return gBrowser;
+-  },
+-
+-  getNavToolbox() {
+-    return document.getElementById("appcontent");
+-  },
+-
+-  onEnter() {
+-    let toolbox = document.getElementById("viewSource-toolbox");
+-    toolbox.hidden = true;
+-    gBrowser.collapsed = true;
+-  },
+-
+-  onExit() {
+-    this._ppBrowser.remove();
+-    gBrowser.collapsed = false;
+-    document.getElementById("viewSource-toolbox").hidden = false;
+-  },
+-
+-  activateBrowser(browser) {
+-    browser.docShellIsActive = true;
+-  },
+-};
+-
+-// viewZoomOverlay.js uses this
+-function getBrowser() {
+-  return gBrowser;
+-}
+-
+-Object.defineProperty(this, "gPageLoader", {
+-  configurable: true,
+-  enumerable: true,
+-  get() {
+-    var webnav = viewSourceChrome.webNav;
+-    if (!webnav)
+-      return null;
+-    delete this.gPageLoader;
+-    this.gPageLoader = (webnav instanceof Ci.nsIWebPageDescriptor) ? webnav
+-                                                                   : null;
+-    return this.gPageLoader;
+-  },
+-});
+-
+-// Strips the |view-source:| for internalSave()
+-function ViewSourceSavePage() {
+-  internalSave(gBrowser.currentURI.spec.replace(/^view-source:/i, ""),
+-               null, null, null, null, null, "SaveLinkTitle",
+-               null, null, gBrowser.contentDocumentAsCPOW, null,
+-               gPageLoader);
+-}
+-
+-// Below are old deprecated functions and variables left behind for
+-// compatibility reasons. These will be removed soon via bug 1159293.
+-
+-Object.defineProperty(this, "gLastLineFound", {
+-  configurable: true,
+-  enumerable: true,
+-  get() {
+-    Deprecated.warning("gLastLineFound is deprecated - please use " +
+-                       "viewSourceChrome.lastLineFound instead.",
+-                       "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-    return viewSourceChrome.lastLineFound;
+-  },
+-});
+-
+-function onLoadViewSource() {
+-  Deprecated.warning("onLoadViewSource() is deprecated - please use " +
+-                     "viewSourceChrome.onXULLoaded() instead.",
+-                     "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-  viewSourceChrome.onXULLoaded();
+-}
+-
+-function isHistoryEnabled() {
+-  Deprecated.warning("isHistoryEnabled() is deprecated - please use " +
+-                     "viewSourceChrome.historyEnabled instead.",
+-                     "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-  return viewSourceChrome.historyEnabled;
+-}
+-
+-function ViewSourceClose() {
+-  Deprecated.warning("ViewSourceClose() is deprecated - please use " +
+-                     "viewSourceChrome.close() instead.",
+-                     "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-  viewSourceChrome.close();
+-}
+-
+-function ViewSourceReload() {
+-  Deprecated.warning("ViewSourceReload() is deprecated - please use " +
+-                     "viewSourceChrome.reload() instead.",
+-                     "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-  viewSourceChrome.reload();
+-}
+-
+-function getWebNavigation() {
+-  Deprecated.warning("getWebNavigation() is deprecated - please use " +
+-                     "viewSourceChrome.webNav instead.",
+-                     "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-  // The original implementation returned null if anything threw during
+-  // the getting of the webNavigation.
+-  try {
+-    return viewSourceChrome.webNav;
+-  } catch (e) {
+-    return null;
+-  }
+-}
+-
+-function viewSource(url) {
+-  Deprecated.warning("viewSource() is deprecated - please use " +
+-                     "viewSourceChrome.loadURL() instead.",
+-                     "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-  viewSourceChrome.loadURL(url);
+-}
+-
+-function ViewSourceGoToLine() {
+-  Deprecated.warning("ViewSourceGoToLine() is deprecated - please use " +
+-                     "viewSourceChrome.promptAndGoToLine() instead.",
+-                     "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-  viewSourceChrome.promptAndGoToLine();
+-}
+-
+-function goToLine(line) {
+-  Deprecated.warning("goToLine() is deprecated - please use " +
+-                     "viewSourceChrome.goToLine() instead.",
+-                     "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-  viewSourceChrome.goToLine(line);
+-}
+-
+-function BrowserForward(aEvent) {
+-  Deprecated.warning("BrowserForward() is deprecated - please use " +
+-                     "viewSourceChrome.goForward() instead.",
+-                     "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-  viewSourceChrome.goForward();
+-}
+-
+-function BrowserBack(aEvent) {
+-  Deprecated.warning("BrowserBack() is deprecated - please use " +
+-                     "viewSourceChrome.goBack() instead.",
+-                     "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-  viewSourceChrome.goBack();
+-}
+-
+-function UpdateBackForwardCommands() {
+-  Deprecated.warning("UpdateBackForwardCommands() is deprecated - please use " +
+-                     "viewSourceChrome.updateCommands() instead.",
+-                     "https://developer.mozilla.org/en-US/Add-ons/Code_snippets/View_Source_for_XUL_Applications");
+-  viewSourceChrome.updateCommands();
+-}
+diff --git a/toolkit/components/viewsource/content/viewSource.xul b/toolkit/components/viewsource/content/viewSource.xul
+deleted file mode 100644
+--- a/toolkit/components/viewsource/content/viewSource.xul
++++ /dev/null
+@@ -1,232 +0,0 @@
+-<?xml version="1.0"?>
+-# -*- Mode: HTML -*-
+-# This Source Code Form is subject to the terms of the Mozilla Public
+-# License, v. 2.0. If a copy of the MPL was not distributed with this
+-# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+-
+-<?xml-stylesheet href="chrome://global/skin/" type="text/css"?>
+-<?xml-stylesheet href="chrome://global/content/viewSource.css" type="text/css"?>
+-<?xml-stylesheet href="chrome://mozapps/skin/viewsource/viewsource.css" type="text/css"?>
+-<?xul-overlay href="chrome://global/content/editMenuOverlay.xul"?>
+-
+-<!DOCTYPE window [
+-<!ENTITY % brandDTD SYSTEM "chrome://branding/locale/brand.dtd" >
+-%brandDTD;
+-<!ENTITY % sourceDTD SYSTEM "chrome://global/locale/viewSource.dtd" >
+-%sourceDTD;
+-<!ENTITY % charsetDTD SYSTEM "chrome://global/locale/charsetMenu.dtd" >
+-%charsetDTD;
+-]>
+-
+-<window id="viewSource"
+-        xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+-        contenttitlesetting="true"
+-        title="&mainWindow.title;"
+-        titlemodifier="&mainWindow.titlemodifier;"
+-        titlepreface="&mainWindow.preface;"
+-        titlemenuseparator ="&mainWindow.titlemodifierseparator;"
+-        windowtype="navigator:view-source"
+-        width="640" height="480"
+-        screenX="10" screenY="10"
+-        persist="screenX screenY width height sizemode">
+-
+-  <script type="application/javascript" src="chrome://global/content/globalOverlay.js"/>
+-  <script type="application/javascript" src="chrome://global/content/printUtils.js"/>
+-  <script type="application/javascript" src="chrome://global/content/viewSource.js"/>
+-  <script type="application/javascript" src="chrome://global/content/viewZoomOverlay.js"/>
+-  <script type="application/javascript" src="chrome://global/content/contentAreaUtils.js"/>
+-
+-  <stringbundle id="viewSourceBundle" src="chrome://global/locale/viewSource.properties"/>
+-
+-  <command id="cmd_savePage" oncommand="ViewSourceSavePage();"/>
+-  <command id="cmd_print" oncommand="PrintUtils.printWindow(gBrowser.outerWindowID, gBrowser);"/>
+-  <command id="cmd_printpreview" oncommand="PrintUtils.printPreview(PrintPreviewListener);"/>
+-  <command id="cmd_pagesetup" oncommand="PrintUtils.showPageSetup();"/>
+-  <command id="cmd_close" oncommand="window.close();"/>
+-  <commandset id="editMenuCommands"/>
+-  <command id="cmd_find"
+-           oncommand="document.getElementById('FindToolbar').onFindCommand();"/>
+-  <command id="cmd_findAgain"
+-           oncommand="document.getElementById('FindToolbar').onFindAgainCommand(false);"/>
+-  <command id="cmd_findPrevious"
+-           oncommand="document.getElementById('FindToolbar').onFindAgainCommand(true);"/>
+-#ifdef XP_MACOSX
+-  <command id="cmd_findSelection"
+-           oncommand="document.getElementById('FindToolbar').onFindSelectionCommand();"/>
+-#endif
+-  <command id="cmd_reload" oncommand="viewSourceChrome.reload();"/>
+-  <command id="cmd_goToLine" oncommand="viewSourceChrome.promptAndGoToLine();" disabled="true"/>
+-  <command id="cmd_highlightSyntax" oncommand="viewSourceChrome.toggleSyntaxHighlighting();"/>
+-  <command id="cmd_wrapLongLines" oncommand="viewSourceChrome.toggleWrapping();"/>
+-  <command id="cmd_textZoomReduce" oncommand="ZoomManager.reduce();"/>
+-  <command id="cmd_textZoomEnlarge" oncommand="ZoomManager.enlarge();"/>
+-  <command id="cmd_textZoomReset" oncommand="ZoomManager.reset();"/>
+-
+-  <command id="Browser:Back" oncommand="viewSourceChrome.goBack()" observes="viewSourceNavigation"/>
+-  <command id="Browser:Forward" oncommand="viewSourceChrome.goForward()" observes="viewSourceNavigation"/>
+-
+-  <broadcaster id="viewSourceNavigation"/>
+-
+-  <keyset id="editMenuKeys"/>
+-  <keyset id="viewSourceKeys">
+-    <key id="key_savePage" key="&savePageCmd.commandkey;" modifiers="accel" command="cmd_savePage"/>
+-    <key id="key_print" key="&printCmd.commandkey;" modifiers="accel" command="cmd_print"/>
+-    <key id="key_close" key="&closeCmd.commandkey;" modifiers="accel" command="cmd_close"/>
+-    <key id="key_goToLine"     key="&goToLineCmd.commandkey;"  command="cmd_goToLine"  modifiers="accel"/>
+-
+-    <key id="key_textZoomEnlarge" key="&textEnlarge.commandkey;" command="cmd_textZoomEnlarge" modifiers="accel"/>
+-    <key id="key_textZoomEnlarge2" key="&textEnlarge.commandkey2;" command="cmd_textZoomEnlarge" modifiers="accel"/>
+-    <key id="key_textZoomEnlarge3" key="&textEnlarge.commandkey3;" command="cmd_textZoomEnlarge" modifiers="accel"/>
+-    <key id="key_textZoomReduce"  key="&textReduce.commandkey;" command="cmd_textZoomReduce" modifiers="accel"/>
+-    <key id="key_textZoomReduce2"  key="&textReduce.commandkey2;" command="cmd_textZoomReduce" modifiers="accel"/>
+-    <key id="key_textZoomReset" key="&textReset.commandkey;" command="cmd_textZoomReset" modifiers="accel"/>
+-    <key id="key_textZoomReset2" key="&textReset.commandkey2;" command="cmd_textZoomReset" modifiers="accel"/>
+-
+-    <key id="key_reload" key="&reloadCmd.commandkey;" command="cmd_reload" modifiers="accel"/>
+-    <key key="&reloadCmd.commandkey;" command="cmd_reload" modifiers="accel,shift"/>
+-    <key keycode="VK_F5" command="cmd_reload"/>
+-    <key keycode="VK_F5" command="cmd_reload" modifiers="accel"/>
+-    <key id="key_find" key="&findOnCmd.commandkey;" command="cmd_find" modifiers="accel"/>
+-    <key id="key_findAgain" key="&findAgainCmd.commandkey;" command="cmd_findAgain" modifiers="accel"/>
+-    <key id="key_findPrevious" key="&findAgainCmd.commandkey;" command="cmd_findPrevious" modifiers="accel,shift"/>
+-#ifdef XP_MACOSX
+-    <key id="key_findSelection" key="&findSelectionCmd.commandkey;" command="cmd_findSelection" modifiers="accel"/>
+-#endif
+-    <key keycode="&findAgainCmd.commandkey2;" command="cmd_findAgain"/>
+-    <key keycode="&findAgainCmd.commandkey2;"  command="cmd_findPrevious" modifiers="shift"/>
+-
+-    <key keycode="VK_BACK" command="Browser:Back"/>
+-    <key keycode="VK_BACK" command="Browser:Forward" modifiers="shift"/>
+-#ifndef XP_MACOSX
+-    <key id="goBackKb" keycode="VK_LEFT" command="Browser:Back" modifiers="alt"/>
+-    <key id="goForwardKb" keycode="VK_RIGHT" command="Browser:Forward" modifiers="alt"/>
+-#else
+-    <key id="goBackKb" keycode="VK_LEFT" command="Browser:Back" modifiers="accel" />
+-    <key id="goForwardKb" keycode="VK_RIGHT" command="Browser:Forward" modifiers="accel" />
+-#endif
+-#ifdef XP_UNIX
+-    <key id="goBackKb2" key="&goBackCmd.commandKey;" command="Browser:Back" modifiers="accel"/>
+-    <key id="goForwardKb2" key="&goForwardCmd.commandKey;" command="Browser:Forward" modifiers="accel"/>
+-#endif
+-
+-  </keyset>
+-
+-  <tooltip id="aHTMLTooltip" page="true"/>
+-
+-  <menupopup id="viewSourceContextMenu">
+-    <menuitem id="context-back"
+-              label="&backCmd.label;"
+-              accesskey="&backCmd.accesskey;"
+-              command="Browser:Back"
+-              observes="viewSourceNavigation"/>
+-    <menuitem id="context-forward"
+-              label="&forwardCmd.label;"
+-              accesskey="&forwardCmd.accesskey;"
+-              command="Browser:Forward"
+-              observes="viewSourceNavigation"/>
+-    <menuseparator observes="viewSourceNavigation"/>
+-    <menuitem id="cMenu_findAgain"/>
+-    <menuseparator/>
+-    <menuitem id="cMenu_copy"/>
+-    <menuitem id="context-copyLink"
+-              label="&copyLinkCmd.label;"
+-              accesskey="&copyLinkCmd.accesskey;"
+-              oncommand="viewSourceChrome.onContextMenuCopyLinkOrEmail();"/>
+-    <menuitem id="context-copyEmail"
+-              label="&copyEmailCmd.label;"
+-              accesskey="&copyEmailCmd.accesskey;"
+-              oncommand="viewSourceChrome.onContextMenuCopyLinkOrEmail();"/>
+-    <menuseparator/>
+-    <menuitem id="cMenu_selectAll"/>
+-  </menupopup>
+-
+-  <!-- Menu -->
+-  <toolbox id="viewSource-toolbox">
+-    <menubar id="viewSource-main-menubar">
+-
+-      <menu id="menu_file" label="&fileMenu.label;" accesskey="&fileMenu.accesskey;">
+-        <menupopup id="menu_FilePopup">
+-          <menuitem key="key_savePage" command="cmd_savePage" id="menu_savePage"
+-                    label="&savePageCmd.label;" accesskey="&savePageCmd.accesskey;"/>
+-          <menuitem command="cmd_pagesetup" id="menu_pageSetup"
+-                    label="&pageSetupCmd.label;" accesskey="&pageSetupCmd.accesskey;"/>
+-#ifndef XP_MACOSX
+-          <menuitem command="cmd_printpreview" id="menu_printPreview"
+-                    label="&printPreviewCmd.label;" accesskey="&printPreviewCmd.accesskey;"/>
+-#endif
+-          <menuitem key="key_print" command="cmd_print" id="menu_print"
+-                    label="&printCmd.label;" accesskey="&printCmd.accesskey;"/>
+-          <menuseparator/>
+-          <menuitem key="key_close" command="cmd_close" id="menu_close"
+-                    label="&closeCmd.label;" accesskey="&closeCmd.accesskey;"/>
+-        </menupopup>
+-      </menu>
+-
+-      <menu id="menu_edit">
+-        <menupopup id="editmenu-popup">
+-          <menuitem id="menu_undo"/>
+-          <menuitem id="menu_redo"/>
+-          <menuseparator/>
+-          <menuitem id="menu_cut"/>
+-          <menuitem id="menu_copy"/>
+-          <menuitem id="menu_paste"/>
+-          <menuitem id="menu_delete"/>
+-          <menuseparator/>
+-          <menuitem id="menu_selectAll"/>
+-          <menuseparator/>
+-          <menuitem id="menu_find"/>
+-          <menuitem id="menu_findAgain"/>
+-          <menuseparator/>
+-          <menuitem id="menu_goToLine" key="key_goToLine" command="cmd_goToLine"
+-                    label="&goToLineCmd.label;" accesskey="&goToLineCmd.accesskey;"/>
+-        </menupopup>
+-      </menu>
+-
+-      <menu id="menu_view" label="&viewMenu.label;" accesskey="&viewMenu.accesskey;">
+-        <menupopup id="viewmenu-popup">
+-          <menuitem id="menu_reload" command="cmd_reload" accesskey="&reloadCmd.accesskey;"
+-                    label="&reloadCmd.label;" key="key_reload"/>
+-          <menuseparator />
+-          <menu id="viewTextZoomMenu" label="&menu_textSize.label;" accesskey="&menu_textSize.accesskey;">
+-            <menupopup>
+-              <menuitem id="menu_textEnlarge" command="cmd_textZoomEnlarge"
+-                        label="&menu_textEnlarge.label;" accesskey="&menu_textEnlarge.accesskey;"
+-                        key="key_textZoomEnlarge"/>
+-              <menuitem id="menu_textReduce" command="cmd_textZoomReduce"
+-                        label="&menu_textReduce.label;" accesskey="&menu_textReduce.accesskey;"
+-                        key="key_textZoomReduce"/>
+-              <menuseparator/>
+-              <menuitem id="menu_textReset" command="cmd_textZoomReset"
+-                        label="&menu_textReset.label;" accesskey="&menu_textReset.accesskey;"
+-                        key="key_textZoomReset"/>
+-            </menupopup>
+-          </menu>
+-
+-          <!-- Charset Menu -->
+-          <menu id="charsetMenu"
+-                label="&charsetMenu2.label;"
+-                accesskey="&charsetMenu2.accesskey;"
+-                oncommand="viewSourceChrome.onSetCharacterSet(event);"
+-                onpopupshowing="CharsetMenu.build(event.target);
+-                                CharsetMenu.update(event.target, content.document.characterSet);">
+-            <menupopup/>
+-          </menu>
+-          <menuseparator/>
+-          <menuitem id="menu_wrapLongLines" type="checkbox" command="cmd_wrapLongLines"
+-                    label="&menu_wrapLongLines.title;" accesskey="&menu_wrapLongLines.accesskey;"/>
+-          <menuitem type="checkbox" id="menu_highlightSyntax" command="cmd_highlightSyntax"
+-                    label="&menu_highlightSyntax.label;" accesskey="&menu_highlightSyntax.accesskey;"/>
+-        </menupopup>
+-      </menu>
+-    </menubar>
+-  </toolbox>
+-
+-  <vbox id="appcontent" flex="1">
+-
+-    <browser id="content" type="content" name="content" src="about:blank" flex="1"
+-             primary="true"
+-             context="viewSourceContextMenu" showcaret="true" tooltip="aHTMLTooltip" />
+-    <findbar id="FindToolbar" browserid="content"/>
+-  </vbox>
+-
+-</window>
+diff --git a/toolkit/components/viewsource/content/viewSourceUtils.js b/toolkit/components/viewsource/content/viewSourceUtils.js
+--- a/toolkit/components/viewsource/content/viewSourceUtils.js
++++ b/toolkit/components/viewsource/content/viewSourceUtils.js
+@@ -10,66 +10,72 @@
+  *
+  * This file silently depends on contentAreaUtils.js for
+  * getDefaultFileName, getNormalizedLeafName and getDefaultExtension
+  */
+ 
+ ChromeUtils.import("resource://gre/modules/XPCOMUtils.jsm");
+ ChromeUtils.defineModuleGetter(this, "ViewSourceBrowser",
+   "resource://gre/modules/ViewSourceBrowser.jsm");
+-ChromeUtils.defineModuleGetter(this, "Deprecated",
+-  "resource://gre/modules/Deprecated.jsm");
+-ChromeUtils.defineModuleGetter(this, "PrivateBrowsingUtils",
++ChromeUtils.defineLazyModuleGetter(this, "PrivateBrowsingUtils",
+   "resource://gre/modules/PrivateBrowsingUtils.jsm");
+ ChromeUtils.defineModuleGetter(this, "Services",
+   "resource://gre/modules/Services.jsm");
+ 
+ var gViewSourceUtils = {
+ 
+   mnsIWebBrowserPersist: Components.interfaces.nsIWebBrowserPersist,
+   mnsIWebProgress: Components.interfaces.nsIWebProgress,
+   mnsIWebPageDescriptor: Components.interfaces.nsIWebPageDescriptor,
+ 
+   /**
+    * Opens the view source window.
+    *
+-   * @param aArgsOrURL (required)
+-   *        This is either an Object containing parameters, or a string
+-   *        URL for the page we want to view the source of. In the latter
+-   *        case we will be paying attention to the other parameters, as
+-   *        we will be supporting the old API for this method.
+-   *        If aArgsOrURL is an Object, the other parameters will be ignored.
+-   *        aArgsOrURL as an Object can include the following properties:
++   * @param aArgs (required)
++   *        This Object can include the following properties:
+    *
+    *        URL (required):
+    *          A string URL for the page we'd like to view the source of.
+    *        browser (optional):
+    *          The browser containing the document that we would like to view the
+    *          source of. This is required if outerWindowID is passed.
+    *        outerWindowID (optional):
+    *          The outerWindowID of the content window containing the document that
+    *          we want to view the source of. Pass this if you want to attempt to
+    *          load the document source out of the network cache.
+    *        lineNumber (optional):
+    *          The line number to focus on once the source is loaded.
+-   *
+-   * @param aPageDescriptor (deprecated, optional)
+-   *        Accepted for compatibility reasons, but is otherwise ignored.
+-   * @param aDocument (deprecated, optional)
+-   *        The content document we would like to view the source of. This
+-   *        function will throw if aDocument is a CPOW.
+-   * @param aLineNumber (deprecated, optional)
+-   *        The line number to focus on once the source is loaded.
+    */
+-  viewSource(aArgsOrURL, aPageDescriptor, aDocument, aLineNumber) {
++  viewSource(aArgs) {
+     if (Services.prefs.getBoolPref("view_source.editor.external")) {
+-      this.openInExternalEditor(aArgsOrURL, aPageDescriptor, aDocument, aLineNumber);
+-    } else {
+-      this._openInInternalViewer(aArgsOrURL, aPageDescriptor, aDocument, aLineNumber);
++      this.openInExternalEditor(aArgs);
++      return;
++    }
++    // Try existing browsers first.
++    let browserWin = Services.wm.getMostRecentWindow("navigator:browser");
++    if (browserWin && browserWin.BrowserViewSourceOfDocument) {
++      browserWin.BrowserViewSourceOfDocument(aArgs);
++      return;
+     }
++    // No browser window created yet, try to create one.
++    let utils = this;
++    Services.ww.registerNotification(function onOpen(subj, topic) {
++      if (subj.document.documentURI !== "about:blank" ||
++          topic !== "domwindowopened") {
++        return;
++      }
++      Services.ww.unregisterNotification(onOpen);
++      let win = subj.QueryInterface(Components.interfaces.nsIInterfaceRequestor)
++                    .getInterface(Components.interfaces.nsIDOMWindow);
++      win.addEventListener("load", () => {
++        aArgs.viewSourceBrowser = win.gBrowser.selectedTab.linkedBrowser;
++        utils.viewSourceInBrowser(aArgs);
++      }, { once: true });
++    });
++    window.top.openUILinkIn("about:blank", "current");
+   },
+ 
+   /**
+    * Displays view source in the provided <browser>.  This allows for non-window
+    * display methods, such as a tab from Firefox.
+    *
+    * @param aArgs
+    *        An object with the following properties:
+@@ -101,76 +107,34 @@
+    * <browser>.  This allows for non-window display methods, such as a tab from
+    * Firefox.
+    *
+    * @param aViewSourceInBrowser
+    *        The browser containing the page to view the source of.
+    * @param aTarget
+    *        Set to the target node for MathML. Null for other types of elements.
+    * @param aGetBrowserFn
+-   *        If set, a function that will return a browser to open the source in.
+-   *        If null, or this function returns null, opens the source in a new window.
++   *        A function that will return a browser to open the source in.
+    */
+   viewPartialSourceInBrowser(aViewSourceInBrowser, aTarget, aGetBrowserFn) {
+     let mm = aViewSourceInBrowser.messageManager;
+     mm.addMessageListener("ViewSource:GetSelectionDone", function gotSelection(message) {
+       mm.removeMessageListener("ViewSource:GetSelectionDone", gotSelection);
+ 
+       if (!message.data)
+         return;
+ 
+-      let browserToOpenIn = aGetBrowserFn ? aGetBrowserFn() : null;
+-      if (browserToOpenIn) {
+-        let viewSourceBrowser = new ViewSourceBrowser(browserToOpenIn);
+-        viewSourceBrowser.loadViewSourceFromSelection(message.data.uri, message.data.drawSelection,
++      let viewSourceBrowser = new ViewSourceBrowser(aGetBrowserFn());
++      viewSourceBrowser.loadViewSourceFromSelection(message.data.uri, message.data.drawSelection,
+                                                       message.data.baseURI);
+-      } else {
+-        window.openDialog("chrome://global/content/viewPartialSource.xul",
+-                          "_blank", "all,dialog=no",
+-                          {
+-                            URI: message.data.uri,
+-                            drawSelection: message.data.drawSelection,
+-                            baseURI: message.data.baseURI,
+-                            partial: true,
+-                          });
+-      }
+     });
+ 
+     mm.sendAsyncMessage("ViewSource:GetSelection", { }, { target: aTarget });
+   },
+ 
+-  // Opens the interval view source viewer
+-  _openInInternalViewer(aArgsOrURL, aPageDescriptor, aDocument, aLineNumber) {
+-    // try to open a view-source window while inheriting the charset (if any)
+-    var charset = null;
+-    var isForcedCharset = false;
+-    if (aDocument) {
+-      if (Components.utils.isCrossProcessWrapper(aDocument)) {
+-        throw new Error("View Source cannot accept a CPOW as a document.");
+-      }
+-
+-      charset = "charset=" + aDocument.characterSet;
+-      try {
+-        isForcedCharset =
+-          aDocument.defaultView
+-                   .QueryInterface(Components.interfaces.nsIInterfaceRequestor)
+-                   .getInterface(Components.interfaces.nsIDOMWindowUtils)
+-                   .docCharsetIsForced;
+-      } catch (ex) {
+-      }
+-    }
+-    Services.telemetry
+-            .getHistogramById("VIEW_SOURCE_IN_WINDOW_OPENED_BOOLEAN")
+-            .add(true);
+-    openDialog("chrome://global/content/viewSource.xul",
+-               "_blank",
+-               "all,dialog=no",
+-               aArgsOrURL, charset, aPageDescriptor, aLineNumber, isForcedCharset);
+-  },
+-
+   buildEditorArgs(aPath, aLineNumber) {
+     // Determine the command line arguments to pass to the editor.
+     // We currently support a %LINE% placeholder which is set to the passed
+     // line number (or to 0 if there's none)
+     var editorArgs = [];
+     var args = Services.prefs.getCharPref("view_source.editor.args");
+     if (args) {
+       args = args.replace("%LINE%", aLineNumber || "0");
+@@ -181,89 +145,54 @@
+     }
+     editorArgs.push(aPath);
+     return editorArgs;
+   },
+ 
+   /**
+    * Opens an external editor with the view source content.
+    *
+-   * @param aArgsOrURL (required)
+-   *        This is either an Object containing parameters, or a string
+-   *        URL for the page we want to view the source of. In the latter
+-   *        case we will be paying attention to the other parameters, as
+-   *        we will be supporting the old API for this method.
+-   *        If aArgsOrURL is an Object, the other parameters will be ignored.
+-   *        aArgsOrURL as an Object can include the following properties:
++   * @param aArgs (required)
++   *        This Object can include the following properties:
+    *
+    *        URL (required):
+    *          A string URL for the page we'd like to view the source of.
+    *        browser (optional):
+    *          The browser containing the document that we would like to view the
+    *          source of. This is required if outerWindowID is passed.
+    *        outerWindowID (optional):
+    *          The outerWindowID of the content window containing the document that
+    *          we want to view the source of. Pass this if you want to attempt to
+    *          load the document source out of the network cache.
+    *        lineNumber (optional):
+    *          The line number to focus on once the source is loaded.
+    *
+-   * @param aPageDescriptor (deprecated, optional)
+-   *        Accepted for compatibility reasons, but is otherwise ignored.
+-   * @param aDocument (deprecated, optional)
+-   *        The content document we would like to view the source of. This
+-   *        function will throw if aDocument is a CPOW.
+-   * @param aLineNumber (deprecated, optional)
+-   *        The line number to focus on once the source is loaded.
+-   * @param aCallBack
++   * @param aCallBack (required)
+    *        A function accepting two arguments:
+    *          * result (true = success)
+    *          * data object
+-   *        The function defaults to opening an internal viewer if external
+-   *        viewing fails.
+    */
+-  openInExternalEditor(aArgsOrURL, aPageDescriptor, aDocument,
+-                                 aLineNumber, aCallBack) {
++  openInExternalEditor(aArgs, aCallBack) {
+     let data;
+-    if (typeof aArgsOrURL == "string") {
+-      Deprecated.warning("The arguments you're passing to " +
+-                         "openInExternalEditor are using an out-of-date API.",
+-                         "https://developer.mozilla.org/en-US/Add-ons/" +
+-                         "Code_snippets/View_Source_for_XUL_Applications");
+-      if (Components.utils.isCrossProcessWrapper(aDocument)) {
+-        throw new Error("View Source cannot accept a CPOW as a document.");
+-      }
+-      data = {
+-        url: aArgsOrURL,
+-        pageDescriptor: aPageDescriptor,
+-        doc: aDocument,
+-        lineNumber: aLineNumber,
+-        isPrivate: false,
++    let { URL, browser, lineNumber } = aArgs;
++    data = {
++      url: URL,
++      lineNumber,
++      isPrivate: false,
++    };
++    if (browser) {
++      data.doc = {
++        characterSet: browser.characterSet,
++        contentType: browser.documentContentType,
++        title: browser.contentTitle,
+       };
+-      if (aDocument) {
+-          data.isPrivate =
+-            PrivateBrowsingUtils.isWindowPrivate(aDocument.defaultView);
+-      }
+-    } else {
+-      let { URL, browser, lineNumber } = aArgsOrURL;
+-      data = {
+-        url: URL,
+-        lineNumber,
+-        isPrivate: false,
+-      };
+-      if (browser) {
+-        data.doc = {
+-          characterSet: browser.characterSet,
+-          contentType: browser.documentContentType,
+-          title: browser.contentTitle,
+-        };
+-        data.isPrivate = PrivateBrowsingUtils.isBrowserPrivate(browser);
+-      }
++      data.isPrivate = PrivateBrowsingUtils.isBrowserPrivate(browser);
+     }
+ 
++
+     try {
+       var editor = this.getExternalViewSourceEditor();
+       if (!editor) {
+         this.handleCallBack(aCallBack, false, data);
+         return;
+       }
+ 
+       // make a uri
+@@ -327,34 +256,22 @@
+       }
+     } catch (ex) {
+       // we failed loading it with the external editor.
+       Components.utils.reportError(ex);
+       this.handleCallBack(aCallBack, false, data);
+     }
+   },
+ 
+-  // Default callback - opens the internal viewer if the external editor failed
+-  internalViewerFallback(result, data) {
+-    if (!result) {
+-      this._openInInternalViewer(data.url, data.pageDescriptor, data.doc, data.lineNumber);
+-    }
+-  },
+-
+-  // Calls the callback, keeping in mind undefined or null values.
++  // Calls the callback, and record result in telemetry.
+   handleCallBack(aCallBack, result, data) {
+     Services.telemetry
+             .getHistogramById("VIEW_SOURCE_EXTERNAL_RESULT_BOOLEAN")
+             .add(result);
+-    // if callback is undefined, default to the internal viewer
+-    if (aCallBack === undefined) {
+-      this.internalViewerFallback(result, data);
+-    } else if (aCallBack) {
+-      aCallBack(result, data);
+-    }
++    aCallBack(result, data);
+   },
+ 
+   // Returns nsIProcess of the external view source editor or null
+   getExternalViewSourceEditor() {
+     try {
+       let viewSourceAppPath =
+         Services.prefs.getComplexValue("view_source.editor.path",
+                                        Components.interfaces.nsIFile);
+diff --git a/toolkit/components/viewsource/jar.mn b/toolkit/components/viewsource/jar.mn
+--- a/toolkit/components/viewsource/jar.mn
++++ b/toolkit/components/viewsource/jar.mn
+@@ -1,14 +1,7 @@
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ toolkit.jar:
+-#ifndef ANDROID
+-  content/global/viewSource.css             (content/viewSource.css)
+-  content/global/viewSource.js              (content/viewSource.js)
+-* content/global/viewSource.xul             (content/viewSource.xul)
+-  content/global/viewPartialSource.js       (content/viewPartialSource.js)
+-* content/global/viewPartialSource.xul      (content/viewPartialSource.xul)
+-#endif
+   content/global/viewSourceUtils.js         (content/viewSourceUtils.js)
+   content/global/viewSource-content.js      (content/viewSource-content.js)
+diff --git a/toolkit/components/viewsource/test/browser/browser_contextmenu.js b/toolkit/components/viewsource/test/browser/browser_contextmenu.js
+--- a/toolkit/components/viewsource/test/browser/browser_contextmenu.js
++++ b/toolkit/components/viewsource/test/browser/browser_contextmenu.js
+@@ -3,63 +3,40 @@
+  */
+ 
+ var source = "data:text/html,text<link%20href='http://example.com/'%20/>more%20text<a%20href='mailto:abc@def.ghi'>email</a>";
+ var gViewSourceWindow, gContextMenu, gCopyLinkMenuItem, gCopyEmailMenuItem;
+ 
+ var expectedData = [];
+ 
+ add_task(async function() {
+-  // Full source in view source window
+-  let newWindow = await loadViewSourceWindow(source);
+-  await SimpleTest.promiseFocus(newWindow);
++  // Full source in view source tab
++  let newTab = await openDocument(source);
++  await onViewSourceWindowOpen(window, true);
+ 
+-  await onViewSourceWindowOpen(newWindow, false);
+-
+-  let contextMenu = gViewSourceWindow.document.getElementById("viewSourceContextMenu");
++  let contextMenu = document.getElementById("contentAreaContextMenu");
+ 
+   for (let test of expectedData) {
+-    await checkMenuItems(contextMenu, false, test[0], test[1], test[2], test[3]);
++    await checkMenuItems(contextMenu, true, test[0], test[1], test[2], test[3]);
+   }
+ 
+-  await new Promise(resolve => {
+-    closeViewSourceWindow(newWindow, resolve);
+-  });
++  gBrowser.removeTab(newTab);
+ 
+   // Selection source in view source tab
+   expectedData = [];
+-  let newTab = await openDocumentSelect(source, "body");
++  newTab = await openDocumentSelect(source, "body");
+   await onViewSourceWindowOpen(window, true);
+ 
+   contextMenu = document.getElementById("contentAreaContextMenu");
+ 
+   for (let test of expectedData) {
+     await checkMenuItems(contextMenu, true, test[0], test[1], test[2], test[3]);
+   }
+ 
+   gBrowser.removeTab(newTab);
+-
+-  // Selection source in view source window
+-  await pushPrefs(["view_source.tab", false]);
+-
+-  expectedData = [];
+-  newWindow = await openDocumentSelect(source, "body");
+-  await SimpleTest.promiseFocus(newWindow);
+-
+-  await onViewSourceWindowOpen(newWindow, false);
+-
+-  contextMenu = newWindow.document.getElementById("viewSourceContextMenu");
+-
+-  for (let test of expectedData) {
+-    await checkMenuItems(contextMenu, false, test[0], test[1], test[2], test[3]);
+-  }
+-
+-  await new Promise(resolve => {
+-    closeViewSourceWindow(newWindow, resolve);
+-  });
+ });
+ 
+ async function onViewSourceWindowOpen(aWindow, aIsTab) {
+   gViewSourceWindow = aWindow;
+ 
+   gCopyLinkMenuItem = aWindow.document.getElementById(aIsTab ? "context-copylink" : "context-copyLink");
+   gCopyEmailMenuItem = aWindow.document.getElementById(aIsTab ? "context-copyemail" : "context-copyEmail");
+ 
+diff --git a/toolkit/components/viewsource/test/browser/browser_gotoline.js b/toolkit/components/viewsource/test/browser/browser_gotoline.js
+--- a/toolkit/components/viewsource/test/browser/browser_gotoline.js
++++ b/toolkit/components/viewsource/test/browser/browser_gotoline.js
+@@ -3,28 +3,31 @@
+  */
+ 
+ ChromeUtils.import("resource://testing-common/ContentTaskUtils.jsm", this);
+ 
+ var content = "line 1\nline 2\nline 3";
+ 
+ add_task(async function() {
+   // First test with text with the text/html mimetype.
+-  let win = await loadViewSourceWindow("data:text/html," + encodeURIComponent(content));
+-  await checkViewSource(win);
+-  await BrowserTestUtils.closeWindow(win);
++  let tab = await openDocument("data:text/html," + encodeURIComponent(content));
++  await checkViewSource(tab);
++  gBrowser.removeTab(tab);
+ 
+-  win = await loadViewSourceWindow("data:text/plain," + encodeURIComponent(content));
+-  await checkViewSource(win);
+-  await BrowserTestUtils.closeWindow(win);
++  tab = await openDocument("data:text/plain," + encodeURIComponent(content));
++  await checkViewSource(tab);
++  gBrowser.removeTab(tab);
+ });
+ 
+-var checkViewSource = async function(aWindow) {
+-  is(aWindow.gBrowser.contentDocument.body.textContent, content, "Correct content loaded");
++var checkViewSource = async function(aTab) {
++  let browser = aTab.linkedBrowser;
++  await ContentTask.spawn(browser, content, async function(text) {
++    is(content.document.body.textContent, text, "Correct content loaded");
++  });
+ 
+   for (let i = 1; i <= 3; i++) {
+-    aWindow.viewSourceChrome.goToLine(i);
+-    await ContentTask.spawn(aWindow.gBrowser, i, async function(i) {
++    browser.messageManager.sendAsyncMessage("ViewSource:GoToLine", { lineNumber: i });
++    await ContentTask.spawn(browser, i, async function(i) {
+       let selection = content.getSelection();
+       Assert.equal(selection.toString(), "line " + i, "Correct text selected");
+     });
+   }
+ };
+diff --git a/toolkit/components/viewsource/test/browser/browser_open_docgroup.js b/toolkit/components/viewsource/test/browser/browser_open_docgroup.js
+--- a/toolkit/components/viewsource/test/browser/browser_open_docgroup.js
++++ b/toolkit/components/viewsource/test/browser/browser_open_docgroup.js
+@@ -13,57 +13,25 @@
+     ],
+   });
+ });
+ 
+ /**
+  * Tests that we can open View Source in a tab.
+  */
+ add_task(async function test_view_source_in_tab() {
+-  await SpecialPowers.pushPrefEnv({
+-    set: [
+-      ["view_source.tab", true],
+-    ],
+-  });
+-
+   await BrowserTestUtils.withNewTab({
+     gBrowser,
+     url: "http://example.com",
+   }, async function(browser) {
+-    let sourceTab = await openViewSource(browser);
++    let sourceTab = await openViewSourceForBrowser(browser);
+     let sourceBrowser = sourceTab.linkedBrowser;
+ 
+     await ContentTask.spawn(sourceBrowser, null, async function() {
+       Assert.equal(content.document.body.id, "viewsource",
+                    "View source mode enabled");
+     });
+ 
+     await BrowserTestUtils.removeTab(sourceTab);
+   });
+ 
+   await SpecialPowers.popPrefEnv();
+ });
+-
+-/**
+- * Tests that we can open View Source in a window.
+- */
+-add_task(async function test_view_source_in_window() {
+-  await SpecialPowers.pushPrefEnv({
+-    set: [
+-      ["view_source.tab", false],
+-    ],
+-  });
+-
+-  await BrowserTestUtils.withNewTab({
+-    gBrowser,
+-    url: "http://example.com",
+-  }, async function(browser) {
+-    let sourceWin = await openViewSource(browser);
+-    await ContentTask.spawn(sourceWin.gBrowser, null, async function() {
+-      Assert.equal(content.document.body.id, "viewsource",
+-                   "View source mode enabled");
+-    });
+-
+-    await closeViewSourceWindow(sourceWin);
+-  });
+-
+-  await SpecialPowers.popPrefEnv();
+-});
+diff --git a/toolkit/components/viewsource/test/browser/browser_viewsourceprefs.js b/toolkit/components/viewsource/test/browser/browser_viewsourceprefs.js
+--- a/toolkit/components/viewsource/test/browser/browser_viewsourceprefs.js
++++ b/toolkit/components/viewsource/test/browser/browser_viewsourceprefs.js
+@@ -13,123 +13,134 @@
+   });
+ });
+ 
+ add_task(async function() {
+   await exercisePrefs(plaintextURL, false);
+   await exercisePrefs(htmlURL, true);
+ });
+ 
++async function removeChecked(browser, id) {
++  await ContentTask.spawn(browser, id, async function(id) {
++    let item = content.document.getElementById(id);
++    if (item.getAttribute("checked") == "false") {
++      item.removeAttribute("checked");
++    }
++  });
++}
++
++async function hasAttribute(browser, id, attribute) {
++  return ContentTask.spawn(browser, { id, attribute }, async function(arg) {
++    let item = content.document.getElementById(arg.id);
++    return item.hasAttribute(arg.attribute);
++  });
++}
++
+ var exercisePrefs = async function(source, highlightable) {
+-  let win = await loadViewSourceWindow(source);
+-  let wrapMenuItem = win.document.getElementById("menu_wrapLongLines");
+-  let syntaxMenuItem = win.document.getElementById("menu_highlightSyntax");
++  let tab = await openDocument(source);
++  let browser = tab.linkedBrowser;
++
++  const wrapMenuItem = "wrapLongLines";
++  const syntaxMenuItem = "highlightSyntax";
+ 
+   // Strip checked="false" attributes, since we're not interested in them.
+-  if (wrapMenuItem.getAttribute("checked") == "false") {
+-    wrapMenuItem.removeAttribute("checked");
+-  }
+-  if (syntaxMenuItem.getAttribute("checked") == "false") {
+-    syntaxMenuItem.removeAttribute("checked");
+-  }
++  await removeChecked(browser, wrapMenuItem);
++  await removeChecked(browser, syntaxMenuItem);
+ 
+   // Test the default states of these menu items.
+-  is(wrapMenuItem.hasAttribute("checked"), false,
++  is(await hasAttribute(browser, wrapMenuItem, "checked"), false,
+      "Wrap menu item not checked by default");
+-  is(syntaxMenuItem.hasAttribute("checked"), true,
++  is(await hasAttribute(browser, syntaxMenuItem, "checked"), true,
+      "Syntax menu item checked by default");
+ 
+-  await checkStyle(win, "-moz-tab-size", 4);
+-  await checkStyle(win, "white-space", "pre");
++  await checkStyle(browser, "-moz-tab-size", 4);
++  await checkStyle(browser, "white-space", "pre");
++
+ 
+   // Next, test that the Wrap Long Lines menu item works.
+   let prefReady = waitForPrefChange("view_source.wrap_long_lines");
+-  simulateClick(wrapMenuItem);
+-  is(wrapMenuItem.hasAttribute("checked"), true, "Wrap menu item checked");
++  await simulateClick(browser, wrapMenuItem);
++  is(await hasAttribute(browser, wrapMenuItem, "checked"), true, "Wrap menu item checked");
+   await prefReady;
+   is(SpecialPowers.getBoolPref("view_source.wrap_long_lines"), true, "Wrap pref set");
+ 
+-  await checkStyle(win, "white-space", "pre-wrap");
++  await checkStyle(browser, "white-space", "pre-wrap");
+ 
+   prefReady = waitForPrefChange("view_source.wrap_long_lines");
+-  simulateClick(wrapMenuItem);
+-  is(wrapMenuItem.hasAttribute("checked"), false, "Wrap menu item unchecked");
++  await simulateClick(browser, wrapMenuItem);
++  is(await hasAttribute(browser, wrapMenuItem, "checked"), false, "Wrap menu item unchecked");
+   await prefReady;
+   is(SpecialPowers.getBoolPref("view_source.wrap_long_lines"), false, "Wrap pref set");
+-  await checkStyle(win, "white-space", "pre");
++  await checkStyle(browser, "white-space", "pre");
+ 
+   // Check that the Syntax Highlighting menu item works.
+   prefReady = waitForPrefChange("view_source.syntax_highlight");
+-  simulateClick(syntaxMenuItem);
+-  is(syntaxMenuItem.hasAttribute("checked"), false, "Syntax menu item unchecked");
++  await simulateClick(browser, syntaxMenuItem);
++  is(await hasAttribute(browser, syntaxMenuItem, "checked"), false, "Syntax menu item unchecked");
+   await prefReady;
+   is(SpecialPowers.getBoolPref("view_source.syntax_highlight"), false, "Syntax highlighting pref set");
+-  await checkHighlight(win, false);
++  await checkHighlight(browser, false);
+ 
+   prefReady = waitForPrefChange("view_source.syntax_highlight");
+-  simulateClick(syntaxMenuItem);
+-  is(syntaxMenuItem.hasAttribute("checked"), true, "Syntax menu item checked");
++  simulateClick(browser, syntaxMenuItem);
++  is(await hasAttribute(browser, syntaxMenuItem, "checked"), true, "Syntax menu item checked");
+   await prefReady;
+   is(SpecialPowers.getBoolPref("view_source.syntax_highlight"), true, "Syntax highlighting pref set");
+-  await checkHighlight(win, highlightable);
+-  await BrowserTestUtils.closeWindow(win);
++  await checkHighlight(browser, highlightable);
++  gBrowser.removeTab(tab);
+ 
+   // Open a new view-source window to check that the prefs are obeyed.
+   SpecialPowers.setIntPref("view_source.tab_size", 2);
+   SpecialPowers.setBoolPref("view_source.wrap_long_lines", true);
+   SpecialPowers.setBoolPref("view_source.syntax_highlight", false);
+ 
+-  win = await loadViewSourceWindow(source);
+-  wrapMenuItem = win.document.getElementById("menu_wrapLongLines");
+-  syntaxMenuItem = win.document.getElementById("menu_highlightSyntax");
++  tab = await openDocument(source);
++  browser = tab.linkedBrowser;
+ 
+   // Strip checked="false" attributes, since we're not interested in them.
+-  if (wrapMenuItem.getAttribute("checked") == "false") {
+-    wrapMenuItem.removeAttribute("checked");
+-  }
+-  if (syntaxMenuItem.getAttribute("checked") == "false") {
+-    syntaxMenuItem.removeAttribute("checked");
+-  }
++  await removeChecked(browser, wrapMenuItem);
++  await removeChecked(browser, syntaxMenuItem);
+ 
+-  is(wrapMenuItem.hasAttribute("checked"), true, "Wrap menu item checked");
+-  is(syntaxMenuItem.hasAttribute("checked"), false, "Syntax menu item unchecked");
+-  await checkStyle(win, "-moz-tab-size", 2);
+-  await checkStyle(win, "white-space", "pre-wrap");
+-  await checkHighlight(win, false);
++  is(await hasAttribute(browser, wrapMenuItem, "checked"), true, "Wrap menu item checked");
++  is(await hasAttribute(browser, syntaxMenuItem, "checked"), false, "Syntax menu item unchecked");
++  await checkStyle(browser, "-moz-tab-size", 2);
++  await checkStyle(browser, "white-space", "pre-wrap");
++  await checkHighlight(browser, false);
+ 
+   SpecialPowers.clearUserPref("view_source.tab_size");
+   SpecialPowers.clearUserPref("view_source.wrap_long_lines");
+   SpecialPowers.clearUserPref("view_source.syntax_highlight");
+ 
+-  await BrowserTestUtils.closeWindow(win);
++  gBrowser.removeTab(tab);
+ };
+ 
+ // Simulate a menu item click, including toggling the checked state.
+ // This saves us from opening the menu and trying to click on the item,
+ // which doesn't work on Mac OS X.
+-function simulateClick(aMenuItem) {
+-  if (aMenuItem.hasAttribute("checked"))
+-    aMenuItem.removeAttribute("checked");
+-  else
+-    aMenuItem.setAttribute("checked", "true");
++async function simulateClick(browser, id) {
++  return ContentTask.spawn(browser, id, async function(id) {
++    let item = content.document.getElementById(id);
++    if (item.hasAttribute("checked"))
++      item.removeAttribute("checked");
++    else
++      item.setAttribute("checked", "true");
+ 
+-  aMenuItem.click();
++    item.click();
++  });
+ }
+ 
+-var checkStyle = async function(win, styleProperty, expected) {
+-  let browser = win.gBrowser;
++var checkStyle = async function(browser, styleProperty, expected) {
+   let value = await ContentTask.spawn(browser, styleProperty, async function(styleProperty) {
+     let style = content.getComputedStyle(content.document.body);
+     return style.getPropertyValue(styleProperty);
+   });
+   is(value, expected, "Correct value of " + styleProperty);
+ };
+ 
+-var checkHighlight = async function(win, expected) {
+-  let browser = win.gBrowser;
++var checkHighlight = async function(browser, expected) {
+   let highlighted = await ContentTask.spawn(browser, {}, async function() {
+     let spans = content.document.getElementsByTagName("span");
+     return Array.some(spans, (span) => {
+       let style = content.getComputedStyle(span);
+       return style.getPropertyValue("color") !== "rgb(0, 0, 0)";
+     });
+   });
+   is(highlighted, expected, "Syntax highlighting " + (expected ? "on" : "off"));
+diff --git a/toolkit/components/viewsource/test/browser/head.js b/toolkit/components/viewsource/test/browser/head.js
+--- a/toolkit/components/viewsource/test/browser/head.js
++++ b/toolkit/components/viewsource/test/browser/head.js
+@@ -1,136 +1,95 @@
+ /* Any copyright is dedicated to the Public Domain.
+  * http://creativecommons.org/publicdomain/zero/1.0/
+  */
+ 
+ ChromeUtils.import("resource://gre/modules/PromiseUtils.jsm");
+ ChromeUtils.import("resource://gre/modules/Preferences.jsm", this);
+ 
+-const WINDOW_TYPE = "navigator:view-source";
+-
+-function openViewSourceWindow(aURI, aCallback) {
+-  let viewSourceWindow = openDialog("chrome://global/content/viewSource.xul", null, null, aURI);
+-  viewSourceWindow.addEventListener("pageshow", function pageShowHandler(event) {
+-    // Wait for the inner window to load, not viewSourceWindow.
+-    if (event.target.location == "view-source:" + aURI) {
+-      info("View source window opened: " + event.target.location);
+-      viewSourceWindow.removeEventListener("pageshow", pageShowHandler);
+-      aCallback(viewSourceWindow);
+-    }
+-  });
+-}
+-
+-function loadViewSourceWindow(URL) {
+-  return new Promise((resolve) => {
+-    openViewSourceWindow(URL, resolve);
+-  });
+-}
+-
+-function closeViewSourceWindow(aWindow, aCallback) {
+-  return new Promise(resolve => {
+-    Services.wm.addListener({
+-      onCloseWindow() {
+-        Services.wm.removeListener(this);
+-        if (aCallback) {
+-          executeSoon(aCallback);
+-        }
+-        resolve();
+-      }
+-    });
+-    aWindow.close();
+-  });
+-}
+-
+-function testViewSourceWindow(aURI, aTestCallback, aCloseCallback) {
+-  openViewSourceWindow(aURI, function(aWindow) {
+-    aTestCallback(aWindow);
+-    closeViewSourceWindow(aWindow, aCloseCallback);
+-  });
+-}
+-
+ /**
+- * Wait for view source tab or window after calling given function to open it.
++ * Wait for view source tab after calling given function to open it.
+  *
+  * @param open - a function to open view source.
+- * @returns the new tab or window which shows the source.
++ * @returns the new tab which shows the source.
+  */
+-async function waitForViewSourceTabOrWindow(open) {
++async function waitForViewSourceTab(open) {
+   let sourceLoadedPromise;
+-  let tabOrWindowPromise;
+-  if (Services.prefs.getBoolPref("view_source.tab")) {
+-    tabOrWindowPromise = new Promise(resolve => {
+-      gBrowser.tabContainer.addEventListener("TabOpen", event => {
+-        let tab = event.target;
+-        sourceLoadedPromise = waitForSourceLoaded(tab);
+-        resolve(tab);
+-      }, { once: true });
+-    });
+-  } else {
+-    tabOrWindowPromise = new Promise(resolve => {
+-      let windowListener = {
+-        onOpenWindow(xulWindow) {
+-          let win = xulWindow.QueryInterface(Ci.nsIInterfaceRequestor)
+-              .getInterface(Ci.nsIDOMWindow);
+-          win.addEventListener("load", function() {
+-            if (win.document.documentElement.getAttribute("windowtype") !=
+-                WINDOW_TYPE) {
+-              return;
+-            }
+-            // Found the window
+-            sourceLoadedPromise = waitForSourceLoaded(win);
+-            resolve(win);
+-            Services.wm.removeListener(windowListener);
+-          }, {once: true});
+-        },
+-        onCloseWindow() {},
+-      };
+-      Services.wm.addListener(windowListener);
+-    });
+-  }
++  let tabPromise;
++
++  tabPromise = new Promise(resolve => {
++    gBrowser.tabContainer.addEventListener("TabOpen", event => {
++      let tab = event.target;
++      sourceLoadedPromise = waitForSourceLoaded(tab);
++      resolve(tab);
++    }, { once: true });
++  });
+ 
+   await open();
+ 
+-  let tabOrWindow = await tabOrWindowPromise;
++  let tab = await tabPromise;
+   await sourceLoadedPromise;
+-
+-  return tabOrWindow;
++  return tab;
+ }
+ 
+ /**
+  * Opens view source for a browser.
+  *
+  * @param browser - the <xul:browser> to open view source for.
+- * @returns the new tab or window which shows the source.
++ * @returns the new tab which shows the source.
+  */
+-function openViewSource(browser) {
+-  return waitForViewSourceTabOrWindow(() => {
++function openViewSourceForBrowser(browser) {
++  return waitForViewSourceTab(() => {
+     window.BrowserViewSource(browser);
+   });
+ }
+ 
+ /**
+- * Opens a view source tab / window for a selection (View Selection Source)
++ * Opens a view source tab. (View Source)
++ * within the currently selected browser in gBrowser.
++ *
++ * @returns the new tab which shows the source.
++ */
++async function openViewSource() {
++  let contentAreaContextMenuPopup =
++    document.getElementById("contentAreaContextMenu");
++  let popupShownPromise =
++    BrowserTestUtils.waitForEvent(contentAreaContextMenuPopup, "popupshown");
++  await BrowserTestUtils.synthesizeMouseAtCenter("body",
++          { type: "contextmenu", button: 2 }, gBrowser.selectedBrowser);
++  await popupShownPromise;
++
++  return waitForViewSourceTab(async () => {
++    let popupHiddenPromise =
++        BrowserTestUtils.waitForEvent(contentAreaContextMenuPopup, "popuphidden");
++    let item = document.getElementById("context-viewsource");
++    EventUtils.synthesizeMouseAtCenter(item, {});
++    await popupHiddenPromise;
++  });
++}
++
++/**
++ * Opens a view source tab for a selection (View Selection Source)
+  * within the currently selected browser in gBrowser.
+  *
+  * @param aCSSSelector - used to specify a node within the selection to
+  *                       view the source of. It is expected that this node is
+  *                       within an existing selection.
+- * @returns the new tab / window which shows the source.
++ * @returns the new tab which shows the source.
+  */
+ async function openViewPartialSource(aCSSSelector) {
+   let contentAreaContextMenuPopup =
+     document.getElementById("contentAreaContextMenu");
+   let popupShownPromise =
+     BrowserTestUtils.waitForEvent(contentAreaContextMenuPopup, "popupshown");
+   await BrowserTestUtils.synthesizeMouseAtCenter(aCSSSelector,
+           { type: "contextmenu", button: 2 }, gBrowser.selectedBrowser);
+   await popupShownPromise;
+ 
+-  return waitForViewSourceTabOrWindow(async () => {
++  return waitForViewSourceTab(async () => {
+     let popupHiddenPromise =
+         BrowserTestUtils.waitForEvent(contentAreaContextMenuPopup, "popuphidden");
+     let item = document.getElementById("context-viewpartialsource-selection");
+     EventUtils.synthesizeMouseAtCenter(item, {});
+     await popupHiddenPromise;
+   });
+ }
+ 
+@@ -151,70 +110,78 @@
+   await popupShownPromise;
+ 
+   let frameContextMenu = document.getElementById("frame");
+   popupShownPromise =
+     BrowserTestUtils.waitForEvent(frameContextMenu, "popupshown");
+   EventUtils.synthesizeMouseAtCenter(frameContextMenu, {});
+   await popupShownPromise;
+ 
+-  return waitForViewSourceTabOrWindow(async () => {
++  return waitForViewSourceTab(async () => {
+     let popupHiddenPromise =
+         BrowserTestUtils.waitForEvent(frameContextMenu, "popuphidden");
+     let item = document.getElementById("context-viewframesource");
+     EventUtils.synthesizeMouseAtCenter(item, {});
+     await popupHiddenPromise;
+   });
+ }
+ 
+-registerCleanupFunction(function() {
+-  var windows = Services.wm.getEnumerator(WINDOW_TYPE);
+-  ok(!windows.hasMoreElements(), "No remaining view source windows still open");
+-  while (windows.hasMoreElements())
+-    windows.getNext().close();
+-});
+-
+ /**
+- * For a given view source tab / window, wait for the source loading step to
++ * For a given view source tab, wait for the source loading step to
+  * complete.
+  */
+-function waitForSourceLoaded(tabOrWindow) {
++function waitForSourceLoaded(tab) {
+   return new Promise(resolve => {
+-    let mm = tabOrWindow.messageManager ||
+-             tabOrWindow.linkedBrowser.messageManager;
++    let mm = tab.linkedBrowser.messageManager;
+     mm.addMessageListener("ViewSource:SourceLoaded", function sourceLoaded() {
+       mm.removeMessageListener("ViewSource:SourceLoaded", sourceLoaded);
+       setTimeout(resolve, 0);
+     });
+   });
+ }
+ 
+ /**
+  * Open a new document in a new tab, select part of it, and view the source of
+  * that selection. The document is not closed afterwards.
+  *
+  * @param aURI - url to load
+  * @param aCSSSelector - used to specify a node to select. All of this node's
+  *                       children will be selected.
+- * @returns the new tab / window which shows the source.
++ * @returns the new tab which shows the source.
+  */
+ async function openDocumentSelect(aURI, aCSSSelector) {
+   let tab = await BrowserTestUtils.openNewForegroundTab(gBrowser, aURI);
+   registerCleanupFunction(function() {
+     gBrowser.removeTab(tab);
+   });
+ 
+   await ContentTask.spawn(gBrowser.selectedBrowser, { selector: aCSSSelector }, async function(arg) {
+     let element = content.document.querySelector(arg.selector);
+     content.getSelection().selectAllChildren(element);
+   });
+ 
+   return openViewPartialSource(aCSSSelector);
+ }
+ 
++/**
++ * Open a new document in a new tab and view the source of whole page.
++ * The document is not closed afterwards.
++ *
++ * @param aURI - url to load
++ * @returns the new tab which shows the source.
++ */
++async function openDocument(aURI) {
++  let tab = await BrowserTestUtils.openNewForegroundTab(gBrowser, aURI);
++  registerCleanupFunction(function() {
++    gBrowser.removeTab(tab);
++  });
++
++  return openViewSource();
++}
++
+ function pushPrefs(...aPrefs) {
+   return SpecialPowers.pushPrefEnv({"set": aPrefs});
+ }
+ 
+ function waitForPrefChange(pref) {
+   let deferred = PromiseUtils.defer();
+   let observer = () => {
+     Preferences.ignore(pref, observer);
+diff --git a/toolkit/locales/en-US/chrome/global/viewSource.dtd b/toolkit/locales/en-US/chrome/global/viewSource.dtd
+deleted file mode 100644
+--- a/toolkit/locales/en-US/chrome/global/viewSource.dtd
++++ /dev/null
+@@ -1,86 +0,0 @@
+-<!-- This Source Code Form is subject to the terms of the Mozilla Public
+-   - License, v. 2.0. If a copy of the MPL was not distributed with this
+-   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-
+-<!-- extracted from content/viewSource.xul -->
+-
+-<!-- LOCALIZATION NOTE (mainWindow.title) : DONT_TRANSLATE --> 
+-<!ENTITY mainWindow.title "&brandFullName;">
+-<!-- LOCALIZATION NOTE (mainWindow.titlemodifier) : DONT_TRANSLATE --> 
+-<!ENTITY mainWindow.titlemodifier "&brandFullName;">
+-<!-- LOCALIZATION NOTE (mainWindow.titlemodifierseparator) : DONT_TRANSLATE -->
+-<!ENTITY mainWindow.titlemodifierseparator " - ">
+-<!ENTITY mainWindow.preface "Source of: ">
+-
+-<!ENTITY fileMenu.label "File">
+-<!ENTITY fileMenu.accesskey "F">
+-<!ENTITY savePageCmd.label "Save Page As…">
+-<!ENTITY savePageCmd.accesskey "A">
+-<!ENTITY savePageCmd.commandkey "S">
+-<!ENTITY pageSetupCmd.label "Page Setup…">
+-<!ENTITY pageSetupCmd.accesskey "u">
+-<!ENTITY printPreviewCmd.label "Print Preview">
+-<!ENTITY printPreviewCmd.accesskey "v">
+-<!ENTITY printCmd.label "Print…">
+-<!ENTITY printCmd.accesskey "P">
+-<!ENTITY printCmd.commandkey "P">
+-<!ENTITY closeCmd.label "Close">
+-<!ENTITY closeCmd.accesskey "C">
+-<!ENTITY closeCmd.commandkey "W">
+-
+-<!-- LOCALIZATION NOTE :
+-textEnlarge.commandkey3, textReduce.commandkey2 and
+-textReset.commandkey2 are alternative acceleration keys for zoom.
+-If shift key is needed with your locale popular keyboard for them,
+-you can use these alternative items. Otherwise, their values should be empty.  -->
+-
+-<!ENTITY textEnlarge.commandkey "+">
+-<!ENTITY textEnlarge.commandkey2 "=">
+-<!ENTITY textEnlarge.commandkey3 "">
+-<!ENTITY textReduce.commandkey "-">
+-<!ENTITY textReduce.commandkey2 "">
+-<!ENTITY textReset.commandkey "0">
+-<!ENTITY textReset.commandkey2 "">
+-
+-<!ENTITY goToLineCmd.label "Go to Line…">
+-<!ENTITY goToLineCmd.accesskey "G">
+-<!ENTITY goToLineCmd.commandkey "l">
+-
+-<!ENTITY viewMenu.label           "View">
+-<!ENTITY viewMenu.accesskey       "V">
+-<!ENTITY reloadCmd.label "Reload">
+-<!ENTITY reloadCmd.accesskey "R">
+-<!ENTITY reloadCmd.commandkey "r">
+-<!ENTITY menu_wrapLongLines.title "Wrap Long Lines"> 
+-<!ENTITY menu_wrapLongLines.accesskey "W">
+-<!ENTITY menu_highlightSyntax.label "Syntax Highlighting">
+-<!ENTITY menu_highlightSyntax.accesskey "H">
+-<!ENTITY menu_textSize.label "Text Size">
+-<!ENTITY menu_textSize.accesskey "Z">
+-<!ENTITY menu_textEnlarge.label "Increase">
+-<!ENTITY menu_textEnlarge.accesskey "I">
+-<!ENTITY menu_textReduce.label "Decrease">
+-<!ENTITY menu_textReduce.accesskey "D">
+-<!ENTITY menu_textReset.label "Normal">
+-<!ENTITY menu_textReset.accesskey "N">
+-
+-<!ENTITY findOnCmd.label     "Find in This Page…">
+-<!ENTITY findOnCmd.accesskey "F">
+-<!ENTITY findOnCmd.commandkey "f">
+-<!ENTITY findAgainCmd.label  "Find Again">
+-<!ENTITY findAgainCmd.accesskey "g">
+-<!ENTITY findAgainCmd.commandkey "g">
+-<!ENTITY findAgainCmd.commandkey2 "VK_F3">
+-<!ENTITY findSelectionCmd.commandkey "e">
+-
+-<!ENTITY backCmd.label "Back">
+-<!ENTITY backCmd.accesskey "B">
+-<!ENTITY forwardCmd.label "Forward">
+-<!ENTITY forwardCmd.accesskey "F">
+-<!ENTITY goBackCmd.commandKey "[">
+-<!ENTITY goForwardCmd.commandKey "]">
+-
+-<!ENTITY copyLinkCmd.label "Copy Link Location">
+-<!ENTITY copyLinkCmd.accesskey "L">
+-<!ENTITY copyEmailCmd.label "Copy Email Address">
+-<!ENTITY copyEmailCmd.accesskey "E">
+diff --git a/toolkit/locales/jar.mn b/toolkit/locales/jar.mn
+--- a/toolkit/locales/jar.mn
++++ b/toolkit/locales/jar.mn
+@@ -69,17 +69,16 @@
+ #endif
+   locale/@AB_CD@/global/regionNames.properties          (%chrome/global/regionNames.properties)
+   locale/@AB_CD@/global/resetProfile.dtd                (%chrome/global/resetProfile.dtd)
+   locale/@AB_CD@/global/resetProfile.properties         (%chrome/global/resetProfile.properties)
+   locale/@AB_CD@/global/dialog.properties               (%chrome/global/dialog.properties)
+   locale/@AB_CD@/global/tree.dtd                        (%chrome/global/tree.dtd)
+   locale/@AB_CD@/global/textcontext.dtd                 (%chrome/global/textcontext.dtd)
+   locale/@AB_CD@/global/videocontrols.dtd               (%chrome/global/videocontrols.dtd)
+-  locale/@AB_CD@/global/viewSource.dtd                  (%chrome/global/viewSource.dtd)
+   locale/@AB_CD@/global/viewSource.properties           (%chrome/global/viewSource.properties)
+   locale/@AB_CD@/global/wizard.dtd                      (%chrome/global/wizard.dtd)
+   locale/@AB_CD@/global/wizard.properties               (%chrome/global/wizard.properties)
+   locale/@AB_CD@/global/crashes.dtd                     (%crashreporter/crashes.dtd)
+   locale/@AB_CD@/global/crashes.properties              (%crashreporter/crashes.properties)
+ % locale global-platform @AB_CD@ %locale/@AB_CD@/global-platform/unix/ os=LikeUnix os=Android
+ % locale global-platform @AB_CD@ %locale/@AB_CD@/global-platform/mac/ os=Darwin
+ % locale global-platform @AB_CD@ %locale/@AB_CD@/global-platform/win/ os=WINNT
+
