@@ -1,7 +1,7 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  f0b98527bb88a3f97ec3c30d4e1991524f1ffaff
-Bug 1392352 - Part 3.0 - Translate the tabbrowser implementation into a JS class;r=mconley,r=dao
+# Parent  9334a3750f2ab582adf2f15bce3398490855b713
+Bug 1392352 - Part 2.0 - Translate the tabbrowser implementation into a JS class;r=mconley,r=dao
 
 We keep the XBL binding around for <content>, <constructor>, and <destructor>. This can
 eventually be migrated to a Custom Element once we have platform support, but in the meantime
@@ -12,7 +12,7 @@ MozReview-Commit-ID: 1dCQp527yF9
 diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowser.js
 --- a/browser/base/content/tabbrowser.js
 +++ b/browser/base/content/tabbrowser.js
-@@ -1,6290 +1,5524 @@
+@@ -1,6289 +1,5775 @@
 -    <implementation implements="nsIDOMEventListener, nsIMessageListener, nsIObserver">
 -
 -      <property name="tabContextMenu" readonly="true"
@@ -118,10 +118,39 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +// STEPS TO BUILD:
 +// Generate the class with `npm run elements` from https://github.com/bgrins/xbl-analysis
 +// Replace document.getAnonymousElementByAttribute(this, ..) with document.getAnonymousElementByAttribute(this.container)
++// Delete `this.tabs =`this.tabContainer =` `this.tabbox =` and `this.mPanelContainer = ` lines
 +// Add: `// eslint-disable-next-line complexity` before `  addTab(`
 +// Replace `window.getComputedStyle(this` with `window.getComputedStyle(this.container`
++// Replace `otherState = (otherBrowser.docShellIsActive ?` statement to all be on one line and remove parens around it
 +// Get rid of all calls to getService except for nsIEventListenerService.
++// Indent calls to `getInterface` inline with the QueryInterface `.` on the line above.
++// Re-indent `this._callProgressListeners` so the array starts on the next line below the `(`. Special case:
++/*
++        this._callProgressListeners("onProgressChange",
++                                    [aWebProgress, aRequest,
++                                     aCurSelfProgress, aMaxSelfProgress,
++                                     aCurTotalProgress, aMaxTotalProgress]);
++*/
++
++// Re-indent `? this.STATE_LOADED` with the ':' below it on the next line
++// Un-indent case blocks for the `switch (aMessage.name)` statement
++// Un-indent case blocks for the `switch (aTopic)` statement
++// Indent `gNavigatorBundle.getFormattedString("customizeMode.tabTitle"` so the array is on a new line
++// Re-indent `gNavigatorBundle.getFormattedString("refreshBlocked."` as:
++/*
++          gNavigatorBundle.getFormattedString("refreshBlocked." +
++                                              (data.sameURI ? "refreshLabel"
++                                                            : "redirectLabel"),
++                                              [brandShortName]);
++*/
 +// Run `./mach eslint browser/base/content/tabbrowser.js --fix`
++// Add the following comment above duplicateTab:
++  /**
++   * @param   aTab
++   *          Can be from a different window as well
++   * @param   aRestoreTabImmediately
++   *          Can defer loading of the tab contents
++   */
 +
 +class TabBrowser {
 +  constructor(container) {
@@ -143,14 +172,15 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    this.namespaceURI = this.container.namespaceURI;
 +    this.style = this.container.style;
 +
-+    this.initialBrowser = document.getAnonymousElementByAttribute(this.container, "anonid", "initialBrowser");
-+
 +    XPCOMUtils.defineLazyServiceGetters(this, {
 +      _unifiedComplete: ["@mozilla.org/autocomplete/search;1?name=unifiedcomplete", "mozIPlacesAutoComplete"],
 +      serializationHelper: ["@mozilla.org/network/serialization-helper;1", "nsISerializationHelper"],
 +      mURIFixup: ["@mozilla.org/docshell/urifixup;1", "nsIURIFixup"],
 +    });
 +
++    XPCOMUtils.defineLazyGetter(this, "initialBrowser", () => {
++      return document.getAnonymousElementByAttribute(this.container, "anonid", "initialBrowser");
++    });
 +    XPCOMUtils.defineLazyGetter(this, "tabContainer", () => {
 +      return document.getElementById(this.getAttribute("tabcontainer"));
 +    });
@@ -199,12 +229,29 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    this.tabAnimationsInProgress = 0;
 +
++    /**
++     * Binding from browser to tab
++     */
 +    this._tabForBrowser = new WeakMap();
 +
++    /**
++     * Holds a unique ID for the tab change that's currently being timed.
++     * Used to make sure that multiple, rapid tab switches do not try to
++     * create overlapping timers.
++     */
 +    this._tabSwitchID = null;
 +
 +    this._preloadedBrowser = null;
 +
++    /**
++     * `_createLazyBrowser` will define properties on the unbound lazy browser
++     * which correspond to properties defined in XBL which will be bound to
++     * the browser when it is inserted into the document.  If any of these
++     * properties are accessed by consumers, `_insertBrowser` is called and
++     * the browser is inserted to ensure that things don't break.  This list
++     * provides the names of properties that may be called while the browser
++     * is in its unbound (lazy) state.
++     */
 +    this._browserBindingProperties = [
 +      "canGoBack", "canGoForward", "goBack", "goForward", "permitUnload",
 +      "reload", "reloadWithFlags", "stop", "loadURI", "loadURIWithFlags",
@@ -222,6 +269,10 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    this._removingTabs = [];
 +
++    /**
++     * Tab close requests are ignored if the window is closing anyway,
++     * e.g. when holding Ctrl+W.
++     */
 +    this._windowIsClosing = false;
 +
 +    // This defines a proxy which allows us to access browsers by
@@ -310,8 +361,50 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      }
 +    });
 +
++    /**
++     * List of browsers whose docshells must be active in order for print preview
++     * to work.
++     */
 +    this._printPreviewBrowsers = new Set();
 +
++    /**
++     * The tab switcher is responsible for asynchronously switching
++     * tabs in e10s. It waits until the new tab is ready (i.e., the
++     * layer tree is available) before switching to it. Then it
++     * unloads the layer tree for the old tab.
++     *
++     * The tab switcher is a state machine. For each tab, it
++     * maintains state about whether the layer tree for the tab is
++     * available, being loaded, being unloaded, or unavailable. It
++     * also keeps track of the tab currently being displayed, the tab
++     * it's trying to load, and the tab the user has asked to switch
++     * to. The switcher object is created upon tab switch. It is
++     * released when there are no pending tabs to load or unload.
++     *
++     * The following general principles have guided the design:
++     *
++     * 1. We only request one layer tree at a time. If the user
++     * switches to a different tab while waiting, we don't request
++     * the new layer tree until the old tab has loaded or timed out.
++     *
++     * 2. If loading the layers for a tab times out, we show the
++     * spinner and possibly request the layer tree for another tab if
++     * the user has requested one.
++     *
++     * 3. We discard layer trees on a delay. This way, if the user is
++     * switching among the same tabs frequently, we don't continually
++     * load the same tabs.
++     *
++     * It's important that we always show either the spinner or a tab
++     * whose layers are available. Otherwise the compositor will draw
++     * an entirely black frame, which is very jarring. To ensure this
++     * never happens when switching away from a tab, we assume the
++     * old tab might still be drawn until a MozAfterPaint event
++     * occurs. Because layout and compositing happen asynchronously,
++     * we don't have any other way of knowing when the switch
++     * actually takes place. Therefore, we don't unload the old tab
++     * until the next MozAfterPaint event.
++     */
 +    this._switcher = null;
 +
 +    this._tabMinWidthLimit = 50;
@@ -374,8 +467,8 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    let messageManager = window.getGroupMessageManager("browsers");
 +
 +    let remote = window.QueryInterface(Ci.nsIInterfaceRequestor)
-+      .getInterface(Ci.nsIWebNavigation)
-+      .QueryInterface(Ci.nsILoadContext)
++                       .getInterface(Ci.nsIWebNavigation)
++                       .QueryInterface(Ci.nsILoadContext)
 +      .useRemoteTabs;
 +    if (remote) {
 +      messageManager.addMessageListener("DOMTitleChanged", this);
@@ -470,7 +563,10 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +  get selectedBrowser() {
 +    return this.mCurrentBrowser;
 +  }
-+
++  /**
++   * BEGIN FORWARDED BROWSER PROPERTIES.  IF YOU ADD A PROPERTY TO THE BROWSER ELEMENT
++   * MAKE SURE TO ADD IT HERE AS WELL.
++   */
 +  get canGoBack() {
 +    return this.mCurrentBrowser.canGoBack;
 +  }
@@ -580,9 +676,11 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    this.tabContainer.style.setProperty("--tab-min-width", val + "px");
 +    return val;
 +  }
++
 +  isFindBarInitialized(aTab) {
 +    return (aTab || this.selectedTab)._findBar != undefined;
 +  }
++
 +  getFindBar(aTab) {
 +    if (!aTab)
 +      aTab = this.selectedTab;
@@ -609,6 +707,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return findBar;
 +  }
++
 +  getStatusPanel() {
 +    if (!this._statusPanel) {
 +      this._statusPanel = document.createElementNS(this.namespaceURI, "statuspanel");
@@ -618,6 +717,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    }
 +    return this._statusPanel;
 +  }
++
 +  _appendStatusPanel() {
 +    if (this._statusPanel) {
 +      let browser = this.selectedBrowser;
@@ -625,6 +725,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      browserContainer.insertBefore(this._statusPanel, browser.parentNode.nextSibling);
 +    }
 +  }
++
 +  pinTab(aTab) {
 +    if (aTab.pinned)
 +      return;
@@ -644,6 +745,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    event.initEvent("TabPinned", true, false);
 +    aTab.dispatchEvent(event);
 +  }
++
 +  unpinTab(aTab) {
 +    if (!aTab.pinned)
 +      return;
@@ -661,6 +763,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    event.initEvent("TabUnpinned", true, false);
 +    aTab.dispatchEvent(event);
 +  }
++
 +  previewTab(aTab, aCallback) {
 +    let currentTab = this.selectedTab;
 +    try {
@@ -673,6 +776,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      this._previewMode = false;
 +    }
 +  }
++
 +  syncThrobberAnimations(aTab) {
 +    BrowserUtils.promiseLayoutFlushed(aTab.ownerDocument, "style", () => {
 +      if (!aTab.parentNode) {
@@ -725,33 +829,39 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      });
 +    });
 +  }
++
 +  getBrowserAtIndex(aIndex) {
 +    return this.browsers[aIndex];
 +  }
++
 +  getBrowserIndexForDocument(aDocument) {
 +    var tab = this._getTabForContentWindow(aDocument.defaultView);
 +    return tab ? tab._tPos : -1;
 +  }
++
 +  getBrowserForDocument(aDocument) {
 +    var tab = this._getTabForContentWindow(aDocument.defaultView);
 +    return tab ? tab.linkedBrowser : null;
 +  }
++
 +  getBrowserForContentWindow(aWindow) {
 +    var tab = this._getTabForContentWindow(aWindow);
 +    return tab ? tab.linkedBrowser : null;
 +  }
++
 +  getBrowserForOuterWindowID(aID) {
 +    return this._outerWindowIDBrowserMap.get(aID);
 +  }
++
 +  _getTabForContentWindow(aWindow) {
 +    // When not using remote browsers, we can take a fast path by getting
 +    // directly from the content window to the browser without looping
 +    // over all browsers.
 +    if (!gMultiProcessBrowser) {
 +      let browser = aWindow.QueryInterface(Ci.nsIInterfaceRequestor)
-+        .getInterface(Ci.nsIWebNavigation)
-+        .QueryInterface(Ci.nsIDocShell)
-+        .chromeEventHandler;
++                           .getInterface(Ci.nsIWebNavigation)
++                           .QueryInterface(Ci.nsIDocShell)
++                           .chromeEventHandler;
 +      return this.getTabForBrowser(browser);
 +    }
 +
@@ -763,18 +873,23 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    }
 +    return null;
 +  }
++
 +  getTabForBrowser(aBrowser) {
 +    return this._tabForBrowser.get(aBrowser);
 +  }
++
 +  getNotificationBox(aBrowser) {
 +    return this.getSidebarContainer(aBrowser).parentNode;
 +  }
++
 +  getSidebarContainer(aBrowser) {
 +    return this.getBrowserContainer(aBrowser).parentNode;
 +  }
++
 +  getBrowserContainer(aBrowser) {
 +    return (aBrowser || this.mCurrentBrowser).parentNode.parentNode;
 +  }
++
 +  getTabModalPromptBox(aBrowser) {
 +    let browser = (aBrowser || this.mCurrentBrowser);
 +    if (!browser.tabModalPromptBox) {
@@ -782,6 +897,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    }
 +    return browser.tabModalPromptBox;
 +  }
++
 +  getTabFromAudioEvent(aEvent) {
 +    if (!Services.prefs.getBoolPref("browser.tabs.showAudioPlayingIcon") ||
 +      !aEvent.isTrusted) {
@@ -792,6 +908,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    var tab = this.getTabForBrowser(browser);
 +    return tab;
 +  }
++
 +  _callProgressListeners(aBrowser, aMethod, aArguments, aCallGlobalListeners, aCallTabsListeners) {
 +    var rv = true;
 +
@@ -857,6 +974,10 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return rv;
 +  }
++
++  /**
++   * Determine if a URI is an about: page pointing to a local resource.
++   */
 +  _isLocalAboutURI(aURI, aResolvedURI) {
 +    if (!aURI.schemeIs("about")) {
 +      return false;
@@ -883,6 +1004,10 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      return false;
 +    }
 +  }
++
++  /**
++   * A web progress listener object definition for a given tab.
++   */
 +  mTabProgressListener(aTab, aBrowser, aStartsBlank, aWasPreloadedBrowser, aOrigStateFlags) {
 +    let stateFlags = aOrigStateFlags || 0;
 +    // Initialize mStateFlags to non-zero e.g. when creating a progress
@@ -964,10 +1089,10 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +        if (this.mTotalProgress && this.mTab.hasAttribute("busy"))
 +          this.mTab.setAttribute("progress", "true");
 +
-+        this._callProgressListeners("onProgressChange", [aWebProgress, aRequest,
-+          aCurSelfProgress, aMaxSelfProgress,
-+          aCurTotalProgress, aMaxTotalProgress
-+        ]);
++        this._callProgressListeners("onProgressChange",
++                                    [aWebProgress, aRequest,
++                                     aCurSelfProgress, aMaxSelfProgress,
++                                     aCurTotalProgress, aMaxTotalProgress]);
 +      },
 +
 +      onProgressChange64(aWebProgress, aRequest,
@@ -1407,15 +1532,18 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +        }
 +
 +        if (ignoreBlank) {
-+          this._callProgressListeners("onUpdateCurrentBrowser", [aStateFlags, aStatus, "", 0],
-+            true, false);
++          this._callProgressListeners("onUpdateCurrentBrowser",
++                                      [aStateFlags, aStatus, "", 0],
++                                      true, false);
 +        } else {
-+          this._callProgressListeners("onStateChange", [aWebProgress, aRequest, aStateFlags, aStatus],
-+            true, false);
++          this._callProgressListeners("onStateChange",
++                                      [aWebProgress, aRequest, aStateFlags, aStatus],
++                                      true, false);
 +        }
 +
-+        this._callProgressListeners("onStateChange", [aWebProgress, aRequest, aStateFlags, aStatus],
-+          false);
++        this._callProgressListeners("onStateChange",
++                                    [aWebProgress, aRequest, aStateFlags, aStatus],
++                                    false);
 +
 +        if (aStateFlags & (nsIWebProgressListener.STATE_START |
 +            nsIWebProgressListener.STATE_STOP)) {
@@ -1538,9 +1666,8 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +        }
 +
 +        if (!this.mBlank) {
-+          this._callProgressListeners("onLocationChange", [aWebProgress, aRequest, aLocation,
-+            aFlags
-+          ]);
++          this._callProgressListeners("onLocationChange",
++                                      [aWebProgress, aRequest, aLocation, aFlags]);
 +        }
 +
 +        if (topLevel) {
@@ -1553,17 +1680,20 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +        if (this.mBlank)
 +          return;
 +
-+        this._callProgressListeners("onStatusChange", [aWebProgress, aRequest, aStatus, aMessage]);
++        this._callProgressListeners("onStatusChange",
++                                    [aWebProgress, aRequest, aStatus, aMessage]);
 +
 +        this.mMessage = aMessage;
 +      },
 +
 +      onSecurityChange(aWebProgress, aRequest, aState) {
-+        this._callProgressListeners("onSecurityChange", [aWebProgress, aRequest, aState]);
++        this._callProgressListeners("onSecurityChange",
++                                    [aWebProgress, aRequest, aState]);
 +      },
 +
 +      onRefreshAttempted(aWebProgress, aURI, aDelay, aSameURI) {
-+        return this._callProgressListeners("onRefreshAttempted", [aWebProgress, aURI, aDelay, aSameURI]);
++        return this._callProgressListeners("onRefreshAttempted",
++                                           [aWebProgress, aURI, aDelay, aSameURI]);
 +      },
 +
 +      QueryInterface(aIID) {
@@ -1576,6 +1706,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      }
 +    });
 +  }
++
 +  storeIcon(aBrowser, aURI, aLoadingPrincipal, aRequestContextID) {
 +    try {
 +      if (!(aURI instanceof Ci.nsIURI)) {
@@ -1586,6 +1717,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      Components.utils.reportError(ex);
 +    }
 +  }
++
 +  setIcon(aTab, aURI, aLoadingPrincipal, aRequestContextID) {
 +    let browser = this.getBrowserForTab(aTab);
 +    browser.mIconURL = aURI instanceof Ci.nsIURI ? aURI.spec : aURI;
@@ -1613,22 +1745,26 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    this._callProgressListeners(browser, "onLinkIconAvailable", [browser.mIconURL]);
 +  }
++
 +  getIcon(aTab) {
 +    let browser = aTab ? this.getBrowserForTab(aTab) : this.selectedBrowser;
 +    return browser.mIconURL;
 +  }
++
 +  setPageInfo(aURL, aDescription, aPreviewImage) {
 +    if (aURL) {
 +      let pageInfo = { url: aURL, description: aDescription, previewImageURL: aPreviewImage };
 +      PlacesUtils.history.update(pageInfo).catch(Components.utils.reportError);
 +    }
 +  }
++
 +  shouldLoadFavIcon(aURI) {
 +    return (aURI &&
 +      Services.prefs.getBoolPref("browser.chrome.site_icons") &&
 +      Services.prefs.getBoolPref("browser.chrome.favicons") &&
 +      ("schemeIs" in aURI) && (aURI.schemeIs("http") || aURI.schemeIs("https")));
 +  }
++
 +  useDefaultIcon(aTab) {
 +    let browser = this.getBrowserForTab(aTab);
 +    let documentURI = browser.documentURI;
@@ -1660,11 +1796,13 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    this.setIcon(aTab, icon, loadingPrincipal, requestContextID);
 +  }
++
 +  isFailedIcon(aURI) {
 +    if (!(aURI instanceof Ci.nsIURI))
 +      aURI = makeURI(aURI);
 +    return PlacesUtils.favicons.isFailedFavicon(aURI);
 +  }
++
 +  getWindowTitleForBrowser(aBrowser) {
 +    var newTitle = "";
 +    var docElement = this.ownerDocument.documentElement;
@@ -1707,9 +1845,11 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return newTitle;
 +  }
++
 +  updateTitlebar() {
 +    this.ownerDocument.title = this.getWindowTitleForBrowser(this.mCurrentBrowser);
 +  }
++
 +  updateCurrentBrowser(aForceUpdate) {
 +    var newBrowser = this.getBrowserAtIndex(this.tabContainer.selectedIndex);
 +    if (this.mCurrentBrowser == newBrowser && !aForceUpdate)
@@ -1808,22 +1948,24 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    var webProgress = this.mCurrentBrowser.webProgress;
 +    var securityUI = this.mCurrentBrowser.securityUI;
 +
-+    this._callProgressListeners(null, "onLocationChange", [webProgress, null, loc, 0], true,
-+      false);
++    this._callProgressListeners(null, "onLocationChange",
++                                [webProgress, null, loc, 0],
++                                true, false);
 +
 +    if (securityUI) {
 +      // Include the true final argument to indicate that this event is
 +      // simulated (instead of being observed by the webProgressListener).
-+      this._callProgressListeners(null, "onSecurityChange", [webProgress, null, securityUI.state, true],
-+        true, false);
++      this._callProgressListeners(null, "onSecurityChange",
++                                  [webProgress, null, securityUI.state, true],
++                                  true, false);
 +    }
 +
 +    var listener = this._tabListeners.get(this.mCurrentTab);
 +    if (listener && listener.mStateFlags) {
-+      this._callProgressListeners(null, "onUpdateCurrentBrowser", [listener.mStateFlags, listener.mStatus,
-+          listener.mMessage, listener.mTotalProgress
-+        ],
-+        true, false);
++      this._callProgressListeners(null, "onUpdateCurrentBrowser",
++                                  [listener.mStateFlags, listener.mStatus,
++                                  listener.mMessage, listener.mTotalProgress],
++                                  true, false);
 +    }
 +
 +    if (!this._previewMode) {
@@ -1856,22 +1998,22 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    const nsIWebProgressListener = Components.interfaces.nsIWebProgressListener;
 +    if (this.mCurrentTab.hasAttribute("busy") && !this.mIsBusy) {
 +      this.mIsBusy = true;
-+      this._callProgressListeners(null, "onStateChange", [webProgress, null,
-+          nsIWebProgressListener.STATE_START |
-+          nsIWebProgressListener.STATE_IS_NETWORK, 0
-+        ],
-+        true, false);
++      this._callProgressListeners(null, "onStateChange",
++                                  [webProgress, null,
++                                   nsIWebProgressListener.STATE_START |
++                                   nsIWebProgressListener.STATE_IS_NETWORK, 0],
++                                  true, false);
 +    }
 +
 +    // If the new tab is not busy, and our current state is busy, then
 +    // we need to fire a stop to all progress listeners.
 +    if (!this.mCurrentTab.hasAttribute("busy") && this.mIsBusy) {
 +      this.mIsBusy = false;
-+      this._callProgressListeners(null, "onStateChange", [webProgress, null,
-+          nsIWebProgressListener.STATE_STOP |
-+          nsIWebProgressListener.STATE_IS_NETWORK, 0
-+        ],
-+        true, false);
++      this._callProgressListeners(null, "onStateChange",
++                                  [webProgress, null,
++                                   nsIWebProgressListener.STATE_STOP |
++                                   nsIWebProgressListener.STATE_IS_NETWORK, 0],
++                                  true, false);
 +    }
 +
 +    // TabSelect events are suppressed during preview mode to avoid confusing extensions and other bits of code
@@ -1968,6 +2110,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    if (!aForceUpdate)
 +      TelemetryStopwatch.finish("FX_TAB_SWITCH_UPDATE_MS");
 +  }
++
 +  _adjustFocusBeforeTabSwitch(oldTab, newTab) {
 +    if (this._previewMode) {
 +      return;
@@ -2003,6 +2146,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      }
 +    }
 +  }
++
 +  _adjustFocusAfterTabSwitch(newTab) {
 +    // Don't steal focus from the tab bar.
 +    if (document.activeElement == newTab)
@@ -2070,6 +2214,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    fm.setFocus(newBrowser, focusFlags);
 +  }
++
 +  _tabAttrModified(aTab, aChanged) {
 +    if (aTab.closing)
 +      return;
@@ -2083,41 +2228,40 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    });
 +    aTab.dispatchEvent(event);
 +  }
++
 +  setBrowserSharing(aBrowser, aState) {
 +    let tab = this.getTabForBrowser(aBrowser);
 +    if (!tab)
 +      return;
 +
-+    let sharing;
-+    if (aState.screen) {
-+      sharing = "screen";
-+    } else if (aState.camera) {
-+      sharing = "camera";
-+    } else if (aState.microphone) {
-+      sharing = "microphone";
-+    }
-+
-+    if (sharing) {
-+      tab.setAttribute("sharing", sharing);
++    if (aState.sharing) {
 +      tab._sharingState = aState;
++      if (aState.paused) {
++        tab.removeAttribute("sharing");
++      } else {
++        tab.setAttribute("sharing", aState.sharing);
++      }
 +    } else {
-+      tab.removeAttribute("sharing");
 +      tab._sharingState = null;
++      tab.removeAttribute("sharing");
 +    }
 +    this._tabAttrModified(tab, ["sharing"]);
 +
 +    if (aBrowser == this.mCurrentBrowser)
 +      gIdentityHandler.updateSharingIndicator();
 +  }
++
 +  getTabSharingState(aTab) {
 +    // Normalize the state object for consumers (ie.extensions).
 +    let state = Object.assign({}, aTab._sharingState);
-+    // ensure bool if undefined
-+    state.camera = !!state.camera;
-+    state.microphone = !!state.microphone;
-+    return state;
++    return {
++      camera: !!state.camera,
++      microphone: !!state.microphone,
++      screen: state.screen && state.screen.replace("Paused", ""),
++    };
 +  }
-+  setTabTitleLoading(aTab) {} setInitialTabTitle(aTab, aTitle, aOptions) {
++
++  setInitialTabTitle(aTab, aTitle, aOptions) {
 +    if (aTitle) {
 +      if (!aTab.getAttribute("label")) {
 +        aTab._labelIsInitialTitle = true;
@@ -2126,6 +2270,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      this._setTabLabel(aTab, aTitle, aOptions);
 +    }
 +  }
++
 +  setTabTitle(aTab) {
 +    var browser = this.getBrowserForTab(aTab);
 +    var title = browser.contentTitle;
@@ -2145,7 +2290,8 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    } else if (aTab.hasAttribute("customizemode")) {
 +      let brandBundle = document.getElementById("bundle_brand");
 +      let brandShortName = brandBundle.getString("brandShortName");
-+      title = gNavigatorBundle.getFormattedString("customizeMode.tabTitle", [brandShortName]);
++      title = gNavigatorBundle.getFormattedString("customizeMode.tabTitle",
++                                                  [brandShortName]);
 +      isContentTitle = true;
 +    } else {
 +      if (browser.currentURI.displaySpec) {
@@ -2306,6 +2452,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return this._setTabLabel(aTab, title, { isContentTitle });
 +  }
++
 +  _setTabLabel(aTab, aLabel, aOptions) {
 +    if (!aLabel) {
 +      return false;
@@ -2329,7 +2476,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    }
 +
 +    let dwu = window.QueryInterface(Ci.nsIInterfaceRequestor)
-+      .getInterface(Ci.nsIDOMWindowUtils);
++                    .getInterface(Ci.nsIDOMWindowUtils);
 +    let isRTL = dwu.getDirectionFromText(aLabel) == Ci.nsIDOMWindowUtils.DIRECTION_RTL;
 +
 +    aTab.setAttribute("label", aLabel);
@@ -2347,6 +2494,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return true;
 +  }
++
 +  loadOneTab(aURI, aReferrerURI, aCharset, aPostData, aLoadInBackground, aAllowThirdPartyFixup) {
 +    var aTriggeringPrincipal;
 +    var aReferrerPolicy;
@@ -2429,6 +2577,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return tab;
 +  }
++
 +  loadTabs(aURIs, aLoadInBackground, aReplace) {
 +    let aTriggeringPrincipal;
 +    let aAllowThirdPartyFixup;
@@ -2525,6 +2674,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      this.selectedTab = firstTabAdded;
 +    }
 +  }
++
 +  updateBrowserRemoteness(aBrowser, aShouldBeRemote, aOptions) {
 +    aOptions = aOptions || {};
 +    let isRemote = aBrowser.getAttribute("remote") == "true";
@@ -2650,8 +2800,9 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      Ci.nsIWebProgressListener.STATE_IS_INSECURE;
 +    // Include the true final argument to indicate that this event is
 +    // simulated (instead of being observed by the webProgressListener).
-+    this._callProgressListeners(aBrowser, "onSecurityChange", [aBrowser.webProgress, null, state, true],
-+      true, false);
++    this._callProgressListeners(aBrowser, "onSecurityChange",
++                                [aBrowser.webProgress, null, state, true],
++                                true, false);
 +
 +    if (aShouldBeRemote) {
 +      // Switching the browser to be remote will connect to a new child
@@ -2679,6 +2830,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return true;
 +  }
++
 +  updateBrowserRemotenessByURL(aBrowser, aURL, aOptions) {
 +    aOptions = aOptions || {};
 +
@@ -2703,6 +2855,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return false;
 +  }
++
 +  removePreloadedBrowser() {
 +    if (!this._isPreloadingEnabled()) {
 +      return;
@@ -2714,6 +2867,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      browser.remove();
 +    }
 +  }
++
 +  _getPreloadedBrowser() {
 +    if (!this._isPreloadingEnabled()) {
 +      return null;
@@ -2740,6 +2894,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return browser;
 +  }
++
 +  _isPreloadingEnabled() {
 +    // Preloading for the newtab page is enabled when the pref is true
 +    // and the URL is "about:newtab". We do not support preloading for
@@ -2747,6 +2902,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    return Services.prefs.getBoolPref("browser.newtab.preload") &&
 +      !aboutNewTabService.overridden;
 +  }
++
 +  _createPreloadBrowser() {
 +    // Do nothing if we have a preloaded browser already
 +    // or preloading of newtab pages is disabled.
@@ -2777,6 +2933,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    let tabURI = Services.io.newURI(BROWSER_NEW_TAB_URL);
 +    FullZoom.onLocationChange(tabURI, false, browser);
 +  }
++
 +  _createBrowser(aParams) {
 +    // Supported parameters:
 +    // userContextId, remote, remoteType, isPreloadBrowser,
@@ -2899,6 +3056,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return b;
 +  }
++
 +  _createLazyBrowser(aTab) {
 +    let browser = aTab.linkedBrowser;
 +
@@ -2992,6 +3150,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      });
 +    }
 +  }
++
 +  _insertBrowser(aTab, aInsertedOnTabCreation) {
 +    "use strict";
 +
@@ -3055,6 +3214,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    var evt = new CustomEvent("TabBrowserInserted", { bubbles: true, detail: { insertedOnTabCreation: aInsertedOnTabCreation } });
 +    aTab.dispatchEvent(evt);
 +  }
++
 +  discardBrowser(aBrowser, aForceDiscard) {
 +    "use strict";
 +
@@ -3113,6 +3273,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    let evt = new CustomEvent("TabBrowserDiscarded", { bubbles: true });
 +    tab.dispatchEvent(evt);
 +  }
++
 +  // eslint-disable-next-line complexity
 +  addTab(aURI, aReferrerURI, aCharset, aPostData, aOwner, aAllowThirdPartyFixup) {
 +    "use strict";
@@ -3450,6 +3611,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return t;
 +  }
++
 +  warnAboutClosingTabs(aCloseTabs, aTab) {
 +    var tabsToClose;
 +    switch (aCloseTabs) {
@@ -3512,6 +3674,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return reallyClose;
 +  }
++
 +  getTabsToTheEndFrom(aTab) {
 +    let tabsToEnd = [];
 +    let tabs = this.visibleTabs;
@@ -3523,6 +3686,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    }
 +    return tabsToEnd;
 +  }
++
 +  removeTabsToTheEndFrom(aTab, aParams) {
 +    if (!this.warnAboutClosingTabs(this.closingTabsEnum.TO_END, aTab))
 +      return;
@@ -3546,6 +3710,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    }
 +    tabsWithBeforeUnload.forEach(removeTab);
 +  }
++
 +  removeAllTabsBut(aTab) {
 +    if (!this.warnAboutClosingTabs(this.closingTabsEnum.OTHER)) {
 +      return;
@@ -3568,9 +3733,11 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      this.removeTab(tab, { animate: true });
 +    }
 +  }
++
 +  removeCurrentTab(aParams) {
 +    this.removeTab(this.mCurrentTab, aParams);
 +  }
++
 +  removeTab(aTab, aParams) {
 +    if (aParams) {
 +      var animate = aParams.animate;
@@ -3639,12 +3806,14 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      }
 +    }, 3000, aTab, this);
 +  }
++
 +  _hasBeforeUnload(aTab) {
 +    let browser = aTab.linkedBrowser;
 +    return browser.isRemoteBrowser && browser.frameLoader &&
 +      browser.frameLoader.tabParent &&
 +      browser.frameLoader.tabParent.hasBeforeUnload;
 +  }
++
 +  _beginRemoveTab(aTab, aAdoptedByTab, aCloseWindowWithLastTab, aCloseWindowFastpath, aSkipPermitUnload) {
 +    if (aTab.closing ||
 +      this._windowIsClosing)
@@ -3751,8 +3920,8 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    if (aTab.linkedPanel) {
 +      if (!aAdoptedByTab && !gMultiProcessBrowser) {
 +        // Prevent this tab from showing further dialogs, since we're closing it
-+        var windowUtils = browser.contentWindow.QueryInterface(Ci.nsIInterfaceRequestor).
-+        getInterface(Ci.nsIDOMWindowUtils);
++        var windowUtils = browser.contentWindow.QueryInterface(Ci.nsIInterfaceRequestor)
++                                               .getInterface(Ci.nsIDOMWindowUtils);
 +        windowUtils.disableDialogs();
 +      }
 +
@@ -3784,6 +3953,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return true;
 +  }
++
 +  _endRemoveTab(aTab) {
 +    if (!aTab || !aTab._endRemoveArgs)
 +      return;
@@ -3903,6 +4073,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    if (aCloseWindow)
 +      this._windowIsClosing = closeWindow(true, window.warnAboutClosingWindow);
 +  }
++
 +  _findTabToBlurTo(aTab) {
 +    if (!aTab.selected) {
 +      return null;
@@ -3940,9 +4111,11 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return tab;
 +  }
++
 +  _blurTab(aTab) {
 +    this.selectedTab = this._findTabToBlurTo(aTab);
 +  }
++
 +  swapBrowsersAndCloseOther(aOurTab, aOtherTab) {
 +    // Do not allow transfering a private tab to a non-private window
 +    // and vice versa.
@@ -3990,15 +4163,15 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    if (closeWindow) {
 +      let win = aOtherTab.ownerGlobal;
 +      let dwu = win.QueryInterface(Ci.nsIInterfaceRequestor)
-+        .getInterface(Ci.nsIDOMWindowUtils);
++                   .getInterface(Ci.nsIDOMWindowUtils);
 +      dwu.suppressAnimation(true);
 +      // Only suppressing window animations isn't enough to avoid
 +      // an empty content area being painted.
 +      let baseWin = win.QueryInterface(Ci.nsIInterfaceRequestor)
-+        .getInterface(Ci.nsIDocShell)
-+        .QueryInterface(Ci.nsIDocShellTreeItem)
-+        .treeOwner
-+        .QueryInterface(Ci.nsIBaseWindow);
++                       .getInterface(Ci.nsIDocShell)
++                       .QueryInterface(Ci.nsIDocShellTreeItem)
++                       .treeOwner
++                       .QueryInterface(Ci.nsIBaseWindow);
 +      baseWin.visibility = false;
 +    }
 +
@@ -4085,6 +4258,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      this._tabAttrModified(aOurTab, modifiedAttrs);
 +    }
 +  }
++
 +  swapBrowsers(aOurTab, aOtherTab, aFlags) {
 +    let otherBrowser = aOtherTab.linkedBrowser;
 +    let otherTabBrowser = otherBrowser.getTabBrowser();
@@ -4106,6 +4280,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    filter.addProgressListener(tabListener, notifyAll);
 +    otherBrowser.webProgress.addProgressListener(filter, notifyAll);
 +  }
++
 +  _swapBrowserDocShells(aOurTab, aOtherBrowser, aFlags, aStateFlags) {
 +    // aOurTab's browser needs to be inserted now if it hasn't already.
 +    this._insertBrowser(aOurTab);
@@ -4172,6 +4347,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    filter.addProgressListener(tabListener, notifyAll);
 +    ourBrowser.webProgress.addProgressListener(filter, notifyAll);
 +  }
++
 +  _swapRegisteredOpenURIs(aOurBrowser, aOtherBrowser) {
 +    // Swap the registeredOpenURI properties of the two browsers
 +    let tmp = aOurBrowser.registeredOpenURI;
@@ -4184,6 +4360,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      aOtherBrowser.registeredOpenURI = tmp;
 +    }
 +  }
++
 +  reloadAllTabs() {
 +    let tabs = this.visibleTabs;
 +    let l = tabs.length;
@@ -4195,6 +4372,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      }
 +    }
 +  }
++
 +  reloadTab(aTab) {
 +    let browser = this.getBrowserForTab(aTab);
 +    // Reset temporary permissions on the current tab. This is done here
@@ -4202,6 +4380,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    SitePermissions.clearTemporaryPermissions(browser);
 +    browser.reload();
 +  }
++
 +  addProgressListener(aListener) {
 +    if (arguments.length != 1) {
 +      Components.utils.reportError("gBrowser.addProgressListener was " +
@@ -4212,20 +4391,25 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    this.mProgressListeners.push(aListener);
 +  }
++
 +  removeProgressListener(aListener) {
 +    this.mProgressListeners =
 +      this.mProgressListeners.filter(l => l != aListener);
 +  }
++
 +  addTabsProgressListener(aListener) {
 +    this.mTabsProgressListeners.push(aListener);
 +  }
++
 +  removeTabsProgressListener(aListener) {
 +    this.mTabsProgressListeners =
 +      this.mTabsProgressListeners.filter(l => l != aListener);
 +  }
++
 +  getBrowserForTab(aTab) {
 +    return aTab.linkedBrowser;
 +  }
++
 +  showOnlyTheseTabs(aTabs) {
 +    for (let tab of this.tabs) {
 +      if (!aTabs.includes(tab))
@@ -4236,6 +4420,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    this.tabContainer._handleTabSelect(true);
 +  }
++
 +  showTab(aTab) {
 +    if (aTab.hidden) {
 +      aTab.removeAttribute("hidden");
@@ -4251,6 +4436,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      SessionStore.deleteTabValue(aTab, "hiddenBy");
 +    }
 +  }
++
 +  hideTab(aTab, aSource) {
 +    if (!aTab.hidden && !aTab.pinned && !aTab.selected &&
 +      !aTab.closing && !aTab._sharingState) {
@@ -4269,6 +4455,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      }
 +    }
 +  }
++
 +  selectTabAtIndex(aIndex, aEvent) {
 +    let tabs = this.visibleTabs;
 +
@@ -4290,6 +4477,11 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      aEvent.stopPropagation();
 +    }
 +  }
++
++  /**
++   * Moves a tab to a new browser window, unless it's already the only tab
++   * in the current window, in which case this will do nothing.
++   */
 +  replaceTabWithWindow(aTab, aOptions) {
 +    if (this.tabs.length == 1)
 +      return null;
@@ -4309,6 +4501,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    // tell a new window to take the "dropped" tab
 +    return window.openDialog(getBrowserURL(), "_blank", options, aTab);
 +  }
++
 +  moveTabTo(aTab, aIndex, aKeepRelatedTabs) {
 +    var oldPosition = aTab._tPos;
 +    if (oldPosition == aIndex)
@@ -4373,6 +4566,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    evt.initUIEvent("TabMove", true, false, window, oldPosition);
 +    aTab.dispatchEvent(evt);
 +  }
++
 +  moveTabForward() {
 +    let nextTab = this.mCurrentTab.nextSibling;
 +    while (nextTab && nextTab.hidden)
@@ -4383,6 +4577,10 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    else if (this.arrowKeysShouldWrap)
 +      this.moveTabToStart();
 +  }
++
++  /**
++   * Adopts a tab from another browser window, and inserts it at aIndex
++   */
 +  adoptTab(aTab, aIndex, aSelectTab) {
 +    // Swap the dropped tab with a new one we create and then close
 +    // it in the other window (making it seem to have moved between
@@ -4435,6 +4633,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    return newTab;
 +  }
++
 +  moveTabBackward() {
 +    let previousTab = this.mCurrentTab.previousSibling;
 +    while (previousTab && previousTab.hidden)
@@ -4445,16 +4644,19 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    else if (this.arrowKeysShouldWrap)
 +      this.moveTabToEnd();
 +  }
++
 +  moveTabToStart() {
 +    var tabPos = this.mCurrentTab._tPos;
 +    if (tabPos > 0)
 +      this.moveTabTo(this.mCurrentTab, 0);
 +  }
++
 +  moveTabToEnd() {
 +    var tabPos = this.mCurrentTab._tPos;
 +    if (tabPos < this.browsers.length - 1)
 +      this.moveTabTo(this.mCurrentTab, this.browsers.length - 1);
 +  }
++
 +  moveTabOver(aEvent) {
 +    var direction = window.getComputedStyle(this.container.parentNode).direction;
 +    if ((direction == "ltr" && aEvent.keyCode == KeyEvent.DOM_VK_RIGHT) ||
@@ -4463,9 +4665,17 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    else
 +      this.moveTabBackward();
 +  }
++
++  /**
++   * @param   aTab
++   *          Can be from a different window as well
++   * @param   aRestoreTabImmediately
++   *          Can defer loading of the tab contents
++   */
 +  duplicateTab(aTab, aRestoreTabImmediately) {
 +    return SessionStore.duplicateTab(window, aTab, 0, aRestoreTabImmediately);
 +  }
++
 +  activateBrowserForPrintPreview(aBrowser) {
 +    this._printPreviewBrowsers.add(aBrowser);
 +    if (this._switcher) {
@@ -4473,6 +4683,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    }
 +    aBrowser.docShellIsActive = true;
 +  }
++
 +  deactivatePrintPreviewBrowsers() {
 +    let browsers = this._printPreviewBrowsers;
 +    this._printPreviewBrowsers = new Set();
@@ -4480,6 +4691,10 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      browser.docShellIsActive = this.shouldActivateDocShell(browser);
 +    }
 +  }
++
++  /**
++   * Returns true if a given browser's docshell should be active.
++   */
 +  shouldActivateDocShell(aBrowser) {
 +    if (this._switcher) {
 +      return this._switcher.shouldActivateDocShell(aBrowser);
@@ -4489,6 +4704,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +        !window.isFullyOccluded) ||
 +      this._printPreviewBrowsers.has(aBrowser);
 +  }
++
 +  _getSwitcher() {
 +    if (this._switcher) {
 +      return this._switcher;
@@ -4659,6 +4875,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +        window.addEventListener("MozAfterPaint", this);
 +        window.addEventListener("MozLayerTreeReady", this);
 +        window.addEventListener("MozLayerTreeCleared", this);
++        window.addEventListener("TabBrowserDiscarded", this);
 +        window.addEventListener("TabRemotenessChange", this);
 +        window.addEventListener("sizemodechange", this);
 +        window.addEventListener("occlusionstatechange", this);
@@ -4678,14 +4895,14 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +        if (!this.minimizedOrFullyOccluded) {
 +          this.log("Initial tab is loaded?: " + tabIsLoaded);
-+          this.setTabState(initialTab, tabIsLoaded ? this.STATE_LOADED :
-+            this.STATE_LOADING);
++          this.setTabState(initialTab, tabIsLoaded ? this.STATE_LOADED
++                                                   : this.STATE_LOADING);
 +        }
 +
 +        for (let ppBrowser of this.tabbrowser._printPreviewBrowsers) {
 +          let ppTab = this.tabbrowser.getTabForBrowser(ppBrowser);
-+          let state = ppBrowser.hasLayers ? this.STATE_LOADED :
-+            this.STATE_LOADING;
++          let state = ppBrowser.hasLayers ? this.STATE_LOADED
++                                          : this.STATE_LOADING;
 +          this.setTabState(ppTab, state);
 +        }
 +      },
@@ -4703,6 +4920,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +        window.removeEventListener("MozAfterPaint", this);
 +        window.removeEventListener("MozLayerTreeReady", this);
 +        window.removeEventListener("MozLayerTreeCleared", this);
++        window.removeEventListener("TabBrowserDiscarded", this);
 +        window.removeEventListener("TabRemotenessChange", this);
 +        window.removeEventListener("sizemodechange", this);
 +        window.removeEventListener("occlusionstatechange", this);
@@ -5102,6 +5320,48 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -                  this.mTabBrowser._unifiedComplete
 -                                  .registerOpenPage(aLocation, userContextId);
 -                  this.mBrowser.registeredOpenURI = aLocation;
+-                }
+-              }
+-
+-              if (!this.mBlank) {
+-                this._callProgressListeners("onLocationChange",
+-                                            [aWebProgress, aRequest, aLocation,
+-                                             aFlags]);
+-              }
+-
+-              if (topLevel) {
+-                this.mBrowser.lastURI = aLocation;
+-                this.mBrowser.lastLocationChange = Date.now();
+-              }
+-            },
+-
+-            onStatusChange(aWebProgress, aRequest, aStatus, aMessage) {
+-              if (this.mBlank)
+-                return;
+-
+-              this._callProgressListeners("onStatusChange",
+-                                          [aWebProgress, aRequest, aStatus, aMessage]);
+-
+-              this.mMessage = aMessage;
+-            },
+-
+-            onSecurityChange(aWebProgress, aRequest, aState) {
+-              this._callProgressListeners("onSecurityChange",
+-                                          [aWebProgress, aRequest, aState]);
+-            },
+-
+-            onRefreshAttempted(aWebProgress, aURI, aDelay, aSameURI) {
+-              return this._callProgressListeners("onRefreshAttempted",
+-                                                 [aWebProgress, aURI, aDelay, aSameURI]);
+-            },
+-
+-            QueryInterface(aIID) {
+-              if (aIID.equals(Components.interfaces.nsIWebProgressListener) ||
+-                  aIID.equals(Components.interfaces.nsIWebProgressListener2) ||
+-                  aIID.equals(Components.interfaces.nsISupportsWeakReference) ||
+-                  aIID.equals(Components.interfaces.nsISupports))
+-                return this;
+-              throw Components.results.NS_NOINTERFACE;
 +              this.maybeActivateDocShell(this.requestedTab);
 +            }
 +          }
@@ -5171,26 +5431,26 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +        this.assert(this.tabbrowser._switcher === this);
 +
 +        for (let [tab, ] of this.tabState) {
-+          if (!tab.linkedBrowser) {
++          if (!tab.linkedPanel) {
 +            this.tabState.delete(tab);
 +            this.unwarmTab(tab);
 +          }
 +        }
 +
-+        if (this.lastVisibleTab && !this.lastVisibleTab.linkedBrowser) {
++        if (this.lastVisibleTab && !this.lastVisibleTab.linkedPanel) {
 +          this.lastVisibleTab = null;
 +        }
-+        if (this.lastPrimaryTab && !this.lastPrimaryTab.linkedBrowser) {
++        if (this.lastPrimaryTab && !this.lastPrimaryTab.linkedPanel) {
 +          this.lastPrimaryTab = null;
 +        }
-+        if (this.blankTab && !this.blankTab.linkedBrowser) {
++        if (this.blankTab && !this.blankTab.linkedPanel) {
 +          this.blankTab = null;
 +        }
-+        if (this.spinnerTab && !this.spinnerTab.linkedBrowser) {
++        if (this.spinnerTab && !this.spinnerTab.linkedPanel) {
 +          this.spinnerHidden();
 +          this.spinnerTab = null;
 +        }
-+        if (this.loadingTab && !this.loadingTab.linkedBrowser) {
++        if (this.loadingTab && !this.loadingTab.linkedPanel) {
 +          this.loadingTab = null;
 +          this.clearTimer(this.loadTimer);
 +          this.loadTimer = null;
@@ -5392,6 +5652,12 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +        }
 +      },
 +
++      // Called when a tab is discarded
++      onTabDiscarded(tab) {
++        this.logState(`onTabDiscarded(${tab._tPos})`);
++        this.setTabStateNoAction(tab, this.STATE_UNLOADED);
++      },
++
 +      // Called when a tab has been removed, and the browser node is
 +      // about to be removed from the DOM.
 +      onTabRemoved(tab) {
@@ -5441,9 +5707,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +          let otherSwitcher = otherTabbrowser._switcher;
 +          otherState = otherSwitcher.getTabState(otherTab);
 +        } else {
-+          otherState = (otherBrowser.docShellIsActive ?
-+            this.STATE_LOADED :
-+            this.STATE_UNLOADED);
++          otherState = otherBrowser.docShellIsActive ? this.STATE_LOADED : this.STATE_UNLOADED;
 +        }
 +
 +        if (!this.swapMap) {
@@ -5560,7 +5824,31 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +              warmingState = "stillLoading";
 +            } else if (tabState == this.STATE_LOADED) {
 +              warmingState = "loaded";
-+            }
+             }
+-          });
+-        ]]>
+-        </body>
+-      </method>
+-
+-      <field name="serializationHelper">
+-        Cc["@mozilla.org/network/serialization-helper;1"]
+-          .getService(Ci.nsISerializationHelper);
+-      </field>
+-
+-      <method name="storeIcon">
+-        <parameter name="aBrowser"/>
+-        <parameter name="aURI"/>
+-        <parameter name="aLoadingPrincipal"/>
+-        <parameter name="aRequestContextID"/>
+-        <body>
+-          <![CDATA[
+-          try {
+-            if (!(aURI instanceof Ci.nsIURI)) {
+-              aURI = makeURI(aURI);
+-            }
+-            PlacesUIUtils.loadFavicon(aBrowser, aLoadingPrincipal, aURI, aRequestContextID);
+-          } catch (ex) {
+-            Components.utils.reportError(ex);
 +          } else if (this.canWarmTab(tab)) {
 +            warmingState = "notWarmed";
 +          }
@@ -5629,6 +5917,8 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +          this.onLayersCleared(event.originalTarget);
 +        } else if (event.type == "TabRemotenessChange") {
 +          this.onRemotenessChange(event.target);
++        } else if (event.type == "TabBrowserDiscarded") {
++          this.onTabDiscarded(event.target);
 +        } else if (event.type == "sizemodechange" ||
 +          event.type == "occlusionstatechange") {
 +          this.onSizeModeOrOcclusionStateChange();
@@ -5671,7 +5961,102 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +            TelemetryStopwatch.finish("FX_TAB_SWITCH_TOTAL_E10S_MS", window);
 +            this.log("DEBUG: tab switch time = " + time);
 +            this.addMarker("AsyncTabSwitch:Finish");
-+          }
+           }
+-        ]]>
+-        </body>
+-      </method>
+-
+-      <method name="setIcon">
+-        <parameter name="aTab"/>
+-        <parameter name="aURI"/>
+-        <parameter name="aLoadingPrincipal"/>
+-        <parameter name="aRequestContextID"/>
+-        <body>
+-          <![CDATA[
+-            let browser = this.getBrowserForTab(aTab);
+-            browser.mIconURL = aURI instanceof Ci.nsIURI ? aURI.spec : aURI;
+-            let loadingPrincipal = aLoadingPrincipal ||
+-                                   Services.scriptSecurityManager.getSystemPrincipal();
+-            let requestContextID = aRequestContextID || 0;
+-            let sizedIconUrl = browser.mIconURL || "";
+-            if (sizedIconUrl != aTab.getAttribute("image")) {
+-              if (sizedIconUrl) {
+-                if (!browser.mIconLoadingPrincipal ||
+-                    !browser.mIconLoadingPrincipal.equals(loadingPrincipal)) {
+-                  aTab.setAttribute("iconloadingprincipal",
+-                    this.serializationHelper.serializeToString(loadingPrincipal));
+-                  aTab.setAttribute("requestcontextid", requestContextID);
+-                  browser.mIconLoadingPrincipal = loadingPrincipal;
+-                }
+-                aTab.setAttribute("image", sizedIconUrl);
+-              } else {
+-                aTab.removeAttribute("iconloadingprincipal");
+-                delete browser.mIconLoadingPrincipal;
+-                aTab.removeAttribute("image");
+-              }
+-              this._tabAttrModified(aTab, ["image"]);
+-            }
+-
+-            this._callProgressListeners(browser, "onLinkIconAvailable", [browser.mIconURL]);
+-          ]]>
+-        </body>
+-      </method>
+-
+-      <method name="getIcon">
+-        <parameter name="aTab"/>
+-        <body>
+-          <![CDATA[
+-            let browser = aTab ? this.getBrowserForTab(aTab) : this.selectedBrowser;
+-            return browser.mIconURL;
+-          ]]>
+-        </body>
+-      </method>
+-
+-      <method name="setPageInfo">
+-        <parameter name="aURL"/>
+-        <parameter name="aDescription"/>
+-        <parameter name="aPreviewImage"/>
+-        <body>
+-          <![CDATA[
+-            if (aURL) {
+-              let pageInfo = {url: aURL, description: aDescription, previewImageURL: aPreviewImage};
+-              PlacesUtils.history.update(pageInfo).catch(Components.utils.reportError);
+-            }
+-          ]]>
+-        </body>
+-      </method>
+-
+-      <method name="shouldLoadFavIcon">
+-        <parameter name="aURI"/>
+-        <body>
+-          <![CDATA[
+-            return (aURI &&
+-                    Services.prefs.getBoolPref("browser.chrome.site_icons") &&
+-                    Services.prefs.getBoolPref("browser.chrome.favicons") &&
+-                    ("schemeIs" in aURI) && (aURI.schemeIs("http") || aURI.schemeIs("https")));
+-          ]]>
+-        </body>
+-      </method>
+-
+-      <method name="useDefaultIcon">
+-        <parameter name="aTab"/>
+-        <body>
+-          <![CDATA[
+-            let browser = this.getBrowserForTab(aTab);
+-            let documentURI = browser.documentURI;
+-            let requestContextID = browser.contentRequestContextID;
+-            let loadingPrincipal = browser.contentPrincipal;
+-            let icon = null;
+-
+-            if (browser.imageDocument) {
+-              if (Services.prefs.getBoolPref("browser.chrome.site_icons")) {
+-                let sz = Services.prefs.getIntPref("browser.chrome.image_icons.max_size");
+-                if (browser.imageDocument.width <= sz &&
+-                    browser.imageDocument.height <= sz) {
+-                  // Don't try to store the icon in Places, regardless it would
+-                  // be skipped (see Bug 403651).
+-                  icon = browser.currentURI;
+-                }
 +          this.switchInProgress = false;
 +        }
 +      },
@@ -5771,29 +6156,43 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    switcher.init();
 +    return switcher;
 +  }
++
 +  warmupTab(aTab) {
 +    if (gMultiProcessBrowser) {
 +      this._getSwitcher().warmupTab(aTab);
 +    }
 +  }
++
 +  goBack() {
 +    return this.mCurrentBrowser.goBack();
 +  }
++
 +  goForward() {
 +    return this.mCurrentBrowser.goForward();
 +  }
++
 +  reload() {
 +    return this.mCurrentBrowser.reload();
 +  }
++
 +  reloadWithFlags(aFlags) {
 +    return this.mCurrentBrowser.reloadWithFlags(aFlags);
 +  }
++
 +  stop() {
 +    return this.mCurrentBrowser.stop();
 +  }
++
++  /**
++   * throws exception for unknown schemes
++   */
 +  loadURI(aURI, aReferrerURI, aCharset) {
 +    return this.mCurrentBrowser.loadURI(aURI, aReferrerURI, aCharset);
 +  }
++
++  /**
++   * throws exception for unknown schemes
++   */
 +  loadURIWithFlags(aURI, aFlags, aReferrerURI, aCharset, aPostData) {
 +    // Note - the callee understands both:
 +    // (a) loadURIWithFlags(aURI, aFlags, ...)
@@ -5802,12 +6201,15 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +    // so you can call us either way too.
 +    return this.mCurrentBrowser.loadURIWithFlags(aURI, aFlags, aReferrerURI, aCharset, aPostData);
 +  }
++
 +  goHome() {
 +    return this.mCurrentBrowser.goHome();
 +  }
++
 +  gotoIndex(aIndex) {
 +    return this.mCurrentBrowser.gotoIndex(aIndex);
 +  }
++
 +  _handleKeyDownEvent(aEvent) {
 +    if (!aEvent.isTrusted) {
 +      // Don't let untrusted events mess with tabs.
@@ -5842,6 +6244,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      }
 +    }
 +  }
++
 +  _handleKeyPressEventMac(aEvent) {
 +    if (!aEvent.isTrusted) {
 +      // Don't let untrusted events mess with tabs.
@@ -5867,6 +6270,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      }
 +    }
 +  }
++
 +  createTooltip(event) {
 +    event.stopPropagation();
 +    var tab = document.tooltipNode;
@@ -5919,6 +6323,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +
 +    event.target.setAttribute("label", label);
 +  }
++
 +  handleEvent(aEvent) {
 +    switch (aEvent.type) {
 +      case "keydown":
@@ -5937,313 +6342,146 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +        break;
 +    }
 +  }
++
 +  receiveMessage(aMessage) {
 +    let data = aMessage.data;
 +    let browser = aMessage.target;
 +
 +    switch (aMessage.name) {
 +      case "DOMTitleChanged":
-+        {
-+          let tab = this.getTabForBrowser(browser);
-+          if (!tab || tab.hasAttribute("pending"))
-+            return undefined;
-+          let titleChanged = this.setTabTitle(tab);
-+          if (titleChanged && !tab.selected && !tab.hasAttribute("busy"))
-+            tab.setAttribute("titlechanged", "true");
-+          break;
-+        }
++      {
++        let tab = this.getTabForBrowser(browser);
++        if (!tab || tab.hasAttribute("pending"))
++          return undefined;
++        let titleChanged = this.setTabTitle(tab);
++        if (titleChanged && !tab.selected && !tab.hasAttribute("busy"))
++          tab.setAttribute("titlechanged", "true");
++        break;
++      }
 +      case "DOMWindowClose":
-+        {
-+          if (this.tabs.length == 1) {
-+            // We already did PermitUnload in the content process
-+            // for this tab (the only one in the window). So we don't
-+            // need to do it again for any tabs.
-+            window.skipNextCanClose = true;
-+            window.close();
-+            return undefined;
-+          }
-+
-+          let tab = this.getTabForBrowser(browser);
-+          if (tab) {
-+            // Skip running PermitUnload since it already happened in
-+            // the content process.
-+            this.removeTab(tab, { skipPermitUnload: true });
-+          }
-+          break;
++      {
++        if (this.tabs.length == 1) {
++          // We already did PermitUnload in the content process
++          // for this tab (the only one in the window). So we don't
++          // need to do it again for any tabs.
++          window.skipNextCanClose = true;
++          window.close();
++          return undefined;
 +        }
++
++        let tab = this.getTabForBrowser(browser);
++        if (tab) {
++          // Skip running PermitUnload since it already happened in
++          // the content process.
++          this.removeTab(tab, { skipPermitUnload: true });
++        }
++        break;
++      }
 +      case "contextmenu":
-+        {
-+          openContextMenu(aMessage);
-+          break;
-+        }
++      {
++        openContextMenu(aMessage);
++        break;
++      }
 +      case "DOMWindowFocus":
-+        {
-+          let tab = this.getTabForBrowser(browser);
-+          if (!tab)
-+            return undefined;
-+          this.selectedTab = tab;
-+          window.focus();
-+          break;
-+        }
++      {
++        let tab = this.getTabForBrowser(browser);
++        if (!tab)
++          return undefined;
++        this.selectedTab = tab;
++        window.focus();
++        break;
++      }
 +      case "Browser:Init":
-+        {
-+          let tab = this.getTabForBrowser(browser);
-+          if (!tab)
-+            return undefined;
++      {
++        let tab = this.getTabForBrowser(browser);
++        if (!tab)
++          return undefined;
 +
-+          this._outerWindowIDBrowserMap.set(browser.outerWindowID, browser);
-+          browser.messageManager.sendAsyncMessage("Browser:AppTab", { isAppTab: tab.pinned });
-+          break;
-+        }
++        this._outerWindowIDBrowserMap.set(browser.outerWindowID, browser);
++        browser.messageManager.sendAsyncMessage("Browser:AppTab", { isAppTab: tab.pinned });
++        break;
++      }
 +      case "Browser:WindowCreated":
-+        {
-+          let tab = this.getTabForBrowser(browser);
-+          if (tab && data.userContextId) {
-+            ContextualIdentityService.telemetry(data.userContextId);
-+            tab.setUserContextId(data.userContextId);
-+          }
-+
-+          // We don't want to update the container icon and identifier if
-+          // this is not the selected browser.
-+          if (browser == gBrowser.selectedBrowser) {
-+            updateUserContextUIIndicator();
-+          }
-+
-+          break;
++      {
++        let tab = this.getTabForBrowser(browser);
++        if (tab && data.userContextId) {
++          ContextualIdentityService.telemetry(data.userContextId);
++          tab.setUserContextId(data.userContextId);
 +        }
++
++        // We don't want to update the container icon and identifier if
++        // this is not the selected browser.
++        if (browser == gBrowser.selectedBrowser) {
++          updateUserContextUIIndicator();
++        }
++
++        break;
++      }
 +      case "Findbar:Keypress":
-+        {
-+          let tab = this.getTabForBrowser(browser);
-+          // If the find bar for this tab is not yet alive, only initialize
-+          // it if there's a possibility FindAsYouType will be used.
-+          // There's no point in doing it for most random keypresses.
-+          if (!this.isFindBarInitialized(tab) &&
-+            data.shouldFastFind) {
-+            let shouldFastFind = this._findAsYouType;
-+            if (!shouldFastFind) {
-+              // Please keep in sync with toolkit/content/widgets/findbar.xml
-+              const FAYT_LINKS_KEY = "'";
-+              const FAYT_TEXT_KEY = "/";
-+              let charCode = data.fakeEvent.charCode;
-+              let key = charCode ? String.fromCharCode(charCode) : null;
-+              shouldFastFind = key == FAYT_LINKS_KEY || key == FAYT_TEXT_KEY;
-+            }
-+            if (shouldFastFind) {
-+              // Make sure we return the result.
-+              return this.getFindBar(tab).receiveMessage(aMessage);
-+            }
++      {
++        let tab = this.getTabForBrowser(browser);
++        // If the find bar for this tab is not yet alive, only initialize
++        // it if there's a possibility FindAsYouType will be used.
++        // There's no point in doing it for most random keypresses.
++        if (!this.isFindBarInitialized(tab) &&
++          data.shouldFastFind) {
++          let shouldFastFind = this._findAsYouType;
++          if (!shouldFastFind) {
++            // Please keep in sync with toolkit/content/widgets/findbar.xml
++            const FAYT_LINKS_KEY = "'";
++            const FAYT_TEXT_KEY = "/";
++            let charCode = data.fakeEvent.charCode;
++            let key = charCode ? String.fromCharCode(charCode) : null;
++            shouldFastFind = key == FAYT_LINKS_KEY || key == FAYT_TEXT_KEY;
 +          }
-+          break;
++          if (shouldFastFind) {
++            // Make sure we return the result.
++            return this.getFindBar(tab).receiveMessage(aMessage);
++          }
 +        }
++        break;
++      }
 +      case "RefreshBlocker:Blocked":
-+        {
-+          // The data object is expected to contain the following properties:
-+          //  - URI (string)
-+          //     The URI that a page is attempting to refresh or redirect to.
-+          //  - delay (int)
-+          //     The delay (in milliseconds) before the page was going to
-+          //     reload or redirect.
-+          //  - sameURI (bool)
-+          //     true if we're refreshing the page. false if we're redirecting.
-+          //  - outerWindowID (int)
-+          //     The outerWindowID of the frame that requested the refresh or
-+          //     redirect.
++      {
++        // The data object is expected to contain the following properties:
++        //  - URI (string)
++        //     The URI that a page is attempting to refresh or redirect to.
++        //  - delay (int)
++        //     The delay (in milliseconds) before the page was going to
++        //     reload or redirect.
++        //  - sameURI (bool)
++        //     true if we're refreshing the page. false if we're redirecting.
++        //  - outerWindowID (int)
++        //     The outerWindowID of the frame that requested the refresh or
++        //     redirect.
 +
-+          let brandBundle = document.getElementById("bundle_brand");
-+          let brandShortName = brandBundle.getString("brandShortName");
-+          let message =
-+            gNavigatorBundle.getFormattedString("refreshBlocked." +
-+              (data.sameURI ? "refreshLabel" :
-+                "redirectLabel"), [brandShortName]);
++        let brandBundle = document.getElementById("bundle_brand");
++        let brandShortName = brandBundle.getString("brandShortName");
++        let message =
++          gNavigatorBundle.getFormattedString("refreshBlocked." +
++                                              (data.sameURI ? "refreshLabel"
++                                                            : "redirectLabel"),
++                                              [brandShortName]);
 +
-+          let notificationBox = this.getNotificationBox(browser);
-+          let notification = notificationBox.getNotificationWithValue("refresh-blocked");
++        let notificationBox = this.getNotificationBox(browser);
++        let notification = notificationBox.getNotificationWithValue("refresh-blocked");
 +
-+          if (notification) {
-+            notification.label = message;
-+          } else {
-+            let refreshButtonText =
-+              gNavigatorBundle.getString("refreshBlocked.goButton");
-+            let refreshButtonAccesskey =
-+              gNavigatorBundle.getString("refreshBlocked.goButton.accesskey");
++        if (notification) {
++          notification.label = message;
++        } else {
++          let refreshButtonText =
++            gNavigatorBundle.getString("refreshBlocked.goButton");
++          let refreshButtonAccesskey =
++            gNavigatorBundle.getString("refreshBlocked.goButton.accesskey");
 +
-+            let buttons = [{
-+              label: refreshButtonText,
-+              accessKey: refreshButtonAccesskey,
-+              callback() {
-+                if (browser.messageManager) {
-+                  browser.messageManager.sendAsyncMessage("RefreshBlocker:Refresh", data);
-                 }
++          let buttons = [{
++            label: refreshButtonText,
++            accessKey: refreshButtonAccesskey,
++            callback() {
++              if (browser.messageManager) {
++                browser.messageManager.sendAsyncMessage("RefreshBlocker:Refresh", data);
                }
--
--              if (!this.mBlank) {
--                this._callProgressListeners("onLocationChange",
--                                            [aWebProgress, aRequest, aLocation,
--                                             aFlags]);
--              }
--
--              if (topLevel) {
--                this.mBrowser.lastURI = aLocation;
--                this.mBrowser.lastLocationChange = Date.now();
--              }
--            },
--
--            onStatusChange(aWebProgress, aRequest, aStatus, aMessage) {
--              if (this.mBlank)
--                return;
--
--              this._callProgressListeners("onStatusChange",
--                                          [aWebProgress, aRequest, aStatus, aMessage]);
--
--              this.mMessage = aMessage;
--            },
--
--            onSecurityChange(aWebProgress, aRequest, aState) {
--              this._callProgressListeners("onSecurityChange",
--                                          [aWebProgress, aRequest, aState]);
--            },
--
--            onRefreshAttempted(aWebProgress, aURI, aDelay, aSameURI) {
--              return this._callProgressListeners("onRefreshAttempted",
--                                                 [aWebProgress, aURI, aDelay, aSameURI]);
--            },
--
--            QueryInterface(aIID) {
--              if (aIID.equals(Components.interfaces.nsIWebProgressListener) ||
--                  aIID.equals(Components.interfaces.nsIWebProgressListener2) ||
--                  aIID.equals(Components.interfaces.nsISupportsWeakReference) ||
--                  aIID.equals(Components.interfaces.nsISupports))
--                return this;
--              throw Components.results.NS_NOINTERFACE;
--            }
--          });
--        ]]>
--        </body>
--      </method>
--
--      <field name="serializationHelper">
--        Cc["@mozilla.org/network/serialization-helper;1"]
--          .getService(Ci.nsISerializationHelper);
--      </field>
--
--      <method name="storeIcon">
--        <parameter name="aBrowser"/>
--        <parameter name="aURI"/>
--        <parameter name="aLoadingPrincipal"/>
--        <parameter name="aRequestContextID"/>
--        <body>
--          <![CDATA[
--          try {
--            if (!(aURI instanceof Ci.nsIURI)) {
--              aURI = makeURI(aURI);
--            }
--            PlacesUIUtils.loadFavicon(aBrowser, aLoadingPrincipal, aURI, aRequestContextID);
--          } catch (ex) {
--            Components.utils.reportError(ex);
-+            }];
-+
-+            notificationBox.appendNotification(message, "refresh-blocked",
-+              "chrome://browser/skin/notification-icons/popup.svg",
-+              notificationBox.PRIORITY_INFO_MEDIUM,
-+              buttons);
-           }
--        ]]>
--        </body>
--      </method>
--
--      <method name="setIcon">
--        <parameter name="aTab"/>
--        <parameter name="aURI"/>
--        <parameter name="aLoadingPrincipal"/>
--        <parameter name="aRequestContextID"/>
--        <body>
--          <![CDATA[
--            let browser = this.getBrowserForTab(aTab);
--            browser.mIconURL = aURI instanceof Ci.nsIURI ? aURI.spec : aURI;
--            let loadingPrincipal = aLoadingPrincipal ||
--                                   Services.scriptSecurityManager.getSystemPrincipal();
--            let requestContextID = aRequestContextID || 0;
--            let sizedIconUrl = browser.mIconURL || "";
--            if (sizedIconUrl != aTab.getAttribute("image")) {
--              if (sizedIconUrl) {
--                if (!browser.mIconLoadingPrincipal ||
--                    !browser.mIconLoadingPrincipal.equals(loadingPrincipal)) {
--                  aTab.setAttribute("iconloadingprincipal",
--                    this.serializationHelper.serializeToString(loadingPrincipal));
--                  aTab.setAttribute("requestcontextid", requestContextID);
--                  browser.mIconLoadingPrincipal = loadingPrincipal;
--                }
--                aTab.setAttribute("image", sizedIconUrl);
--              } else {
--                aTab.removeAttribute("iconloadingprincipal");
--                delete browser.mIconLoadingPrincipal;
--                aTab.removeAttribute("image");
--              }
--              this._tabAttrModified(aTab, ["image"]);
--            }
--
--            this._callProgressListeners(browser, "onLinkIconAvailable", [browser.mIconURL]);
--          ]]>
--        </body>
--      </method>
--
--      <method name="getIcon">
--        <parameter name="aTab"/>
--        <body>
--          <![CDATA[
--            let browser = aTab ? this.getBrowserForTab(aTab) : this.selectedBrowser;
--            return browser.mIconURL;
--          ]]>
--        </body>
--      </method>
--
--      <method name="setPageInfo">
--        <parameter name="aURL"/>
--        <parameter name="aDescription"/>
--        <parameter name="aPreviewImage"/>
--        <body>
--          <![CDATA[
--            if (aURL) {
--              let pageInfo = {url: aURL, description: aDescription, previewImageURL: aPreviewImage};
--              PlacesUtils.history.update(pageInfo).catch(Components.utils.reportError);
--            }
--          ]]>
--        </body>
--      </method>
--
--      <method name="shouldLoadFavIcon">
--        <parameter name="aURI"/>
--        <body>
--          <![CDATA[
--            return (aURI &&
--                    Services.prefs.getBoolPref("browser.chrome.site_icons") &&
--                    Services.prefs.getBoolPref("browser.chrome.favicons") &&
--                    ("schemeIs" in aURI) && (aURI.schemeIs("http") || aURI.schemeIs("https")));
--          ]]>
--        </body>
--      </method>
--
--      <method name="useDefaultIcon">
--        <parameter name="aTab"/>
--        <body>
--          <![CDATA[
--            let browser = this.getBrowserForTab(aTab);
--            let documentURI = browser.documentURI;
--            let requestContextID = browser.contentRequestContextID;
--            let loadingPrincipal = browser.contentPrincipal;
--            let icon = null;
--
--            if (browser.imageDocument) {
--              if (Services.prefs.getBoolPref("browser.chrome.site_icons")) {
--                let sz = Services.prefs.getIntPref("browser.chrome.image_icons.max_size");
--                if (browser.imageDocument.width <= sz &&
--                    browser.imageDocument.height <= sz) {
--                  // Don't try to store the icon in Places, regardless it would
--                  // be skipped (see Bug 403651).
--                  icon = browser.currentURI;
--                }
--              }
--            }
+             }
 -
 -            // Use documentURIObject in the check for shouldLoadFavIcon so that we
 -            // do the right thing with about:-style error pages.  Bug 453442
@@ -6568,7 +6806,27 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -        <body><![CDATA[
 -          if (this._previewMode) {
 -            return;
--          }
++          }];
++
++          notificationBox.appendNotification(message, "refresh-blocked",
++            "chrome://browser/skin/notification-icons/popup.svg",
++            notificationBox.PRIORITY_INFO_MEDIUM,
++            buttons);
++        }
++        break;
++      }
++    }
++    return undefined;
++  }
++
++  observe(aSubject, aTopic, aData) {
++    switch (aTopic) {
++      case "contextual-identity-updated":
++      {
++        for (let tab of this.tabs) {
++          if (tab.getAttribute("usercontextid") == aData) {
++            ContextualIdentityService.setTabStyle(tab);
+           }
 -
 -          let oldBrowser = oldTab.linkedBrowser;
 -          let newBrowser = newTab.linkedBrowser;
@@ -6597,20 +6855,8 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -              // Clear focus so that _adjustFocusAfterTabSwitch can detect if
 -              // some element has been focused and respect that.
 -              document.activeElement.blur();
-+          break;
-+        }
-+    }
-+    return undefined;
-+  }
-+  observe(aSubject, aTopic, aData) {
-+    switch (aTopic) {
-+      case "contextual-identity-updated":
-+        {
-+          for (let tab of this.tabs) {
-+            if (tab.getAttribute("usercontextid") == aData) {
-+              ContextualIdentityService.setTabStyle(tab);
-             }
-           }
+-            }
+-          }
 -        ]]></body>
 -      </method>
 -
@@ -6629,16 +6875,18 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -          let prompts = newBrowser.parentNode.getElementsByTagNameNS(XUL_NS, "tabmodalprompt");
 -          let prompt = prompts[prompts.length - 1];
 -          prompt.Dialog.setDefaultFocus();
-+          break;
 +        }
++        break;
++      }
 +      case "nsPref:changed":
-+        {
-+          // This is the only pref observed.
-+          this._findAsYouType = Services.prefs.getBoolPref("accessibility.typeaheadfind");
-+          break;
-+        }
++      {
++        // This is the only pref observed.
++        this._findAsYouType = Services.prefs.getBoolPref("accessibility.typeaheadfind");
++        break;
++      }
 +    }
 +  }
++
 +  _updateNewTabVisibility() {
 +    // Helper functions to help deal with customize mode wrapping some items
 +    let wrap = n => n.parentNode.localName == "toolbarpaletteitem" ? n.parentNode : n;
@@ -6656,35 +6904,40 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      this.tabContainer.removeAttribute(kAttr);
 +    }
 +  }
++
 +  onWidgetAfterDOMChange(aNode, aNextNode, aContainer) {
 +    if (aContainer.ownerDocument == document &&
 +      aContainer.id == "TabsToolbar") {
 +      this._updateNewTabVisibility();
 +    }
 +  }
++
 +  onAreaNodeRegistered(aArea, aContainer) {
 +    if (aContainer.ownerDocument == document &&
 +      aArea == "TabsToolbar") {
 +      this._updateNewTabVisibility();
 +    }
 +  }
++
 +  onAreaReset(aArea, aContainer) {
 +    this.onAreaNodeRegistered(aArea, aContainer);
 +  }
++
 +  _generateUniquePanelID() {
 +    if (!this._uniquePanelIDCounter) {
 +      this._uniquePanelIDCounter = 0;
 +    }
 +
 +    let outerID = window.QueryInterface(Ci.nsIInterfaceRequestor)
-+      .getInterface(Ci.nsIDOMWindowUtils)
-+      .outerWindowID;
++                        .getInterface(Ci.nsIDOMWindowUtils)
++                        .outerWindowID;
 +
 +    // We want panel IDs to be globally unique, that's why we include the
 +    // window ID. We switched to a monotonic counter as Date.now() lead
 +    // to random failures because of colliding IDs.
 +    return "panel-" + outerID + "-" + (++this._uniquePanelIDCounter);
 +  }
++
 +  disconnectedCallback() {
 +    Services.obs.removeObserver(this, "contextual-identity-updated");
 +
@@ -6737,7 +6990,6 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +  }
 +
 +  _setupEventListeners() {
-+
 +    this.addEventListener("DOMWindowClose", (event) => {
 +      if (!event.isTrusted)
 +        return;
@@ -6890,21 +7142,16 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -          if (!tab)
 -            return;
 -
--          let sharing;
--          if (aState.screen) {
--            sharing = "screen";
--          } else if (aState.camera) {
--            sharing = "camera";
--          } else if (aState.microphone) {
--            sharing = "microphone";
--          }
--
--          if (sharing) {
--            tab.setAttribute("sharing", sharing);
+-          if (aState.sharing) {
 -            tab._sharingState = aState;
+-            if (aState.paused) {
+-              tab.removeAttribute("sharing");
+-            } else {
+-              tab.setAttribute("sharing", aState.sharing);
+-            }
 -          } else {
--            tab.removeAttribute("sharing");
 -            tab._sharingState = null;
+-            tab.removeAttribute("sharing");
 -          }
 -          this._tabAttrModified(tab, ["sharing"]);
 -
@@ -6918,17 +7165,12 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -        <body><![CDATA[
 -          // Normalize the state object for consumers (ie.extensions).
 -          let state = Object.assign({}, aTab._sharingState);
--          // ensure bool if undefined
--          state.camera = !!state.camera;
--          state.microphone = !!state.microphone;
--          return state;
+-          return {
+-            camera: !!state.camera,
+-            microphone: !!state.microphone,
+-            screen: state.screen && state.screen.replace("Paused", ""),
+-          };
 -        ]]></body>
--      </method>
--
--      <!-- TODO: remove after 57, once we know add-ons can no longer use it. -->
--      <method name="setTabTitleLoading">
--        <parameter name="aTab"/>
--        <body/>
 -      </method>
 -
 -      <method name="setInitialTabTitle">
@@ -9830,6 +10072,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -              window.addEventListener("MozAfterPaint", this);
 -              window.addEventListener("MozLayerTreeReady", this);
 -              window.addEventListener("MozLayerTreeCleared", this);
+-              window.addEventListener("TabBrowserDiscarded", this);
 -              window.addEventListener("TabRemotenessChange", this);
 -              window.addEventListener("sizemodechange", this);
 -              window.addEventListener("occlusionstatechange", this);
@@ -9874,6 +10117,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -              window.removeEventListener("MozAfterPaint", this);
 -              window.removeEventListener("MozLayerTreeReady", this);
 -              window.removeEventListener("MozLayerTreeCleared", this);
+-              window.removeEventListener("TabBrowserDiscarded", this);
 -              window.removeEventListener("TabRemotenessChange", this);
 -              window.removeEventListener("sizemodechange", this);
 -              window.removeEventListener("occlusionstatechange", this);
@@ -10096,26 +10340,26 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -              this.assert(this.tabbrowser._switcher === this);
 -
 -              for (let [tab, ] of this.tabState) {
--                if (!tab.linkedBrowser) {
+-                if (!tab.linkedPanel) {
 -                  this.tabState.delete(tab);
 -                  this.unwarmTab(tab);
 -                }
 -              }
 -
--              if (this.lastVisibleTab && !this.lastVisibleTab.linkedBrowser) {
+-              if (this.lastVisibleTab && !this.lastVisibleTab.linkedPanel) {
 -                this.lastVisibleTab = null;
 -              }
--              if (this.lastPrimaryTab && !this.lastPrimaryTab.linkedBrowser) {
+-              if (this.lastPrimaryTab && !this.lastPrimaryTab.linkedPanel) {
 -                this.lastPrimaryTab = null;
 -              }
--              if (this.blankTab && !this.blankTab.linkedBrowser) {
+-              if (this.blankTab && !this.blankTab.linkedPanel) {
 -                this.blankTab = null;
 -              }
--              if (this.spinnerTab && !this.spinnerTab.linkedBrowser) {
+-              if (this.spinnerTab && !this.spinnerTab.linkedPanel) {
 -                this.spinnerHidden();
 -                this.spinnerTab = null;
 -              }
--              if (this.loadingTab && !this.loadingTab.linkedBrowser) {
+-              if (this.loadingTab && !this.loadingTab.linkedPanel) {
 -                this.loadingTab = null;
 -                this.clearTimer(this.loadTimer);
 -                this.loadTimer = null;
@@ -10315,6 +10559,12 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -                // it sends up a layer tree.
 -                this.setTabState(tab, this.STATE_LOADING);
 -              }
+-            },
+-
+-            // Called when a tab is discarded
+-            onTabDiscarded(tab) {
+-              this.logState(`onTabDiscarded(${tab._tPos})`);
+-              this.setTabStateNoAction(tab, this.STATE_UNLOADED);
 -            },
 -
 -            // Called when a tab has been removed, and the browser node is
@@ -10553,6 +10803,8 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -                this.onLayersCleared(event.originalTarget);
 -              } else if (event.type == "TabRemotenessChange") {
 -                this.onRemotenessChange(event.target);
+-              } else if (event.type == "TabBrowserDiscarded") {
+-                this.onTabDiscarded(event.target);
 -              } else if (event.type == "sizemodechange" ||
 -                         event.type == "occlusionstatechange") {
 -                this.onSizeModeOrOcclusionStateChange();
@@ -11570,8 +11822,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 -          if (this.selectedBrowser == browser) {
 -            TabCrashHandler.onSelectedBrowserCrash(browser);
 -          } else {
--            this.updateBrowserRemoteness(browser, false);
--            SessionStore.reviveCrashedTab(tab);
+-            this.discardBrowser(browser);
 -          }
 -
 +        // ... so system and expanded principals, as well as permitted "normal"
@@ -11618,8 +11869,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
 +      if (this.selectedBrowser == browser) {
 +        TabCrashHandler.onSelectedBrowserCrash(browser);
 +      } else {
-+        this.updateBrowserRemoteness(browser, false);
-+        SessionStore.reviveCrashedTab(tab);
++        this.discardBrowser(browser);
 +      }
 +
 +      tab.removeAttribute("soundplaying");
