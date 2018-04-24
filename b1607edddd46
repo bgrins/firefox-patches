@@ -1,0 +1,182 @@
+
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Date 1522902546 25200
+# Node ID b1607edddd46915f991b8f7663e409c529a10817
+# Parent  7b4d9740429ba22405a508e112ef200828143ff2
+Bug 1411707 - Switch XUL iframe from a XBL binding to a Custom Element;
+
+MozReview-Commit-ID: F95i9H9FvYv
+
+diff --git a/toolkit/components/processsingleton/MainProcessSingleton.js b/toolkit/components/processsingleton/MainProcessSingleton.js
+--- a/toolkit/components/processsingleton/MainProcessSingleton.js
++++ b/toolkit/components/processsingleton/MainProcessSingleton.js
+@@ -60,26 +60,52 @@ MainProcessSingleton.prototype = {
+       Services.search.addEngine(engineURL.spec, null, iconURL ? iconURL.spec : null, true);
+     });
+   },
+ 
+   observe(subject, topic, data) {
+     switch (topic) {
+     case "app-startup": {
+       Services.obs.addObserver(this, "xpcom-shutdown");
++      Services.obs.addObserver(this, "document-element-inserted");
+ 
+       // Load this script early so that console.* is initialized
+       // before other frame scripts.
+       Services.mm.loadFrameScript("chrome://global/content/browser-content.js", true);
+       Services.ppmm.loadProcessScript("chrome://global/content/process-content.js", true);
+       Services.mm.addMessageListener("Search:AddEngine", this.addSearchEngine);
+       Services.ppmm.loadProcessScript("resource:///modules/ContentObservers.js", true);
+       break;
+     }
+ 
++    case "document-element-inserted":
++      // We want to load chromeGlobals.js in all chrome XUL documents before any other
++      // scripts run.
++      const document = subject;
++      if (document.nodePrincipal.isSystemPrincipal &&
++          document.contentType == "application/vnd.mozilla.xul+xml") {
++        const window = document.ownerGlobal;
++        let targetObj = {
++          window,
++          document,
++          Services,
++          customElements: window.customElements,
++          XULElement: window.XULElement,
++        };
++        for (let script of [
++          "chrome://global/content/widgets/general.js",
++        ]) {
++          // Pass in only a subset of variables instead of `this` as targetObj,
++          // to prevent accidentally adding globals from these scripts.
++          Services.scriptloader.loadSubScript(script, targetObj);
++        }
++      }
++      break;
++
+     case "xpcom-shutdown":
+       Services.mm.removeMessageListener("Search:AddEngine", this.addSearchEngine);
++      Services.obs.removeObserver(this, "document-element-inserted");
+       break;
+     }
+   },
+ };
+ 
+ this.NSGetFactory = XPCOMUtils.generateNSGetFactory([MainProcessSingleton]);
+diff --git a/toolkit/content/jar.mn b/toolkit/content/jar.mn
+--- a/toolkit/content/jar.mn
++++ b/toolkit/content/jar.mn
+@@ -56,16 +56,17 @@ toolkit.jar:
+    content/global/resetProfile.xul
+    content/global/resetProfileProgress.xul
+    content/global/TopLevelVideoDocument.js
+    content/global/timepicker.xhtml
+    content/global/treeUtils.js
+ #ifndef MOZ_FENNEC
+    content/global/viewZoomOverlay.js
+ #endif
++   content/global/widgets/general.js           (widgets/general.js)
+    content/global/bindings/autocomplete.xml    (widgets/autocomplete.xml)
+    content/global/bindings/browser.xml         (widgets/browser.xml)
+    content/global/bindings/button.xml          (widgets/button.xml)
+    content/global/bindings/calendar.js         (widgets/calendar.js)
+    content/global/bindings/checkbox.xml        (widgets/checkbox.xml)
+    content/global/bindings/colorpicker.xml     (widgets/colorpicker.xml)
+    content/global/bindings/datekeeper.js       (widgets/datekeeper.js)
+    content/global/bindings/datepicker.js       (widgets/datepicker.js)
+diff --git a/toolkit/content/widgets/general.js b/toolkit/content/widgets/general.js
+new file mode 100644
+--- /dev/null
++++ b/toolkit/content/widgets/general.js
+@@ -0,0 +1,27 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++class MozIframe extends XULElement {
++  get docShell() {
++    let { frameLoader } = this;
++    return frameLoader ? frameLoader.docShell : null;
++  }
++
++  get contentWindow() {
++    return this.docShell
++      .QueryInterface(Ci.nsIInterfaceRequestor)
++      .getInterface(Ci.nsIDOMWindow);
++  }
++
++  get webNavigation() {
++    return this.docShell.QueryInterface(Ci.nsIWebNavigation);
++  }
++
++  get contentDocument() {
++    return this.webNavigation.document;
++  }
++}
++customElements.define("iframe", MozIframe);
+diff --git a/toolkit/content/widgets/general.xml b/toolkit/content/widgets/general.xml
+--- a/toolkit/content/widgets/general.xml
++++ b/toolkit/content/widgets/general.xml
+@@ -52,35 +52,16 @@
+           ]]>
+         </setter>
+       </property>
+ 
+       <field name="labelElement"/>
+     </implementation>
+   </binding>
+ 
+-  <binding id="iframe">
+-    <implementation>
+-      <property name="docShell" readonly="true">
+-        <getter><![CDATA[
+-          let {frameLoader} = this;
+-          return frameLoader ? frameLoader.docShell : null;
+-        ]]></getter>
+-      </property>
+-      <property name="contentWindow"
+-                readonly="true"
+-                onget="return this.docShell.QueryInterface(Components.interfaces.nsIInterfaceRequestor).getInterface(Components.interfaces.nsIDOMWindow);"/>
+-      <property name="webNavigation"
+-                onget="return this.docShell.QueryInterface(Components.interfaces.nsIWebNavigation);"
+-                readonly="true"/>
+-      <property name="contentDocument" readonly="true"
+-                onget="return this.webNavigation.document;"/>
+-    </implementation>
+-  </binding>
+-
+   <binding id="deck">
+     <implementation>
+       <property name="selectedIndex"
+                 onget="return this.getAttribute('selectedIndex') || '0'">
+         <setter>
+         <![CDATA[
+           if (this.selectedIndex == val)
+             return val;
+diff --git a/toolkit/content/xul.css b/toolkit/content/xul.css
+--- a/toolkit/content/xul.css
++++ b/toolkit/content/xul.css
+@@ -171,20 +171,16 @@ browser {
+ browser[remote=true]:not(.lightweight) {
+   -moz-binding: url("chrome://global/content/bindings/remote-browser.xml#remote-browser");
+ }
+ 
+ editor {
+   -moz-binding: url("chrome://global/content/bindings/editor.xml#editor");
+ }
+ 
+-iframe {
+-  -moz-binding: url("chrome://global/content/bindings/general.xml#iframe");
+-}
+-
+ /********** notifications **********/
+ 
+ notificationbox {
+   -moz-binding: url("chrome://global/content/bindings/notification.xml#notificationbox");
+   -moz-box-orient: vertical;
+ }
+ 
+ .notificationbox-stack {
