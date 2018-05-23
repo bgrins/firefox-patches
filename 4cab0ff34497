@@ -3,7 +3,7 @@
 # User Brian Grinstead <bgrinstead@mozilla.com>
 # Date 1522902546 25200
 # Node ID 4cab0ff344971d359b0627c66ae0f87af2e4bd1e
-# Parent  17b6fd4f45c95354d37a61d53aa2ce3548b6cd92
+# Parent  effefabf9c623861f7cd10f9e18ddcdffb1ca232
 Bug 1411707 - Switch XUL findbar from a XBL binding to a Custom Element;
 
 MozReview-Commit-ID: F95i9H9FvYv
@@ -109,46 +109,38 @@ diff --git a/toolkit/components/extensions/test/browser/browser_ext_themes_findb
  
    info("Checking findbar textbox color is set as toolbar field text color");
    Assert.equal(window.getComputedStyle(findbar_textbox).color,
-diff --git a/toolkit/components/processsingleton/MainProcessSingleton.js b/toolkit/components/processsingleton/MainProcessSingleton.js
---- a/toolkit/components/processsingleton/MainProcessSingleton.js
-+++ b/toolkit/components/processsingleton/MainProcessSingleton.js
-@@ -79,21 +79,30 @@ MainProcessSingleton.prototype = {
-     case "document-element-inserted":
-       // Set up Custom Elements for XUL windows before anything else happens
-       // in the document. Anything loaded here should be considered part of
-       // core XUL functionality. Any window-specific elements can be registered
-       // via <script> tags at the top of individual documents.
-       const doc = subject;
-       if (doc.nodePrincipal.isSystemPrincipal &&
-           doc.contentType == "application/vnd.mozilla.xul+xml") {
-+        const win = doc.ownerGlobal;
-         for (let script of [
--          "chrome://global/content/elements/stringbundle.js",
-           "chrome://global/content/elements/general.js",
-         ]) {
--          Services.scriptloader.loadSubScript(script, doc.ownerGlobal);
-+          Services.scriptloader.loadSubScript(script, win);
-+        }
-+
-+        for (let [tag, script] of [
-+          ["findbar", "chrome://global/content/elements/findbar.js"],
-+          ["stringbundle", "chrome://global/content/elements/stringbundle.js"],
-+        ]) {
-+          win.customElements.setElementCreationCallback(tag, () => {
-+            Services.scriptloader.loadSubScript(script, win);
-+          });
-         }
-       }
-       break;
+diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.js
+--- a/toolkit/content/customElements.js
++++ b/toolkit/content/customElements.js
+@@ -59,15 +59,23 @@ class MozXULElement extends XULElement {
+     return range.extractContents();
+   }
+ }
  
-     case "xpcom-shutdown":
-       Services.mm.removeMessageListener("Search:AddEngine", this.addSearchEngine);
-       Services.obs.removeObserver(this, "document-element-inserted");
-       break;
+ // Attach the base class to the window so other scripts can use it:
+ window.MozXULElement = MozXULElement;
+ 
+ for (let script of [
+-  "chrome://global/content/elements/stringbundle.js",
+   "chrome://global/content/elements/general.js",
+ ]) {
+   Services.scriptloader.loadSubScript(script, window);
+ }
+ 
++for (let [tag, script] of [
++  ["findbar", "chrome://global/content/elements/findbar.js"],
++  ["stringbundle", "chrome://global/content/elements/stringbundle.js"],
++]) {
++  customElements.setElementCreationCallback(tag, () => {
++    Services.scriptloader.loadSubScript(script, window);
++  });
+ }
++
++}
 diff --git a/toolkit/content/jar.mn b/toolkit/content/jar.mn
 --- a/toolkit/content/jar.mn
 +++ b/toolkit/content/jar.mn
-@@ -69,17 +69,17 @@ toolkit.jar:
+@@ -70,17 +70,17 @@ toolkit.jar:
     content/global/bindings/colorpicker.xml     (widgets/colorpicker.xml)
     content/global/bindings/datekeeper.js       (widgets/datekeeper.js)
     content/global/bindings/datepicker.js       (widgets/datepicker.js)
@@ -167,7 +159,7 @@ diff --git a/toolkit/content/jar.mn b/toolkit/content/jar.mn
     content/global/bindings/notification.xml    (widgets/notification.xml)
     content/global/bindings/numberbox.xml       (widgets/numberbox.xml)
     content/global/bindings/popup.xml           (widgets/popup.xml)
-@@ -95,15 +95,16 @@ toolkit.jar:
+@@ -96,15 +96,16 @@ toolkit.jar:
  *  content/global/bindings/textbox.xml         (widgets/textbox.xml)
     content/global/bindings/timekeeper.js       (widgets/timekeeper.js)
     content/global/bindings/timepicker.js       (widgets/timepicker.js)
@@ -188,7 +180,7 @@ diff --git a/toolkit/content/jar.mn b/toolkit/content/jar.mn
 diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findbar.js
 --- a/toolkit/content/widgets/findbar.js
 +++ b/toolkit/content/widgets/findbar.js
-@@ -1,1208 +1,1098 @@
+@@ -1,1208 +1,1085 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -203,27 +195,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +{
 +
 +ChromeUtils.import("resource://gre/modules/Services.jsm");
-+
-+// Helper function needed to create a DOM that will still get XBL attached
-+// when accessing DOM nodes. This is needed because:
-+// If you do something like `textbox = document.createElement("textbox")`,
-+// then `textbox` won't have a XBL binding attached, since the JS reflector
-+// gets created before it's in the document. This is usually fine, since
-+// the textbox will get a binding attached after layout, but if the
-+// parent node is hidden, then the textbox never will get it.
-+// Using this function, we append the elements into the DOM before accessing
-+// them directly from JS, so the constructor will run eagerly on the next
-+// JS access once it's appended into the parent.
-+function parseDOM(str) {
-+  const d = new DOMParser();
-+  d.forceEnableXULXBL();
-+  const doc = d.parseFromString(
-+    `<box xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">${str}</box>`,
-+    "application/xml");
-+  const range = doc.createRange();
-+  range.selectNodeContents(doc.firstChild);
-+  return range.extractContents();
-+}
  
 -    <content hidden="true">
 -    <xul:hbox anonid="findbar-container" class="findbar-container" flex="1" align="center">
@@ -284,9 +255,9 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -                       oncommand="close();"/>
 -    </content>
 +class MozFindbar extends XULElement {
-+  connectedCallback() {
-+
-+    this.appendChild(parseDOM(`
++  constructor() {
++    super();
++    this.content = MozXULElement.parseXULToFragment(`
 +      <hbox anonid="findbar-container" class="findbar-container" flex="1" align="center">
 +        <hbox anonid="findbar-textbox-wrapper" align="stretch">
 +          <textbox anonid="findbar-textbox" class="findbar-textbox findbar-find-fast" />
@@ -303,7 +274,11 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +        <description anonid="find-status" control="findbar-textbox" class="findbar-find-fast findbar-find-status" />
 +      </hbox>
 +      <toolbarbutton anonid="find-closebutton" class="findbar-closebutton close-icon" data-l10n-id="findbar-find-button-close" oncommand="close();" />
-+    `));
++    `);
++  }
++
++  connectedCallback() {
++    this.appendChild(document.importNode(this.content, true));
 +
 +    this.hidden = true;
 +
@@ -315,46 +290,51 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +    this.FIND_TYPEAHEAD = 1;
 +
 +    this.FIND_LINKS = 2;
++
++    this.__findMode = 0;
++
++    this._flashFindBar = 0;
++
++    this._initialFlashFindBarCount = 6;
++
++    /**
++     * - For tests that need to know when the find bar is finished
++     * - initializing, we store a promise to notify on.
++     */
++    this._startFindDeferred = null;
++
++    this._browser = null;
  
 -    <implementation>
 -      <!-- Please keep in sync with toolkit/content/browser-content.js -->
 -      <field name="FIND_NORMAL">0</field>
 -      <field name="FIND_TYPEAHEAD">1</field>
 -      <field name="FIND_LINKS">2</field>
-+    this.__findMode = 0;
-+
-+    this._flashFindBar = 0;
-+
-+    this._initialFlashFindBarCount = 6;
++    this.__prefsvc = null;
  
 -      <field name="__findMode">0</field>
 -      <property name="_findMode" onget="return this.__findMode;"
 -                onset="this.__findMode = val; this._updateBrowserWithState(); return val;"/>
-+    /**
-+     * - For tests that need to know when the find bar is finished
-+     * - initializing, we store a promise to notify on.
-+     */
-+    this._startFindDeferred = null;
- 
+-
 -      <field name="_flashFindBar">0</field>
 -      <field name="_initialFlashFindBarCount">6</field>
-+    this._browser = null;
++    this._observer = {
++      _self: this,
  
 -      <!--
 -        - For tests that need to know when the find bar is finished
 -        - initializing, we store a promise to notify on.
 -        -->
 -      <field name="_startFindDeferred">null</field>
-+    this.__prefsvc = null;
-+
-+    this._observer = {
-+      _self: this,
++      QueryInterface: ChromeUtils.generateQI(["nsIObserver",
++                                              "nsISupportsWeakReference"]),
  
 -      <property name="prefillWithSelection"
 -                onget="return this.getAttribute('prefillwithselection') != 'false'"
 -                onset="this.setAttribute('prefillwithselection', val); return val;"/>
-+      QueryInterface: ChromeUtils.generateQI(["nsIObserver",
-+                                              "nsISupportsWeakReference"]),
++      observe(aSubject, aTopic, aPrefName) {
++        if (aTopic != "nsPref:changed")
++          return;
  
 -      <method name="getElement">
 -        <parameter name="aAnonymousID"/>
@@ -364,10 +344,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -                                                         aAnonymousID);
 -        ]]></body>
 -      </method>
-+      observe(aSubject, aTopic, aPrefName) {
-+        if (aTopic != "nsPref:changed")
-+          return;
-+
 +        let prefsvc = this._self._prefsvc;
  
 -      <property name="findMode"
@@ -445,6 +421,16 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +    this._foundMatches = this.getElement("found-matches");
 +    this._findStatusIcon = this.getElement("find-status-icon");
 +    this._findStatusDesc = this.getElement("find-status");
++
++    this._foundURL = null;
++
++    let prefsvc = this._prefsvc;
++
++    this._quickFindTimeoutLength =
++      prefsvc.getIntPref("accessibility.typeaheadfind.timeout");
++    this._flashFindBar =
++      prefsvc.getIntPref("accessibility.typeaheadfind.flashBar");
++    this._useModalHighlight = prefsvc.getBoolPref("findbar.modalHighlight");
  
 -          this._browser = val;
 -          if (this._browser) {
@@ -453,30 +439,11 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -            this._browser.messageManager.addMessageListener("Findbar:Keypress", this);
 -            this._browser.messageManager.addMessageListener("Findbar:Mouseup", this);
 -            this._browser.finder.addResultListener(this);
-+    this._foundURL = null;
-+
-+    let prefsvc = this._prefsvc;
- 
+-
 -            this._findField.value = this._browser._lastSearchString;
 -          }
 -          return val;
 -        ]]></setter>
--      </property>
-+    this._quickFindTimeoutLength =
-+      prefsvc.getIntPref("accessibility.typeaheadfind.timeout");
-+    this._flashFindBar =
-+      prefsvc.getIntPref("accessibility.typeaheadfind.flashBar");
-+    this._useModalHighlight = prefsvc.getBoolPref("findbar.modalHighlight");
- 
--      <field name="__prefsvc">null</field>
--      <property name="_prefsvc">
--        <getter><![CDATA[
--          if (!this.__prefsvc) {
--            this.__prefsvc = Cc["@mozilla.org/preferences-service;1"]
--              .getService(Ci.nsIPrefBranch);
--          }
--          return this.__prefsvc;
--        ]]></getter>
 -      </property>
 +    prefsvc.addObserver("accessibility.typeaheadfind",
 +      this._observer);
@@ -488,17 +455,16 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +    prefsvc.addObserver("findbar.highlightAll", this._observer);
 +    prefsvc.addObserver("findbar.modalHighlight", this._observer);
  
--      <field name="_observer"><![CDATA[({
--        _self: this,
--
--        QueryInterface: ChromeUtils.generateQI(["nsIObserver",
--                                                "nsISupportsWeakReference"]),
--
--        observe(aSubject, aTopic, aPrefName) {
--          if (aTopic != "nsPref:changed")
--            return;
--
--          let prefsvc = this._self._prefsvc;
+-      <field name="__prefsvc">null</field>
+-      <property name="_prefsvc">
+-        <getter><![CDATA[
+-          if (!this.__prefsvc) {
+-            this.__prefsvc = Cc["@mozilla.org/preferences-service;1"]
+-              .getService(Ci.nsIPrefBranch);
+-          }
+-          return this.__prefsvc;
+-        ]]></getter>
+-      </property>
 +    this._findAsYouType =
 +      prefsvc.getBoolPref("accessibility.typeaheadfind");
 +    this._typeAheadLinksOnly =
@@ -507,6 +473,27 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +      prefsvc.getIntPref("accessibility.typeaheadfind.casesensitive");
 +    this._entireWord = prefsvc.getBoolPref("findbar.entireword");
 +    this._highlightAll = prefsvc.getBoolPref("findbar.highlightAll");
+ 
+-      <field name="_observer"><![CDATA[({
+-        _self: this,
+-
+-        QueryInterface: ChromeUtils.generateQI(["nsIObserver",
+-                                                "nsISupportsWeakReference"]),
++    // Convenience
++    this.nsITypeAheadFind = Ci.nsITypeAheadFind;
++    this.nsISelectionController = Ci.nsISelectionController;
++    this._findSelection = this.nsISelectionController.SELECTION_FIND;
+ 
+-        observe(aSubject, aTopic, aPrefName) {
+-          if (aTopic != "nsPref:changed")
+-            return;
++    this._findResetTimeout = -1;
+ 
+-          let prefsvc = this._self._prefsvc;
++    // Make sure the FAYT keypress listener is attached by initializing the
++    // browser property
++    if (this.getAttribute("browserid"))
++      setTimeout(function(aSelf) { aSelf.browser = aSelf.browser; }, 0, this);
  
 -          switch (aPrefName) {
 -            case "accessibility.typeaheadfind":
@@ -533,19 +520,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          }
 -        }
 -      })]]></field>
-+    // Convenience
-+    this.nsITypeAheadFind = Ci.nsITypeAheadFind;
-+    this.nsISelectionController = Ci.nsISelectionController;
-+    this._findSelection = this.nsISelectionController.SELECTION_FIND;
-+
-+    this._findResetTimeout = -1;
-+
-+    // Make sure the FAYT keypress listener is attached by initializing the
-+    // browser property
-+    if (this.getAttribute("browserid"))
-+      setTimeout(function(aSelf) { aSelf.browser = aSelf.browser; }, 0, this);
- 
--      <field name="_destroyed">false</field>
 +    // We have to guard against `this.close` being |null| due to an unknown
 +    // issue, which is tracked in bug 957999.
 +    this.addEventListener("keypress", (event) => {
@@ -555,18 +529,12 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +        event.preventDefault();
 +      }
 +    }, true);
- 
--      <constructor><![CDATA[
--        // These elements are accessed frequently and are therefore cached
--        this._findField = this.getElement("findbar-textbox");
--        this._foundMatches = this.getElement("found-matches");
--        this._findStatusIcon = this.getElement("find-status-icon");
--        this._findStatusDesc = this.getElement("find-status");
++
 +    this.destroy = this.destroy.bind(this);
 +    window.addEventListener("unload", this.destroy);
 +  }
  
--        this._foundURL = null;
+-      <field name="_destroyed">false</field>
 +  set _findMode(val) {
 +    this.__findMode = val;
 +    this._updateBrowserWithState();
@@ -577,19 +545,42 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +    return this.__findMode;
 +  }
  
--        let prefsvc = this._prefsvc;
+-      <constructor><![CDATA[
+-        // These elements are accessed frequently and are therefore cached
+-        this._findField = this.getElement("findbar-textbox");
+-        this._foundMatches = this.getElement("found-matches");
+-        this._findStatusIcon = this.getElement("find-status-icon");
+-        this._findStatusDesc = this.getElement("find-status");
 +  set prefillWithSelection(val) {
 +    this.setAttribute("prefillwithselection", val);
 +    return val;
 +  }
+ 
+-        this._foundURL = null;
++  get prefillWithSelection() {
++    return this.getAttribute("prefillwithselection") != "false";
++  }
++
++  get findMode() {
++    return this._findMode;
++  }
+ 
+-        let prefsvc = this._prefsvc;
++  get hasTransactions() {
++    if (this._findField.value)
++      return true;
  
 -        this._quickFindTimeoutLength =
 -          prefsvc.getIntPref("accessibility.typeaheadfind.timeout");
 -        this._flashFindBar =
 -          prefsvc.getIntPref("accessibility.typeaheadfind.flashBar");
 -        this._useModalHighlight = prefsvc.getBoolPref("findbar.modalHighlight");
-+  get prefillWithSelection() {
-+    return this.getAttribute("prefillwithselection") != "false";
++    // Watch out for lazy editor init
++    if (this._findField.editor) {
++      let tm = this._findField.editor.transactionManager;
++      return !!(tm.numberOfUndoItems || tm.numberOfRedoItems);
++    }
++    return false;
 +  }
  
 -        prefsvc.addObserver("accessibility.typeaheadfind",
@@ -601,13 +592,16 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -        prefsvc.addObserver("findbar.entireword", this._observer);
 -        prefsvc.addObserver("findbar.highlightAll", this._observer);
 -        prefsvc.addObserver("findbar.modalHighlight", this._observer);
-+  get findMode() {
-+    return this._findMode;
-+  }
-+
-+  get hasTransactions() {
-+    if (this._findField.value)
-+      return true;
++  set browser(val) {
++    if (this._browser) {
++      if (this._browser.messageManager) {
++        this._browser.messageManager.removeMessageListener("Findbar:Keypress", this);
++        this._browser.messageManager.removeMessageListener("Findbar:Mouseup", this);
++      }
++      let finder = this._browser.finder;
++      if (finder)
++        finder.removeResultListener(this);
++    }
  
 -        this._findAsYouType =
 -          prefsvc.getBoolPref("accessibility.typeaheadfind");
@@ -624,42 +618,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -        this._findSelection = this.nsISelectionController.SELECTION_FIND;
 -
 -        this._findResetTimeout = -1;
-+    // Watch out for lazy editor init
-+    if (this._findField.editor) {
-+      let tm = this._findField.editor.transactionManager;
-+      return !!(tm.numberOfUndoItems || tm.numberOfRedoItems);
-+    }
-+    return false;
-+  }
- 
--        // Make sure the FAYT keypress listener is attached by initializing the
--        // browser property
--        if (this.getAttribute("browserid"))
--          setTimeout(function(aSelf) { aSelf.browser = aSelf.browser; }, 0, this);
--      ]]></constructor>
-+  set browser(val) {
-+    if (this._browser) {
-+      if (this._browser.messageManager) {
-+        this._browser.messageManager.removeMessageListener("Findbar:Keypress", this);
-+        this._browser.messageManager.removeMessageListener("Findbar:Mouseup", this);
-+      }
-+      let finder = this._browser.finder;
-+      if (finder)
-+        finder.removeResultListener(this);
-+    }
- 
--      <destructor><![CDATA[
--        this.destroy();
--      ]]></destructor>
--
--      <!-- This is necessary because the destructor isn't called when
--           we are removed from a document that is not destroyed. This
--           needs to be explicitly called in this case -->
--      <method name="destroy">
--        <body><![CDATA[
--          if (this._destroyed)
--            return;
--          this._destroyed = true;
 +    this._browser = val;
 +    if (this._browser) {
 +      // Need to do this to ensure the correct initial state.
@@ -668,13 +626,49 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +      this._browser.messageManager.addMessageListener("Findbar:Mouseup", this);
 +      this._browser.finder.addResultListener(this);
  
+-        // Make sure the FAYT keypress listener is attached by initializing the
+-        // browser property
+-        if (this.getAttribute("browserid"))
+-          setTimeout(function(aSelf) { aSelf.browser = aSelf.browser; }, 0, this);
+-      ]]></constructor>
++      this._findField.value = this._browser._lastSearchString;
++    }
++    return val;
++  }
+ 
+-      <destructor><![CDATA[
+-        this.destroy();
+-      ]]></destructor>
++  get browser() {
++    if (!this._browser) {
++      this._browser =
++        document.getElementById(this.getAttribute("browserid"));
++    }
++    return this._browser;
++  }
+ 
+-      <!-- This is necessary because the destructor isn't called when
+-           we are removed from a document that is not destroyed. This
+-           needs to be explicitly called in this case -->
+-      <method name="destroy">
+-        <body><![CDATA[
+-          if (this._destroyed)
+-            return;
+-          this._destroyed = true;
++  get _prefsvc() {
++    return Services.prefs;
++  }
+ 
 -          if (this.browser && this.browser.finder)
 -            this.browser.finder.destroy();
 -
 -          this.browser = null;
-+      this._findField.value = this._browser._lastSearchString;
++  get pluralForm() {
++    if (!this._pluralForm) {
++      this._pluralForm = ChromeUtils.import(
++        "resource://gre/modules/PluralForm.jsm", {}).PluralForm;
 +    }
-+    return val;
++    return this._pluralForm;
 +  }
  
 -          let prefsvc = this._prefsvc;
@@ -687,28 +681,20 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          prefsvc.removeObserver("findbar.entireword", this._observer);
 -          prefsvc.removeObserver("findbar.highlightAll", this._observer);
 -          prefsvc.removeObserver("findbar.modalHighlight", this._observer);
-+  get browser() {
-+    if (!this._browser) {
-+      this._browser =
-+        document.getElementById(this.getAttribute("browserid"));
++  get strBundle() {
++    if (!this._strBundle) {
++      this._strBundle = Services.strings.createBundle(
++        "chrome://global/locale/findbar.properties");
 +    }
-+    return this._browser;
++    return this._strBundle;
 +  }
  
 -          // Clear all timers that might still be running.
 -          this._cancelTimers();
 -        ]]></body>
 -      </method>
-+  get _prefsvc() {
-+    return Services.prefs;
-+  }
-+
-+  get pluralForm() {
-+    if (!this._pluralForm) {
-+      this._pluralForm = ChromeUtils.import(
-+        "resource://gre/modules/PluralForm.jsm", {}).PluralForm;
-+    }
-+    return this._pluralForm;
++  getElement(aAnonymousID) {
++    return this.querySelector(`[anonid=${aAnonymousID}]`);
 +  }
  
 -      <method name="_cancelTimers">
@@ -727,22 +713,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          }
 -        ]]></body>
 -      </method>
-+  get strBundle() {
-+    if (!this._strBundle) {
-+      this._strBundle = Services.strings.createBundle(
-+        "chrome://global/locale/findbar.properties");
-+    }
-+    return this._strBundle;
-+  }
-+
-+  getElement(aAnonymousID) {
-+    return this.querySelector(`[anonid=${aAnonymousID}]`);
-+  }
- 
--      <method name="_setFindCloseTimeout">
--        <body><![CDATA[
--          if (this._quickFindTimeout)
--            clearTimeout(this._quickFindTimeout);
 +  /**
 +   * This is necessary because the destructor isn't called when
 +   * we are removed from a document that is not destroyed. This
@@ -753,6 +723,15 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +      return;
 +    window.removeEventListener("unload", this.destroy);
 +    this._destroyed = true;
++
++    if (this.browser && this.browser.finder)
++      this.browser.finder.destroy();
+ 
+-      <method name="_setFindCloseTimeout">
+-        <body><![CDATA[
+-          if (this._quickFindTimeout)
+-            clearTimeout(this._quickFindTimeout);
++    this.browser = null;
  
 -          // Don't close the find toolbar while IME is composing OR when the
 -          // findbar is already hidden.
@@ -761,19 +740,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -            this._updateBrowserWithState();
 -            return;
 -          }
-+    if (this.browser && this.browser.finder)
-+      this.browser.finder.destroy();
-+
-+    this.browser = null;
- 
--          this._quickFindTimeout = setTimeout(() => {
--             if (this._findMode != this.FIND_NORMAL)
--               this.close();
--             this._quickFindTimeout = null;
--           }, this._quickFindTimeoutLength);
--          this._updateBrowserWithState();
--        ]]></body>
--      </method>
 +    let prefsvc = this._prefsvc;
 +    prefsvc.removeObserver("accessibility.typeaheadfind",
 +      this._observer);
@@ -789,16 +755,14 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +    this._cancelTimers();
 +  }
  
--      <field name="_pluralForm">null</field>
--      <property name="pluralForm">
--        <getter><![CDATA[
--          if (!this._pluralForm) {
--            this._pluralForm = ChromeUtils.import(
--                               "resource://gre/modules/PluralForm.jsm", {}).PluralForm;
--          }
--          return this._pluralForm;
--        ]]></getter>
--      </property>
+-          this._quickFindTimeout = setTimeout(() => {
+-             if (this._findMode != this.FIND_NORMAL)
+-               this.close();
+-             this._quickFindTimeout = null;
+-           }, this._quickFindTimeoutLength);
+-          this._updateBrowserWithState();
+-        ]]></body>
+-      </method>
 +  _cancelTimers() {
 +    if (this._flashFindBarTimeout) {
 +      clearInterval(this._flashFindBarTimeout);
@@ -814,6 +778,20 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +    }
 +  }
  
+-      <field name="_pluralForm">null</field>
+-      <property name="pluralForm">
+-        <getter><![CDATA[
+-          if (!this._pluralForm) {
+-            this._pluralForm = ChromeUtils.import(
+-                               "resource://gre/modules/PluralForm.jsm", {}).PluralForm;
+-          }
+-          return this._pluralForm;
+-        ]]></getter>
+-      </property>
++  _setFindCloseTimeout() {
++    if (this._quickFindTimeout)
++      clearTimeout(this._quickFindTimeout);
+ 
 -      <!--
 -        - Updates the search match count after each find operation on a new string.
 -        - @param aRes
@@ -823,14 +801,25 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -        <body><![CDATA[
 -          if (!this._dispatchFindEvent("matchescount"))
 -            return;
--
++    // Don't close the find toolbar while IME is composing OR when the
++    // findbar is already hidden.
++    if (this._isIMEComposing || this.hidden) {
++      this._quickFindTimeout = null;
++      this._updateBrowserWithState();
++      return;
++    }
+ 
 -          this.browser.finder.requestMatchesCount(this._findField.value,
 -            this._findMode == this.FIND_LINKS);
 -        ]]></body>
 -      </method>
-+  _setFindCloseTimeout() {
-+    if (this._quickFindTimeout)
-+      clearTimeout(this._quickFindTimeout);
++    this._quickFindTimeout = setTimeout(() => {
++      if (this._findMode != this.FIND_NORMAL)
++        this.close();
++      this._quickFindTimeout = null;
++    }, this._quickFindTimeoutLength);
++    this._updateBrowserWithState();
++  }
  
 -      <!--
 -        - Turns highlight on or off.
@@ -847,33 +836,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          if (aHighlight === this._highlightAll) {
 -            return;
 -          }
--
--          this.browser.finder.onHighlightAllChange(aHighlight);
-+    // Don't close the find toolbar while IME is composing OR when the
-+    // findbar is already hidden.
-+    if (this._isIMEComposing || this.hidden) {
-+      this._quickFindTimeout = null;
-+      this._updateBrowserWithState();
-+      return;
-+    }
- 
--          this._setHighlightAll(aHighlight, aFromPrefObserver);
--
--          if (!this._dispatchFindEvent("highlightallchange")) {
--            return;
--          }
-+    this._quickFindTimeout = setTimeout(() => {
-+      if (this._findMode != this.FIND_NORMAL)
-+        this.close();
-+      this._quickFindTimeout = null;
-+    }, this._quickFindTimeoutLength);
-+    this._updateBrowserWithState();
-+  }
- 
--          let word = this._findField.value;
--          // Bug 429723. Don't attempt to highlight ""
--          if (aHighlight && !word)
--            return;
 +  /**
 +   * - Updates the search match count after each find operation on a new string.
 +   * - @param aRes
@@ -883,6 +845,35 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +    if (!this._dispatchFindEvent("matchescount"))
 +      return;
  
+-          this.browser.finder.onHighlightAllChange(aHighlight);
++    this.browser.finder.requestMatchesCount(this._findField.value,
++      this._findMode == this.FIND_LINKS);
++  }
+ 
+-          this._setHighlightAll(aHighlight, aFromPrefObserver);
+-
+-          if (!this._dispatchFindEvent("highlightallchange")) {
+-            return;
+-          }
++  /**
++   * - Turns highlight on or off.
++   * - @param aHighlight (boolean)
++   * -        Whether to turn the highlight on or off
++   * - @param aFromPrefObserver (boolean)
++   * -        Whether the callee is the pref observer, which means we should
++   * -        not set the same pref again.
++   */
++  toggleHighlight(aHighlight, aFromPrefObserver) {
++    if (aHighlight === this._highlightAll) {
++      return;
++    }
+ 
+-          let word = this._findField.value;
+-          // Bug 429723. Don't attempt to highlight ""
+-          if (aHighlight && !word)
+-            return;
++    this.browser.finder.onHighlightAllChange(aHighlight);
+ 
 -          this.browser.finder.highlight(aHighlight, word,
 -            this._findMode == this.FIND_LINKS);
 -
@@ -890,9 +881,7 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          this._updateMatchesCount(this.nsITypeAheadFind.FIND_FOUND);
 -        ]]></body>
 -      </method>
-+    this.browser.finder.requestMatchesCount(this._findField.value,
-+      this._findMode == this.FIND_LINKS);
-+  }
++    this._setHighlightAll(aHighlight, aFromPrefObserver);
  
 -      <!--
 -        - Updates the highlight-all mode of the findbar and its UI.
@@ -917,20 +906,21 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          checkbox.checked = this._highlightAll;
 -        ]]></body>
 -      </method>
-+  /**
-+   * - Turns highlight on or off.
-+   * - @param aHighlight (boolean)
-+   * -        Whether to turn the highlight on or off
-+   * - @param aFromPrefObserver (boolean)
-+   * -        Whether the callee is the pref observer, which means we should
-+   * -        not set the same pref again.
-+   */
-+  toggleHighlight(aHighlight, aFromPrefObserver) {
-+    if (aHighlight === this._highlightAll) {
++    if (!this._dispatchFindEvent("highlightallchange")) {
 +      return;
 +    }
 +
-+    this.browser.finder.onHighlightAllChange(aHighlight);
++    let word = this._findField.value;
++    // Bug 429723. Don't attempt to highlight ""
++    if (aHighlight && !word)
++      return;
++
++    this.browser.finder.highlight(aHighlight, word,
++      this._findMode == this.FIND_LINKS);
++
++    // Update the matches count
++    this._updateMatchesCount(this.nsITypeAheadFind.FIND_FOUND);
++  }
  
 -      <!--
 -        - Updates the case-sensitivity mode of the findbar and its UI.
@@ -944,23 +934,14 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -        <parameter name="aString"/>
 -        <body><![CDATA[
 -          let val = aString || this._findField.value;
-+    this._setHighlightAll(aHighlight, aFromPrefObserver);
-+
-+    if (!this._dispatchFindEvent("highlightallchange")) {
-+      return;
-+    }
- 
+-
 -          let caseSensitive = this._shouldBeCaseSensitive(val);
 -          let checkbox = this.getElement("find-case-sensitive");
 -          let statusLabel = this.getElement("match-case-status");
 -          checkbox.checked = caseSensitive;
 -
 -          statusLabel.value = caseSensitive ? this._caseSensitiveStr : "";
-+    let word = this._findField.value;
-+    // Bug 429723. Don't attempt to highlight ""
-+    if (aHighlight && !word)
-+      return;
- 
+-
 -          // Show the checkbox on the full Find bar in non-auto mode.
 -          // Show the label in all other cases.
 -          let hideCheckbox = this._findMode != this.FIND_NORMAL ||
@@ -968,16 +949,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -             this._typeAheadCaseSensitive != 1);
 -          checkbox.hidden = hideCheckbox;
 -          statusLabel.hidden = !hideCheckbox;
-+    this.browser.finder.highlight(aHighlight, word,
-+      this._findMode == this.FIND_LINKS);
-+
-+    // Update the matches count
-+    this._updateMatchesCount(this.nsITypeAheadFind.FIND_FOUND);
-+  }
- 
--          this.browser.finder.caseSensitive = caseSensitive;
--        ]]></body>
--      </method>
 +  /**
 +   * - Updates the highlight-all mode of the findbar and its UI.
 +   * - @param aHighlight (boolean)
@@ -998,6 +969,20 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +    checkbox.checked = this._highlightAll;
 +  }
  
+-          this.browser.finder.caseSensitive = caseSensitive;
+-        ]]></body>
+-      </method>
++  /**
++   * - Updates the case-sensitivity mode of the findbar and its UI.
++   * - @param [optional] aString
++   * -        The string for which case sensitivity might be turned on.
++   * -        This only used when case-sensitivity is in auto mode,
++   * -        @see _shouldBeCaseSensitive. The default value for this
++   * -        parameter is the find-field value.
++   */
++  _updateCaseSensitivity(aString) {
++    let val = aString || this._findField.value;
+ 
 -      <!--
 -        - Sets the findbar case-sensitivity mode
 -        - @param aCaseSensitivity (int)
@@ -1013,24 +998,23 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          this._updateCaseSensitivity();
 -          this._findFailedString = null;
 -          this._find();
-+  /**
-+   * - Updates the case-sensitivity mode of the findbar and its UI.
-+   * - @param [optional] aString
-+   * -        The string for which case sensitivity might be turned on.
-+   * -        This only used when case-sensitivity is in auto mode,
-+   * -        @see _shouldBeCaseSensitive. The default value for this
-+   * -        parameter is the find-field value.
-+   */
-+  _updateCaseSensitivity(aString) {
-+    let val = aString || this._findField.value;
- 
--          this._dispatchFindEvent("casesensitivitychange");
--        ]]></body>
--      </method>
 +    let caseSensitive = this._shouldBeCaseSensitive(val);
 +    let checkbox = this.getElement("find-case-sensitive");
 +    let statusLabel = this.getElement("match-case-status");
 +    checkbox.checked = caseSensitive;
++
++    statusLabel.value = caseSensitive ? this._caseSensitiveStr : "";
+ 
+-          this._dispatchFindEvent("casesensitivitychange");
+-        ]]></body>
+-      </method>
++    // Show the checkbox on the full Find bar in non-auto mode.
++    // Show the label in all other cases.
++    let hideCheckbox = this._findMode != this.FIND_NORMAL ||
++      (this._typeAheadCaseSensitive != 0 &&
++        this._typeAheadCaseSensitive != 1);
++    checkbox.hidden = hideCheckbox;
++    statusLabel.hidden = !hideCheckbox;
  
 -      <!--
 -        - Updates the entire-word mode of the findbar and its UI.
@@ -1043,25 +1027,32 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          checkbox.checked = entireWord;
 -
 -          statusLabel.value = entireWord ? this._entireWordStr : "";
-+    statusLabel.value = caseSensitive ? this._caseSensitiveStr : "";
++    this.browser.finder.caseSensitive = caseSensitive;
++  }
  
 -          // Show the checkbox on the full Find bar in non-auto mode.
 -          // Show the label in all other cases.
 -          let hideCheckbox = this._findMode != this.FIND_NORMAL;
 -          checkbox.hidden = hideCheckbox;
 -          statusLabel.hidden = !hideCheckbox;
-+    // Show the checkbox on the full Find bar in non-auto mode.
-+    // Show the label in all other cases.
-+    let hideCheckbox = this._findMode != this.FIND_NORMAL ||
-+      (this._typeAheadCaseSensitive != 0 &&
-+        this._typeAheadCaseSensitive != 1);
-+    checkbox.hidden = hideCheckbox;
-+    statusLabel.hidden = !hideCheckbox;
++  /**
++   * - Sets the findbar case-sensitivity mode
++   * - @param aCaseSensitivity (int)
++   * -   0 - case insensitive
++   * -   1 - case sensitive
++   * -   2 - auto = case sensitive iff match string contains upper case letters
++   * -   @see _shouldBeCaseSensitive
++   */
++  _setCaseSensitivity(aCaseSensitivity) {
++    this._typeAheadCaseSensitive = aCaseSensitivity;
++    this._updateCaseSensitivity();
++    this._findFailedString = null;
++    this._find();
  
 -          this.browser.finder.entireWord = entireWord;
 -        ]]></body>
 -      </method>
-+    this.browser.finder.caseSensitive = caseSensitive;
++    this._dispatchFindEvent("casesensitivitychange");
 +  }
  
 -      <!--
@@ -1079,25 +1070,19 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -            return;
 -          }
 +  /**
-+   * - Sets the findbar case-sensitivity mode
-+   * - @param aCaseSensitivity (int)
-+   * -   0 - case insensitive
-+   * -   1 - case sensitive
-+   * -   2 - auto = case sensitive iff match string contains upper case letters
-+   * -   @see _shouldBeCaseSensitive
++   * - Updates the entire-word mode of the findbar and its UI.
 +   */
-+  _setCaseSensitivity(aCaseSensitivity) {
-+    this._typeAheadCaseSensitive = aCaseSensitivity;
-+    this._updateCaseSensitivity();
-+    this._findFailedString = null;
-+    this._find();
++  _setEntireWord() {
++    let entireWord = this._entireWord;
++    let checkbox = this.getElement("find-entire-word");
++    let statusLabel = this.getElement("entire-word-status");
++    checkbox.checked = entireWord;
  
 -          this._findFailedString = null;
 -          this._find();
 -        ]]></body>
 -      </method>
-+    this._dispatchFindEvent("casesensitivitychange");
-+  }
++    statusLabel.value = entireWord ? this._entireWordStr : "";
  
 -      <field name="_strBundle">null</field>
 -      <property name="strBundle">
@@ -1111,16 +1096,14 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          return this._strBundle;
 -        ]]></getter>
 -      </property>
-+  /**
-+   * - Updates the entire-word mode of the findbar and its UI.
-+   */
-+  _setEntireWord() {
-+    let entireWord = this._entireWord;
-+    let checkbox = this.getElement("find-entire-word");
-+    let statusLabel = this.getElement("entire-word-status");
-+    checkbox.checked = entireWord;
++    // Show the checkbox on the full Find bar in non-auto mode.
++    // Show the label in all other cases.
++    let hideCheckbox = this._findMode != this.FIND_NORMAL;
++    checkbox.hidden = hideCheckbox;
++    statusLabel.hidden = !hideCheckbox;
 +
-+    statusLabel.value = entireWord ? this._entireWordStr : "";
++    this.browser.finder.entireWord = entireWord;
++  }
  
 -      <!--
 -        - Opens and displays the find bar.
@@ -1136,14 +1119,17 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -        <body><![CDATA[
 -          if (aMode != undefined)
 -            this._findMode = aMode;
-+    // Show the checkbox on the full Find bar in non-auto mode.
-+    // Show the label in all other cases.
-+    let hideCheckbox = this._findMode != this.FIND_NORMAL;
-+    checkbox.hidden = hideCheckbox;
-+    statusLabel.hidden = !hideCheckbox;
-+
-+    this.browser.finder.entireWord = entireWord;
-+  }
++  /**
++   * - Sets the findbar entire-word mode
++   * - @param aEntireWord (boolean)
++   * - Whether or not entire-word mode should be turned on.
++   */
++  toggleEntireWord(aEntireWord, aFromPrefObserver) {
++    if (!aFromPrefObserver) {
++      // Just set the pref; our observer will change the find bar behavior.
++      this._prefsvc.setBoolPref("findbar.entireword", aEntireWord);
++      return;
++    }
  
 -          if (!this._notFoundStr) {
 -            var stringsBundle = this.strBundle;
@@ -1163,23 +1149,11 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -            this._entireWordStr =
 -              stringsBundle.GetStringFromName("EntireWord");
 -          }
-+  /**
-+   * - Sets the findbar entire-word mode
-+   * - @param aEntireWord (boolean)
-+   * - Whether or not entire-word mode should be turned on.
-+   */
-+  toggleEntireWord(aEntireWord, aFromPrefObserver) {
-+    if (!aFromPrefObserver) {
-+      // Just set the pref; our observer will change the find bar behavior.
-+      this._prefsvc.setBoolPref("findbar.entireword", aEntireWord);
-+      return;
-+    }
- 
--          this._findFailedString = null;
 +    this._findFailedString = null;
 +    this._find();
 +  }
-+
+ 
+-          this._findFailedString = null;
 +  /**
 +   * - Opens and displays the find bar.
 +   * -
@@ -1199,18 +1173,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -            this.hidden = false;
 -
 -            this._updateStatusUI(this.nsITypeAheadFind.FIND_FOUND);
--
--            let event = document.createEvent("Events");
--            event.initEvent("findbaropen", true, false);
--            this.dispatchEvent(event);
--
--            this.browser.finder.onFindbarOpen();
--
--            return true;
--          }
--          return false;
--        ]]></body>
--      </method>
 +    if (!this._notFoundStr) {
 +      var stringsBundle = this.strBundle;
 +      this._notFoundStr = stringsBundle.GetStringFromName("NotFound");
@@ -1230,6 +1192,19 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +        stringsBundle.GetStringFromName("EntireWord");
 +    }
  
+-            let event = document.createEvent("Events");
+-            event.initEvent("findbaropen", true, false);
+-            this.dispatchEvent(event);
+-
+-            this.browser.finder.onFindbarOpen();
+-
+-            return true;
+-          }
+-          return false;
+-        ]]></body>
+-      </method>
++    this._findFailedString = null;
+ 
 -      <!--
 -        - Closes the findbar.
 -        -->
@@ -1238,27 +1213,37 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -        <body><![CDATA[
 -          if (this.hidden)
 -            return;
-+    this._findFailedString = null;
-+
 +    this._updateFindUI();
 +    if (this.hidden) {
 +      this.removeAttribute("noanim");
 +      this.hidden = false;
 +
 +      this._updateStatusUI(this.nsITypeAheadFind.FIND_FOUND);
++
++      let event = document.createEvent("Events");
++      event.initEvent("findbaropen", true, false);
++      this.dispatchEvent(event);
++
++      this.browser.finder.onFindbarOpen();
  
 -          if (aNoAnim)
 -            this.setAttribute("noanim", true);
 -          this.hidden = true;
-+      let event = document.createEvent("Events");
-+      event.initEvent("findbaropen", true, false);
-+      this.dispatchEvent(event);
++      return true;
++    }
++    return false;
++  }
  
 -          // 'focusContent()' iterates over all listeners in the chrome
 -          // process, so we need to call it from here.
 -          this.browser.finder.focusContent();
 -          this.browser.finder.onFindbarClose();
-+      this.browser.finder.onFindbarOpen();
++  /**
++   * - Closes the findbar.
++   */
++  close(aNoAnim) {
++    if (this.hidden)
++      return;
  
 -          this._cancelTimers();
 -          this._updateBrowserWithState();
@@ -1266,10 +1251,9 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          this._findFailedString = null;
 -        ]]></body>
 -      </method>
-+      return true;
-+    }
-+    return false;
-+  }
++    if (aNoAnim)
++      this.setAttribute("noanim", true);
++    this.hidden = true;
  
 -      <method name="clear">
 -        <body><![CDATA[
@@ -1280,23 +1264,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          this._enableFindButtons(false);
 -        ]]></body>
 -      </method>
-+  /**
-+   * - Closes the findbar.
-+   */
-+  close(aNoAnim) {
-+    if (this.hidden)
-+      return;
-+
-+    if (aNoAnim)
-+      this.setAttribute("noanim", true);
-+    this.hidden = true;
- 
--      <method name="_dispatchKeypressEvent">
--        <parameter name="aTarget"/>
--        <parameter name="fakeEvent"/>
--        <body><![CDATA[
--          if (!aTarget)
--            return;
 +    // 'focusContent()' iterates over all listeners in the chrome
 +    // process, so we need to call it from here.
 +    this.browser.finder.focusContent();
@@ -1304,6 +1271,23 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +
 +    this._cancelTimers();
 +    this._updateBrowserWithState();
++
++    this._findFailedString = null;
++  }
+ 
+-      <method name="_dispatchKeypressEvent">
+-        <parameter name="aTarget"/>
+-        <parameter name="fakeEvent"/>
+-        <body><![CDATA[
+-          if (!aTarget)
+-            return;
++  clear() {
++    this.browser.finder.removeSelection();
++    this._findField.reset();
++    this.toggleHighlight(false);
++    this._updateStatusUI();
++    this._enableFindButtons(false);
++  }
  
 -          // The event information comes from the child process. If we need more
 -          // properties/information here, change the list of sent properties in
@@ -1312,16 +1296,9 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          aTarget.dispatchEvent(event);
 -        ]]></body>
 -      </method>
-+    this._findFailedString = null;
-+  }
-+
-+  clear() {
-+    this.browser.finder.removeSelection();
-+    this._findField.reset();
-+    this.toggleHighlight(false);
-+    this._updateStatusUI();
-+    this._enableFindButtons(false);
-+  }
++  _dispatchKeypressEvent(aTarget, fakeEvent) {
++    if (!aTarget)
++      return;
  
 -      <field name="_xulBrowserWindow">null</field>
 -      <method name="_updateStatusUIBar">
@@ -1341,10 +1318,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -            if (!this._xulBrowserWindow)
 -              return false;
 -          }
-+  _dispatchKeypressEvent(aTarget, fakeEvent) {
-+    if (!aTarget)
-+      return;
-+
 +    // The event information comes from the child process. If we need more
 +    // properties/information here, change the list of sent properties in
 +    // browser-content.js
@@ -1378,26 +1351,30 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -        <parameter name="aKeypressEvent"/>
 -        <body><![CDATA[
 -          this.browser.finder.focusContent();
--
--          if (aKeypressEvent)
--            aKeypressEvent.preventDefault();
--
--          this.browser.finder.keyPress(aKeypressEvent);
 +    // Call this has the same effect like hovering over link,
 +    // the browser shows the URL as a tooltip.
 +    this._xulBrowserWindow.setOverLink(aFoundURL || "", null);
 +    return true;
 +  }
  
+-          if (aKeypressEvent)
+-            aKeypressEvent.preventDefault();
++  _finishFAYT(aKeypressEvent) {
++    this.browser.finder.focusContent();
+ 
+-          this.browser.finder.keyPress(aKeypressEvent);
++    if (aKeypressEvent)
++      aKeypressEvent.preventDefault();
+ 
 -          this.close();
 -          return true;
 -        ]]></body>
 -      </method>
-+  _finishFAYT(aKeypressEvent) {
-+    this.browser.finder.focusContent();
++    this.browser.finder.keyPress(aKeypressEvent);
 +
-+    if (aKeypressEvent)
-+      aKeypressEvent.preventDefault();
++    this.close();
++    return true;
++  }
  
 -      <method name="_shouldBeCaseSensitive">
 -        <parameter name="aString"/>
@@ -1406,20 +1383,17 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -            return false;
 -          if (this._typeAheadCaseSensitive == 1)
 -            return true;
-+    this.browser.finder.keyPress(aKeypressEvent);
-+
-+    this.close();
-+    return true;
-+  }
- 
--          return aString != aString.toLowerCase();
--        ]]></body>
--      </method>
 +  _shouldBeCaseSensitive(aString) {
 +    if (this._typeAheadCaseSensitive == 0)
 +      return false;
 +    if (this._typeAheadCaseSensitive == 1)
 +      return true;
+ 
+-          return aString != aString.toLowerCase();
+-        ]]></body>
+-      </method>
++    return aString != aString.toLowerCase();
++  }
  
 -      <!-- We get a fake event object through an IPC message when FAYT is being used
 -           from within the browser. We then stuff that input in the find bar here. -->
@@ -1428,13 +1402,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -        <body><![CDATA[
 -          const FAYT_LINKS_KEY = "'";
 -          const FAYT_TEXT_KEY = "/";
-+    return aString != aString.toLowerCase();
-+  }
- 
--          if (!this.hidden && this._findField.inputField == document.activeElement) {
--            this._dispatchKeypressEvent(this._findField.inputField, aFakeEvent);
--            return;
--          }
 +  /**
 +   * We get a fake event object through an IPC message when FAYT is being used
 +   * from within the browser. We then stuff that input in the find bar here.
@@ -1443,13 +1410,24 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +    const FAYT_LINKS_KEY = "'";
 +    const FAYT_TEXT_KEY = "/";
  
+-          if (!this.hidden && this._findField.inputField == document.activeElement) {
+-            this._dispatchKeypressEvent(this._findField.inputField, aFakeEvent);
+-            return;
+-          }
++    if (!this.hidden && this._findField.inputField == document.activeElement) {
++      this._dispatchKeypressEvent(this._findField.inputField, aFakeEvent);
++      return;
++    }
+ 
 -          if (this._findMode != this.FIND_NORMAL && this._quickFindTimeout) {
 -            this._findField.select();
 -            this._findField.focus();
 -            this._dispatchKeypressEvent(this._findField.inputField, aFakeEvent);
 -            return;
 -          }
-+    if (!this.hidden && this._findField.inputField == document.activeElement) {
++    if (this._findMode != this.FIND_NORMAL && this._quickFindTimeout) {
++      this._findField.select();
++      this._findField.focus();
 +      this._dispatchKeypressEvent(this._findField.inputField, aFakeEvent);
 +      return;
 +    }
@@ -1462,16 +1440,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -            let mode = (key == FAYT_LINKS_KEY ||
 -                        (autostartFAYT && this._typeAheadLinksOnly)) ?
 -              this.FIND_LINKS : this.FIND_TYPEAHEAD;
-+    if (this._findMode != this.FIND_NORMAL && this._quickFindTimeout) {
-+      this._findField.select();
-+      this._findField.focus();
-+      this._dispatchKeypressEvent(this._findField.inputField, aFakeEvent);
-+      return;
-+    }
- 
--            // Clear bar first, so that when openFindBar() calls setCaseSensitivity()
--            // it doesn't get confused by a lingering value
--            this._findField.value = "";
 +    let key = aFakeEvent.charCode ? String.fromCharCode(aFakeEvent.charCode) : null;
 +    let manualstartFAYT = (key == FAYT_LINKS_KEY || key == FAYT_TEXT_KEY);
 +    let autostartFAYT = !manualstartFAYT && this._findAsYouType &&
@@ -1481,13 +1449,21 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +          (autostartFAYT && this._typeAheadLinksOnly)) ?
 +        this.FIND_LINKS : this.FIND_TYPEAHEAD;
  
+-            // Clear bar first, so that when openFindBar() calls setCaseSensitivity()
+-            // it doesn't get confused by a lingering value
+-            this._findField.value = "";
++      // Clear bar first, so that when openFindBar() calls setCaseSensitivity()
++      // it doesn't get confused by a lingering value
++      this._findField.value = "";
+ 
 -            this.open(mode);
 -            this._setFindCloseTimeout();
 -            this._findField.select();
 -            this._findField.focus();
-+      // Clear bar first, so that when openFindBar() calls setCaseSensitivity()
-+      // it doesn't get confused by a lingering value
-+      this._findField.value = "";
++      this.open(mode);
++      this._setFindCloseTimeout();
++      this._findField.select();
++      this._findField.focus();
  
 -            if (autostartFAYT)
 -              this._dispatchKeypressEvent(this._findField.inputField, aFakeEvent);
@@ -1496,11 +1472,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -          }
 -        ]]></body>
 -      </method>
-+      this.open(mode);
-+      this._setFindCloseTimeout();
-+      this._findField.select();
-+      this._findField.focus();
-+
 +      if (autostartFAYT)
 +        this._dispatchKeypressEvent(this._findField.inputField, aFakeEvent);
 +      else
@@ -2275,41 +2246,50 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 +    // it would have been overwritten anyway. See bug 1198465.
 +    if (aIsInitialSelection && !this._startFindDeferred)
 +      return;
- 
--          if (/Mac/.test(navigator.platform) && aIsInitialSelection && !aSelectionString) {
--            let clipboardSearchString = this.browser.finder.clipboardSearchString;
--            if (clipboardSearchString)
--              aSelectionString = clipboardSearchString;
--          }
++
 +    if (/Mac/.test(window.navigator.platform) && aIsInitialSelection && !aSelectionString) {
 +      let clipboardSearchString = this.browser.finder.clipboardSearchString;
 +      if (clipboardSearchString)
 +        aSelectionString = clipboardSearchString;
 +    }
  
--          if (aSelectionString)
--            this._findField.value = aSelectionString;
+-          if (/Mac/.test(navigator.platform) && aIsInitialSelection && !aSelectionString) {
+-            let clipboardSearchString = this.browser.finder.clipboardSearchString;
+-            if (clipboardSearchString)
+-              aSelectionString = clipboardSearchString;
+-          }
 +    if (aSelectionString)
 +      this._findField.value = aSelectionString;
+ 
+-          if (aSelectionString)
+-            this._findField.value = aSelectionString;
++    if (aIsInitialSelection) {
++      this._enableFindButtons(!!this._findField.value);
++      this._findField.select();
++      this._findField.focus();
  
 -          if (aIsInitialSelection) {
 -            this._enableFindButtons(!!this._findField.value);
 -            this._findField.select();
 -            this._findField.focus();
-+    if (aIsInitialSelection) {
-+      this._enableFindButtons(!!this._findField.value);
-+      this._findField.select();
-+      this._findField.focus();
++      this._startFindDeferred.resolve();
++      this._startFindDeferred = null;
++    }
++  }
  
 -            this._startFindDeferred.resolve();
 -            this._startFindDeferred = null;
 -          }
 -        ]]></body>
 -      </method>
-+      this._startFindDeferred.resolve();
-+      this._startFindDeferred = null;
-+    }
-+  }
++  /**
++   * - This handler may cancel a request to focus content by returning |false|
++   * - explicitly.
++   */
++  shouldFocusContent() {
++    const fm = Services.focus;
++    if (fm.focusedWindow != window)
++      return false;
  
 -      <!--
 -        - This handler may cancel a request to focus content by returning |false|
@@ -2321,36 +2301,37 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -                       .getService(Ci.nsIFocusManager);
 -          if (fm.focusedWindow != window)
 -            return false;
-+  /**
-+   * - This handler may cancel a request to focus content by returning |false|
-+   * - explicitly.
-+   */
-+  shouldFocusContent() {
-+    const fm = Services.focus;
-+    if (fm.focusedWindow != window)
++    let focusedElement = fm.focusedElement;
++    if (!focusedElement)
 +      return false;
  
 -          let focusedElement = fm.focusedElement;
 -          if (!focusedElement)
 -            return false;
-+    let focusedElement = fm.focusedElement;
-+    if (!focusedElement)
++    let bindingParent = document.getBindingParent(focusedElement);
++    if (bindingParent != this && bindingParent != this._findField)
 +      return false;
++
++    return true;
++  }
  
 -          let bindingParent = document.getBindingParent(focusedElement);
 -          if (bindingParent != this && bindingParent != this._findField)
 -            return false;
-+    let bindingParent = document.getBindingParent(focusedElement);
-+    if (bindingParent != this && bindingParent != this._findField)
-+      return false;
- 
+-
 -          return true;
 -        ]]></body>
 -      </method>
 -
 -    </implementation>
-+    return true;
++  disconnectedCallback() {
++    // Empty the DOM. We will rebuild if reconnected.
++    while (this.lastChild) {
++      this.removeChild(this.lastChild);
++    }
++    this.destroy();
 +  }
++}
  
 -    <handlers>
 -      <!--
@@ -2362,11 +2343,6 @@ diff --git a/toolkit/content/widgets/findbar.js b/toolkit/content/widgets/findba
 -    </handlers>
 -  </binding>
 -</bindings>
-+  disconnectedCallback() {
-+    this.destroy();
-+  }
-+}
-+
 +customElements.define("findbar", MozFindbar);
 +
 +}
