@@ -1,0 +1,279 @@
+
+# HG changeset patch
+# User Zibi Braniecki <zbraniecki@mozilla.com>
+# Date 1527011454 25200
+# Node ID 1ec0d628252a23c4d9a91882ba9d87d1b6bad8bd
+# Parent  96a6ea5ea3468b4c9e20ff8d9795a7ef136213a9
+Bug 1455649 - Implement DocumentLocalization XPIDL API.
+
+MozReview-Commit-ID: A4Mf5nY5MKb
+
+diff --git a/browser/installer/package-manifest.in b/browser/installer/package-manifest.in
+--- a/browser/installer/package-manifest.in
++++ b/browser/installer/package-manifest.in
+@@ -355,16 +355,19 @@
+ @RESPATH@/components/TestInterfaceJSMaplike.js
+ #endif
+ 
+ #if defined(MOZ_DEBUG) || defined(MOZ_DEV_EDITION) || defined(NIGHTLY_BUILD)
+ @RESPATH@/browser/components/testComponents.manifest
+ @RESPATH@/browser/components/startupRecorder.js
+ #endif
+ 
++@RESPATH@/components/mozDocumentLocalization.js
++@RESPATH@/components/mozDocumentLocalization.manifest
++
+ ; [Extensions]
+ @RESPATH@/components/extensions-toolkit.manifest
+ @RESPATH@/components/extension-process-script.js
+ @RESPATH@/browser/components/extensions-browser.manifest
+ 
+ ; Modules
+ @RESPATH@/browser/modules/*
+ @RESPATH@/modules/*
+diff --git a/intl/l10n/DOMLocalization.jsm b/intl/l10n/DOMLocalization.jsm
+--- a/intl/l10n/DOMLocalization.jsm
++++ b/intl/l10n/DOMLocalization.jsm
+@@ -545,16 +545,21 @@
+   }
+ 
+   /**
+    * Translate all roots associated with this `DOMLocalization`.
+    *
+    * @returns {Promise}
+    */
+   translateRoots() {
++    // Bail out early if there are no registered translations.
++    if (this.resourceIds.length == 0) {
++      return Promise.resolve();
++    }
++
+     const roots = Array.from(this.roots);
+     return Promise.all(
+       roots.map(root => this.translateFragment(root))
+     );
+   }
+ 
+   /**
+    * Pauses the `MutationObserver`.
+diff --git a/intl/l10n/moz.build b/intl/l10n/moz.build
+--- a/intl/l10n/moz.build
++++ b/intl/l10n/moz.build
+@@ -6,16 +6,27 @@
+ 
+ EXTRA_JS_MODULES += [
+     'DOMLocalization.jsm',
+     'L10nRegistry.jsm',
+     'Localization.jsm',
+     'MessageContext.jsm',
+ ]
+ 
++XPIDL_SOURCES += [
++    'mozIDocumentLocalization.idl',
++]
++
++XPIDL_MODULE = 'locale'
++
++EXTRA_COMPONENTS += [
++    'mozDocumentLocalization.js',
++    'mozDocumentLocalization.manifest',
++]
++
+ XPCSHELL_TESTS_MANIFESTS += ['test/xpcshell.ini']
+ 
+ MOCHITEST_CHROME_MANIFESTS += ['test/chrome.ini']
+ 
+ JAR_MANIFESTS += ['jar.mn']
+ 
+ SPHINX_TREES['l10n'] = 'docs'
+ 
+diff --git a/intl/l10n/mozDocumentLocalization.js b/intl/l10n/mozDocumentLocalization.js
+new file mode 100644
+--- /dev/null
++++ b/intl/l10n/mozDocumentLocalization.js
+@@ -0,0 +1,101 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++const { XPCOMUtils } = ChromeUtils.import("resource://gre/modules/XPCOMUtils.jsm", {});
++const { DOMLocalization } = ChromeUtils.import("resource://gre/modules/DOMLocalization.jsm", {});
++const { PromiseUtils } = ChromeUtils.import("resource://gre/modules/PromiseUtils.jsm", {});
++
++class mozDocumentLocalization {
++  constructor() {
++    this.resourceIds = [];
++
++    const deferredL10nContainerParsed = PromiseUtils.defer();
++    const deferredDOMParsed = PromiseUtils.defer();
++
++    this.localization = deferredL10nContainerParsed.promise.then(() => {
++      const l10n = new DOMLocalization(this.document.defaultView, this.resourceIds);
++      l10n.ctxs.touchNext(2);
++      this.resolveLocalization = null;
++      return l10n;
++    });
++
++    this.resolveLocalization = deferredL10nContainerParsed.resolve;
++
++    this.ready = deferredDOMParsed.promise;
++    this.resolveReady = deferredDOMParsed.resolve;
++  }
++
++  getReady() {
++    return this.ready;
++  }
++
++  init(document, isL10nContainerParsed, isDOMParsed) {
++    console.log('mozDocumentLocalization::init');
++    this.document = document;
++    if (isL10nContainerParsed) {
++      console.log('mozDocumentLocalization::init l10nContainerParsed');
++      this.resolveLocalization();
++    }
++    if (isDOMParsed) {
++      console.log('mozDocumentLocalization::init DOMParsed');
++      this.resolveReady();
++    }
++  }
++
++  async localizeDocument() {
++    console.log('mozDocumentLocalization::onDOMReady');
++    const l10n = await this.localization;
++    l10n.registerObservers();
++    l10n.connectRoot(this.document.documentElement);
++    await l10n.translateRoots();
++    this.resolveReady();
++  }
++
++  loadLocalizations() {
++    console.log('mozDocumentLocalization::loadLocalizations');
++    this.resolveLocalization();
++  }
++
++  async addResourceId(resourceId) {
++    console.log(`mozDocumentLocalization::addResourceId for "${resourceId}"`)
++    if (this.resolveLocalization) {
++      this.resourceIds.push(resourceId);
++    } else {
++      const l10n = await this.localization;
++      l10n.addResourceIds([resourceId]);
++    }
++  }
++
++  async removeResourceId(resourceId) {
++    const l10n = await this.localization;
++    l10n.removeResourceIds([resourceId]);
++  }
++
++  setAttributes(element, id, args) {
++    element.setAttribute("data-l10n-id", id);
++    if (args) {
++      element.setAttribute("data-l10n-args", JSON.stringify(args));
++    } else {
++      element.removeAttribute("data-l10n-args");
++    }
++    return element;
++  }
++
++  async formatValues(keys, length) {
++    let l10n = await this.localization;
++    return l10n.formatValues(keys);
++  }
++
++  async formatValue(id, args) {
++    let l10n = await this.localization;
++    return l10n.formatValue(id, args);
++  }
++}
++
++mozDocumentLocalization.prototype.classID =
++  Components.ID("{29cc3895-8835-4c5b-b53a-0c0d1a458dee}");
++mozDocumentLocalization.prototype.QueryInterface =
++  ChromeUtils.generateQI([Ci.mozIDocumentLocalization]);
++
++this.NSGetFactory = XPCOMUtils.generateNSGetFactory([mozDocumentLocalization]);
+diff --git a/intl/l10n/mozDocumentLocalization.manifest b/intl/l10n/mozDocumentLocalization.manifest
+new file mode 100644
+--- /dev/null
++++ b/intl/l10n/mozDocumentLocalization.manifest
+@@ -0,0 +1,2 @@
++component {29cc3895-8835-4c5b-b53a-0c0d1a458dee} mozDocumentLocalization.js
++contract @mozilla.org/intl/documentlocalization;1 {29cc3895-8835-4c5b-b53a-0c0d1a458dee}
+diff --git a/intl/l10n/mozIDocumentLocalization.idl b/intl/l10n/mozIDocumentLocalization.idl
+new file mode 100644
+--- /dev/null
++++ b/intl/l10n/mozIDocumentLocalization.idl
+@@ -0,0 +1,32 @@
++/* -*- Mode: IDL; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "nsISupports.idl"
++
++webidl Document;
++webidl Element;
++
++[scriptable, uuid(7c468500-541f-4fe0-98c9-92a53b63ec8d)]
++interface mozIDocumentLocalization : nsISupports
++{
++  void init(in Document document, in boolean isL10nContainerParsed, in boolean isDOMParsed);
++  void localizeDocument();
++  void loadLocalizations();
++
++  void setAttributes(in Element aElement, in DOMString aId, [optional] in jsval aArgs);
++  jsval getAttributes(in Element aElement);
++
++  Promise translateFragment(in Element aElement);
++  Promise translateElements([array, size_is(aLength)] in Element aElements, in unsigned long aLength);
++
++  void addResourceId(in DOMString aResource);
++  void removeResourceId(in DOMString aResource);
++
++  Promise formatMessages([array, size_is(aLength)] in jsval aKeys, in unsigned long aLength);
++  Promise formatValues([array, size_is(aLength)] in jsval aKeys, in unsigned long aLength);
++  Promise formatValue(in DOMString aId, [optional] in jsval aArgs);
++
++  Promise getReady();
++};
+diff --git a/intl/l10n/test/test_documentlocalization.js b/intl/l10n/test/test_documentlocalization.js
+new file mode 100644
+--- /dev/null
++++ b/intl/l10n/test/test_documentlocalization.js
+@@ -0,0 +1,22 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++const documentLocalization =
++  Cc["@mozilla.org/intl/documentlocalization;1"].createInstance(
++    Ci.mozIDocumentLocalization);
++
++add_task(function test_methods_presence() {
++  equal(typeof documentLocalization.setDocument, "function");
++  equal(typeof documentLocalization.init, "function");
++  equal(typeof documentLocalization.onDOMReady, "function");
++  equal(typeof documentLocalization.setAttributes, "function");
++  equal(typeof documentLocalization.getAttributes, "function");
++  equal(typeof documentLocalization.translateElements, "function");
++  equal(typeof documentLocalization.translateFragment, "function");
++  equal(typeof documentLocalization.addResourceId, "function");
++  equal(typeof documentLocalization.removeResourceId, "function");
++  equal(typeof documentLocalization.formatMessages, "function");
++  equal(typeof documentLocalization.formatValues, "function");
++  equal(typeof documentLocalization.formatValue, "function");
++  equal(typeof documentLocalization.getReady, "function");
++});
+diff --git a/intl/l10n/test/xpcshell.ini b/intl/l10n/test/xpcshell.ini
+--- a/intl/l10n/test/xpcshell.ini
++++ b/intl/l10n/test/xpcshell.ini
+@@ -1,7 +1,8 @@
+ [DEFAULT]
+ head =
+ 
++[test_documentlocalization.js]
+ [test_domlocalization.js]
+ [test_l10nregistry.js]
+ [test_localization.js]
+ [test_messagecontext.js]
+
