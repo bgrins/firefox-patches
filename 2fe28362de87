@@ -1,0 +1,660 @@
+
+# HG changeset patch
+# User Nicolas Chevobbe <nchevobbe@mozilla.com>
+# Date 1526891927 -7200
+# Node ID 2fe28362de8750831bc51713a06a3521099780bc
+# Parent  bf4762f10b8d3076d6862e88ca61f90271291508
+Bug 983473 - Put a CodeMirror instance in JsTerm; r=bgrins.
+
+This is only about adding an editor in the JsTerm and making
+sure we can still execute input strings.
+The styles should stay the same, except that now we don't have
+to do the computation for the input height, since they're already
+done in CodeMirror. In-line style, history navigation and
+autocompletion will be handled in separate bugs.
+The creation of the editor might be done outside of the JsTerm in
+the future so we can re-use it to syntax highligh Evaluation input
+in the output; but not in this bug since it would need to move
+jsterm.execute as well.
+
+MozReview-Commit-ID: 75TmF055mkp
+
+diff --git a/devtools/client/sourceeditor/editor.js b/devtools/client/sourceeditor/editor.js
+--- a/devtools/client/sourceeditor/editor.js
++++ b/devtools/client/sourceeditor/editor.js
+@@ -229,17 +229,17 @@
+           "for it to be appended to the DOM."
+       );
+     }
+     return editors.get(this);
+   },
+ 
+   /**
+    * Appends the current Editor instance to the element specified by
+-   * 'el'. You can also provide your won iframe to host the editor as
++   * 'el'. You can also provide your own iframe to host the editor as
+    * an optional second parameter. This method actually creates and
+    * loads CodeMirror and all its dependencies.
+    *
+    * This method is asynchronous and returns a promise.
+    */
+   appendTo: function(el, env) {
+     return new Promise(resolve => {
+       let cm = editors.get(this);
+diff --git a/devtools/client/themes/webconsole.css b/devtools/client/themes/webconsole.css
+--- a/devtools/client/themes/webconsole.css
++++ b/devtools/client/themes/webconsole.css
+@@ -343,16 +343,50 @@
+ }
+ 
+ /* Unset the bottom right radius on the jsterm inputs when the sidebar is visible */
+ :root[platform="mac"] .sidebar ~ .jsterm-input-container textarea.jsterm-input-node,
+ :root[platform="mac"] .sidebar ~ .jsterm-input-container textarea.jsterm-complete-node {
+   border-bottom-right-radius: 0;
+ }
+ 
++/* CodeMirror-powered JsTerm */
++.jsterm-cm .jsterm-input-container {
++  /* Always allow scrolling on input - it auto expands in js by setting height,
++     but don't want it to get bigger than the window. 24px = toolbar height. */
++  max-height: calc(90vh - 24px);
++}
++
++.jsterm-cm .jsterm-input-container > .CodeMirror {
++  border: 1px solid transparent;
++  font-size: inherit;
++  line-height: 16px;
++  padding-inline-start: 20px;
++  /* input icon */
++  background-image: var(--theme-command-line-image);
++  background-repeat: no-repeat;
++  background-size: 16px 16px;
++  background-position: 4px 4px;
++}
++
++.jsterm-cm .jsterm-input-container > .CodeMirror-focused {
++  background-image: var(--theme-command-line-image-focus);
++  border: 1px solid var(--blue-50);
++  transition: border-color 0.2s ease-in-out;
++}
++
++:root[platform="mac"] .jsterm-cm .jsterm-input-container > .CodeMirror {
++  border-radius: 0 0 4px 4px;
++}
++
++/* Unset the bottom right radius on the jsterm inputs when the sidebar is visible */
++:root[platform="mac"]  .jsterm-cm .sidebar ~ .jsterm-input-container > .CodeMirror {
++  border-bottom-right-radius: 0;
++}
++
+ /* Security styles */
+ 
+ .message.security > .indent {
+   border-inline-end: solid red 6px;
+ }
+ 
+ .message.security.error > .icon::before {
+   background-position: -12px -48px;
+@@ -625,17 +659,16 @@
+   -moz-user-select: none;
+ }
+ 
+ .webconsole-filterbar-filtered-messages .reset-filters-button {
+   margin-inline-start: 0.5em;
+ }
+ 
+ .webconsole-output {
+-  flex: 1;
+   overflow: auto;
+ }
+ 
+ .webconsole-output-wrapper .message {
+   --border-size: 3px;
+   border-inline-start: var(--border-size) solid transparent;
+ }
+ 
+@@ -950,16 +983,17 @@
+  *  | JSTERM CONTAINER             |              |
+  *  +------------------------------+--------------+
+  */
+ .webconsole-output-wrapper {
+   display: grid;
+   grid-template-columns: minmax(200px, 1fr) auto;
+   grid-template-rows: auto 1fr auto auto;
+   height: 100%;
++  max-height: 100%;
+   width: 100vw;
+ }
+ 
+ .webconsole-output-wrapper #webconsole-notificationbox {
+   grid-column: 1 / 2;
+   grid-row: 3 / 4;
+ }
+ 
+@@ -1030,16 +1064,23 @@
+ }
+ 
+ /* Sidebar */
+ .sidebar {
+   display: flex;
+   grid-row: 1 / -1;
+   grid-column: -1 / -2;
+   background-color: var(--theme-sidebar-background);
++  border-inline-start: 1px solid var(--theme-splitter-color);
++}
++
++.sidebar .splitter {
++  /* Let the parent component handle the border. This is needed otherwise there is a visual
++     glitch between the input and the sidebar borders */
++  background-color: transparent;
+ }
+ 
+ .split-box.vert.sidebar {
+   /* Set to prevent the sidebar from extending past the right edge of the page */
+   width: unset;
+ }
+ 
+ .sidebar-wrapper {
+diff --git a/devtools/client/webconsole/components/App.js b/devtools/client/webconsole/components/App.js
+--- a/devtools/client/webconsole/components/App.js
++++ b/devtools/client/webconsole/components/App.js
+@@ -38,16 +38,17 @@
+     return {
+       attachRefToHud: PropTypes.func.isRequired,
+       dispatch: PropTypes.func.isRequired,
+       hud: PropTypes.object.isRequired,
+       notifications: PropTypes.object,
+       onFirstMeaningfulPaint: PropTypes.func.isRequired,
+       serviceContainer: PropTypes.object.isRequired,
+       closeSplitConsole: PropTypes.func.isRequired,
++      jstermCodeMirror: PropTypes.boolean,
+     };
+   }
+ 
+   constructor(props) {
+     super(props);
+ 
+     this.onPaste = this.onPaste.bind(this);
+   }
+@@ -117,28 +118,34 @@
+   render() {
+     const {
+       attachRefToHud,
+       hud,
+       notifications,
+       onFirstMeaningfulPaint,
+       serviceContainer,
+       closeSplitConsole,
++      jstermCodeMirror,
+     } = this.props;
+ 
++    const classNames = ["webconsole-output-wrapper"];
++    if (jstermCodeMirror) {
++      classNames.push("jsterm-cm");
++    }
++
+     // Render the entire Console panel. The panel consists
+     // from the following parts:
+     // * FilterBar - Buttons & free text for content filtering
+     // * Content - List of logs & messages
+     // * SideBar - Object inspector
+     // * NotificationBox - Notifications for JSTerm (self-xss warning at the moment)
+     // * JSTerm - Input command line.
+     return (
+       div({
+-        className: "webconsole-output-wrapper",
++        className: classNames.join(" "),
+         ref: node => {
+           this.node = node;
+         }},
+         FilterBar({
+           hidePersistLogsCheckbox: hud.isBrowserConsole,
+           serviceContainer: {
+             attachRefToHud
+           },
+@@ -153,16 +160,17 @@
+         }),
+         NotificationBox({
+           id: "webconsole-notificationbox",
+           notifications,
+         }),
+         JSTerm({
+           hud,
+           onPaste: this.onPaste,
++          codeMirrorEnabled: jstermCodeMirror,
+         }),
+       )
+     );
+   }
+ }
+ 
+ const mapStateToProps = state => ({
+   notifications: getAllNotifications(state),
+diff --git a/devtools/client/webconsole/components/JSTerm.js b/devtools/client/webconsole/components/JSTerm.js
+--- a/devtools/client/webconsole/components/JSTerm.js
++++ b/devtools/client/webconsole/components/JSTerm.js
+@@ -13,16 +13,17 @@
+ loader.lazyRequireGetter(this, "defer", "devtools/shared/defer");
+ loader.lazyRequireGetter(this, "Debugger", "Debugger");
+ loader.lazyRequireGetter(this, "EventEmitter", "devtools/shared/event-emitter");
+ loader.lazyRequireGetter(this, "AutocompletePopup", "devtools/client/shared/autocomplete-popup");
+ loader.lazyRequireGetter(this, "asyncStorage", "devtools/shared/async-storage");
+ loader.lazyRequireGetter(this, "PropTypes", "devtools/client/shared/vendor/react-prop-types");
+ loader.lazyRequireGetter(this, "gDevTools", "devtools/client/framework/devtools", true);
+ loader.lazyRequireGetter(this, "KeyCodes", "devtools/client/shared/keycodes", true);
++loader.lazyRequireGetter(this, "Editor", "devtools/client/sourceeditor/editor");
+ 
+ const l10n = require("devtools/client/webconsole/webconsole-l10n");
+ 
+ // Constants used for defining the direction of JSTerm input history navigation.
+ const HISTORY_BACK = -1;
+ const HISTORY_FORWARD = 1;
+ 
+ const HELP_URL = "https://developer.mozilla.org/docs/Tools/Web_Console/Helpers";
+@@ -48,16 +49,17 @@
+  *        The WebConsoleFrame object that owns this JSTerm instance.
+  */
+ class JSTerm extends Component {
+   static get propTypes() {
+     return {
+       hud: PropTypes.object.isRequired,
+       // Handler for clipboard 'paste' event (also used for 'drop' event).
+       onPaste: PropTypes.func,
++      codeMirrorEnabled: PropTypes.boolean,
+     };
+   }
+ 
+   constructor(props) {
+     super(props);
+ 
+     const {
+       hud,
+@@ -136,56 +138,86 @@
+     this.completeNode = null;
+ 
+     this.COMPLETE_FORWARD = 0;
+     this.COMPLETE_BACKWARD = 1;
+     this.COMPLETE_HINT_ONLY = 2;
+     this.COMPLETE_PAGEUP = 3;
+     this.COMPLETE_PAGEDOWN = 4;
+ 
++    if (this.props.codeMirrorEnabled) {
++      this.editor = new Editor({
++        autofocus: true,
++        enableCodeFolding: false,
++        gutters: [],
++        lineWrapping: true,
++        mode: Editor.modes.js,
++        styleActiveLine: false,
++        tabIndex: "0",
++        viewportMargin: Infinity,
++        extraKeys: {
++          "Enter": (e, cm) => {
++            let autoMultiline = Services.prefs.getBoolPref(PREF_AUTO_MULTILINE);
++            if (e.shiftKey
++              || (
++                !Debugger.isCompilableUnit(this.getInputValue())
++                && autoMultiline
++              )
++            ) {
++              // shift return or incomplete statement
++              return "CodeMirror.Pass";
++            }
++            this.execute();
++            return null;
++          },
++        },
++      });
++    }
++
+     EventEmitter.decorate(this);
+     hud.jsterm = this;
+   }
+ 
+   componentDidMount() {
+-    if (!this.inputNode) {
+-      return;
+-    }
+-
+     let autocompleteOptions = {
+       onSelect: this.onAutocompleteSelect.bind(this),
+       onClick: this.acceptProposedCompletion.bind(this),
+       listId: "webConsole_autocompletePopupListBox",
+       position: "top",
+       theme: "auto",
+       autoSelect: true
+     };
+ 
+     let doc = this.hud.document;
+     let toolbox = gDevTools.getToolbox(this.hud.owner.target);
+     let tooltipDoc = toolbox ? toolbox.doc : doc;
+     // The popup will be attached to the toolbox document or HUD document in the case
+     // such as the browser console which doesn't have a toolbox.
+     this.autocompletePopup = new AutocompletePopup(tooltipDoc, autocompleteOptions);
+ 
+-    this.inputBorderSize = this.inputNode.getBoundingClientRect().height -
+-                           this.inputNode.clientHeight;
++    this.inputBorderSize = this.inputNode
++      ? this.inputNode.getBoundingClientRect().height - this.inputNode.clientHeight
++      : 0;
+ 
+     // Update the character width and height needed for the popup offset
+     // calculations.
+     this._updateCharSize();
+ 
+-    this.inputNode.addEventListener("keypress", this._keyPress);
+-    this.inputNode.addEventListener("input", this._inputEventHandler);
+-    this.inputNode.addEventListener("keyup", this._inputEventHandler);
+-    this.inputNode.addEventListener("focus", this._focusEventHandler);
++    if (this.props.codeMirrorEnabled) {
++      this.editor.appendToLocalElement(this.node);
++    } else {
++      this.inputNode.addEventListener("keypress", this._keyPress);
++      this.inputNode.addEventListener("input", this._inputEventHandler);
++      this.inputNode.addEventListener("keyup", this._inputEventHandler);
++      this.inputNode.addEventListener("focus", this._focusEventHandler);
++      this.focus();
++    }
++
+     this.hud.window.addEventListener("blur", this._blurEventHandler);
+     this.lastInputValue && this.setInputValue(this.lastInputValue);
+-
+-    this.focus();
+   }
+ 
+   shouldComponentUpdate() {
+     // XXX: For now, everything is handled in an imperative way and we only want React
+     // to do the initial rendering of the component.
+     // This should be modified when the actual refactoring will take place.
+     return false;
+   }
+@@ -251,17 +283,24 @@
+    * Getter for the debugger WebConsoleClient.
+    * @type object
+    */
+   get webConsoleClient() {
+     return this.hud.webConsoleClient;
+   }
+ 
+   focus() {
+-    if (this.inputNode && !this.inputNode.getAttribute("focused")) {
++    if (this.props.codeMirrorEnabled && this.editor) {
++      try {
++        // Putting the focus in a try/catch as this might get called when the editor is
++        // not initialized yet. It shouldn't be a problem since the editor is autofocused
++        // when apended to the DOM.
++        this.editor.focus();
++      } catch (e) {}
++    } else if (this.inputNode && !this.inputNode.getAttribute("focused")) {
+       this.inputNode.focus();
+     }
+   }
+ 
+   /**
+    * The JavaScript evaluation response handler.
+    *
+    * @private
+@@ -526,64 +565,76 @@
+   }
+ 
+   /**
+    * Updates the size of the input field (command line) to fit its contents.
+    *
+    * @returns void
+    */
+   resizeInput() {
++    if (this.props.codeMirrorEnabled) {
++      return;
++    }
++
+     if (!this.inputNode) {
+       return;
+     }
+ 
+     let inputNode = this.inputNode;
+ 
+     // Reset the height so that scrollHeight will reflect the natural height of
+     // the contents of the input field.
+     inputNode.style.height = "auto";
+ 
+     // Now resize the input field to fit its contents.
+-    // TODO: remove `inputNode.inputField.scrollHeight` when the old
+-    // console UI is removed. See bug 1381834
+-    let scrollHeight = inputNode.inputField ?
+-      inputNode.inputField.scrollHeight : inputNode.scrollHeight;
++    let scrollHeight = inputNode.scrollHeight;
+ 
+     if (scrollHeight > 0) {
+       inputNode.style.height = (scrollHeight + this.inputBorderSize) + "px";
+     }
+   }
+ 
+   /**
+    * Sets the value of the input field (command line), and resizes the field to
+    * fit its contents. This method is preferred over setting "inputNode.value"
+    * directly, because it correctly resizes the field.
+    *
+    * @param string newValue
+    *        The new value to set.
+    * @returns void
+    */
+   setInputValue(newValue) {
+-    if (!this.inputNode) {
+-      return;
++    if (this.props.codeMirrorEnabled) {
++      if (this.editor) {
++        this.editor.setText(newValue);
++      }
++    } else {
++      if (!this.inputNode) {
++        return;
++      }
++
++      this.inputNode.value = newValue;
++      this.completeNode.value = "";
+     }
+ 
+-    this.inputNode.value = newValue;
+     this.lastInputValue = newValue;
+-    this.completeNode.value = "";
+     this.resizeInput();
+     this._inputChanged = true;
+     this.emit("set-input-value");
+   }
+ 
+   /**
+    * Gets the value from the input field
+    * @returns string
+    */
+   getInputValue() {
++    if (this.props.codeMirrorEnabled) {
++      return this.editor.getText() || "";
++    }
++
+     return this.inputNode ? this.inputNode.value || "" : "";
+   }
+ 
+   /**
+    * The inputNode "input" and "keyup" event handler.
+    * @private
+    */
+   _inputEventHandler() {
+@@ -1251,16 +1302,20 @@
+   }
+   /**
+    * Calculates the width and height of a single character of the input box.
+    * This will be used in opening the popup at the correct offset.
+    *
+    * @private
+    */
+   _updateCharSize() {
++    if (this.props.codeMirrorEnabled) {
++      return;
++    }
++
+     let doc = this.hud.document;
+     let tempLabel = doc.createElement("span");
+     let style = tempLabel.style;
+     style.position = "fixed";
+     style.padding = "0";
+     style.margin = "0";
+     style.width = "auto";
+     style.color = "transparent";
+@@ -1302,16 +1357,28 @@
+   }
+ 
+   render() {
+     if (this.props.hud.isBrowserConsole &&
+         !Services.prefs.getBoolPref("devtools.chrome.enabled")) {
+       return null;
+     }
+ 
++    if (this.props.codeMirrorEnabled) {
++      return dom.div({
++        className: "jsterm-input-container devtools-monospace",
++        key: "jsterm-container",
++        style: {direction: "ltr"},
++        "aria-live": "off",
++        ref: node => {
++          this.node = node;
++        },
++      });
++    }
++
+     let {
+       onPaste
+     } = this.props;
+ 
+     return (
+       dom.div({
+         className: "jsterm-input-container",
+         key: "jsterm-container",
+diff --git a/devtools/client/webconsole/constants.js b/devtools/client/webconsole/constants.js
+--- a/devtools/client/webconsole/constants.js
++++ b/devtools/client/webconsole/constants.js
+@@ -47,18 +47,21 @@
+       NETXHR: "filter.netxhr",
+     },
+     UI: {
+       // Filter bar UI preference only have the suffix since it can be used either for
+       // the webconsole or the browser console.
+       FILTER_BAR: "ui.filterbar",
+       // Persist is only used by the webconsole.
+       PERSIST: "devtools.webconsole.persistlog",
++    },
++    FEATURES: {
+       // We use the same pref to enable the sidebar on webconsole and browser console.
+       SIDEBAR_TOGGLE: "devtools.webconsole.sidebarToggle",
++      JSTERM_CODE_MIRROR: "devtools.webconsole.jsterm.codeMirror",
+     }
+   }
+ };
+ 
+ const FILTERS = {
+   CSS: "css",
+   DEBUG: "debug",
+   ERROR: "error",
+diff --git a/devtools/client/webconsole/new-console-output-wrapper.js b/devtools/client/webconsole/new-console-output-wrapper.js
+--- a/devtools/client/webconsole/new-console-output-wrapper.js
++++ b/devtools/client/webconsole/new-console-output-wrapper.js
+@@ -48,18 +48,26 @@
+       };
+       // Focus the input line whenever the output area is clicked.
+       this.parentNode.addEventListener("click", (event) => {
+         // Do not focus on middle/right-click or 2+ clicks.
+         if (event.detail !== 1 || event.button !== 0) {
+           return;
+         }
+ 
++        let target = event.originalTarget || event.target;
++
++        // If the target is a code mirror frame, let it handle the focus.
++        if (target.URL ===
++          "chrome://devtools/content/sourceeditor/codemirror/cmiframe.htm"
++        ) {
++          return;
++        }
++
+         // Do not focus if a link was clicked
+-        let target = event.originalTarget || event.target;
+         if (target.closest("a")) {
+           return;
+         }
+ 
+         // Do not focus if an input field was clicked
+         if (target.closest("input")) {
+           return;
+         }
+@@ -209,16 +217,17 @@
+       }
+ 
+       const app = App({
+         attachRefToHud,
+         serviceContainer,
+         hud,
+         onFirstMeaningfulPaint: resolve,
+         closeSplitConsole: this.closeSplitConsole.bind(this),
++        jstermCodeMirror: store.getState().prefs.jstermCodeMirror,
+       });
+ 
+       // Render the root Application component.
+       let provider = createElement(Provider, { store }, app);
+       this.body = ReactDOM.render(provider, this.parentNode);
+     });
+   },
+ 
+diff --git a/devtools/client/webconsole/reducers/prefs.js b/devtools/client/webconsole/reducers/prefs.js
+--- a/devtools/client/webconsole/reducers/prefs.js
++++ b/devtools/client/webconsole/reducers/prefs.js
+@@ -2,17 +2,18 @@
+ /* vim: set ft=javascript ts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ "use strict";
+ 
+ const PrefState = (overrides) => Object.freeze(Object.assign({
+   logLimit: 1000,
+-  sidebarToggle: false
++  sidebarToggle: false,
++  jstermCodeMirror: false,
+ }, overrides));
+ 
+ function prefs(state = PrefState(), action) {
+   return state;
+ }
+ 
+ exports.PrefState = PrefState;
+ exports.prefs = prefs;
+diff --git a/devtools/client/webconsole/store.js b/devtools/client/webconsole/store.js
+--- a/devtools/client/webconsole/store.js
++++ b/devtools/client/webconsole/store.js
+@@ -44,20 +44,25 @@
+   const prefsService = getPrefsService(hud);
+   const {
+     getBoolPref,
+     getIntPref,
+   } = prefsService;
+ 
+   const logLimit = options.logLimit
+     || Math.max(getIntPref("devtools.hud.loglimit"), 1);
+-  const sidebarToggle = getBoolPref(PREFS.UI.SIDEBAR_TOGGLE);
++  const sidebarToggle = getBoolPref(PREFS.FEATURES.SIDEBAR_TOGGLE);
++  const jstermCodeMirror = getBoolPref(PREFS.FEATURES.JSTERM_CODE_MIRROR);
+ 
+   const initialState = {
+-    prefs: PrefState({ logLimit, sidebarToggle }),
++    prefs: PrefState({
++      logLimit,
++      sidebarToggle,
++      jstermCodeMirror,
++    }),
+     filters: FilterState({
+       error: getBoolPref(PREFS.FILTER.ERROR),
+       warn: getBoolPref(PREFS.FILTER.WARN),
+       info: getBoolPref(PREFS.FILTER.INFO),
+       debug: getBoolPref(PREFS.FILTER.DEBUG),
+       log: getBoolPref(PREFS.FILTER.LOG),
+       css: getBoolPref(PREFS.FILTER.CSS),
+       net: getBoolPref(PREFS.FILTER.NET),
+
