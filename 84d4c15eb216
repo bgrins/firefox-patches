@@ -1,0 +1,480 @@
+
+# HG changeset patch
+# User Zibi Braniecki <zbraniecki@mozilla.com>
+# Date 1527881833 25200
+# Node ID 84d4c15eb216e1b2aaaa7cab8b0c0592b591f6fd
+# Parent  42880a726964a0bd66e2f636931e8322eae86ef7
+Bug 1450781 - Enable pseudolocalization in Fluent. r?mossop
+
+MozReview-Commit-ID: Cs8OubRRur4
+
+diff --git a/intl/l10n/L10nRegistry.jsm b/intl/l10n/L10nRegistry.jsm
+--- a/intl/l10n/L10nRegistry.jsm
++++ b/intl/l10n/L10nRegistry.jsm
+@@ -240,16 +240,103 @@
+         default:
+           return "other";
+       }
+     }
+   }
+ };
+ 
+ /**
++ * Pseudolocalizations
++ *
++ * PSEUDO_STRATEGIES is a dict of strategies to be used to modify a
++ * context in order to create pseudolocalizations.  These can be used by
++ * developers to test the localizability of their code without having to
++ * actually speak a foreign language.
++ *
++ * Currently, the following pseudolocales are supported:
++ *
++ *   accented - Ȧȧƈƈḗḗƞŧḗḗḓ Ḗḗƞɠŀīīşħ
++ *
++ *     In Accented English all Latin letters are replaced by accented
++ *     Unicode counterparts which don't impair the readability of the content.
++ *     This allows developers to quickly test if any given string is being
++ *     correctly displayed in its 'translated' form.  Additionally, simple
++ *     heuristics are used to make certain words longer to better simulate the
++ *     experience of international users.
++ *
++ *   bidi - ɥsıʅƃuƎ ıpıԐ
++ *
++ *     Bidi English is a fake RTL locale.  All words are surrounded by
++ *     Unicode formatting marks forcing the RTL directionality of characters.
++ *     In addition, to make the reversed text easier to read, individual
++ *     letters are flipped.
++ *
++ *     Note: The name above is hardcoded to be RTL in case code editors have
++ *     trouble with the RLO and PDF Unicode marks.  In reality, it should be
++ *     surrounded by those marks as well.
++ *
++ * See https://bugzil.la/1450781 for more information.
++ *
++ * In this implementation we use code points instead of inline unicode characters
++ * because the encoding of JSM files mangles them otherwise.
++ */
++
++const ACCENTED_MAP = {
++      // ȦƁƇḒḖƑƓĦĪĴĶĿḾȠǾƤɊŘŞŦŬṼẆẊẎẐ
++      "caps": [550, 385, 391, 7698, 7702, 401, 403, 294, 298, 308, 310, 319, 7742, 544, 510, 420, 586, 344, 350, 358, 364, 7804, 7814, 7818, 7822, 7824],
++      // ȧƀƈḓḗƒɠħīĵķŀḿƞǿƥɋřşŧŭṽẇẋẏẑ
++      "small": [551, 384, 392, 7699, 7703, 402, 608, 295, 299, 309, 311, 320, 7743, 414, 511, 421, 587, 345, 351, 359, 365, 7805, 7815, 7819, 7823, 7825],
++};
++
++const FLIPPED_MAP = {
++      // ∀ԐↃᗡƎℲ⅁HIſӼ⅂WNOԀÒᴚS⊥∩ɅMX⅄Z
++      "caps": [8704, 1296, 8579, 5601, 398, 8498, 8513, 72, 73, 383, 1276, 8514, 87, 78, 79, 1280, 210, 7450, 83, 8869, 8745, 581, 77, 88, 8516, 90],
++      // ɐqɔpǝɟƃɥıɾʞʅɯuodbɹsʇnʌʍxʎz
++      "small": [592, 113, 596, 112, 477, 607, 387, 613, 305, 638, 670, 645, 623, 117, 111, 100, 98, 633, 115, 647, 110, 652, 653, 120, 654, 122],
++};
++
++function transformString(map, elongate = false, prefix = "", postfix = "", msg) {
++  // Exclude access-keys and other single-char messages
++  if (msg.length === 1) {
++    return msg;
++  }
++  // XML entities (&#x202a;) and XML tags.
++  const reExcluded = /(&[#\w]+;|<\s*.+?\s*>)/;
++
++  const parts = msg.split(reExcluded);
++  const modified = parts.map((part) => {
++    if (reExcluded.test(part)) {
++      return part;
++    }
++    return prefix + part.replace(/[a-z]/ig, (ch) => {
++      let cc = ch.charCodeAt(0);
++      if (cc >= 97 && cc <= 122) {
++        const newChar = String.fromCodePoint(map.small[cc - 97]);
++        // duplicate "a", "e", "o" and "u" to emulate ~30% longer text
++        if (elongate && (cc === 97 || cc === 101 || cc === 111 || cc === 117)) {
++          return newChar + newChar;
++        }
++        return newChar;
++      }
++      if (cc >= 65 && cc <= 90) {
++        return String.fromCodePoint(map.caps[cc - 65]);
++      }
++      return ch;
++    }) + postfix;
++  });
++  return modified.join("");
++}
++
++const PSEUDO_STRATEGIES = {
++  "accented": transformString.bind(null, ACCENTED_MAP, true, "", ""),
++  "bidi": transformString.bind(null, FLIPPED_MAP, false, "\u202e", "\u202c"),
++};
++
++/**
+  * Generates a single MessageContext by loading all resources
+  * from the listed sources for a given locale.
+  *
+  * The function casts all error cases into a Promise that resolves with
+  * value `null`.
+  * This allows the caller to be an async generator without using
+  * try/catch clauses.
+  *
+@@ -265,17 +352,21 @@
+   }
+ 
+   const fetchPromises = resourceIds.map((resourceId, i) => {
+     return L10nRegistry.sources.get(sourcesOrder[i]).fetchFile(locale, resourceId);
+   });
+ 
+   const ctxPromise = Promise.all(fetchPromises).then(
+     dataSets => {
+-      const ctx = new MessageContext(locale, MSG_CONTEXT_OPTIONS);
++      const pseudoNameFromPref = Services.prefs.getStringPref("intl.l10n.pseudo", "");
++      const ctx = new MessageContext(locale, {
++        ...MSG_CONTEXT_OPTIONS,
++        transform: PSEUDO_STRATEGIES[pseudoNameFromPref],
++      });
+       for (const data of dataSets) {
+         if (data === null) {
+           return null;
+         }
+         ctx.addMessages(data);
+       }
+       return ctx;
+     },
+diff --git a/intl/l10n/Localization.jsm b/intl/l10n/Localization.jsm
+--- a/intl/l10n/Localization.jsm
++++ b/intl/l10n/Localization.jsm
+@@ -238,30 +238,38 @@
+     return val;
+   }
+ 
+   /**
+    * Register weak observers on events that will trigger cache invalidation
+    */
+   registerObservers() {
+     Services.obs.addObserver(this, "intl:app-locales-changed", true);
++    Services.prefs.addObserver("intl.l10n.pseudo", this, true);
+   }
+ 
+   /**
+    * Default observer handler method.
+    *
+    * @param {String} subject
+    * @param {String} topic
+    * @param {Object} data
+    */
+   observe(subject, topic, data) {
+     switch (topic) {
+       case "intl:app-locales-changed":
+         this.onChange();
+         break;
++      case "nsPref:changed":
++        switch (data) {
++          case "intl.l10n.pseudo":
++            L10nRegistry.ctxCache.clear();
++            this.onChange();
++        }
++        break;
+       default:
+         break;
+     }
+   }
+ 
+   /**
+    * This method should be called when there's a reason to believe
+    * that language negotiation or available resources changed.
+diff --git a/intl/l10n/MessageContext.jsm b/intl/l10n/MessageContext.jsm
+--- a/intl/l10n/MessageContext.jsm
++++ b/intl/l10n/MessageContext.jsm
+@@ -1412,17 +1412,19 @@
+  * @param   {Object} expr
+  *    An expression object to be resolved into a Fluent type.
+  * @returns {FluentType}
+  * @private
+  */
+ function Type(env, expr) {
+   // A fast-path for strings which are the most common case, and for
+   // `FluentNone` which doesn't require any additional logic.
+-  if (typeof expr === "string" || expr instanceof FluentNone) {
++  if (typeof expr === "string") {
++    return env.ctx._transform(expr);
++  } else if (expr instanceof FluentNone) {
+     return expr;
+   }
+ 
+   // The Runtime AST (Entries) encodes patterns (complex strings with
+   // placeables) as Arrays.
+   if (Array.isArray(expr)) {
+     return Pattern(env, expr);
+   }
+@@ -1609,17 +1611,17 @@
+   const result = [];
+ 
+   // Wrap interpolations with Directional Isolate Formatting characters
+   // only when the pattern has more than one element.
+   const useIsolating = ctx._useIsolating && ptn.length > 1;
+ 
+   for (const elem of ptn) {
+     if (typeof elem === "string") {
+-      result.push(elem);
++      result.push(ctx._transform(elem));
+       continue;
+     }
+ 
+     const part = Type(env, elem).toString(ctx);
+ 
+     if (useIsolating) {
+       result.push(FSI);
+     }
+@@ -1708,23 +1710,24 @@
+    *
+    *   - `useIsolating` - boolean specifying whether to use Unicode isolation
+    *                    marks (FSI, PDI) for bidi interpolations.
+    *
+    * @param   {string|Array<string>} locales - Locale or locales of the context
+    * @param   {Object} [options]
+    * @returns {MessageContext}
+    */
+-  constructor(locales, { functions = {}, useIsolating = true } = {}) {
++  constructor(locales, { functions = {}, useIsolating = true, transform = v => v } = {}) {
+     this.locales = Array.isArray(locales) ? locales : [locales];
+ 
+     this._terms = new Map();
+     this._messages = new Map();
+     this._functions = functions;
+     this._useIsolating = useIsolating;
++    this._transform = transform;
+     this._intls = new WeakMap();
+   }
+ 
+   /*
+    * Return an iterator over public `[id, message]` pairs.
+    *
+    * @returns {Iterator}
+    */
+@@ -1824,22 +1827,22 @@
+    * @param   {Object | string}    message
+    * @param   {Object | undefined} args
+    * @param   {Array}              errors
+    * @returns {?string}
+    */
+   format(message, args, errors) {
+     // optimize entities which are simple strings with no attributes
+     if (typeof message === "string") {
+-      return message;
++      return this._transform(message);
+     }
+ 
+     // optimize simple-string entities with attributes
+     if (typeof message.val === "string") {
+-      return message.val;
++      return this._transform(message.val);
+     }
+ 
+     // optimize entities with null values
+     if (message.val === undefined) {
+       return null;
+     }
+ 
+     return resolve(this, args, message, errors);
+diff --git a/intl/l10n/docs/fluent_tutorial.rst b/intl/l10n/docs/fluent_tutorial.rst
+--- a/intl/l10n/docs/fluent_tutorial.rst
++++ b/intl/l10n/docs/fluent_tutorial.rst
+@@ -75,16 +75,17 @@
+  - Full internationalization (i18n) support: date and time formatting, number formatting, plurals, genders etc.
+  - Strong focus on `declarative API via DOM attributes`__
+  - Extensible with custom formatters, Mozilla-specific APIs etc.
+  - `Separation of concerns`__: localization details, and the added complexity of some languages, don't leak onto the source code and are no concern for developers
+  - Compound messages link a single translation unit to a single UI element
+  - `DOM Overlays`__ allow for localization of DOM fragments
+  - Simplified build system model
+  - No need for pre-processing instructions
++ - Support for pseudolocalization
+ 
+ __ https://github.com/projectfluent/fluent/wiki/Get-Started
+ __ https://github.com/projectfluent/fluent/wiki/Design-Principles
+ __ https://github.com/projectfluent/fluent.js/wiki/DOM-Overlays
+ 
+ 
+ Product Quality
+ ------------------
+@@ -608,16 +609,63 @@
+   equals(element.textContent.contains("John"));
+ 
+ .. important::
+ 
+   Testing against whole values is brittle and will break when we insert Unicode
+   bidirectionality marks into the result string or adapt the output in other ways.
+ 
+ 
++Pseudolocalization
++==================
++
++When working with a Fluent-backed UI, the developer gets a new tool to test their UI
++against several classes of problems.
++
++Pseudolocalization is a mechanism which transforms messages on-fly, using specific
++logic to help emulate how the UI will look once it gets localized.
++
++The three classes of potential problems that this can help with are:
++
++ - Hardcoded strings.
++
++   Turning on pseudolocalization should expose any string that were left
++   hardcoded in the source, since they won't get transfomed.
++
++
++ - UI space not adapting to longer text.
++
++   Many languages use longer strings than English. For example, German string
++   may be 30% longer. Turning on pseudolocalization is a quick way to test how
++   the layout handles such locales.
++
++
++ - Bidi adaptation.
++
++   For many developers, testing the UI in right-to-left mode is hard. Mozilla
++   offers a pref :js:`intl.uidirection` which switches the direction of the layout,
++   but that doesn't expose problems related to right-to-left text.
++   Pseudolocalization shows how a right-to-left locale will look like.
++
++To turn on pseudolocalization, add a new string pref :js:`intl.l10n.pseudo` and
++select the strategy to be used:
++
++ - :js:`accented` - Ȧȧƈƈḗḗƞŧḗḗḓ Ḗḗƞɠŀīīşħ
++
++   This strategy replaces all Latin characters with their accented equivalents,
++   and duplicates some vovels to create roughly 30% longer strings.
++
++
++ - :js:`bidi` - ɥsıʅƃuƎ ıpıԐ
++
++   This strategy replaces all Latin characters with their 180 degree rotated versions
++   and enforces right to left text flow using Unicode UAX#9 `Explicit Directional Embeddings`__.
++
++__ https://www.unicode.org/reports/tr9/#Explicit_Directional_Embeddings
++
+ Inner Structure of Fluent
+ =========================
+ 
+ The inner structure of Fluent in Gecko is out of scope of this tutorial, but
+ since the class and file names may show up during debugging or profiling,
+ below is a list of major components, each with a corresponding file in `/intl/l10n`
+ modules in Gecko.
+ 
+diff --git a/intl/l10n/test/test_pseudo.js b/intl/l10n/test/test_pseudo.js
+new file mode 100644
+--- /dev/null
++++ b/intl/l10n/test/test_pseudo.js
+@@ -0,0 +1,101 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++const { Localization } = ChromeUtils.import("resource://gre/modules/Localization.jsm", {});
++const { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm", {});
++const { L10nRegistry, FileSource } =
++  ChromeUtils.import("resource://gre/modules/L10nRegistry.jsm", {});
++
++const originalValues = {};
++
++function addMockFileSource() {
++
++  const fs = {
++    "/localization/de/browser/menu.ftl": `
++key = This is a single message
++    .tooltip = This is a tooltip
++    .accesskey = f`,
++  };
++  originalValues.load = L10nRegistry.load;
++  originalValues.requested = Services.locale.getRequestedLocales();
++
++  L10nRegistry.load = async function(url) {
++    return fs[url];
++  };
++
++  const source = new FileSource("test", ["de"], "/localization/{locale}");
++  L10nRegistry.registerSource(source);
++
++  return async function* generateMessages(resIds) {
++    yield * await L10nRegistry.generateContexts(["de"], resIds);
++  };
++}
++
++/**
++ * This test verifies that as we switching between
++ * different pseudo strategies the Localization object
++ * follows and formats using the given strategy.
++ *
++ * We test values and attributes and make sure that
++ * a single-character attributes, commonly used for access keys
++ * don't get transformed.
++ */
++add_task(async function test_accented_works() {
++
++  Services.prefs.setStringPref("intl.l10n.pseudo", "");
++
++  let generateMessages = addMockFileSource();
++
++  const l10n = new Localization([
++    "/browser/menu.ftl"
++  ], generateMessages);
++  l10n.registerObservers();
++
++  {
++    // 1. Start with no pseudo
++
++    let message = (await l10n.formatMessages([{id: "key"}]))[0];
++
++    ok(message.value.includes("This is a single message"));
++    ok(message.attributes[0].value.includes("This is a tooltip"));
++    equal(message.attributes[1].value, "f");
++  }
++
++  {
++    // 2. Set Accented Pseudo
++
++    Services.prefs.setStringPref("intl.l10n.pseudo", "accented");
++    let message = (await l10n.formatMessages([{id: "key"}]))[0];
++
++    ok(message.value.includes("Ŧħīş īş ȧȧ şīƞɠŀḗḗ ḿḗḗşşȧȧɠḗḗ"));
++    ok(message.attributes[0].value.includes("Ŧħīş īş ȧȧ ŧǿǿǿǿŀŧīƥ"));
++    equal(message.attributes[1].value, "f");
++  }
++
++  {
++    // 3. Set Bidi Pseudo
++
++    Services.prefs.setStringPref("intl.l10n.pseudo", "bidi");
++    let message = (await l10n.formatMessages([{id: "key"}]))[0];
++
++    ok(message.value.includes("ıs ɐ sıuƃʅǝ ɯǝssɐƃǝ"));
++    ok(message.attributes[0].value.includes("⊥ɥıs ıs ɐ ʇooʅʇıd"));
++    equal(message.attributes[1].value, "f");
++  }
++
++  {
++    // 4. Remove pseudo
++
++    Services.prefs.setStringPref("intl.l10n.pseudo", "");
++    let message = (await l10n.formatMessages([{id: "key"}]))[0];
++
++    ok(message.value.includes("This is a single message"));
++    ok(message.attributes[0].value.includes("This is a tooltip"));
++    equal(message.attributes[1].value, "f");
++  }
++
++  L10nRegistry.sources.clear();
++  L10nRegistry.ctxCache.clear();
++  L10nRegistry.load = originalValues.load;
++  Services.locale.setRequestedLocales(originalValues.requested);
++});
+diff --git a/intl/l10n/test/xpcshell.ini b/intl/l10n/test/xpcshell.ini
+--- a/intl/l10n/test/xpcshell.ini
++++ b/intl/l10n/test/xpcshell.ini
+@@ -1,7 +1,8 @@
+ [DEFAULT]
+ head =
+ 
+ [test_domlocalization.js]
+ [test_l10nregistry.js]
+ [test_localization.js]
+ [test_messagecontext.js]
++[test_pseudo.js]
+
