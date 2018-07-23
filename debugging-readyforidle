@@ -1,0 +1,102 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  ff3fab43d24dfdaa8971d92cc4caaf4dc9f54dba
+Bug 1477765 - Deal with rejected Promises in object preview
+
+- Don't consider them 'safe' getters
+- Handle rejection to prevent exceptions
+
+diff --git a/devtools/server/actors/object.js b/devtools/server/actors/object.js
+--- a/devtools/server/actors/object.js
++++ b/devtools/server/actors/object.js
+@@ -374,35 +374,45 @@ const proto = {
+           // The above can throw if the cache becomes stale.
+         }
+         if (!getter) {
+           obj._safeGetters = null;
+           continue;
+         }
+ 
+         const result = getter.call(this.obj);
+-        if (result && !("throw" in result)) {
+-          let getterValue = undefined;
+-          if ("return" in result) {
+-            getterValue = result.return;
+-          } else if ("yield" in result) {
+-            getterValue = result.yield;
+-          }
+-          // WebIDL attributes specified with the LenientThis extended attribute
+-          // return undefined and should be ignored.
+-          if (getterValue !== undefined) {
+-            safeGetterValues[name] = {
+-              getterValue: this.hooks.createValueGrip(getterValue),
+-              getterPrototypeLevel: level,
+-              enumerable: desc.enumerable,
+-              writable: level == 0 ? desc.writable : true,
+-            };
+-            if (limit && ++i == limit) {
+-              break;
+-            }
++        if (!result || "throw" in result) {
++          continue;
++        }
++
++        let getterValue = undefined;
++        if ("return" in result) {
++          getterValue = result.return;
++        } else if ("yield" in result) {
++          getterValue = result.yield;
++        }
++
++        if (getterValue && (getterValue.class == "Promise" &&
++                            getterValue.promiseState == "rejected")) {
++          // XXX: How should we properly silence the Promise rejection?
++          getterValue.unsafeDereference().catch(e=>e);
++          continue;
++        }
++
++        // WebIDL attributes specified with the LenientThis extended attribute
++        // return undefined and should be ignored.
++        if (getterValue !== undefined) {
++          safeGetterValues[name] = {
++            getterValue: this.hooks.createValueGrip(getterValue),
++            getterPrototypeLevel: level,
++            enumerable: desc.enumerable,
++            writable: level == 0 ? desc.writable : true,
++          };
++          if (limit && ++i == limit) {
++            break;
+           }
+         }
+       }
+       if (limit && i == limit) {
+         break;
+       }
+ 
+       obj = obj.proto;
+diff --git a/devtools/shared/webconsole/test/test_object_actor_native_getters_lenient_this.html b/devtools/shared/webconsole/test/test_object_actor_native_getters_lenient_this.html
+--- a/devtools/shared/webconsole/test/test_object_actor_native_getters_lenient_this.html
++++ b/devtools/shared/webconsole/test/test_object_actor_native_getters_lenient_this.html
+@@ -61,21 +61,17 @@ function onConsoleCall(aState, aType, aP
+ function onProperties(aState, aResponse)
+ {
+   let props = aResponse.ownProperties;
+   let keys = Object.keys(props);
+   info(keys.length + " ownProperties: " + keys);
+ 
+   is(keys.length, 0, "number of properties");
+   keys = Object.keys(aResponse.safeGetterValues);
+-  // There is one "safe getter" as far as the code in _findSafeGetterValues is
+-  // concerned, because it treats any Promise-returning attribute as a "safe
+-  // getter".  See bug 1438015.
+-  is(keys.length, 1, "number of safe getters");
+-  is(keys[0], "documentReadyForIdle", "Unexpected safe getter");
++  is(keys.length, 0, "number of safe getters");
+ 
+   closeDebugger(aState, function() {
+     SimpleTest.finish();
+   });
+ }
+ 
+ addEventListener("load", startTest);
+ </script>
