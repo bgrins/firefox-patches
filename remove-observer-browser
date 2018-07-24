@@ -1,0 +1,223 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  4eaebcb9e651f5e5e90a5082cb04678b4739e585
+Stop implementing nsIObserver on browsers
+
+diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/browser.xml
+--- a/toolkit/content/widgets/browser.xml
++++ b/toolkit/content/widgets/browser.xml
+@@ -7,17 +7,37 @@
+ <bindings id="browserBindings"
+           xmlns="http://www.mozilla.org/xbl"
+           xmlns:xul="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
+ 
+   <binding id="browser">
+     <content clickthrough="never">
+       <children/>
+     </content>
+-    <implementation type="application/javascript" implements="nsIObserver, nsIBrowser">
++    <implementation type="application/javascript" implements="nsIBrowser">
++      <field name="_observer">({
++        observe: function(aSubject, aTopic, aState) {
++          if (aTopic == "browser:purge-session-history") {
++            this.purgeSessionHistory();
++          } else if (aTopic == "apz:cancel-autoscroll") {
++            if (aState == this._autoScrollScrollId) {
++              // Set this._autoScrollScrollId to null, so in stopScroll() we
++              // don't call stopApzAutoscroll() (since it's APZ that
++              // initiated the stopping).
++              this._autoScrollScrollId = null;
++              this._autoScrollPresShellId = null;
++
++              this._autoScrollPopup.hidePopup();
++            }
++          }
++        }.bind(this),
++        QueryInterface: ChromeUtils.generateQI([Ci.nsIObserver,
++                                                Ci.nsISupportsWeakReference]),
++      })</field>
++
+       <property name="autoscrollEnabled">
+         <getter>
+           <![CDATA[
+             if (this.getAttribute("autoscroll") == "false")
+               return false;
+ 
+             return this.mPrefs.getBoolPref("general.autoScroll", true);
+           ]]>
+@@ -801,17 +821,17 @@
+         <![CDATA[
+           try {
+             // |webNavigation.sessionHistory| will have been set by the frame
+             // loader when creating the docShell as long as this xul:browser
+             // doesn't have the 'disablehistory' attribute set.
+             if (this.docShell && this.webNavigation.sessionHistory) {
+               var os = Cc["@mozilla.org/observer-service;1"]
+                          .getService(Ci.nsIObserverService);
+-              os.addObserver(this, "browser:purge-session-history", true);
++              os.addObserver(this._observer, "browser:purge-session-history", true);
+ 
+               // enable global history if we weren't told otherwise
+               if (!this.hasAttribute("disableglobalhistory") && !this.isRemoteBrowser) {
+                 try {
+                   this.docShell.useGlobalHistory = true;
+                 } catch (ex) {
+                   // This can occur if the Places database is locked
+                   Cu.reportError("Error enabling browser global history: " + ex);
+@@ -882,17 +902,17 @@
+           if (this.mDestroyed)
+             return;
+           this.mDestroyed = true;
+ 
+           if (this.docShell && this.webNavigation.sessionHistory) {
+             var os = Cc["@mozilla.org/observer-service;1"]
+                        .getService(Ci.nsIObserverService);
+             try {
+-              os.removeObserver(this, "browser:purge-session-history");
++              os.removeObserver(this._observer, "browser:purge-session-history");
+             } catch (ex) {
+               // It's not clear why this sometimes throws an exception.
+             }
+           }
+ 
+           this._fastFind = null;
+           this._webBrowserFind = null;
+ 
+@@ -941,17 +961,17 @@
+                   this.mPrefs.getBoolPref("apz.autoscroll.enabled", false)) {
+                 let { tabParent } = this.frameLoader;
+                 if (tabParent) {
+                   // If APZ is handling the autoscroll, it may decide to cancel
+                   // it of its own accord, so register an observer to allow it
+                   // to notify us of that.
+                   var os = Cc["@mozilla.org/observer-service;1"]
+                              .getService(Ci.nsIObserverService);
+-                  os.addObserver(this, "apz:cancel-autoscroll", true);
++                  os.addObserver(this._observer, "apz:cancel-autoscroll", true);
+ 
+                   usingApz = tabParent.startApzAutoscroll(
+                       data.screenX, data.screenY,
+                       data.scrollId, data.presShellId);
+                 }
+                 // Save the IDs for later
+                 this._autoScrollScrollId = data.scrollId;
+                 this._autoScrollPresShellId = data.presShellId;
+@@ -1009,39 +1029,16 @@
+ 
+       <method name="receiveMessage">
+         <parameter name="aMessage"/>
+         <body><![CDATA[
+           return this._receiveMessage(aMessage);
+         ]]></body>
+       </method>
+ 
+-      <method name="observe">
+-        <parameter name="aSubject"/>
+-        <parameter name="aTopic"/>
+-        <parameter name="aState"/>
+-        <body>
+-          <![CDATA[
+-            if (aTopic == "browser:purge-session-history") {
+-              this.purgeSessionHistory();
+-            } else if (aTopic == "apz:cancel-autoscroll") {
+-              if (aState == this._autoScrollScrollId) {
+-                // Set this._autoScrollScrollId to null, so in stopScroll() we
+-                // don't call stopApzAutoscroll() (since it's APZ that
+-                // initiated the stopping).
+-                this._autoScrollScrollId = null;
+-                this._autoScrollPresShellId = null;
+-
+-                this._autoScrollPopup.hidePopup();
+-              }
+-            }
+-          ]]>
+-        </body>
+-      </method>
+-
+       <method name="purgeSessionHistory">
+         <body>
+           <![CDATA[
+             this.messageManager.sendAsyncMessage("Browser:PurgeSessionHistory");
+           ]]>
+         </body>
+       </method>
+ 
+@@ -1078,17 +1075,17 @@
+               window.removeEventListener("keydown", this, true);
+               window.removeEventListener("keypress", this, true);
+               window.removeEventListener("keyup", this, true);
+               this.messageManager.sendAsyncMessage("Autoscroll:Stop");
+ 
+               var os = Cc["@mozilla.org/observer-service;1"]
+                          .getService(Ci.nsIObserverService);
+               try {
+-                os.removeObserver(this, "apz:cancel-autoscroll");
++                os.removeObserver(this._observer, "apz:cancel-autoscroll");
+               } catch (ex) {
+                 // It's not clear why this sometimes throws an exception
+               }
+ 
+               if (this.isRemoteBrowser && this._autoScrollScrollId != null) {
+                 let { tabParent } = this.frameLoader;
+                 if (tabParent) {
+                   tabParent.stopApzAutoscroll(this._autoScrollScrollId,
+diff --git a/toolkit/content/widgets/remote-browser.xml b/toolkit/content/widgets/remote-browser.xml
+--- a/toolkit/content/widgets/remote-browser.xml
++++ b/toolkit/content/widgets/remote-browser.xml
+@@ -6,17 +6,17 @@
+ 
+ <bindings id="firefoxBrowserBindings"
+           xmlns="http://www.mozilla.org/xbl"
+           xmlns:xul="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
+ 
+   <binding id="remote-browser" extends="chrome://global/content/bindings/browser.xml#browser">
+ 
+     <implementation type="application/javascript"
+-                    implements="nsIObserver, nsIRemoteBrowser">
++                    implements="nsIRemoteBrowser">
+ 
+       <field name="_securityUI">null</field>
+ 
+       <property name="securityUI"
+                 readonly="true">
+         <getter><![CDATA[
+           if (!this._securityUI) {
+             // Don't attempt to create the remote web progress if the
+@@ -415,17 +415,17 @@
+           this.messageManager.loadFrameScript("chrome://global/content/browser-child.js", true);
+ 
+           if (this.hasAttribute("selectmenulist")) {
+             this.messageManager.addMessageListener("Forms:ShowDropDown", this);
+             this.messageManager.addMessageListener("Forms:HideDropDown", this);
+           }
+ 
+           if (!this.hasAttribute("disablehistory")) {
+-            Services.obs.addObserver(this, "browser:purge-session-history", true);
++            Services.obs.addObserver(this._observer, "browser:purge-session-history", true);
+           }
+ 
+           let rc_js = "resource://gre/modules/RemoteController.js";
+           let scope = {};
+           Services.scriptloader.loadSubScript(rc_js, scope);
+           let RemoteController = scope.RemoteController;
+           this._controller = new RemoteController(this);
+           this.controllers.appendController(this._controller);
+@@ -459,17 +459,17 @@
+           } catch (ex) {
+             // This can fail when this browser element is not attached to a
+             // BrowserDOMWindow.
+           }
+ 
+           if (!this.hasAttribute("disablehistory")) {
+             let Services = ChromeUtils.import("resource://gre/modules/Services.jsm", {}).Services;
+             try {
+-              Services.obs.removeObserver(this, "browser:purge-session-history");
++              Services.obs.removeObserver(this._observer, "browser:purge-session-history");
+             } catch (ex) {
+               // It's not clear why this sometimes throws an exception.
+             }
+           }
+         ]]></body>
+       </method>
+ 
+       <method name="receiveMessage">
