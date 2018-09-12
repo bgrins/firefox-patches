@@ -1,0 +1,208 @@
+# HG changeset patch
+# User Daniel Holbert <dholbert@cs.stanford.edu>
+# Date 1536703294 25200
+#      Tue Sep 11 15:01:34 2018 -0700
+# Node ID ca961467934b82a838f5e9f3ba84e8c433c82465
+# Parent  423bdf7a802b0d302244492b423609187de39f56
+bug 1377253 WIP
+
+diff --git a/layout/generic/nsFlexContainerFrame.cpp b/layout/generic/nsFlexContainerFrame.cpp
+--- a/layout/generic/nsFlexContainerFrame.cpp
++++ b/layout/generic/nsFlexContainerFrame.cpp
+@@ -1277,16 +1277,21 @@ nsFlexContainerFrame::CSSAlignmentForAbs
+ 
+ UniquePtr<FlexItem>
+ nsFlexContainerFrame::GenerateFlexItemForChild(
+   nsPresContext* aPresContext,
+   nsIFrame*      aChildFrame,
+   const ReflowInput& aParentReflowInput,
+   const FlexboxAxisTracker& aAxisTracker)
+ {
++  // XXXdholbert If !NS_SUBTREE_DIRTY(aChildFrame), we should try to use saved
++  // flex-item-state from the child. (Assuming that no changes outside of the
++  // child's subtree will have influenced those values.)
++
++
+   // Create temporary reflow state just for sizing -- to get hypothetical
+   // main-size and the computed values of min / max main-size property.
+   // (This reflow state will _not_ be used for reflow.)
+   ReflowInput
+     childRI(aPresContext, aParentReflowInput, aChildFrame,
+             aParentReflowInput.ComputedSize(aChildFrame->GetWritingMode()));
+ 
+   // FLEX GROW & SHRINK WEIGHTS
+@@ -1785,16 +1790,18 @@ public:
+   nscoord BSize() const { return mBSize; }
+ 
+   nscoord Ascent() const { return mAscent; }
+ };
+ 
+ NS_DECLARE_FRAME_PROPERTY_DELETABLE(CachedFlexMeasuringReflow,
+                                     CachedMeasuringReflowResult);
+ 
++NS_DECLARE_FRAME_PROPERTY_SMALL_VALUE(CachedFlexItemSize, nsSize)
++
+ const CachedMeasuringReflowResult&
+ nsFlexContainerFrame::MeasureAscentAndBSizeForFlexItem(
+   FlexItem& aItem,
+   nsPresContext* aPresContext,
+   ReflowInput& aChildReflowInput)
+ {
+   if (const auto* cachedResult =
+         aItem.Frame()->GetProperty(CachedFlexMeasuringReflow())) {
+@@ -1829,22 +1836,30 @@ nsFlexContainerFrame::MeasureAscentAndBS
+ 
+   aItem.Frame()->SetProperty(CachedFlexMeasuringReflow(), result);
+   return *result;
+ }
+ 
+ /* virtual */ void
+ nsFlexContainerFrame::MarkIntrinsicISizesDirty()
+ {
++  // XXXdholbert This might be overkill!  This gets called on the flex
++  // container when e.g. one of its flex items has some text changed (via
++  // PresShell::FrameNeedsReflow doing its "Mark argument and all ancestors
++  // dirty" clause.  This can only influence our items' cached measuring-reflow
++  // sizes if: (a) the item is itself the frame that needs reflow,  or maybe
++  // (b) if the item has a percent flex-basis or min/max main-size.  (Also
++  // right now, the flex container's size influences the measuring reflow,
++  // since we use it as the available size -- but that is a bug that needs fixing.)
+   mCachedMinISize = NS_INTRINSIC_WIDTH_UNKNOWN;
+   mCachedPrefISize = NS_INTRINSIC_WIDTH_UNKNOWN;
+ 
+-  for (nsIFrame* childFrame : mFrames) {
+-    childFrame->DeleteProperty(CachedFlexMeasuringReflow());
+-  }
++  //  for (nsIFrame* childFrame : mFrames) {
++  //    childFrame->DeleteProperty(CachedFlexMeasuringReflow());
++  //  }
+   nsContainerFrame::MarkIntrinsicISizesDirty();
+ }
+ 
+ nscoord
+ nsFlexContainerFrame::
+   MeasureFlexItemContentBSize(nsPresContext* aPresContext,
+                               FlexItem& aFlexItem,
+                               bool aForceBResizeForMeasuringReflow,
+@@ -4965,17 +4980,18 @@ nsFlexContainerFrame::DoFlexLayout(nsPre
+       framePos += containerContentBoxOrigin;
+ 
+       // (Intentionally snapshotting this before ApplyRelativePositioning, to
+       // maybe use for setting the flex container's baseline.)
+       const nscoord itemNormalBPos = framePos.B(flexWM);
+ 
+       // Check if we actually need to reflow the item -- if we already reflowed
+       // it with the right size, we can just reposition it as-needed.
+-      bool itemNeedsReflow = true; // (Start out assuming the worst.)
++      // XXXdholbert maybe make this a 3-state enum
++      Maybe<bool> itemNeedsReflow; // (Start out assuming the worst.)
+       if (item->HadMeasuringReflow()) {
+         LogicalSize finalFlexItemCBSize =
+           aAxisTracker.LogicalSizeFromFlexRelativeSizes(item->GetMainSize(),
+                                                         item->GetCrossSize());
+         // We've already reflowed the child once. Was the size we gave it in
+         // that reflow the same as its final (post-flexing/stretching) size?
+         if (finalFlexItemCBSize ==
+             LogicalSize(flexWM,
+@@ -4984,27 +5000,56 @@ nsFlexContainerFrame::DoFlexLayout(nsPre
+           // care that our bsize is now considered "definite" (whereas it
+           // wasn't in our previous "measuring" reflow), if they have a
+           // relative bsize.
+           if (!(item->Frame()->GetStateBits() &
+                 NS_FRAME_CONTAINS_RELATIVE_BSIZE)) {
+             // Item has the correct size (and its children don't care that
+             // it's now "definite"). Let's just make sure it's at the right
+             // position.
+-            itemNeedsReflow = false;
+-            MoveFlexItemToFinalPosition(aReflowInput, *item, framePos,
+-                                        containerSize);
++            itemNeedsReflow.emplace(false);
+           }
+         }
++        if (!itemNeedsReflow) {
++          itemNeedsReflow.emplace(true);
++        }
+       }
+-      if (itemNeedsReflow) {
++      bool found;
++      // abusing nsSize here; putting main-size in .width, cross-size in .height
++      nsSize sizeToCache = nsSize(item->GetMainSize(),
++                                  item->GetCrossSize());
++      nsSize sizeFromCache =
++        item->Frame()->GetProperty(CachedFlexItemSize(), &found);
++      bool isCachedSizeStale = !found || sizeFromCache != sizeToCache;
++      if (isCachedSizeStale) {
++        item->Frame()->SetProperty(CachedFlexItemSize(), sizeToCache);
++      }
++
++      if (!itemNeedsReflow) { // (if we don't yet know...)
++        // If the child's subtree isn't dirty, and its resolved main size is
++        // the same as the last time we reflowed it, then we don't need to
++        // bother reflowing.
++        if (!NS_SUBTREE_DIRTY(item->Frame()) && !isCachedSizeStale) {
++          NS_WARNING("********dholbert skipping reflow due to "
++                     "cached size being up-to-date");
++          itemNeedsReflow.emplace(false);
++        }
++      }
++      if (!itemNeedsReflow || *itemNeedsReflow) { // If we don't know, or if we
++                                                  // do know it does need a reflow:
+         ReflowFlexItem(aPresContext, aAxisTracker, aReflowInput,
+                        *item, framePos, containerSize);
++      } else {
++        // We know flex item doesn't need reflow; but let's be sure it's at the
++        // right position.
++        MoveFlexItemToFinalPosition(aReflowInput, *item, framePos,
++                                    containerSize);
+       }
+ 
++
+       // If the item has auto margins, and we were tracking the UsedMargin
+       // property, set the property to the computed margin values.
+       if (item->HasAnyAutoMargin()) {
+         nsMargin* propValue =
+           item->Frame()->GetProperty(nsIFrame::UsedMarginProperty());
+         if (propValue) {
+           *propValue = item->GetMargin();
+         }
+diff --git a/layout/generic/nsFlexContainerFrame.h b/layout/generic/nsFlexContainerFrame.h
+--- a/layout/generic/nsFlexContainerFrame.h
++++ b/layout/generic/nsFlexContainerFrame.h
+@@ -451,11 +451,14 @@ protected:
+    * Cached values to optimize GetMinISize/GetPrefISize.
+    */
+   nscoord mCachedMinISize;
+   nscoord mCachedPrefISize;
+ 
+   nscoord mBaselineFromLastReflow;
+   // Note: the last baseline is a distance from our border-box end edge.
+   nscoord mLastBaselineFromLastReflow;
++
++  // XXXdholbert Do we need to even save this, or can we just use mRect?
++  nscoord mCrossSizeFromLastReflow;
+ };
+ 
+ #endif /* nsFlexContainerFrame_h___ */
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -5245,16 +5245,19 @@ nsFrame::MarkIntrinsicISizesDirty()
+     SizeNeedsRecalc(metrics->mMinSize);
+     SizeNeedsRecalc(metrics->mMaxSize);
+     SizeNeedsRecalc(metrics->mBlockPrefSize);
+     SizeNeedsRecalc(metrics->mBlockMinSize);
+     CoordNeedsRecalc(metrics->mFlex);
+     CoordNeedsRecalc(metrics->mAscent);
+   }
+ 
++  // XXXdholbert Maybe condition this on an "is flex item" bit/check?
++  DeleteProperty(CachedFlexMeasuringReflow());
++
+   if (GetStateBits() & NS_FRAME_FONT_INFLATION_FLOW_ROOT) {
+     nsFontInflationData::MarkFontInflationDataTextDirty(this);
+   }
+ }
+ 
+ /* virtual */ nscoord
+ nsFrame::GetMinISize(gfxContext *aRenderingContext)
+ {
