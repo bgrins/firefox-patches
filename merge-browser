@@ -1,12 +1,300 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  ac9f1219d11bf1a56ec1ace8e3ba9ff113b5cacb
+# Parent  5347c7e4811a1a4d80bcee4119cead9192fdff69
 Bug 1492967 - Merge together remote-browser and browser bindings
+* * *
+Bug
 
+diff --git a/devtools/client/responsive.html/browser/tunnel.js b/devtools/client/responsive.html/browser/tunnel.js
+--- a/devtools/client/responsive.html/browser/tunnel.js
++++ b/devtools/client/responsive.html/browser/tunnel.js
+@@ -59,19 +59,19 @@ const PROPERTIES_FROM_BROWSER_WINDOW = [
+ 
+ /**
+  * This module takes an "outer" <xul:browser> from a browser tab as described by
+  * Firefox's tabbrowser.xml and wires it up to an "inner" <iframe mozbrowser>
+  * browser element containing arbitrary page content of interest.
+  *
+  * The inner <iframe mozbrowser> element is _just_ the page content.  It is not
+  * enough to to replace <xul:browser> on its own.  <xul:browser> comes along
+- * with lots of associated functionality via XBL bindings defined for such
+- * elements in browser.xml and remote-browser.xml, and the Firefox UI depends on
+- * these various things to make the UI function.
++ * with lots of associated functionality via XBL binding defined for such
++ * elements in browser.xml, and the Firefox UI depends on these various things
++ * to make the UI function.
+  *
+  * By mapping various methods, properties, and messages from the outer browser
+  * to the inner browser, we can control the content inside the inner browser
+  * using the standard Firefox UI elements for navigation, reloading, and more.
+  *
+  * The approaches used in this module were chosen to avoid needing changes to
+  * the core browser for this specialized use case.  If we start to increase
+  * usage of <iframe mozbrowser> in the core browser, we should avoid this module
+@@ -98,19 +98,19 @@ function tunnelToInnerBrowser(outer, inn
+         throw new Error("The outer browser must be non-remote.");
+       }
+       if (!inner.isRemoteBrowser) {
+         throw new Error("The inner browser must be remote.");
+       }
+ 
+       // Various browser methods access the `frameLoader` property, including:
+       //   * `saveBrowser` from contentAreaUtils.js
+-      //   * `docShellIsActive` from remote-browser.xml
+-      //   * `hasContentOpener` from remote-browser.xml
+-      //   * `preserveLayers` from remote-browser.xml
++      //   * `docShellIsActive` from browser.xml
++      //   * `hasContentOpener` from browser.xml
++      //   * `preserveLayers` from browser.xml
+       //   * `receiveMessage` from SessionStore.jsm
+       // In general, these methods are interested in the `frameLoader` for the content,
+       // so we redirect them to the inner browser's `frameLoader`.
+       outer[FRAME_LOADER] = outer.frameLoader;
+       Object.defineProperty(outer, "frameLoader", {
+         get() {
+           const stack = getStack();
+           // One exception is `receiveMessage` from SessionStore.jsm.  SessionStore
+@@ -153,51 +153,46 @@ function tunnelToInnerBrowser(outer, inn
+       // which we can use to route messages of interest to the inner browser instead.
+       // Note: The _actual_ messageManager accessible from
+       // `browser.frameLoader.messageManager` is not overridable and is left unchanged.
+       // Only the XBL getter `browser.messageManager` is overridden.  Browser UI code
+       // always uses this getter instead of `browser.frameLoader.messageManager` directly,
+       // so this has the effect of overriding the message manager for browser UI code.
+       mmTunnel = new MessageManagerTunnel(outer, inner);
+ 
++      // Clear out any cached state that references the XBL binding's non-remote state,
++      // such as form fill controllers.  Otherwise they will remain in place and leak the
++      // outer docshell.
++      outer.destroy();
++
+       // We are tunneling to an inner browser with a specific remoteness, so it is simpler
+       // for the logic of the browser UI to assume this tab has taken on that remoteness,
+       // even though it's not true.  Since the actions the browser UI performs are sent
+       // down to the inner browser by this tunnel, the tab's remoteness effectively is the
+       // remoteness of the inner browser.
+-      // Setting this attribute changes the browser to the remote XBL binding via CSS.
+-      // The XBL binding for remote browsers uses the message manager for many actions in
+-      // the UI and that works well here, since it gives us one main thing we need to
++      // By setting this attribute and then forcibly reinitializing the binding state,
++      // we start using the remote browser message manager which is used for many actions
++      // in the UI. This works well here, since it gives us one main thing we need to
+       // route to the inner browser (the messages), instead of having to tweak many
+-      // different browser properties.  It is safe to alter a XBL binding dynamically.
++      // different browser properties.
+       // The content within is not reloaded.
+       outer.setAttribute("remote", "true");
+       outer.setAttribute("remoteType", inner.remoteType);
+-
+-      // Clear out any cached state that references the current non-remote XBL binding,
+-      // such as form fill controllers.  Otherwise they will remain in place and leak the
+-      // outer docshell.
+-      outer.destroy();
++      outer.construct();
+ 
+-      // The constructor of the new XBL binding is run asynchronously and there is no
+-      // event to signal its completion.  Spin an event loop to watch for properties that
+-      // are set by the contructor.
+-      Services.tm.spinEventLoopUntil(() => {
+-        return outer._remoteWebNavigation;
+-      });
+       // Verify that we indeed have the correct binding.
+       if (!outer.isRemoteBrowser) {
+         throw new Error("Browser failed to switch to remote browser binding");
+       }
+ 
+       // Replace the `webNavigation` object with our own version which tries to use
+       // mozbrowser APIs where possible.  This replaces the webNavigation object that the
+-      // remote-browser.xml binding creates.  We do not care about it's original value
+-      // because stop() will remove the remote-browser.xml binding and these will no
+-      // longer be used.
++      // remote browser binding creates.  We do not care about it's original value
++      // because stop() will remove the browser binding and these will no longer bee
++      // used.
+       const webNavigation = new BrowserElementWebNavigation(inner);
+       webNavigation.copyStateFrom(inner._remoteWebNavigationImpl);
+       outer._remoteWebNavigation = webNavigation;
+       outer._remoteWebNavigationImpl = webNavigation;
+ 
+       // Now that we've flipped to the remote browser XBL binding, add `progressListener`
+       // onto the remote version of `webProgress`.  Normally tabbrowser.xml does this step
+       // when it creates a new browser, etc.  Since we manually changed the XBL binding
+@@ -274,22 +269,23 @@ function tunnelToInnerBrowser(outer, inn
+       }
+ 
+       // Remove the inner browser from the WeakMap from browser to tab.
+       gBrowser._tabForBrowser.delete(inner);
+ 
+       // Remove the progress listener we added manually.
+       outer.webProgress.removeProgressListener(filteredProgressListener);
+ 
+-      // Reset the XBL binding back to the default.
++      // Reset the XBL binding back to the original state.
+       outer.destroy();
+ 
+       // Reset @remote since this is now back to a regular, non-remote browser
+       outer.setAttribute("remote", "false");
+       outer.removeAttribute("remoteType");
++      outer.construct();
+ 
+       // Delete browser window properties exposed on content's owner global
+       for (const property of PROPERTIES_FROM_BROWSER_WINDOW) {
+         delete inner.ownerGlobal[property];
+       }
+ 
+       // Remove mozbrowser event handlers
+       inner.removeEventListener("mozbrowseropenwindow", this);
+diff --git a/dom/chrome-webidl/XULFrameElement.webidl b/dom/chrome-webidl/XULFrameElement.webidl
+--- a/dom/chrome-webidl/XULFrameElement.webidl
++++ b/dom/chrome-webidl/XULFrameElement.webidl
+@@ -5,15 +5,15 @@
+ 
+ interface nsIDocShell;
+ interface nsIWebNavigation;
+ 
+ [HTMLConstructor, Func="IsChromeOrXBL"]
+ interface XULFrameElement : XULElement
+ {
+   readonly attribute nsIDocShell? docShell;
+-  readonly attribute nsIWebNavigation? webNavigation;
++  readonly attribute nsIWebNavigation? nonRemoteWebNavigation;
+ 
+   readonly attribute WindowProxy? contentWindow;
+-  readonly attribute Document? contentDocument; 
++  readonly attribute Document? contentDocument;
+ };
+ 
+ XULFrameElement implements MozFrameLoaderOwner;
+diff --git a/dom/xul/XULFrameElement.cpp b/dom/xul/XULFrameElement.cpp
+--- a/dom/xul/XULFrameElement.cpp
++++ b/dom/xul/XULFrameElement.cpp
+@@ -44,17 +44,17 @@ XULFrameElement::WrapNode(JSContext *aCx
+ nsIDocShell*
+ XULFrameElement::GetDocShell()
+ {
+   RefPtr<nsFrameLoader> frameLoader = GetFrameLoader();
+   return frameLoader ? frameLoader->GetDocShell(IgnoreErrors()) : nullptr;
+ }
+ 
+ already_AddRefed<nsIWebNavigation>
+-XULFrameElement::GetWebNavigation()
++XULFrameElement::GetNonRemoteWebNavigation()
+ {
+   nsCOMPtr<nsIDocShell> docShell = GetDocShell();
+   nsCOMPtr<nsIWebNavigation> webnav = do_QueryInterface(docShell);
+   return webnav.forget();
+ }
+ 
+ already_AddRefed<nsPIDOMWindowOuter>
+ XULFrameElement::GetContentWindow()
+diff --git a/dom/xul/XULFrameElement.h b/dom/xul/XULFrameElement.h
+--- a/dom/xul/XULFrameElement.h
++++ b/dom/xul/XULFrameElement.h
+@@ -30,17 +30,17 @@ public:
+   {
+   }
+ 
+   NS_DECL_ISUPPORTS_INHERITED
+   NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(XULFrameElement, nsXULElement)
+ 
+   // XULFrameElement.webidl
+   nsIDocShell* GetDocShell();
+-  already_AddRefed<nsIWebNavigation> GetWebNavigation();
++  already_AddRefed<nsIWebNavigation> GetNonRemoteWebNavigation();
+   already_AddRefed<nsPIDOMWindowOuter> GetContentWindow();
+   nsIDocument* GetContentDocument();
+ 
+   // nsIFrameLoaderOwner / MozFrameLoaderOwner
+   NS_IMETHOD_(already_AddRefed<nsFrameLoader>) GetFrameLoader() override
+   {
+     return do_AddRef(mFrameLoader);
+   }
+diff --git a/testing/mochitest/tests/SimpleTest/test.css b/testing/mochitest/tests/SimpleTest/test.css
+--- a/testing/mochitest/tests/SimpleTest/test.css
++++ b/testing/mochitest/tests/SimpleTest/test.css
+@@ -32,12 +32,8 @@
+ }
+ 
+ .tests_report {
+   border-width: 2px;
+   border-style: solid;
+   width: 20em;
+   display: table;
+ }
+-
+-browser[remote="true"] {
+-  -moz-binding: url("chrome://global/content/bindings/remote-browser.xml#remote-browser");
+-}
+diff --git a/toolkit/content/jar.mn b/toolkit/content/jar.mn
+--- a/toolkit/content/jar.mn
++++ b/toolkit/content/jar.mn
+@@ -79,17 +79,16 @@ toolkit.jar:
+    content/global/bindings/groupbox.xml        (widgets/groupbox.xml)
+    content/global/bindings/menu.xml            (widgets/menu.xml)
+    content/global/bindings/menulist.xml        (widgets/menulist.xml)
+    content/global/bindings/notification.xml    (widgets/notification.xml)
+    content/global/bindings/numberbox.xml       (widgets/numberbox.xml)
+    content/global/bindings/popup.xml           (widgets/popup.xml)
+    content/global/bindings/progressmeter.xml   (widgets/progressmeter.xml)
+    content/global/bindings/radio.xml           (widgets/radio.xml)
+-   content/global/bindings/remote-browser.xml  (widgets/remote-browser.xml)
+    content/global/bindings/richlistbox.xml     (widgets/richlistbox.xml)
+    content/global/bindings/scrollbox.xml       (widgets/scrollbox.xml)
+    content/global/bindings/spinner.js          (widgets/spinner.js)
+ *  content/global/bindings/tabbox.xml          (widgets/tabbox.xml)
+    content/global/bindings/text.xml            (widgets/text.xml)
+ *  content/global/bindings/textbox.xml         (widgets/textbox.xml)
+    content/global/bindings/timekeeper.js       (widgets/timekeeper.js)
+    content/global/bindings/timepicker.js       (widgets/timepicker.js)
 diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/browser.xml
 --- a/toolkit/content/widgets/browser.xml
 +++ b/toolkit/content/widgets/browser.xml
-@@ -202,60 +202,114 @@
+@@ -149,27 +149,40 @@
+         Used by session restore to ensure that currentURI is set so
+         that switch-to-tab works before the tab is fully
+         restored. This function also invokes onLocationChanged
+         listeners in tabbrowser.xml.
+       -->
+       <method name="_setCurrentURI">
+         <parameter name="aURI"/>
+         <body><![CDATA[
+-          this.docShell.setCurrentURI(aURI);
++          if (this.isRemoteBrowser) {
++            this._remoteWebProgressManager.setCurrentURI(aURI);
++          } else {
++            this.docShell.setCurrentURI(aURI);
++          }
+         ]]></body>
+       </method>
+ 
++      <field name="_documentURI">null</field>
+       <property name="documentURI"
+-                onget="return this.contentDocument.documentURIObject;"
++                onget="return this.isRemoteBrowser ? this._documentURI : this.contentDocument.documentURIObject;"
+                 readonly="true"/>
+ 
++
++      <field name="_documentContentType">null</field>
+       <property name="documentContentType"
+-                onget="return this.contentDocument ? this.contentDocument.contentType : null;"
+-                readonly="true"/>
++                readonly="true">
++        <getter><![CDATA[
++          if (this.isRemoteBrowser) {
++            return this._documentContentType;
++          }
++          return this.contentDocument ? this.contentDocument.contentType : null;
++        ]]></getter>
++      </property>
+ 
+       <!--
+         Weak reference to an optional frame loader that can be used to influence
+         process selection for this browser.
+         See nsIBrowser.sameProcessAsFrameLoader.
+       -->
+       <field name="_sameProcessAsFrameLoader">null</field>
+       <property name="sameProcessAsFrameLoader">
+@@ -202,60 +215,114 @@
  
        <property name="dateTimePicker"
                  onget="return document.getElementById(this.getAttribute('datetimepicker'))"
@@ -114,7 +402,7 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
          <getter>
            <![CDATA[
 +            if (this.isRemoteBrowser) {
-+              return this._imageDocument
++              return this._imageDocument;
 +            }
              var document = this.contentDocument;
              if (!document || !(document instanceof Ci.nsIImageDocument))
@@ -124,7 +412,41 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
                  return {width: document.imageRequest.image.width, height: document.imageRequest.image.height };
              } catch (e) {}
              return null;
-@@ -357,24 +411,32 @@
+@@ -321,19 +388,32 @@
+               return this.ownerGlobal.gBrowser;
+             }
+             return null;
+           ]]>
+         </body>
+       </method>
+ 
+       <field name="_finder">null</field>
+-
++      <field name="_remoteFinder">null</field>
+       <property name="finder" readonly="true">
+         <getter><![CDATA[
++          if (this.isRemoteBrowser) {
++            if (!this._remoteFinder) {
++              // Don't attempt to create the remote finder if the
++              // messageManager has already gone away
++              if (!this.messageManager)
++                return null;
++
++              let jsm = "resource://gre/modules/FinderParent.jsm";
++              let { FinderParent } = ChromeUtils.import(jsm, {});
++              this._remoteFinder = new FinderParent(this);
++            }
++            return this._remoteFinder;
++          }
+           if (!this._finder) {
+             if (!this.docShell)
+               return null;
+ 
+             let Finder = ChromeUtils.import("resource://gre/modules/Finder.jsm", {}).Finder;
+             this._finder = new Finder(this.docShell);
+           }
+           return this._finder;
+@@ -357,120 +437,200 @@
              this._fastFind = Cc["@mozilla.org/typeaheadfind;1"]
                                 .createInstance(Ci.nsITypeAheadFind);
              this._fastFind.init(this.docShell);
@@ -157,7 +479,33 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
              }
              return null;
            }
-@@ -394,18 +456,19 @@
+         ]]></getter>
+       </property>
+ 
+       <field name="_lastSearchString">null</field>
+ 
++
++      <field name="_controller">null</field>
++
++      <field name="_selectParentHelper">null</field>
++
++      <field name="_remoteWebNavigation">null</field>
++      <property name="webNavigation"
++                readonly="true"
++                onget="return this.isRemoteBrowser ? this._remoteWebNavigation : this.nonRemoteWebNavigation;"/>
++
++      <field name="_remoteWebProgress">null</field>
+       <property name="webProgress"
+                 readonly="true"
+-                onget="return this.docShell.QueryInterface(Components.interfaces.nsIInterfaceRequestor).getInterface(Components.interfaces.nsIWebProgress);"/>
++                onget="return this.isRemoteBrowser ? this._remoteWebProgress : this.docShell.QueryInterface(Components.interfaces.nsIInterfaceRequestor).getInterface(Components.interfaces.nsIWebProgress);"/>
+ 
++      <field name="_contentWindow">null</field>
+       <property name="contentWindowAsCPOW"
+                 readonly="true"
+-                onget="return this.contentWindow;"/>
++                onget="return this.isRemoteBrowser ? this._contentWindow : this.contentWindow;"/>
+ 
        <property name="sessionHistory"
                  onget="return this.webNavigation.sessionHistory;"
                  readonly="true"/>
@@ -170,21 +518,44 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
        <property name="contentDocumentAsCPOW"
 -                onget="return this.contentDocument;"
 +                onget="return this.isRemoteBrowser ? this._contentDocument : this.contentDocument;"
++                readonly="true"/>
++
++      <field name="_contentTitle">""</field>
++      <property name="contentTitle"
++                onget="return this.isRemoteBrowser ? this._contentTitle : this.contentDocument.title;"
                  readonly="true"/>
  
-       <property name="contentTitle"
-                 onget="return this.contentDocument.title;"
-                 readonly="true"/>
- 
+-      <property name="contentTitle"
+-                onget="return this.contentDocument.title;"
+-                readonly="true"/>
+-
++      <field name="_characterSet">""</field>
        <property name="characterSet"
-                 onget="return this.docShell.charset;">
-@@ -418,59 +481,112 @@
+-                onget="return this.docShell.charset;">
++                onget="return this.isRemoteBrowser ? this._characterSet : this.docShell.charset;">
+         <setter><![CDATA[
+-          this.docShell.charset = val;
+-          this.docShell.gatherCharsetMenuTelemetry();
++          if (this.isRemoteBrowser) {
++            this.messageManager.sendAsyncMessage("UpdateCharacterSet", {value: val});
++            this._characterSet = val;
++          } else {
++            this.docShell.charset = val;
++            this.docShell.gatherCharsetMenuTelemetry();
++          }
+         ]]></setter>
+       </property>
+ 
++      <field name="_mayEnableCharacterEncodingMenu">null</field>
        <property name="mayEnableCharacterEncodingMenu"
-                 onget="return this.docShell.mayEnableCharacterEncodingMenu;"
+-                onget="return this.docShell.mayEnableCharacterEncodingMenu;"
++                onget="return this.isRemoteBrowser ? this._mayEnableCharacterEncodingMenu : this.docShell.mayEnableCharacterEncodingMenu;"
                  readonly="true"/>
  
++      <field name="_contentPrincipal">null</field>
        <property name="contentPrincipal"
-                 onget="return this.contentDocument.nodePrincipal;"
+-                onget="return this.contentDocument.nodePrincipal;"
++                onget="return this.isRemoteBrowser ? this._contentPrincipal : this.contentDocument.nodePrincipal;"
                  readonly="true"/>
  
 +      <field name="_contentRequestContextID">null</field>
@@ -217,6 +588,7 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
            return this.markupDocumentViewer.fullZoom;
          ]]></getter>
          <setter><![CDATA[
+-          this.markupDocumentViewer.fullZoom = val;
 +          if (this.isRemoteBrowser) {
 +            let changed = val.toFixed(2) != this._fullZoom.toFixed(2);
 +
@@ -232,9 +604,6 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
 +          } else {
 +            this.markupDocumentViewer.fullZoom = val;
 +          }
-+        ]]></setter>
-+        <setter><![CDATA[
-           this.markupDocumentViewer.fullZoom = val;
          ]]></setter>
        </property>
  
@@ -292,7 +661,7 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
          Cc["@mozilla.org/preferences-service;1"].getService(Ci.nsIPrefBranch);
        </field>
  
-@@ -722,37 +838,53 @@
+@@ -722,37 +882,53 @@
                return;
              }
              this.messageManager.sendAsyncMessage("Browser:UnselectedTabHover",
@@ -352,7 +721,7 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
  
            startedLoad() {
              this._startedLoadSinceLastUserTyping = true;
-@@ -794,16 +926,69 @@
+@@ -794,17 +970,74 @@
  
        <!-- This is managed by the tabbrowser -->
        <field name="lastURI">null</field>
@@ -361,6 +730,12 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
  
        <constructor>
          <![CDATA[
++        this.construct();
++        ]]>
++      </constructor>
++
++      <method name="construct">
++        <body><![CDATA[
 +          if (this.isRemoteBrowser) {
 +            /*
 +            * Don't try to send messages from this function. The message manager for
@@ -409,12 +784,10 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
 +            let RemoteController = scope.RemoteController;
 +            this._controller = new RemoteController(this);
 +            this.controllers.appendController(this._controller);
-+            return;
 +          }
 +
-+
-+
            try {
++          console.log(this, this.isRemoteBrowser, this.webNavigation, this._remoteWebNavigation)
              // |webNavigation.sessionHistory| will have been set by the frame
              // loader when creating the docShell as long as this xul:browser
              // doesn't have the 'disablehistory' attribute set.
@@ -422,8 +795,20 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
                var os = Cc["@mozilla.org/observer-service;1"]
                           .getService(Ci.nsIObserverService);
                os.addObserver(this, "browser:purge-session-history", true);
-@@ -862,33 +1047,52 @@
-       </constructor>
+ 
+@@ -853,42 +1086,61 @@
+             this.messageManager.addMessageListener("AudibleAutoplayMediaOccurred", this);
+ 
+             if (this.hasAttribute("selectmenulist")) {
+               this.messageManager.addMessageListener("Forms:ShowDropDown", this);
+               this.messageManager.addMessageListener("Forms:HideDropDown", this);
+             }
+ 
+           }
+-        ]]>
+-      </constructor>
++        ]]></body>
++      </method>
  
        <destructor>
          <![CDATA[
@@ -479,7 +864,7 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
              } catch (ex) {
                // It's not clear why this sometimes throws an exception.
              }
-@@ -902,20 +1106,20 @@
+@@ -902,20 +1154,20 @@
            if (!this.isRemoteBrowser) {
              this.removeEventListener("pagehide", this.onPageHide, true);
            }
@@ -502,7 +887,7 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
          <parameter name="aMessage"/>
          <body><![CDATA[
            let data = aMessage.data;
-@@ -1006,20 +1210,102 @@
+@@ -1006,20 +1258,102 @@
            }
            return undefined;
          ]]></body>
@@ -606,7 +991,7 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
            <![CDATA[
              if (aTopic == "browser:purge-session-history") {
                this.purgeSessionHistory();
-@@ -1036,25 +1322,49 @@
+@@ -1036,25 +1370,49 @@
              }
            ]]>
          </body>
@@ -656,7 +1041,7 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
  
        <field name="_AUTOSCROLL_SNAP">10</field>
        <field name="_scrolling">false</field>
-@@ -1402,20 +1712,33 @@
+@@ -1402,20 +1760,33 @@
            event = new CustomEvent("EndSwapDocShells", {"detail": aOtherBrowser});
            this.dispatchEvent(event);
            event = new CustomEvent("EndSwapDocShells", {"detail": this});
@@ -690,7 +1075,7 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
          ]]>
          </body>
        </method>
-@@ -1427,16 +1750,80 @@
+@@ -1427,16 +1798,80 @@
        <property name="dontPromptAndUnload"
                  onget="return 2;"
                  readonly="true"/>
@@ -771,7 +1156,7 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
          ]]>
          </body>
        </method>
-@@ -1576,13 +1963,23 @@
+@@ -1576,13 +2011,23 @@
          }
  
          if (links.length) {
@@ -796,17 +1181,24 @@ diff --git a/toolkit/content/widgets/browser.xml b/toolkit/content/widgets/brows
  
  </bindings>
 diff --git a/toolkit/content/widgets/remote-browser.xml b/toolkit/content/widgets/remote-browser.xml
+deleted file mode 100644
 --- a/toolkit/content/widgets/remote-browser.xml
-+++ b/toolkit/content/widgets/remote-browser.xml
-@@ -7,40 +7,16 @@
- <bindings id="firefoxBrowserBindings"
-           xmlns="http://www.mozilla.org/xbl"
-           xmlns:xul="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
- 
-   <binding id="remote-browser" extends="chrome://global/content/bindings/browser.xml#browser">
- 
-     <implementation type="application/javascript">
- 
++++ /dev/null
+@@ -1,600 +0,0 @@
+-<?xml version="1.0"?>
+-
+-<!-- This Source Code Form is subject to the terms of the Mozilla Public
+-   - License, v. 2.0. If a copy of the MPL was not distributed with this
+-   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+-
+-<bindings id="firefoxBrowserBindings"
+-          xmlns="http://www.mozilla.org/xbl"
+-          xmlns:xul="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
+-
+-  <binding id="remote-browser" extends="chrome://global/content/bindings/browser.xml#browser">
+-
+-    <implementation type="application/javascript">
+-
 -      <field name="_securityUI">null</field>
 -
 -      <property name="securityUI"
@@ -831,23 +1223,165 @@ diff --git a/toolkit/content/widgets/remote-browser.xml b/toolkit/content/widget
 -        ]]></getter>
 -      </property>
 -
-       <field name="_controller">null</field>
- 
-       <field name="_selectParentHelper">null</field>
- 
-       <field name="_remoteWebNavigation">null</field>
- 
-       <property name="webNavigation"
-                 onget="return this._remoteWebNavigation;"
-@@ -190,411 +166,13 @@
-             } catch (ex) {}
- 
-             let event = new Event("TextZoomChange", {bubbles: true});
-             this.dispatchEvent(event);
-           }
-         ]]></setter>
-       </property>
- 
+-      <field name="_controller">null</field>
+-
+-      <field name="_selectParentHelper">null</field>
+-
+-      <field name="_remoteWebNavigation">null</field>
+-
+-      <property name="webNavigation"
+-                onget="return this._remoteWebNavigation;"
+-                readonly="true"/>
+-
+-      <field name="_remoteWebProgress">null</field>
+-
+-      <property name="webProgress"
+-                onget="return this._remoteWebProgress;"
+-                readonly="true"/>
+-
+-      <field name="_remoteFinder">null</field>
+-
+-      <property name="finder" readonly="true">
+-        <getter><![CDATA[
+-          if (!this._remoteFinder) {
+-            // Don't attempt to create the remote finder if the
+-            // messageManager has already gone away
+-            if (!this.messageManager)
+-              return null;
+-
+-            let jsm = "resource://gre/modules/FinderParent.jsm";
+-            let { FinderParent } = ChromeUtils.import(jsm, {});
+-            this._remoteFinder = new FinderParent(this);
+-          }
+-          return this._remoteFinder;
+-        ]]></getter>
+-      </property>
+-
+-      <field name="_documentURI">null</field>
+-
+-      <field name="_documentContentType">null</field>
+-
+-      <!--
+-        Used by session restore to ensure that currentURI is set so
+-        that switch-to-tab works before the tab is fully
+-        restored. This function also invokes onLocationChanged
+-        listeners in tabbrowser.xml.
+-      -->
+-      <method name="_setCurrentURI">
+-        <parameter name="aURI"/>
+-        <body><![CDATA[
+-          this._remoteWebProgressManager.setCurrentURI(aURI);
+-        ]]></body>
+-      </method>
+-
+-      <property name="documentURI"
+-                onget="return this._documentURI;"
+-                readonly="true"/>
+-
+-      <property name="documentContentType"
+-                onget="return this._documentContentType;"
+-                readonly="true"/>
+-
+-      <field name="_contentTitle">""</field>
+-
+-      <property name="contentTitle"
+-                onget="return this._contentTitle"
+-                readonly="true"/>
+-
+-      <field name="_characterSet">""</field>
+-
+-      <property name="characterSet"
+-                onget="return this._characterSet">
+-        <setter><![CDATA[
+-          this.messageManager.sendAsyncMessage("UpdateCharacterSet", {value: val});
+-          this._characterSet = val;
+-        ]]></setter>
+-      </property>
+-
+-      <field name="_mayEnableCharacterEncodingMenu">null</field>
+-
+-      <property name="mayEnableCharacterEncodingMenu"
+-                onget="return this._mayEnableCharacterEncodingMenu;"
+-                readonly="true"/>
+-
+-      <field name="_contentWindow">null</field>
+-
+-      <property name="contentWindow"
+-                onget="return null"
+-                readonly="true"/>
+-
+-      <property name="contentWindowAsCPOW"
+-                onget="return this._contentWindow"
+-                readonly="true"/>
+-
+-      <property name="contentDocument"
+-                onget="return null"
+-                readonly="true"/>
+-
+-      <field name="_contentPrincipal">null</field>
+-
+-      <property name="contentPrincipal"
+-                onget="return this._contentPrincipal"
+-                readonly="true"/>
+-
+-      <field name="_contentRequestContextID">null</field>
+-
+-      <property name="contentRequestContextID"
+-                onget="return this._contentRequestContextID"
+-                readonly="true"/>
+-
+-      <field name="_contentDocument">null</field>
+-
+-      <property name="contentDocumentAsCPOW"
+-                onget="return this._contentDocument"
+-                readonly="true"/>
+-
+-      <field name="_imageDocument">null</field>
+-
+-      <property name="imageDocument"
+-                onget="return this._imageDocument"
+-                readonly="true"/>
+-
+-      <field name="_fullZoom">1</field>
+-      <property name="fullZoom">
+-        <getter><![CDATA[
+-          return this._fullZoom;
+-        ]]></getter>
+-        <setter><![CDATA[
+-          let changed = val.toFixed(2) != this._fullZoom.toFixed(2);
+-
+-          if (changed) {
+-            this._fullZoom = val;
+-            try {
+-              this.messageManager.sendAsyncMessage("FullZoom", {value: val});
+-            } catch (ex) {}
+-
+-            let event = new Event("FullZoomChange", {bubbles: true});
+-            this.dispatchEvent(event);
+-          }
+-        ]]></setter>
+-      </property>
+-
+-      <field name="_textZoom">1</field>
+-      <property name="textZoom">
+-        <getter><![CDATA[
+-          return this._textZoom;
+-        ]]></getter>
+-        <setter><![CDATA[
+-          let changed = val.toFixed(2) != this._textZoom.toFixed(2);
+-
+-          if (changed) {
+-            this._textZoom = val;
+-            try {
+-              this.messageManager.sendAsyncMessage("TextZoom", {value: val});
+-            } catch (ex) {}
+-
+-            let event = new Event("TextZoomChange", {bubbles: true});
+-            this.dispatchEvent(event);
+-          }
+-        ]]></setter>
+-      </property>
+-
 -      <field name="_isSyntheticDocument">false</field>
 -      <property name="isSyntheticDocument">
 -        <getter><![CDATA[
@@ -1236,7 +1770,7 @@ diff --git a/toolkit/content/widgets/remote-browser.xml b/toolkit/content/widget
 -          ]]>
 -        </body>
 -      </method>
-     </implementation>
+-    </implementation>
 -    <handlers>
 -      <handler event="dragstart">
 -      <![CDATA[
@@ -1247,14 +1781,14 @@ diff --git a/toolkit/content/widgets/remote-browser.xml b/toolkit/content/widget
 -      ]]>
 -      </handler>
 -    </handlers>
- 
-   </binding>
- 
- </bindings>
+-
+-  </binding>
+-
+-</bindings>
 diff --git a/toolkit/content/xul.css b/toolkit/content/xul.css
 --- a/toolkit/content/xul.css
 +++ b/toolkit/content/xul.css
-@@ -180,19 +180,19 @@ iframe {
+@@ -180,20 +180,16 @@ iframe {
      display: block;
    }
  }
@@ -1264,11 +1798,9 @@ diff --git a/toolkit/content/xul.css b/toolkit/content/xul.css
  }
  
 -browser[remote=true]:not(.lightweight) {
-+/* browser[remote=true]:not(.lightweight) {
-   -moz-binding: url("chrome://global/content/bindings/remote-browser.xml#remote-browser");
+-  -moz-binding: url("chrome://global/content/bindings/remote-browser.xml#remote-browser");
 -}
-+} */
- 
+-
  /********** notifications **********/
  
  notificationbox {
@@ -1276,3 +1808,26 @@ diff --git a/toolkit/content/xul.css b/toolkit/content/xul.css
    -moz-box-orient: vertical;
  }
  
+ .notificationbox-stack {
+diff --git a/toolkit/modules/RemoteController.js b/toolkit/modules/RemoteController.js
+--- a/toolkit/modules/RemoteController.js
++++ b/toolkit/modules/RemoteController.js
+@@ -62,17 +62,17 @@ RemoteController.prototype = {
+   },
+ 
+   getSupportedCommands(aCount, aCommands) {
+     throw Cr.NS_ERROR_NOT_IMPLEMENTED;
+   },
+ 
+   onEvent() {},
+ 
+-  // This is intended to be called from the remote-browser binding to update
++  // This is intended to be called from the browser binding to update
+   // the enabled and disabled commands.
+   enableDisableCommands(aAction,
+                                   aEnabledLength, aEnabledCommands,
+                                   aDisabledLength, aDisabledCommands) {
+     // Clear the list first
+     this._supportedCommands = { };
+ 
+     for (let c = 0; c < aEnabledLength; c++) {
