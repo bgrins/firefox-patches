@@ -3,41 +3,98 @@
 # Date 1538583568 25200
 #      Wed Oct 03 09:19:28 2018 -0700
 # Node ID 777b07294dcf7f3315280d2d005f09cb9144f311
-# Parent  1c04f6945b1688e513dc2ab0a3fd0ee2af23a542
+# Parent  17c314f6930d2b8d6e456aa9e9d41407a45c3008
 Bug 1495946 - WIP - Defer connectedCallback until DOMContentLoaded
 
 Differential Revision: https://phabricator.services.mozilla.com/D7621
 
+diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.js
+--- a/toolkit/content/customElements.js
++++ b/toolkit/content/customElements.js
+@@ -11,17 +11,45 @@
+ {
+ 
+ ChromeUtils.import("resource://gre/modules/Services.jsm");
+ ChromeUtils.import("resource://gre/modules/AppConstants.jsm");
+ 
+ const gXULDOMParser = new DOMParser();
+ gXULDOMParser.forceEnableXULXBL();
+ 
++
+ class MozXULElement extends XULElement {
++  /*
++   * Elements should generally prefer to implement `connect` and let the
++   * base class handle the connectedCallback. This prevents an initial
++   * connectedCallback running synchronously during parse, when child Custom
++   * Elements aren't yet in the DOM.
++   */
++  connectedCallback() {
++    let firstConnection = !!this._connectedOnce;
++    this._connectedOnce = true;
++
++    if (this.connect) {
++      if (!MozXULElement.isDOMReady) {
++        MozXULElement.pendingConnections.add(this);
++      } else {
++        this.connect(firstConnection);
++      }
++    }
++  }
++
++  disconnectedCallback() {
++    if (MozXULElement.pendingConnections.has(this)) {
++      MozXULElement.pendingConnections.delete(this);
++    } else if (this.disconnect) {
++      this.disconnect();
++    }
++  }
++
+   /**
+    * Allows eager deterministic construction of XUL elements with XBL attached, by
+    * parsing an element tree and returning a DOM fragment to be inserted in the
+    * document before any of the inner elements is referenced by JavaScript.
+    *
+    * This process is required instead of calling the createElement method directly
+    * because bindings get attached when:
+    *
+@@ -158,16 +186,33 @@ function getInterfaceProxy(obj) {
+         return propOrMethod;
+       },
+     });
+   }
+ 
+   return obj._customInterfaceProxy;
+ }
+ 
++
++// We can't check document.readyState since in XUL it's uninitialized during DOMContentLoaded
++// callbacks.
++MozXULElement.isDOMReady = false;
++MozXULElement.pendingConnections = new Set();
++document.addEventListener("DOMContentLoaded", () => {
++  MozXULElement.isDOMReady = true;
++  // let d = Date.now();
++  for (let el of MozXULElement.pendingConnections) {
++    if (el.isConnected && el.connect) {
++      el.connect(true);
++    }
++  }
++  // console.log(`Took ${Date.now() - d}ms to connect ${MozXULElement.pendingConnections.size} elements in ${document.documentURI}`, [...MozXULElement.pendingConnections]);
++  MozXULElement.pendingConnections.clear();
++}, { once: true });
++
+ class MozBaseControl extends MozXULElement {
+   get disabled() {
+     return this.getAttribute("disabled") == "true";
+   }
+ 
+   set disabled(val) {
+     if (val) {
+       this.setAttribute("disabled", "true");
 diff --git a/toolkit/content/widgets/radio.js b/toolkit/content/widgets/radio.js
 --- a/toolkit/content/widgets/radio.js
 +++ b/toolkit/content/widgets/radio.js
-@@ -3,16 +3,25 @@
-   * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
- 
- "use strict";
- 
- // This is loaded into all XUL windows. Wrap in a block to prevent
- // leaking to window scope.
- {
- 
-+let pendingConnections = new Set();
-+let domLoaded = false;
-+window.addEventListener("DOMContentLoaded", () => {
-+  domLoaded = true;
-+  for (let el of pendingConnections) {
-+    el.connect();
-+  }
-+});
-+
- class MozRadiogroup extends MozBaseControl {
-   constructor() {
-     super();
- 
-     this.addEventListener("mousedown", (event) => {
-       if (this.disabled)
-         event.preventDefault();
-     });
-@@ -106,17 +115,21 @@ class MozRadiogroup extends MozBaseContr
+@@ -106,17 +106,17 @@ class MozRadiogroup extends MozBaseContr
        if (event.originalTarget != this) {
          return;
        }
@@ -48,10 +105,6 @@ diff --git a/toolkit/content/widgets/radio.js b/toolkit/content/widgets/radio.js
  
 -  connectedCallback() {
 +  connect() {
-+    if (!domLoaded) {
-+      throw new Error("element connect() called before dom loaded");
-+    }
-+
      this._radioChildren = null;
  
      if (this.getAttribute("disabled") == "true")
@@ -60,29 +113,3 @@ diff --git a/toolkit/content/widgets/radio.js b/toolkit/content/widgets/radio.js
      var children = this._getRadioChildren();
      var length = children.length;
      for (var i = 0; i < length; i++) {
-@@ -128,16 +141,25 @@ class MozRadiogroup extends MozBaseContr
- 
-     var value = this.value;
-     if (value)
-       this.value = value;
-     else
-       this.selectedIndex = 0;
-   }
- 
-+  connectedCallback() {
-+    if (!domLoaded) {
-+      pendingConnections.add(this);
-+      return;
-+    }
-+
-+    this.connect();
-+  }
-+
-   set value(val) {
-     this.setAttribute("value", val);
-     var children = this._getRadioChildren();
-     for (var i = 0; i < children.length; i++) {
-       if (String(children[i].value) == String(val)) {
-         this.selectedItem = children[i];
-         break;
-       }
