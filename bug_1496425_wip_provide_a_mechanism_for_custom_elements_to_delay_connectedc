@@ -1,0 +1,206 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Date 1538775858 25200
+#      Fri Oct 05 14:44:18 2018 -0700
+# Node ID 73fb283de22a60e2a1a416df79ed9aed5277977b
+# Parent  97208b5251d7e86cb4051711609b6236a944981e
+Bug 1496425 - WIP - Provide a mechanism for Custom Elements to delay connectedCallback until after DOMContentLoaded
+
+There are two reasons for this:
+1) It's faster than running the connectedCallback in the middle of document parse, at least for
+   <radiogroups> in about:preferences
+2) It provides a construction sequence more similar to XBL, so the translation from XBL <constructor>
+   to CE connectedCallback is more likely to be sound. This is because when there is markup like:
+       <parent-ce><child-ce></child-ce></parent-ce>
+   the parent-ce node is empty during the first connectedCallback. If we wait for DOMContentLoaded
+   then the parent-ce has the child-ce node below it.
+
+Differential Revision: https://phabricator.services.mozilla.com/D7944
+
+diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.js
+--- a/toolkit/content/customElements.js
++++ b/toolkit/content/customElements.js
+@@ -8,21 +8,64 @@
+ 
+ // This is loaded into chrome windows with the subscript loader. Wrap in
+ // a block to prevent accidentally leaking globals onto `window`.
+ {
+ 
+ ChromeUtils.import("resource://gre/modules/Services.jsm");
+ ChromeUtils.import("resource://gre/modules/AppConstants.jsm");
+ 
++// The listener of DOMContentLoaded must be set on window, rather than
++// document, because the window can go away before the event is fired.
++// In that case, we don't want to initialize anything, otherwise we
++// may be leaking things because they will never be destroyed after.
++let gDOMReady = false;
++let gPendingConnectionCallbacks = new Set();
++window.addEventListener("DOMContentLoaded", () => {
++  // console.log(`DOM ready with ${gPendingConnectionCallbacks.size} elements in ${document.documentURI}`);
++  gDOMReady = true;
++  for (let el of gPendingConnectionCallbacks) {
++    if (el.isConnected && el.connectedCallback) {
++      el.connectedCallback();
++    }
++  }
++  gPendingConnectionCallbacks.clear();
++}, { once: true });
++
++
+ const gXULDOMParser = new DOMParser();
+ gXULDOMParser.forceEnableXULXBL();
+ 
+ class MozXULElement extends XULElement {
+   /**
++   * Sometimes an element may not want to run connectedCallback logic during
++   * parse. This could be because we don't want to initialize the element before
++   * the element's contents have been fully parsed, or for performance reasons.
++   * If you'd like to opt-in to this, then add this to the beginning of your
++   * `connectedCallback` and `disconnectedCallback`:
++   *
++   *    if (this.waitForDOMReady()) { return }
++   *
++   * And this at the beginning of your `attributeChangedCallback`
++   *
++   *    if (!this.isConnectedAndReady) { return; }
++   */
++  waitForDOMReady() {
++    if (gDOMReady) {
++      return false;
++    }
++    gPendingConnectionCallbacks.add(this);
++    return true;
++  }
++
++  get isConnectedAndReady() {
++    return gDOMReady && this.isConnected;
++  }
++
++  /**
+    * Allows eager deterministic construction of XUL elements with XBL attached, by
+    * parsing an element tree and returning a DOM fragment to be inserted in the
+    * document before any of the inner elements is referenced by JavaScript.
+    *
+    * This process is required instead of calling the createElement method directly
+    * because bindings get attached when:
+    *
+    * 1. the node gets a layout frame constructed, or
+diff --git a/toolkit/content/tests/chrome/test_custom_element_base.xul b/toolkit/content/tests/chrome/test_custom_element_base.xul
+--- a/toolkit/content/tests/chrome/test_custom_element_base.xul
++++ b/toolkit/content/tests/chrome/test_custom_element_base.xul
+@@ -12,27 +12,91 @@
+   <!-- test results are displayed in the html:body -->
+   <body xmlns="http://www.w3.org/1999/xhtml" style="height: 300px; overflow: auto;"/>
+ 
+   <button id="one"/>
+   <simpleelement id="two" style="-moz-user-focus: normal;"/>
+   <simpleelement id="three" disabled="true" style="-moz-user-focus: normal;"/>
+   <button id="four"/>
+ 
++  <delayed-connection></delayed-connection>
++
++  <script type="application/javascript"><![CDATA[
++  // Register this custom element before DOMContentLoaded has fired and before it's parsed in
++  // the markup:
++
++  let delayedConnectionPromise = new Promise(resolve => {
++    let nativeDOMContentLoadedFired = false;
++    document.addEventListener("DOMContentLoaded", () => {
++      nativeDOMContentLoadedFired = true;
++    });
++
++    let numSkippedAttributeChanges = 0;
++    let numDelayedConnections = 0;
++    let numDelayedDisconnections = 0;
++    let finishedWaitingForDOMReady = false;
++
++    customElements.define("delayed-connection", class DelayedConnection extends MozXULElement {
++      static get observedAttributes() { return ["foo"]; }
++      attributeChangedCallback() {
++        ok(!this.isConnectedAndReady, "attributeChangedCallback fires before isConnectedAndReady");
++        ok(!nativeDOMContentLoadedFired, "attributeChangedCallback fires before nativeDOMContentLoadedFired");
++        numSkippedAttributeChanges++;
++      }
++      disconnectedCallback() {
++        ok(this.waitForDOMReady(), "disconnectedCallback while DOM not ready");
++        is(numDelayedDisconnections, 0, "disconnectedCallback fired only once");
++        numDelayedDisconnections++;
++      }
++      connectedCallback() {
++        if (this.waitForDOMReady()) {
++          ok(!finishedWaitingForDOMReady, "!finishedWaitingForDOMReady when waitForDOMReady()");
++          ok(!this.isConnectedAndReady, "connectedCallback fires before isConnectedAndReady");
++          ok(!nativeDOMContentLoadedFired, "!nativeDOMContentLoadedFired");
++          numDelayedConnections++;
++          return;
++        }
++
++        ok(!finishedWaitingForDOMReady, "Only fires once");
++        finishedWaitingForDOMReady = true;
++        ok(this.isConnectedAndReady, "connected and ready");
++        ok(nativeDOMContentLoadedFired, "nativeDOMContentLoadedFired");
++
++        is(numSkippedAttributeChanges, 2, "Correct number of skipped attribute changes");
++        is(numDelayedConnections, 2, "Correct number of delayed connections");
++        is(numDelayedDisconnections, 1, "Correct number of delated disconnections");
++        resolve();
++      }
++    })
++  });
++
++  // Fire connectedCallback and attributeChangedCallback twice before DOMContentLoaded
++  // fires. The first connectedCallback is due to the parse and the second due to re-appending.
++  let delayedConnection = document.querySelector("delayed-connection");
++  delayedConnection.setAttribute("foo", "bar");
++  delayedConnection.remove();
++  delayedConnection.setAttribute("foo", "bat");
++  document.documentElement.append(delayedConnection);
++
++  ]]>
++  </script>
+ 
+   <!-- test code goes here -->
+   <script type="application/javascript"><![CDATA[
+ 
+   SimpleTest.waitForExplicitFinish();
+ 
+   async function runTests() {
+     ok(MozXULElement, "MozXULElement defined on the window");
+     testParseXULToFragment();
+     await testCustomInterface();
+ 
++    info("Waiting for delayed connection to fire");
++    await delayedConnectionPromise;
++
+     let htmlWin = await new Promise(resolve => {
+       let htmlIframe = document.createElement("iframe");
+       htmlIframe.src = "file_empty.xhtml";
+       htmlIframe.onload = () => resolve(htmlIframe.contentWindow);
+       document.documentElement.appendChild(htmlIframe);
+     });
+ 
+     ok(htmlWin.MozXULElement, "MozXULElement defined on a chrome HTML window");
+diff --git a/toolkit/content/widgets/radio.js b/toolkit/content/widgets/radio.js
+--- a/toolkit/content/widgets/radio.js
++++ b/toolkit/content/widgets/radio.js
+@@ -107,16 +107,20 @@ class MozRadiogroup extends MozBaseContr
+         return;
+       }
+       this.removeAttribute("focused");
+       this.focusedItem = null;
+     });
+   }
+ 
+   connectedCallback() {
++    if (this.waitForDOMReady()) {
++      return;
++    }
++
+     this.init();
+     if (!this.value) {
+       this.selectedIndex = 0;
+     }
+   }
+ 
+   init() {
+     this._radioChildren = null;
