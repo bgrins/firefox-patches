@@ -20,7 +20,7 @@ Differential Revision: https://phabricator.services.mozilla.com/D7944
 diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.js
 --- a/toolkit/content/customElements.js
 +++ b/toolkit/content/customElements.js
-@@ -8,21 +8,62 @@
+@@ -8,21 +8,64 @@
  
  // This is loaded into chrome windows with the subscript loader. Wrap in
  // a block to prevent accidentally leaking globals onto `window`.
@@ -33,16 +33,18 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
 +// document, because the window can go away before the event is fired.
 +// In that case, we don't want to initialize anything, otherwise we
 +// may be leaking things because they will never be destroyed after.
-+let gDOMReady = false;
-+const gPendingConnectionCallbacks = new Set();
++let gIsDOMContentLoaded = false;
++const gElementsPendingConnection = new Set();
 +window.addEventListener("DOMContentLoaded", () => {
-+  gDOMReady = true;
-+  for (let el of gPendingConnectionCallbacks) {
-+    if (el.isConnected && el.connectedCallback) {
-+      el.connectedCallback();
++  gIsDOMContentLoaded = true;
++  for (let element of gElementsPendingConnection) {
++    if (element.isConnected) {
++      try {
++        element.connectedCallback();
++      } catch (ex) { console.error(ex); }
 +    }
 +  }
-+  gPendingConnectionCallbacks.clear();
++  gElementsPendingConnection.clear();
 +}, { once: true });
 +
  const gXULDOMParser = new DOMParser();
@@ -63,15 +65,15 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
 +   *    if (!this.isConnectedAndReady) { return; }
 +   */
 +  waitForDOMReady() {
-+    if (gDOMReady) {
++    if (gIsDOMContentLoaded) {
 +      return false;
 +    }
-+    gPendingConnectionCallbacks.add(this);
++    gElementsPendingConnection.add(this);
 +    return true;
 +  }
 +
 +  get isConnectedAndReady() {
-+    return gDOMReady && this.isConnected;
++    return gIsDOMContentLoaded && this.isConnected;
 +  }
 +
 +  /**
@@ -83,6 +85,27 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
     * because bindings get attached when:
     *
     * 1. the node gets a layout frame constructed, or
+diff --git a/toolkit/content/tests/chrome/chrome.ini b/toolkit/content/tests/chrome/chrome.ini
+--- a/toolkit/content/tests/chrome/chrome.ini
++++ b/toolkit/content/tests/chrome/chrome.ini
+@@ -101,16 +101,17 @@ skip-if = (os == 'mac' && os_version == 
+ [test_bug792324.xul]
+ [test_bug1048178.xul]
+ skip-if = toolkit == "cocoa"
+ [test_button.xul]
+ [test_closemenu_attribute.xul]
+ [test_colorpicker_popup.xul]
+ [test_contextmenu_list.xul]
+ [test_custom_element_base.xul]
++[test_custom_element_delay_connection.xul]
+ [test_deck.xul]
+ [test_dialogfocus.xul]
+ [test_editor_for_input_with_autocomplete.html]
+ [test_editor_for_textbox_with_autocomplete.xul]
+ [test_findbar.xul]
+ subsuite = clipboard
+ [test_findbar_entireword.xul]
+ [test_findbar_events.xul]
 diff --git a/toolkit/content/tests/chrome/test_custom_element_base.xul b/toolkit/content/tests/chrome/test_custom_element_base.xul
 --- a/toolkit/content/tests/chrome/test_custom_element_base.xul
 +++ b/toolkit/content/tests/chrome/test_custom_element_base.xul
@@ -183,6 +206,112 @@ diff --git a/toolkit/content/tests/chrome/test_custom_element_base.xul b/toolkit
      });
  
      ok(htmlWin.MozXULElement, "MozXULElement defined on a chrome HTML window");
+diff --git a/toolkit/content/tests/chrome/test_custom_element_delay_connection.xul b/toolkit/content/tests/chrome/test_custom_element_delay_connection.xul
+new file mode 100644
+--- /dev/null
++++ b/toolkit/content/tests/chrome/test_custom_element_delay_connection.xul
+@@ -0,0 +1,100 @@
++<?xml version="1.0"?>
++<?xml-stylesheet href="chrome://global/skin" type="text/css"?>
++<?xml-stylesheet href="chrome://mochikit/content/tests/SimpleTest/test.css" type="text/css"?>
++
++<window title="Custom Element Base Class Tests"
++  onload="runTests();"
++  xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
++
++  <script type="application/javascript" src="chrome://mochikit/content/tests/SimpleTest/SimpleTest.js"></script>
++  <script type="application/javascript" src="chrome://mochikit/content/tests/SimpleTest/EventUtils.js"></script>
++
++  <!-- test results are displayed in the html:body -->
++  <body xmlns="http://www.w3.org/1999/xhtml" style="height: 300px; overflow: auto;"/>
++
++  <button id="one"/>
++  <simpleelement id="two" style="-moz-user-focus: normal;"/>
++  <simpleelement id="three" disabled="true" style="-moz-user-focus: normal;"/>
++  <button id="four"/>
++
++  <script type="application/javascript"><![CDATA[
++  // To test `waitForDOMReady` and `isConnectedAndReady` we have to run this before
++  // DOMContentLoaded, which is why this is done in a separate script that runs
++  // immediately and not in `runTests`.
++  let delayedConnectionPromise = new Promise(resolve => {
++    let nativeDOMContentLoadedFired = false;
++    document.addEventListener("DOMContentLoaded", () => {
++      nativeDOMContentLoadedFired = true;
++    });
++
++    let numSkippedAttributeChanges = 0;
++    let numDelayedConnections = 0;
++    let numDelayedDisconnections = 0;
++    let finishedWaitingForDOMReady = false;
++
++    // Register this custom element before DOMContentLoaded has fired and before it's parsed in
++    // the markup:
++    customElements.define("delayed-connection", class DelayedConnection extends MozXULElement {
++      static get observedAttributes() { return ["foo"]; }
++      attributeChangedCallback() {
++        ok(!this.isConnectedAndReady, "attributeChangedCallback fires before isConnectedAndReady");
++        ok(!nativeDOMContentLoadedFired, "attributeChangedCallback fires before nativeDOMContentLoadedFired");
++        numSkippedAttributeChanges++;
++      }
++      disconnectedCallback() {
++        ok(this.waitForDOMReady(), "disconnectedCallback while DOM not ready");
++        is(numDelayedDisconnections, 0, "disconnectedCallback fired only once");
++        numDelayedDisconnections++;
++      }
++      connectedCallback() {
++        if (this.waitForDOMReady()) {
++          ok(!finishedWaitingForDOMReady, "connectedCallback with waitForDOMReady fires before finishedWaitingForDOMReady");
++          ok(!this.isConnectedAndReady, "connectedCallback with waitForDOMReady fires before isConnectedAndReady");
++          ok(!nativeDOMContentLoadedFired, "connectedCallback with waitForDOMReady fires before nativeDOMContentLoadedFired");
++          numDelayedConnections++;
++          return;
++        }
++
++        ok(!finishedWaitingForDOMReady, "connectedCallback only fires once when DOM is ready");
++        finishedWaitingForDOMReady = true;
++        ok(this.isConnectedAndReady, "isConnectedAndReady during connectedCallback");
++        ok(nativeDOMContentLoadedFired, "nativeDOMContentLoadedFired during connectedCallback");
++
++        is(numSkippedAttributeChanges, 2, "Correct number of skipped attribute changes");
++        is(numDelayedConnections, 2, "Correct number of delayed connections");
++        is(numDelayedDisconnections, 1, "Correct number of delated disconnections");
++        resolve();
++      }
++    })
++  });
++
++  // This should be called after the element is parsed below this.
++  function mutateDelayedConnection() {
++    // Fire connectedCallback and attributeChangedCallback twice before DOMContentLoaded
++    // fires. The first connectedCallback is due to the parse and the second due to re-appending.
++    let delayedConnection = document.querySelector("delayed-connection");
++    delayedConnection.setAttribute("foo", "bar");
++    delayedConnection.remove();
++    delayedConnection.setAttribute("foo", "bat");
++    document.documentElement.append(delayedConnection);
++  }
++  ]]>
++  </script>
++
++  <delayed-connection></delayed-connection>
++
++  <!-- test code goes here -->
++  <script type="application/javascript"><![CDATA[
++
++  SimpleTest.waitForExplicitFinish();
++  mutateDelayedConnection();
++
++  async function runTests() {
++    info("Waiting for delayed connection to fire");
++    await delayedConnectionPromise;
++    SimpleTest.finish();
++  }
++
++  ]]>
++  </script>
++</window>
+\ No newline at end of file
 diff --git a/toolkit/content/widgets/radio.js b/toolkit/content/widgets/radio.js
 --- a/toolkit/content/widgets/radio.js
 +++ b/toolkit/content/widgets/radio.js
