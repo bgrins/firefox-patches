@@ -1,12 +1,12 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
 # Parent  18859d2fec94f35e924e9093a99169623e0b2d78
-Convert menulist bindings to CE
+Bug 1499832 - Migrate menulist bindings to a Custom Element
 
 diff --git a/browser/components/preferences/in-content/tests/browser_permissions_dialog.js b/browser/components/preferences/in-content/tests/browser_permissions_dialog.js
 --- a/browser/components/preferences/in-content/tests/browser_permissions_dialog.js
 +++ b/browser/components/preferences/in-content/tests/browser_permissions_dialog.js
-@@ -16,16 +16,17 @@ function checkPermissionItem(origin, sta
+@@ -16,17 +16,20 @@ function checkPermissionItem(origin, sta
    let doc = sitePermissionsDialog.document;
  
    let label = doc.getElementsByTagName("label")[0];
@@ -15,8 +15,10 @@ diff --git a/browser/components/preferences/in-content/tests/browser_permissions
    let menulist = doc.getElementsByTagName("menulist")[0];
    let selectedIndex = menulist.selectedIndex;
    let selectedItem = menulist.querySelectorAll("menuitem")[selectedIndex];
-+  console.log("Checking selected", selectedIndex, selectedItem)
++  menulist.menupopup.getBoundingClientRect();
++  console.log("Checking selected", selectedIndex, selectedItem, selectedItem.value);
    Assert.equal(selectedItem.value, state);
++  Assert.equal(selectedItem, menulist.selectedItem);
  }
  
  async function openPermissionsDialog() {
@@ -24,7 +26,8 @@ diff --git a/browser/components/preferences/in-content/tests/browser_permissions
  
    await ContentTask.spawn(gBrowser.selectedBrowser, null, function() {
      let doc = content.document;
-@@ -52,16 +53,18 @@ add_task(async function addPermission() 
+     let settingsButton = doc.getElementById("notificationSettingsButton");
+@@ -52,16 +55,18 @@ add_task(async function addPermission() 
  
    // Add notification permission for a website.
    SitePermissions.set(URI, "desktop-notification", SitePermissions.ALLOW);
@@ -46,7 +49,7 @@ diff --git a/browser/components/preferences/in-content/tests/browser_permissions
 diff --git a/browser/components/preferences/sitePermissions.js b/browser/components/preferences/sitePermissions.js
 --- a/browser/components/preferences/sitePermissions.js
 +++ b/browser/components/preferences/sitePermissions.js
-@@ -259,40 +259,39 @@ var gSitePermissionsManager = {
+@@ -259,40 +259,38 @@ var gSitePermissionsManager = {
      let website = document.createXULElement("label");
      website.setAttribute("value", permission.origin);
      website.setAttribute("width", "50");
@@ -74,12 +77,12 @@ diff --git a/browser/components/preferences/sitePermissions.js b/browser/compone
 -      let m = document.createXULElement("menuitem");
 +
 +      let m = menulist.appendItem("", state);
-+      // console.log(m, m.value);
        document.l10n.setAttributes(m, this._getCapabilityString(state));
 -      m.setAttribute("value", state);
 -      menupopup.appendChild(m);
      }
-     menulist.value = permission.capability;
+-    menulist.value = permission.capability;
++    menulist.setAttribute("value", permission.capability);
  
      menulist.addEventListener("select", () => {
 +      // console.log(permission, menulist.selectedItem, menulist.selectedItem.value)
@@ -254,12 +257,54 @@ diff --git a/toolkit/content/jar.mn b/toolkit/content/jar.mn
     content/global/elements/videocontrols.js    (widgets/videocontrols.js)
  #ifdef XP_MACOSX
     content/global/macWindowMenu.js
+diff --git a/toolkit/content/preferencesBindings.js b/toolkit/content/preferencesBindings.js
+--- a/toolkit/content/preferencesBindings.js
++++ b/toolkit/content/preferencesBindings.js
+@@ -345,17 +345,17 @@ const Preferences = window.Preferences =
+       /**
+        * Initialize a UI element property with a value. Handles the case
+        * where an element has not yet had a XBL binding attached for it and
+        * the property setter does not yet exist by setting the same attribute
+        * on the XUL element using DOM apis and assuming the element's
+        * constructor or property getters appropriately handle this state.
+        */
+       function setValue(element, attribute, value) {
+-        if (attribute in element) {
++        if (attribute in element && !element.menulistWaitingForConstruction) {
+           element[attribute] = value;
+         } else if (attribute === "checked") {
+           // The "checked" attribute can't simply be set to the specified value;
+           // it has to be set if the value is true and removed if the value
+           // is false in order to be interpreted correctly by the element.
+           if (value) {
+             // In theory we can set it to anything; however xbl implementation
+             // of `checkbox` only works with "true".
+@@ -397,17 +397,18 @@ const Preferences = window.Preferences =
+ 
+       /**
+        * Read the value of an attribute from an element, assuming the
+        * attribute is a property on the element's node API. If the property
+        * is not present in the API, then assume its value is contained in
+        * an attribute, as is the case before a binding has been attached.
+        */
+       function getValue(element, attribute) {
+-        if (attribute in element)
++        // XXX: this is probably not needed
++        if (attribute in element && !element.menulistWaitingForConstruction)
+           return element[attribute];
+         return element.getAttribute(attribute);
+       }
+       let value;
+       if (aElement.localName == "checkbox")
+         value = getValue(aElement, "checked");
+       else
+         value = getValue(aElement, "value");
 diff --git a/toolkit/content/widgets/menulist.xml b/toolkit/content/widgets/menulist.js
 rename from toolkit/content/widgets/menulist.xml
 rename to toolkit/content/widgets/menulist.js
 --- a/toolkit/content/widgets/menulist.xml
 +++ b/toolkit/content/widgets/menulist.js
-@@ -1,341 +1,385 @@
+@@ -1,341 +1,380 @@
 -<?xml version="1.0"?>
 -<!-- This Source Code Form is subject to the terms of the Mozilla Public
 -   - License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -269,26 +314,17 @@ rename to toolkit/content/widgets/menulist.js
 +  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
  
 +"use strict";
-+
-+// This is loaded into all XUL windows. Wrap in a block to prevent
-+// leaking to window scope.
-+{
  
 -<bindings id="menulistBindings"
 -   xmlns="http://www.mozilla.org/xbl"
 -   xmlns:html="http://www.w3.org/1999/xhtml"
 -   xmlns:xul="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
 -   xmlns:xbl="http://www.mozilla.org/xbl">
-+/* globals MozBaseControlMixin,MozElementMixin,XULMenuElement */
++// This is loaded into all XUL windows. Wrap in a block to prevent
++// leaking to window scope.
++{
 +
-+let gFragment = MozXULElement.parseXULToFragment(`
-+  <hbox class="menulist-label-box" flex="1">
-+    <image class="menulist-icon"></image>
-+    <label class="menulist-label" inherits="value=label,crop,accesskey,highlightable" crop="right" flex="1"></label>
-+    <label class="menulist-highlightable-label" inherits="text=label,crop,accesskey,highlightable" crop="right" flex="1"></label>
-+  </hbox>
-+  <dropmarker class="menulist-dropmarker" type="menu" inherits="disabled,open"></dropmarker>
-+`);
++/* globals MozBaseControlMixin,MozElementMixin,XULMenuElement */
  
 -  <binding id="menulist"
 -           extends="chrome://global/content/bindings/general.xml#basecontrol">
@@ -301,21 +337,21 @@ rename to toolkit/content/widgets/menulist.js
 -      <xul:dropmarker class="menulist-dropmarker" type="menu" xbl:inherits="disabled,open"/>
 -      <children includes="menupopup"/>
 -    </content>
-+class MozMenulist extends MozBaseControlMixin(MozElementMixin(XULMenuElement)) {
-+  constructor() {
-+    super();
-+
-+    this.mSelectedInternal = null;
-+    this.mAttributeObserver = null;
++let gFragment = MozXULElement.parseXULToFragment(`
++  <hbox class="menulist-label-box" flex="1">
++    <image class="menulist-icon"></image>
++    <label class="menulist-label" inherits="value=label,crop,accesskey,highlightable" crop="right" flex="1"></label>
++    <label class="menulist-highlightable-label" inherits="text=label,crop,accesskey,highlightable" crop="right" flex="1"></label>
++  </hbox>
++  <dropmarker class="menulist-dropmarker" type="menu" inherits="disabled,open"></dropmarker>
++`);
  
 -    <handlers>
 -      <handler event="command" phase="capturing"
 -        action="if (event.target.parentNode.parentNode == this) this.selectedItem = event.target;"/>
-+    this.addEventListener("command", (event) => {
-+      if (event.target.parentNode.parentNode == this) {
-+        this.selectedItem = event.target;
-+      }
-+    }, true);
++class MozMenulist extends MozBaseControlMixin(MozElementMixin(XULMenuElement)) {
++  constructor() {
++    super();
  
 -      <handler event="popupshowing">
 -        <![CDATA[
@@ -328,15 +364,15 @@ rename to toolkit/content/widgets/menulist.js
 -          }
 -        ]]>
 -      </handler>
-+    this.addEventListener("popupshowing", (event) => {
-+      if (event.target.parentNode == this) {
-+        this.activeChild = null;
-+        if (this.selectedItem)
-+          // Not ready for auto-setting the active child in hierarchies yet.
-+          // For now, only do this when the outermost menupopup opens.
-+          this.activeChild = this.mSelectedInternal;
++    this.menulistWaitingForConstruction = true;
++    this.mSelectedInternal = null;
++    this.mAttributeObserver = null;
++
++    this.addEventListener("command", (event) => {
++      if (event.target.parentNode.parentNode == this) {
++        this.selectedItem = event.target;
 +      }
-+    });
++    }, true);
  
 -      <handler event="keypress" modifiers="shift any" group="system">
 -        <![CDATA[
@@ -359,6 +395,22 @@ rename to toolkit/content/widgets/menulist.js
 -        ]]>
 -      </handler>
 -    </handlers>
++    this.addEventListener("popupshowing", (event) => {
++      if (event.target.parentNode == this) {
++        this.activeChild = null;
++        if (this.selectedItem)
++          // Not ready for auto-setting the active child in hierarchies yet.
++          // For now, only do this when the outermost menupopup opens.
++          this.activeChild = this.mSelectedInternal;
++      }
++    });
+ 
+-    <implementation implements="nsIDOMXULMenuListElement">
+-      <constructor>
+-        this.mSelectedInternal = null;
+-        this.mAttributeObserver = null;
+-        this.setInitialSelection();
+-      </constructor>
 +    this.addEventListener("keypress", (event) => {
 +      if (!event.defaultPrevented &&
 +        (event.keyCode == KeyEvent.DOM_VK_UP ||
@@ -378,17 +430,21 @@ rename to toolkit/content/widgets/menulist.js
 +      }
 +    }, { mozSystemGroup: true });
 +  }
-+
+ 
+-      <method name="setInitialSelection">
+-        <body>
+-          <![CDATA[
+-            var popup = this.menupopup;
+-            if (popup) {
+-              var arr = popup.getElementsByAttribute("selected", "true");
 +  static get observedAttributes() {
 +    return ["image", "label", "crop", "accesskey", "highlightable"];
 +  }
  
--    <implementation implements="nsIDOMXULMenuListElement">
--      <constructor>
--        this.mSelectedInternal = null;
--        this.mAttributeObserver = null;
--        this.setInitialSelection();
--      </constructor>
+-              var editable = this.editable;
+-              var value = this.value;
+-              if (!arr.item(0) && value)
+-                arr = popup.getElementsByAttribute(editable ? "label" : "value", value);
 +  attributeChangedCallback() {
 +    if (!this.isConnectedAndReady) {
 +      return;
@@ -402,17 +458,14 @@ rename to toolkit/content/widgets/menulist.js
 +      return;
 +    }
  
--      <method name="setInitialSelection">
--        <body>
--          <![CDATA[
--            var popup = this.menupopup;
--            if (popup) {
--              var arr = popup.getElementsByAttribute("selected", "true");
--
--              var editable = this.editable;
--              var value = this.value;
--              if (!arr.item(0) && value)
--                arr = popup.getElementsByAttribute(editable ? "label" : "value", value);
+-              if (arr.item(0))
+-                this.selectedItem = arr[0];
+-              else if (!editable)
+-                this.selectedIndex = 0;
+-            }
+-          ]]>
+-        </body>
+-      </method>
 +    this.inheritAttribute(this.menulistIcon, "image", "src");
 +    this.inheritAttribute(this.menulistLabel, "label", "value");
 +    this.inheritAttribute(this.menulistLabel, "crop");
@@ -426,27 +479,15 @@ rename to toolkit/content/widgets/menulist.js
 +    this.inheritAttribute(this.menulistDropmarker, "open");
 +  }
  
--              if (arr.item(0))
--                this.selectedItem = arr[0];
--              else if (!editable)
--                this.selectedIndex = 0;
--            }
--          ]]>
--        </body>
--      </method>
-+  menupopupConnected(menupopup) {
-+    // console.log("menupopupConnected", menupopup);
-+    // console.trace();
-+
-+    if (!this.connectedOnce) {
-+      this.connectedOnce = true;
- 
 -      <property name="value" onget="return this.getAttribute('value');">
 -        <setter>
 -          <![CDATA[
 -            // if the new value is null, we still need to remove the old value
 -            if (val == null)
 -              return this.selectedItem = val;
++  menupopupConnected(menupopup) {
++    if (this.menulistWaitingForConstruction) {
++      this.menulistWaitingForConstruction = false;
 +      if (!this.isPopupOnly) {
 +        this.prepend(document.importNode(gFragment, true));
 +        this.menulistIcon = this.querySelector(".menulist-icon");
@@ -454,19 +495,16 @@ rename to toolkit/content/widgets/menulist.js
 +        this.menulistHighlightableLabel = this.querySelector(".menulist-highlightable-label");
 +        this.menulistDropmarker = this.querySelector(".menulist-dropmarker");
 +      }
-+
-+      this.setInitialSelection();
-+    }
-+  }
  
 -            var arr = null;
 -            var popup = this.menupopup;
 -            if (popup)
 -              arr = popup.getElementsByAttribute("value", val);
-+  connectedCallback() {
-+    if (this.delayConnectedCallback()) {
-+      return;
++      this.inheritAttributes();
++      this.setInitialSelection();
++      // console.log("Menupopup is connected", document.documentElement.contains(this), this.parentNode, this.innerHTML);
 +    }
++  }
  
 -            if (arr && arr.item(0))
 -              this.selectedItem = arr[0];
@@ -474,22 +512,16 @@ rename to toolkit/content/widgets/menulist.js
 -              this.selectedItem = null;
 -              this.setAttribute("value", val);
 -            }
-+    this.setAttribute("sizetopopup", "pref");
-+
-+    // XXX: Invert the relationship here and wait for menupopup to tell us it's created
-+    // before we try and make the menulist?
-+    this.inheritAttributes();
-+  }
++  connectedCallback() {
++    if (this.delayConnectedCallback()) {
++      return;
++    }
  
 -            return val;
 -          ]]>
 -        </setter>
 -      </property>
-+  disconnectedCallback() {
-+    if (this.mAttributeObserver) {
-+      this.mAttributeObserver.disconnect();
-+    }
-+    // this._menupopup = null;
++    this.setAttribute("sizetopopup", "pref");
 +  }
  
 -      <property name="crop" onset="this.setAttribute('crop',val); return val;"
@@ -499,30 +531,30 @@ rename to toolkit/content/widgets/menulist.js
 -      <property name="label" readonly="true" onget="return this.getAttribute('label');"/>
 -      <property name="description" onset="this.setAttribute('description',val); return val;"
 -                                   onget="return this.getAttribute('description');"/>
++  disconnectedCallback() {
++    if (this.mAttributeObserver) {
++      this.mAttributeObserver.disconnect();
++    }
++    // this._menupopup = null;
++  }
++
 +  get isPopupOnly() {
 +    return this.hasAttribute("popuponly");
 +  }
-+
+ 
+-      <property name="open" onset="this.openMenu(val); return val;"
+-                            onget="return this.hasAttribute('open');"/>
 +  set value(val) {
 +    // if the new value is null, we still need to remove the old value
 +    if (val == null)
 +      return this.selectedItem = val;
  
--      <property name="open" onset="this.openMenu(val); return val;"
--                            onget="return this.hasAttribute('open');"/>
+-      <property name="itemCount" readonly="true"
+-                onget="return this.menupopup ? this.menupopup.children.length : 0"/>
 +    var arr = null;
 +    var popup = this.menupopup;
 +    if (popup)
 +      arr = popup.getElementsByAttribute("value", val);
- 
--      <property name="itemCount" readonly="true"
--                onget="return this.menupopup ? this.menupopup.children.length : 0"/>
-+    if (arr && arr.item(0))
-+      this.selectedItem = arr[0];
-+    else {
-+      this.selectedItem = null;
-+      this.setAttribute("value", val);
-+    }
  
 -      <property name="menupopup" readonly="true">
 -        <getter>
@@ -534,16 +566,18 @@ rename to toolkit/content/widgets/menulist.js
 -          ]]>
 -        </getter>
 -      </property>
++    if (arr && arr.item(0))
++      this.selectedItem = arr[0];
++    else {
++      this.selectedItem = null;
++      this.setAttribute("value", val);
++    }
++
 +    return val;
 +  }
 +
 +  get value() {
 +    return this.getAttribute("value");
-+  }
-+
-+  set crop(val) {
-+    this.setAttribute("crop", val);
-+    return val;
 +  }
  
 -      <method name="contains">
@@ -552,8 +586,9 @@ rename to toolkit/content/widgets/menulist.js
 -          <![CDATA[
 -            if (!item)
 -              return false;
-+  get crop() {
-+    return this.getAttribute("crop");
++  set crop(val) {
++    this.setAttribute("crop", val);
++    return val;
 +  }
  
 -            var parent = item.parentNode;
@@ -561,13 +596,13 @@ rename to toolkit/content/widgets/menulist.js
 -          ]]>
 -        </body>
 -      </method>
++  get crop() {
++    return this.getAttribute("crop");
++  }
++
 +  set image(val) {
 +    this.setAttribute("image", val);
 +    return val;
-+  }
-+
-+  get image() {
-+    return this.getAttribute("image");
 +  }
  
 -      <property name="selectedIndex">
@@ -578,6 +613,10 @@ rename to toolkit/content/widgets/menulist.js
 -                !this.mSelectedInternal.parentNode ||
 -                this.mSelectedInternal.parentNode.parentNode != this)
 -              return -1;
++  get image() {
++    return this.getAttribute("image");
++  }
++
 +  get label() {
 +    return this.getAttribute("label");
 +  }
@@ -623,15 +662,6 @@ rename to toolkit/content/widgets/menulist.js
 +  get itemCount() {
 +    return this.menupopup ? this.menupopup.children.length : 0;
 +  }
-+
-+  get menupopup() {
-+    // if (this._menupopup) {
-+    //   return this._menupopup;
-+    // }
-+    // this._menupopup = this.querySelector(":scope > menupopup");
-+    // return this._menupopup;
-+    return this.querySelector(":scope > menupopup");
-+  }
  
 -      <property name="selectedItem">
 -        <getter>
@@ -644,6 +674,20 @@ rename to toolkit/content/widgets/menulist.js
 -            var oldval = this.mSelectedInternal;
 -            if (oldval == val)
 -              return val;
++  get menupopup() {
++    // if (this._menupopup) {
++    //   return this._menupopup;
++    // }
++    // this._menupopup = this.querySelector(":scope > menupopup");
++    // return this._menupopup;
++    if (this.menulistWaitingForConstruction) {
++      // console.trace("Don't use API until menupopup XBL construction is done");
++    }
++    return this.querySelector(":scope > menupopup");
++  }
+ 
+-            if (val && !this.contains(val))
+-              return val;
 +  set selectedIndex(val) {
 +    var popup = this.menupopup;
 +    // console.log("set selectedIndex", val, popup, popup.children.length);
@@ -653,9 +697,7 @@ rename to toolkit/content/widgets/menulist.js
 +    } else
 +      this.selectedItem = null;
 +  }
- 
--            if (val && !this.contains(val))
--              return val;
++
 +  get selectedIndex() {
 +    if (!this.selectedItem ||
 +      !this.mSelectedInternal.parentNode ||
@@ -667,20 +709,17 @@ rename to toolkit/content/widgets/menulist.js
 +    while (i--)
 +      if (children[i] == this.mSelectedInternal)
 +        break;
-+
-+    return i;
-+  }
  
 -            if (oldval) {
 -              oldval.removeAttribute("selected");
 -              this.mAttributeObserver.disconnect();
 -            }
++    return i;
++  }
++
 +  set selectedItem(val) {
 +    var oldval = this.mSelectedInternal;
 +    if (oldval == val)
-+      return val;
-+
-+    if (val && !this.contains(val))
 +      return val;
  
 -            this.mSelectedInternal = val;
@@ -694,13 +733,13 @@ rename to toolkit/content/widgets/menulist.js
 -                  this.removeAttribute(attr);
 -                }
 -              }
++    if (val && !this.contains(val))
++      return val;
++
 +    if (oldval) {
 +      oldval.removeAttribute("selected");
 +      this.mAttributeObserver.disconnect();
 +    }
-+
-+    // XXX: When do we hit this without a connected menupopup?
-+    this.menupopupConnected(this.menupopup);
  
 -              this.mAttributeObserver = new MutationObserver(this.handleMutation.bind(this));
 -              this.mAttributeObserver.observe(val, { attributeFilter });
