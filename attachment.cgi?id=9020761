@@ -1,0 +1,635 @@
+# HG changeset patch
+# User Victor Porof <vporof@mozilla.com>
+# Date 1540455719 -7200
+#      Thu Oct 25 10:21:59 2018 +0200
+# Node ID 8c2da33bd8592ade939984ca78fca6fa9f0911e9
+# Parent  28a4562cb5173c543cce6b58480ac80fcce3763a
+Bug 1499423 - Migrate the 3 treecol bindings into a Custom Element, r=bgrins
+
+diff --git a/browser/components/preferences/in-content/tests/browser_permissions_dialog.js b/browser/components/preferences/in-content/tests/browser_permissions_dialog.js
+--- a/browser/components/preferences/in-content/tests/browser_permissions_dialog.js
++++ b/browser/components/preferences/in-content/tests/browser_permissions_dialog.js
+@@ -10,17 +10,17 @@ ChromeUtils.import("resource://gre/modul
+ const PERMISSIONS_URL = "chrome://browser/content/preferences/sitePermissions.xul";
+ const URL = "http://www.example.com";
+ const URI = Services.io.newURI(URL);
+ var sitePermissionsDialog;
+ 
+ function checkPermissionItem(origin, state) {
+   let doc = sitePermissionsDialog.document;
+ 
+-  let label = doc.getElementsByTagName("label")[0];
++  let label = doc.getElementsByTagName("label")[2];
+   Assert.equal(label.value, origin);
+ 
+   let menulist = doc.getElementsByTagName("menulist")[0];
+   let selectedIndex = menulist.selectedIndex;
+   let selectedItem = menulist.querySelectorAll("menuitem")[selectedIndex];
+   Assert.equal(selectedItem.value, state);
+ }
+ 
+diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.js
+--- a/toolkit/content/customElements.js
++++ b/toolkit/content/customElements.js
+@@ -19,17 +19,17 @@ ChromeUtils.import("resource://gre/modul
+ // may be leaking things because they will never be destroyed after.
+ let gIsDOMContentLoaded = false;
+ const gElementsPendingConnection = new Set();
+ window.addEventListener("DOMContentLoaded", () => {
+   gIsDOMContentLoaded = true;
+   for (let element of gElementsPendingConnection) {
+     try {
+       if (element.isConnected) {
+-        element.connectedCallback();
++        element.connectedCallback(true);
+       }
+     } catch (ex) { console.error(ex); }
+   }
+   gElementsPendingConnection.clear();
+ }, { once: true, capture: true });
+ 
+ const gXULDOMParser = new DOMParser();
+ gXULDOMParser.forceEnableXULXBL();
+@@ -246,16 +246,17 @@ window.MozBaseControl = MozBaseControl;
+ const isDummyDocument = document.documentURI == "chrome://extensions/content/dummy.xul";
+ if (!isDummyDocument) {
+   for (let script of [
+     "chrome://global/content/elements/general.js",
+     "chrome://global/content/elements/progressmeter.js",
+     "chrome://global/content/elements/radio.js",
+     "chrome://global/content/elements/textbox.js",
+     "chrome://global/content/elements/tabbox.js",
++    "chrome://global/content/elements/tree.js",
+   ]) {
+     Services.scriptloader.loadSubScript(script, window);
+   }
+ 
+   for (let [tag, script] of [
+     ["findbar", "chrome://global/content/elements/findbar.js"],
+     ["stringbundle", "chrome://global/content/elements/stringbundle.js"],
+     ["printpreview-toolbar", "chrome://global/content/printPreviewToolbar.js"],
+diff --git a/toolkit/content/jar.mn b/toolkit/content/jar.mn
+--- a/toolkit/content/jar.mn
++++ b/toolkit/content/jar.mn
+@@ -97,13 +97,14 @@ toolkit.jar:
+    content/global/elements/editor.js          (widgets/editor.js)
+    content/global/elements/general.js          (widgets/general.js)
+    content/global/elements/progressmeter.js    (widgets/progressmeter.js)
+    content/global/elements/radio.js            (widgets/radio.js)
+    content/global/elements/stringbundle.js     (widgets/stringbundle.js)
+    content/global/elements/tabbox.js           (widgets/tabbox.js)
+    content/global/elements/textbox.js          (widgets/textbox.js)
+    content/global/elements/videocontrols.js    (widgets/videocontrols.js)
++   content/global/elements/tree.js             (widgets/tree.js)
+ #ifdef XP_MACOSX
+    content/global/macWindowMenu.js
+ #endif
+    content/global/gmp-sources/openh264.json    (gmp-sources/openh264.json)
+    content/global/gmp-sources/widevinecdm.json (gmp-sources/widevinecdm.json)
+diff --git a/toolkit/content/widgets/tree.js b/toolkit/content/widgets/tree.js
+new file mode 100644
+--- /dev/null
++++ b/toolkit/content/widgets/tree.js
+@@ -0,0 +1,276 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++  * License, v. 2.0. If a copy of the MPL was not distributed with this
++  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++  "use strict";
++
++  // This is loaded into all XUL windows. Wrap in a block to prevent
++  // leaking to window scope.
++  {
++
++  class MozTreecolBase extends MozBaseControl {
++    constructor() {
++      super();
++
++      this.addEventListener("mousedown", (event) => {
++        if (event.button != 0) { return; }
++        if (this.parentNode.parentNode.enableColumnDrag) {
++          var xulns = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
++          var cols = this.parentNode.getElementsByTagNameNS(xulns, "treecol");
++
++          // only start column drag operation if there are at least 2 visible columns
++          var visible = 0;
++          for (var i = 0; i < cols.length; ++i)
++            if (cols[i].boxObject.width > 0) ++visible;
++
++          if (visible > 1) {
++            window.addEventListener("mousemove", this._onDragMouseMove, true);
++            window.addEventListener("mouseup", this._onDragMouseUp, true);
++            document.treecolDragging = this;
++            this.mDragGesturing = true;
++            this.mStartDragX = event.clientX;
++            this.mStartDragY = event.clientY;
++          }
++        }
++      });
++
++      this.addEventListener("click", (event) => {
++        if (event.button != 0) { return; }
++        if (event.target != event.originalTarget)
++          return;
++
++        // On Windows multiple clicking on tree columns only cycles one time
++        // every 2 clicks.
++        if (/Win/.test(navigator.platform) && event.detail % 2 == 0)
++          return;
++
++        var tree = this.parentNode.parentNode;
++        if (tree.columns) {
++          tree.view.cycleHeader(tree.columns.getColumnFor(this));
++        }
++      });
++
++    }
++
++    markTreeDirty() {
++      this.parentNode.parentNode._columnsDirty = true;
++    }
++
++    set ordinal(val) {
++      this.setAttribute("ordinal", val);
++      return val;
++    }
++
++    get ordinal() {
++      var val = this.getAttribute("ordinal");
++      if (val == "")
++        return "1";
++
++      return "" + (val == "0" ? 0 : parseInt(val));
++    }
++
++    get _previousVisibleColumn() {
++      var sib = this.boxObject.previousSibling;
++      while (sib) {
++        if (sib.localName == "treecol" && sib.boxObject.width > 0 && sib.parentNode == this.parentNode)
++          return sib;
++        sib = sib.boxObject.previousSibling;
++      }
++      return null;
++    }
++
++    _onDragMouseMove(aEvent) {
++      var col = document.treecolDragging;
++      if (!col) return;
++
++      // determine if we have moved the mouse far enough
++      // to initiate a drag
++      if (col.mDragGesturing) {
++        if (Math.abs(aEvent.clientX - col.mStartDragX) < 5 &&
++          Math.abs(aEvent.clientY - col.mStartDragY) < 5) {
++          return;
++        }
++        col.mDragGesturing = false;
++        col.setAttribute("dragging", "true");
++        window.addEventListener("click", col._onDragMouseClick, true);
++      }
++
++      var pos = {};
++      var targetCol = col.parentNode.parentNode._getColumnAtX(aEvent.clientX, 0.5, pos);
++
++      // bail if we haven't mousemoved to a different column
++      if (col.mTargetCol == targetCol && col.mTargetDir == pos.value)
++        return;
++
++      var tree = col.parentNode.parentNode;
++      var sib;
++      var column;
++      if (col.mTargetCol) {
++        // remove previous insertbefore/after attributes
++        col.mTargetCol.removeAttribute("insertbefore");
++        col.mTargetCol.removeAttribute("insertafter");
++        column = tree.columns.getColumnFor(col.mTargetCol);
++        tree.treeBoxObject.invalidateColumn(column);
++        sib = col.mTargetCol._previousVisibleColumn;
++        if (sib) {
++          sib.removeAttribute("insertafter");
++          column = tree.columns.getColumnFor(sib);
++          tree.treeBoxObject.invalidateColumn(column);
++        }
++        col.mTargetCol = null;
++        col.mTargetDir = null;
++      }
++
++      if (targetCol) {
++        // set insertbefore/after attributes
++        if (pos.value == "after") {
++          targetCol.setAttribute("insertafter", "true");
++        } else {
++          targetCol.setAttribute("insertbefore", "true");
++          sib = targetCol._previousVisibleColumn;
++          if (sib) {
++            sib.setAttribute("insertafter", "true");
++            column = tree.columns.getColumnFor(sib);
++            tree.treeBoxObject.invalidateColumn(column);
++          }
++        }
++        column = tree.columns.getColumnFor(targetCol);
++        tree.treeBoxObject.invalidateColumn(column);
++        col.mTargetCol = targetCol;
++        col.mTargetDir = pos.value;
++      }
++    }
++
++    _onDragMouseUp(aEvent) {
++      var col = document.treecolDragging;
++      if (!col) return;
++
++      if (!col.mDragGesturing) {
++        if (col.mTargetCol) {
++          // remove insertbefore/after attributes
++          var before = col.mTargetCol.hasAttribute("insertbefore");
++          col.mTargetCol.removeAttribute(before ? "insertbefore" : "insertafter");
++
++          var sib = col.mTargetCol._previousVisibleColumn;
++          if (before && sib) {
++            sib.removeAttribute("insertafter");
++          }
++
++          // Move the column only if it will result in a different column
++          // ordering
++          var move = true;
++
++          // If this is a before move and the previous visible column is
++          // the same as the column we're moving, don't move
++          if (before && col == sib) {
++            move = false;
++          } else if (!before && col == col.mTargetCol) {
++            // If this is an after move and the column we're moving is
++            // the same as the target column, don't move.
++            move = false;
++          }
++
++          if (move) {
++            col.parentNode.parentNode._reorderColumn(col, col.mTargetCol, before);
++          }
++
++          // repaint to remove lines
++          col.parentNode.parentNode.treeBoxObject.invalidate();
++
++          col.mTargetCol = null;
++        }
++      } else
++        col.mDragGesturing = false;
++
++      document.treecolDragging = null;
++      col.removeAttribute("dragging");
++
++      window.removeEventListener("mousemove", col._onDragMouseMove, true);
++      window.removeEventListener("mouseup", col._onDragMouseUp, true);
++      // we have to wait for the click event to fire before removing
++      // cancelling handler
++      var clickHandler = function(handler) {
++        window.removeEventListener("click", handler, true);
++      };
++      window.setTimeout(clickHandler, 0, col._onDragMouseClick);
++    }
++
++    _onDragMouseClick(aEvent) {
++      // prevent click event from firing after column drag and drop
++      aEvent.stopPropagation();
++      aEvent.preventDefault();
++    }
++  }
++
++  customElements.define("treecol-base", MozTreecolBase);
++
++  class MozTreecol extends MozTreecolBase {
++    static get observedAttributes() {
++      return [
++        "label",
++        "sortdirection",
++        "hideheader",
++        "crop",
++      ];
++    }
++
++    connectedCallback(isDelayed) {
++      if (this.delayConnectedCallback()) {
++        return;
++      }
++      if (!isDelayed) {
++        super.markTreeDirty();
++      }
++
++      this.textContent = "";
++      this.appendChild(MozXULElement.parseXULToFragment(`
++        <label class="treecol-text" flex="1" crop="right"></label>
++        <image class="treecol-sortdirection"></image>
++      `));
++
++      this._updateAttributes();
++    }
++
++    attributeChangedCallback() {
++      if (this.isConnectedAndReady) {
++        this._updateAttributes();
++      }
++    }
++
++    _updateAttributes() {
++      let label = this.querySelector(".treecol-text");
++      let image = this.querySelector(".treecol-sortdirection");
++
++      this._inheritAttributes(label, ["value=label"]);
++      this._inheritAttributes(image, ["sortdirection", "hidden=hideheader"]);
++
++      if (this.hasAttribute("crop")) {
++        this._inheritAttributes(label, ["crop"]);
++      }
++    }
++
++    // TODO: Remove me after the helper from bug 1455433 lands.
++    _inheritAttributes(child, attrs) {
++      for (let attr of attrs) {
++        let attrName = attr;
++        let attrNewName = attr;
++        let split = attrName.split("=");
++        if (split.length == 2) {
++          attrName = split[1];
++          attrNewName = split[0];
++        }
++
++        if (attrNewName === "text") {
++          child.textContent = this.hasAttribute(attrName) ? this.getAttribute(attrName) : "";
++        } else if (this.hasAttribute(attrName)) {
++          child.setAttribute(attrNewName, this.getAttribute(attrName));
++        } else {
++          child.removeAttribute(attrNewName);
++        }
++      }
++    }
++  }
++
++  customElements.define("treecol", MozTreecol);
++
++}
+diff --git a/toolkit/content/widgets/tree.xml b/toolkit/content/widgets/tree.xml
+--- a/toolkit/content/widgets/tree.xml
++++ b/toolkit/content/widgets/tree.xml
+@@ -1118,234 +1118,16 @@
+         if (cell.col && !cell.col.cycler && cell.childElt != "twisty")
+           this.parentNode.changeOpenState(row);
+       ]]>
+       </handler>
+ 
+     </handlers>
+   </binding>
+ 
+-  <binding id="treecol-base"
+-           extends="chrome://global/content/bindings/general.xml#basecontrol">
+-    <implementation>
+-      <constructor>
+-        this.parentNode.parentNode._columnsDirty = true;
+-      </constructor>
+-
+-      <property name="ordinal">
+-        <getter><![CDATA[
+-          var val = this.getAttribute("ordinal");
+-          if (val == "")
+-            return "1";
+-
+-          return "" + (val == "0" ? 0 : parseInt(val));
+-        ]]></getter>
+-        <setter><![CDATA[
+-          this.setAttribute("ordinal", val);
+-          return val;
+-        ]]></setter>
+-      </property>
+-
+-      <property name="_previousVisibleColumn">
+-        <getter><![CDATA[
+-          var sib = this.boxObject.previousSibling;
+-          while (sib) {
+-            if (sib.localName == "treecol" && sib.boxObject.width > 0 && sib.parentNode == this.parentNode)
+-              return sib;
+-            sib = sib.boxObject.previousSibling;
+-          }
+-          return null;
+-        ]]></getter>
+-      </property>
+-
+-      <method name="_onDragMouseMove">
+-        <parameter name="aEvent"/>
+-        <body><![CDATA[
+-          var col = document.treecolDragging;
+-          if (!col) return;
+-
+-          // determine if we have moved the mouse far enough
+-          // to initiate a drag
+-          if (col.mDragGesturing) {
+-            if (Math.abs(aEvent.clientX - col.mStartDragX) < 5 &&
+-                Math.abs(aEvent.clientY - col.mStartDragY) < 5) {
+-              return;
+-            }
+-            col.mDragGesturing = false;
+-            col.setAttribute("dragging", "true");
+-            window.addEventListener("click", col._onDragMouseClick, true);
+-          }
+-
+-          var pos = {};
+-          var targetCol = col.parentNode.parentNode._getColumnAtX(aEvent.clientX, 0.5, pos);
+-
+-          // bail if we haven't mousemoved to a different column
+-          if (col.mTargetCol == targetCol && col.mTargetDir == pos.value)
+-            return;
+-
+-          var tree = col.parentNode.parentNode;
+-          var sib;
+-          var column;
+-          if (col.mTargetCol) {
+-            // remove previous insertbefore/after attributes
+-            col.mTargetCol.removeAttribute("insertbefore");
+-            col.mTargetCol.removeAttribute("insertafter");
+-            column = tree.columns.getColumnFor(col.mTargetCol);
+-            tree.treeBoxObject.invalidateColumn(column);
+-            sib = col.mTargetCol._previousVisibleColumn;
+-            if (sib) {
+-              sib.removeAttribute("insertafter");
+-              column = tree.columns.getColumnFor(sib);
+-              tree.treeBoxObject.invalidateColumn(column);
+-            }
+-            col.mTargetCol = null;
+-            col.mTargetDir = null;
+-          }
+-
+-          if (targetCol) {
+-            // set insertbefore/after attributes
+-            if (pos.value == "after") {
+-              targetCol.setAttribute("insertafter", "true");
+-            } else {
+-              targetCol.setAttribute("insertbefore", "true");
+-              sib = targetCol._previousVisibleColumn;
+-              if (sib) {
+-                sib.setAttribute("insertafter", "true");
+-                column = tree.columns.getColumnFor(sib);
+-                tree.treeBoxObject.invalidateColumn(column);
+-              }
+-            }
+-            column = tree.columns.getColumnFor(targetCol);
+-            tree.treeBoxObject.invalidateColumn(column);
+-            col.mTargetCol = targetCol;
+-            col.mTargetDir = pos.value;
+-          }
+-        ]]></body>
+-      </method>
+-
+-      <method name="_onDragMouseUp">
+-        <parameter name="aEvent"/>
+-        <body><![CDATA[
+-          var col = document.treecolDragging;
+-          if (!col) return;
+-
+-          if (!col.mDragGesturing) {
+-            if (col.mTargetCol) {
+-              // remove insertbefore/after attributes
+-              var before = col.mTargetCol.hasAttribute("insertbefore");
+-              col.mTargetCol.removeAttribute(before ? "insertbefore" : "insertafter");
+-
+-              var sib = col.mTargetCol._previousVisibleColumn;
+-              if (before && sib) {
+-                sib.removeAttribute("insertafter");
+-              }
+-
+-              // Move the column only if it will result in a different column
+-              // ordering
+-              var move = true;
+-
+-              // If this is a before move and the previous visible column is
+-              // the same as the column we're moving, don't move
+-              if (before && col == sib) {
+-                move = false;
+-              } else if (!before && col == col.mTargetCol) {
+-                // If this is an after move and the column we're moving is
+-                // the same as the target column, don't move.
+-                move = false;
+-              }
+-
+-              if (move) {
+-                col.parentNode.parentNode._reorderColumn(col, col.mTargetCol, before);
+-              }
+-
+-              // repaint to remove lines
+-              col.parentNode.parentNode.treeBoxObject.invalidate();
+-
+-              col.mTargetCol = null;
+-            }
+-          } else
+-            col.mDragGesturing = false;
+-
+-          document.treecolDragging = null;
+-          col.removeAttribute("dragging");
+-
+-          window.removeEventListener("mousemove", col._onDragMouseMove, true);
+-          window.removeEventListener("mouseup", col._onDragMouseUp, true);
+-          // we have to wait for the click event to fire before removing
+-          // cancelling handler
+-          var clickHandler = function(handler) {
+-            window.removeEventListener("click", handler, true);
+-          };
+-          window.setTimeout(clickHandler, 0, col._onDragMouseClick);
+-        ]]></body>
+-      </method>
+-
+-      <method name="_onDragMouseClick">
+-        <parameter name="aEvent"/>
+-        <body><![CDATA[
+-          // prevent click event from firing after column drag and drop
+-          aEvent.stopPropagation();
+-          aEvent.preventDefault();
+-        ]]></body>
+-      </method>
+-    </implementation>
+-
+-    <handlers>
+-      <handler event="mousedown" button="0"><![CDATA[
+-        if (this.parentNode.parentNode.enableColumnDrag) {
+-          var xulns = "http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul";
+-          var cols = this.parentNode.getElementsByTagNameNS(xulns, "treecol");
+-
+-          // only start column drag operation if there are at least 2 visible columns
+-          var visible = 0;
+-          for (var i = 0; i < cols.length; ++i)
+-            if (cols[i].boxObject.width > 0) ++visible;
+-
+-          if (visible > 1) {
+-            window.addEventListener("mousemove", this._onDragMouseMove, true);
+-            window.addEventListener("mouseup", this._onDragMouseUp, true);
+-            document.treecolDragging = this;
+-            this.mDragGesturing = true;
+-            this.mStartDragX = event.clientX;
+-            this.mStartDragY = event.clientY;
+-          }
+-        }
+-      ]]></handler>
+-      <handler event="click" button="0" phase="target">
+-        <![CDATA[
+-          if (event.target != event.originalTarget)
+-            return;
+-
+-          // On Windows multiple clicking on tree columns only cycles one time
+-          // every 2 clicks.
+-          if (/Win/.test(navigator.platform) && event.detail % 2 == 0)
+-            return;
+-
+-          var tree = this.parentNode.parentNode;
+-          if (tree.columns) {
+-            tree.view.cycleHeader(tree.columns.getColumnFor(this));
+-          }
+-        ]]>
+-      </handler>
+-    </handlers>
+-  </binding>
+-
+-  <binding id="treecol" extends="chrome://global/content/bindings/tree.xml#treecol-base">
+-    <content>
+-      <xul:label class="treecol-text" xbl:inherits="crop,value=label" flex="1" crop="right"/>
+-      <xul:image class="treecol-sortdirection" xbl:inherits="sortDirection,hidden=hideheader"/>
+-    </content>
+-  </binding>
+-
+-  <binding id="treecol-image" extends="chrome://global/content/bindings/tree.xml#treecol-base">
+-    <content>
+-      <xul:image class="treecol-icon" xbl:inherits="src"/>
+-    </content>
+-  </binding>
+-
+   <binding id="columnpicker" display="xul:button"
+            extends="chrome://global/content/bindings/general.xml#basecontrol">
+     <content>
+       <xul:image class="tree-columnpicker-icon"/>
+       <xul:menupopup anonid="popup">
+         <xul:menuseparator anonid="menuseparator"/>
+         <xul:menuitem anonid="menuitem" label="&restoreColumnOrder.label;"/>
+       </xul:menupopup>
+diff --git a/toolkit/content/xul.css b/toolkit/content/xul.css
+--- a/toolkit/content/xul.css
++++ b/toolkit/content/xul.css
+@@ -457,24 +457,19 @@ tree {
+   -moz-binding: url("chrome://global/content/bindings/tree.xml#tree");
+ }
+ 
+ treecols {
+   -moz-binding: url("chrome://global/content/bindings/tree.xml#treecols");
+ }
+ 
+ treecol {
+-  -moz-binding: url("chrome://global/content/bindings/tree.xml#treecol");
+   -moz-box-ordinal-group: 2147483646;
+ }
+ 
+-treecol.treecol-image {
+-  -moz-binding: url("chrome://global/content/bindings/tree.xml#treecol-image");
+-}
+-
+ tree > treechildren {
+   display: -moz-box;
+   -moz-binding: url("chrome://global/content/bindings/tree.xml#treebody");
+   -moz-user-select: none;
+   -moz-box-flex: 1;
+ }
+ 
+ treerows {
