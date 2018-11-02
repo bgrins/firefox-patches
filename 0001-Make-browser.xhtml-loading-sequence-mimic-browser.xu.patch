@@ -1,0 +1,187 @@
+From 34a310257bd03dbfa3a0a76f2c6bbd95c8beb2c3 Mon Sep 17 00:00:00 2001
+From: Brendan Dahl <bdahl@mozilla.com>
+Date: Wed, 31 Oct 2018 14:55:06 -0700
+Subject: [PATCH] Make browser.xhtml loading sequence mimic browser.xul.
+
+---
+ browser/base/content/browser.xul | 11 +----------
+ dom/base/nsDocument.cpp          |  8 ++++----
+ dom/xml/nsXMLContentSink.cpp     | 27 +++++++++++++++++++++++++--
+ 3 files changed, 30 insertions(+), 16 deletions(-)
+
+diff --git a/browser/base/content/browser.xul b/browser/base/content/browser.xul
+--- a/browser/base/content/browser.xul
++++ b/browser/base/content/browser.xul
+@@ -67,17 +67,16 @@
+         windowtype="navigator:browser"
+         macanimationtype="document"
+         screenX="4" screenY="4"
+         fullscreenbutton="true"
+         sizemode="normal"
+         retargetdocumentfocus="urlbar"
+         persist="screenX screenY width height sizemode"
+ #ifdef BROWSER_XHTML
+-        hidden="true"
+ #endif
+         >
+ 
+ # All JS files which are needed by browser.xul and other top level windows to
+ # support MacOS specific features *must* go into the global-scripts.inc file so
+ # that they can be shared with macWindow.inc.xul.
+ #include global-scripts.inc
+ 
+@@ -88,27 +87,19 @@ xmlns="http://www.w3.org/1999/xhtml"
+ >
+   Services.scriptloader.loadSubScript("chrome://global/content/contentAreaUtils.js", this);
+   Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser.js", this);
+ 
+   window.onload = gBrowserInit.onLoad.bind(gBrowserInit);
+   window.onunload = gBrowserInit.onUnload.bind(gBrowserInit);
+   window.onclose = WindowIsClosing;
+ 
+-#ifdef BROWSER_XHTML
+-  window.addEventListener("readystatechange", () => {
+-    // We initially hide the window to prevent layouts during parse. This lets us
+-    // avoid accidental XBL construction and better match browser.xul (see Bug 1497975).
+-    gBrowserInit.onBeforeInitialXULLayout();
+-    document.documentElement.removeAttribute("hidden");
+-  }, { once: true, capture: true });
+-#else
+   window.addEventListener("MozBeforeInitialXULLayout",
+     gBrowserInit.onBeforeInitialXULLayout.bind(gBrowserInit), { once: true });
+-#endif
++
+   // The listener of DOMContentLoaded must be set on window, rather than
+   // document, because the window can go away before the event is fired.
+   // In that case, we don't want to initialize anything, otherwise we
+   // may be leaking things because they will never be destroyed after.
+   window.addEventListener("DOMContentLoaded",
+     gBrowserInit.onDOMContentLoaded.bind(gBrowserInit), { once: true });
+ </script>
+ 
+diff --git a/dom/base/nsDocument.cpp b/dom/base/nsDocument.cpp
+--- a/dom/base/nsDocument.cpp
++++ b/dom/base/nsDocument.cpp
+@@ -6646,20 +6646,20 @@ nsIDocument::FlushSkinBindings()
+ void
+ nsIDocument::SetMayStartLayout(bool aMayStartLayout)
+ {
+   mMayStartLayout = aMayStartLayout;
+   if (MayStartLayout()) {
+     // Before starting layout, check whether we're a toplevel chrome
+     // window.  If we are, setup some state so that we don't have to restyle
+     // the whole tree after StartLayout.
+-    if (nsCOMPtr<nsIXULWindow> win = GetXULWindowIfToplevelChrome()) {
+-        // We're the chrome document!
+-        win->BeforeStartLayout();
+-    }
++    // if (nsCOMPtr<nsIXULWindow> win = GetXULWindowIfToplevelChrome()) {
++    //     // We're the chrome document!
++    //     win->BeforeStartLayout();
++    // }
+     ReadyState state = GetReadyStateEnum();
+     if (state >= READYSTATE_INTERACTIVE) {
+       // DOMContentLoaded has fired already.
+       MaybeResolveReadyForIdle();
+     }
+   }
+ }
+ 
+diff --git a/dom/xml/nsXMLContentSink.cpp b/dom/xml/nsXMLContentSink.cpp
+--- a/dom/xml/nsXMLContentSink.cpp
++++ b/dom/xml/nsXMLContentSink.cpp
+@@ -32,16 +32,17 @@
+ #include "nsIScriptElement.h"
+ #include "nsStyleLinkElement.h"
+ #include "nsReadableUtils.h"
+ #include "nsUnicharUtils.h"
+ #include "nsICookieService.h"
+ #include "nsIPrompt.h"
+ #include "nsIChannel.h"
+ #include "nsIPrincipal.h"
++#include "nsIXULWindow.h"
+ #include "nsXMLPrettyPrinter.h"
+ #include "nsNodeInfoManager.h"
+ #include "nsContentCreatorFunctions.h"
+ #include "nsIContentPolicy.h"
+ #include "nsContentPolicyUtils.h"
+ #include "nsError.h"
+ #include "nsNodeUtils.h"
+ #include "nsIScriptGlobalObject.h"
+@@ -321,16 +322,38 @@ nsXMLContentSink::DidBuildModel(bool aTe
+       // stylesheet loads
+       if (mDocument->CSSLoader()->HasPendingLoads()) {
+         mDocument->CSSLoader()->AddObserver(this);
+         // wait for those sheets to load
+         startLayout = false;
+       }
+     }
+ 
++    // For performance reasons, we want to trigger the DocumentL10n's `TriggerInitialDocumentTranslation` within the same
++    // microtask that will be created for a `MozBeforeInitialXULLayout`
++    // event listener.
++    // AddEventListener(NS_LITERAL_STRING("MozBeforeInitialXULLayout"), mDocumentL10n, true, false);
++
++    nsContentUtils::DispatchTrustedEvent(
++        mDocument,
++        static_cast<nsIDocument*>(mDocument),
++        NS_LITERAL_STRING("MozBeforeInitialXULLayout"),
++        CanBubble::eYes,
++        Cancelable::eNo);
++
++    // RemoveEventListener(NS_LITERAL_STRING("MozBeforeInitialXULLayout"), mDocumentL10n, true);
++
++    // Before starting layout, check whether we're a toplevel chrome
++    // window.  If we are, setup some state so that we don't have to restyle
++    // the whole tree after StartLayout.
++    if (nsCOMPtr<nsIXULWindow> win = mDocument->GetXULWindowIfToplevelChrome()) {
++        // We're the chrome document!
++        win->BeforeStartLayout();
++    }
++
+     if (startLayout) {
+       StartLayout(false);
+ 
+       ScrollToRef();
+     }
+ 
+     mDocument->RemoveObserver(this);
+     mIsDocumentObserver = false;
+@@ -1089,17 +1112,17 @@ nsXMLContentSink::HandleStartElement(con
+           new nsDocElementCreatedNotificationRunner(mDocument));
+ 
+       if (aInterruptable && NS_SUCCEEDED(result) && mParser && !mParser->IsParserEnabled()) {
+         return NS_ERROR_HTMLPARSER_BLOCK;
+       }
+     } else if (!mCurrentHead) {
+       // This isn't the root and we're not inside an XHTML <head>.
+       // Might need to start layout
+-      MaybeStartLayout(false);
++      // MaybeStartLayout(false);
+     }
+   }
+ 
+   return aInterruptable && NS_SUCCEEDED(result) ? DidProcessATokenImpl() :
+                                                   result;
+ }
+ 
+ NS_IMETHODIMP
+@@ -1172,17 +1195,17 @@ nsXMLContentSink::HandleEndElement(const
+   }
+ 
+   if (mDocElement == content) {
+     // XXXbz for roots that don't want to be appended on open, we
+     // probably need to deal here.... (and stop appending them on open).
+     mState = eXMLContentSinkState_InEpilog;
+ 
+     // We might have had no occasion to start layout yet.  Do so now.
+-    MaybeStartLayout(false);
++    // MaybeStartLayout(false);
+   }
+ 
+   DidAddContent();
+ 
+   if (content->IsSVGElement(nsGkAtoms::svg)) {
+     FlushTags();
+     nsCOMPtr<nsIRunnable> event = new nsHtml5SVGLoadDispatcher(content);
+     if (NS_FAILED(content->OwnerDoc()->Dispatch(TaskCategory::Other,
