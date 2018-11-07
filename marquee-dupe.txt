@@ -1,0 +1,4816 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Date 1516137741 28800
+#      Tue Jan 16 13:22:21 2018 -0800
+# Node ID 5d186365742a04298400c21f6c0f43944f979ec0
+# Parent  957a743c4ca2907d8e357fce43fbcd9f619f1122
+Bug 1425874 - Implement HTMLMarqueeElement
+
+This adds a new class for the marquee tag, instead of overloading HTMLDivElement.
+It removes some of the XBL that was used to expose properties to web content.
+
+Differential Revision: https://phabricator.services.mozilla.com/D3824
+
+diff --git a/dom/html/HTMLDivElement.cpp b/dom/html/HTMLDivElement.cpp
+--- a/dom/html/HTMLDivElement.cpp
++++ b/dom/html/HTMLDivElement.cpp
+@@ -29,86 +29,42 @@ HTMLDivElement::WrapNode(JSContext *aCx,
+ 
+ bool
+ HTMLDivElement::ParseAttribute(int32_t aNamespaceID,
+                                nsAtom* aAttribute,
+                                const nsAString& aValue,
+                                nsIPrincipal* aMaybeScriptedPrincipal,
+                                nsAttrValue& aResult)
+ {
+-  if (aNamespaceID == kNameSpaceID_None) {
+-    if (mNodeInfo->Equals(nsGkAtoms::marquee)) {
+-      if ((aAttribute == nsGkAtoms::width) ||
+-          (aAttribute == nsGkAtoms::height)) {
+-        return aResult.ParseSpecialIntValue(aValue);
+-      }
+-      if (aAttribute == nsGkAtoms::bgcolor) {
+-        return aResult.ParseColor(aValue);
+-      }
+-      if ((aAttribute == nsGkAtoms::hspace) ||
+-          (aAttribute == nsGkAtoms::vspace)) {
+-        return aResult.ParseIntWithBounds(aValue, 0);
+-      }
+-    }
+-
+-    if (mNodeInfo->Equals(nsGkAtoms::div) &&
+-        aAttribute == nsGkAtoms::align) {
+-      return ParseDivAlignValue(aValue, aResult);
+-    }
++  if (aNamespaceID == kNameSpaceID_None && aAttribute == nsGkAtoms::align) {
++    return ParseDivAlignValue(aValue, aResult);
+   }
+ 
+   return nsGenericHTMLElement::ParseAttribute(aNamespaceID, aAttribute, aValue,
+                                               aMaybeScriptedPrincipal, aResult);
+ }
+ 
+ void
+ HTMLDivElement::MapAttributesIntoRule(const nsMappedAttributes* aAttributes,
+                                       MappedDeclarations& aDecls)
+ {
+   nsGenericHTMLElement::MapDivAlignAttributeInto(aAttributes, aDecls);
+   nsGenericHTMLElement::MapCommonAttributesInto(aAttributes, aDecls);
+ }
+ 
+-static void
+-MapMarqueeAttributesIntoRule(const nsMappedAttributes* aAttributes, MappedDeclarations& aDecls)
+-{
+-  nsGenericHTMLElement::MapImageMarginAttributeInto(aAttributes, aDecls);
+-  nsGenericHTMLElement::MapImageSizeAttributesInto(aAttributes, aDecls);
+-  nsGenericHTMLElement::MapCommonAttributesInto(aAttributes, aDecls);
+-  nsGenericHTMLElement::MapBGColorInto(aAttributes, aDecls);
+-}
+-
+ NS_IMETHODIMP_(bool)
+ HTMLDivElement::IsAttributeMapped(const nsAtom* aAttribute) const
+ {
+-  if (mNodeInfo->Equals(nsGkAtoms::div)) {
+-    static const MappedAttributeEntry* const map[] = {
+-      sDivAlignAttributeMap,
+-      sCommonAttributeMap
+-    };
+-    return FindAttributeDependence(aAttribute, map);
+-  }
+-  if (mNodeInfo->Equals(nsGkAtoms::marquee)) {
+-    static const MappedAttributeEntry* const map[] = {
+-      sImageMarginSizeAttributeMap,
+-      sBackgroundColorAttributeMap,
+-      sCommonAttributeMap
+-    };
+-    return FindAttributeDependence(aAttribute, map);
+-  }
+-
+-  return nsGenericHTMLElement::IsAttributeMapped(aAttribute);
++  static const MappedAttributeEntry* const map[] = {
++    sDivAlignAttributeMap,
++    sCommonAttributeMap
++  };
++  return FindAttributeDependence(aAttribute, map);
+ }
+ 
+ nsMapRuleToAttributesFunc
+ HTMLDivElement::GetAttributeMappingFunction() const
+ {
+-  if (mNodeInfo->Equals(nsGkAtoms::div)) {
+-    return &MapAttributesIntoRule;
+-  }
+-  if (mNodeInfo->Equals(nsGkAtoms::marquee)) {
+-    return &MapMarqueeAttributesIntoRule;
+-  }
+-  return nsGenericHTMLElement::GetAttributeMappingFunction();
++  return &MapAttributesIntoRule;
+ }
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/html/HTMLMarqueeElement.cpp b/dom/html/HTMLMarqueeElement.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/html/HTMLMarqueeElement.cpp
+@@ -0,0 +1,155 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "mozilla/dom/HTMLMarqueeElement.h"
++#include "nsGenericHTMLElement.h"
++#include "nsStyleConsts.h"
++#include "nsMappedAttributes.h"
++#include "mozilla/dom/HTMLMarqueeElementBinding.h"
++#include "mozilla/dom/CustomEvent.h"
++
++NS_IMPL_NS_NEW_HTML_ELEMENT(Marquee)
++
++namespace mozilla {
++namespace dom {
++
++HTMLMarqueeElement::~HTMLMarqueeElement()
++{
++}
++
++NS_IMPL_ELEMENT_CLONE(HTMLMarqueeElement)
++
++static const nsAttrValue::EnumTable kBehaviorTable[] = {
++  { "scroll", 1 },
++  { "slide", 2 },
++  { "alternate", 3 },
++  { nullptr, 0 }
++};
++
++// Default behavior value is "scroll".
++static const nsAttrValue::EnumTable* kDefaultBehavior = &kBehaviorTable[0];
++
++static const nsAttrValue::EnumTable kDirectionTable[] = {
++  { "left", 1 },
++  { "right", 2 },
++  { "up", 3 },
++  { "down", 4 },
++  { nullptr, 0 }
++};
++
++// Default direction value is "left".
++static const nsAttrValue::EnumTable* kDefaultDirection = &kDirectionTable[0];
++
++JSObject*
++HTMLMarqueeElement::WrapNode(JSContext *aCx, JS::Handle<JSObject*> aGivenProto)
++{
++  return dom::HTMLMarqueeElement_Binding::Wrap(aCx, this, aGivenProto);
++}
++
++void
++HTMLMarqueeElement::GetBehavior(nsAString& aValue)
++{
++  GetEnumAttr(nsGkAtoms::behavior, kDefaultBehavior->tag, aValue);
++}
++
++void
++HTMLMarqueeElement::GetDirection(nsAString& aValue)
++{
++  GetEnumAttr(nsGkAtoms::direction, kDefaultDirection->tag, aValue);
++}
++
++bool
++HTMLMarqueeElement::ParseAttribute(int32_t aNamespaceID,
++                               nsAtom* aAttribute,
++                               const nsAString& aValue,
++                               nsIPrincipal* aMaybeScriptedPrincipal,
++                               nsAttrValue& aResult)
++{
++  if (aNamespaceID == kNameSpaceID_None) {
++    if ((aAttribute == nsGkAtoms::width) ||
++        (aAttribute == nsGkAtoms::height)) {
++      return aResult.ParseSpecialIntValue(aValue);
++    }
++    if (aAttribute == nsGkAtoms::bgcolor) {
++      return aResult.ParseColor(aValue);
++    }
++    if (aAttribute == nsGkAtoms::behavior) {
++      return aResult.ParseEnumValue(aValue, kBehaviorTable, false, kDefaultBehavior);
++    }
++    if (aAttribute == nsGkAtoms::direction) {
++      return aResult.ParseEnumValue(aValue, kDirectionTable, false, kDefaultDirection);
++    }
++    if ((aAttribute == nsGkAtoms::hspace) ||
++        (aAttribute == nsGkAtoms::vspace)) {
++      return aResult.ParseIntWithBounds(aValue, 0);
++    }
++
++    if (aAttribute == nsGkAtoms::loop) {
++      return aResult.ParseIntValue(aValue);
++    }
++
++    if (aAttribute == nsGkAtoms::scrollamount ||
++        aAttribute == nsGkAtoms::scrolldelay) {
++      return aResult.ParseNonNegativeIntValue(aValue);
++    }
++  }
++
++  return nsGenericHTMLElement::ParseAttribute(aNamespaceID, aAttribute, aValue,
++                                              aMaybeScriptedPrincipal, aResult);
++}
++
++void
++HTMLMarqueeElement::MapAttributesIntoRule(const nsMappedAttributes* aAttributes, MappedDeclarations& aDecls)
++{
++  nsGenericHTMLElement::MapImageMarginAttributeInto(aAttributes, aDecls);
++  nsGenericHTMLElement::MapImageSizeAttributesInto(aAttributes, aDecls);
++  nsGenericHTMLElement::MapCommonAttributesInto(aAttributes, aDecls);
++  nsGenericHTMLElement::MapBGColorInto(aAttributes, aDecls);
++}
++
++NS_IMETHODIMP_(bool)
++HTMLMarqueeElement::IsAttributeMapped(const nsAtom* aAttribute) const
++{
++  static const MappedAttributeEntry* const map[] = {
++    sImageMarginSizeAttributeMap,
++    sBackgroundColorAttributeMap,
++    sCommonAttributeMap
++  };
++  return FindAttributeDependence(aAttribute, map);
++}
++
++nsMapRuleToAttributesFunc
++HTMLMarqueeElement::GetAttributeMappingFunction() const
++{
++  return &MapAttributesIntoRule;
++}
++
++void
++HTMLMarqueeElement::Start()
++{
++  RefPtr<CustomEvent> event = NS_NewDOMCustomEvent(this, nullptr, nullptr);
++  MOZ_ASSERT(event);
++  event->InitCustomEvent(nullptr, NS_LITERAL_STRING("marquee-start"), false, false, JS::NullHandleValue);
++  event->SetTrusted(true);
++
++  ErrorResult err;
++  this->DispatchEvent(*event, err);
++}
++
++void
++HTMLMarqueeElement::Stop()
++{
++  RefPtr<CustomEvent> event = NS_NewDOMCustomEvent(this, nullptr, nullptr);
++  MOZ_ASSERT(event);
++  event->InitCustomEvent(nullptr, NS_LITERAL_STRING("marquee-stop"), false, false, JS::NullHandleValue);
++  event->SetTrusted(true);
++
++  ErrorResult err;
++  this->DispatchEvent(*event, err);
++}
++
++} // namespace dom
++} // namespace mozilla
+diff --git a/dom/html/HTMLMarqueeElement.h b/dom/html/HTMLMarqueeElement.h
+new file mode 100644
+--- /dev/null
++++ b/dom/html/HTMLMarqueeElement.h
+@@ -0,0 +1,146 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++#ifndef HTMLMarqueeElement_h___
++#define HTMLMarqueeElement_h___
++
++#include "mozilla/Attributes.h"
++#include "nsGenericHTMLElement.h"
++#include "nsContentUtils.h"
++
++namespace mozilla {
++namespace dom {
++
++class HTMLMarqueeElement final : public nsGenericHTMLElement
++{
++public:
++  explicit HTMLMarqueeElement(already_AddRefed<dom::NodeInfo>&& aNodeInfo)
++    : nsGenericHTMLElement(std::move(aNodeInfo))
++  {
++  }
++
++  static const int kDefaultLoop = -1;
++  static const int kDefaultScrollAmount = 6;
++  static const int kDefaultScrollDelayMS = 85;
++
++  void GetBehavior(nsAString& aValue);
++  void SetBehavior(const nsAString& aValue, ErrorResult& aError)
++  {
++    SetHTMLAttr(nsGkAtoms::behavior, aValue, aError);
++  }
++
++  void GetDirection(nsAString& aValue);
++  void SetDirection(const nsAString& aValue, ErrorResult& aError)
++  {
++    SetHTMLAttr(nsGkAtoms::direction, aValue, aError);
++  }
++
++  void GetBgColor(DOMString& aBgColor)
++  {
++    GetHTMLAttr(nsGkAtoms::bgcolor, aBgColor);
++  }
++  void SetBgColor(const nsAString& aBgColor, ErrorResult& aError)
++  {
++    SetHTMLAttr(nsGkAtoms::bgcolor, aBgColor, aError);
++  }
++  void GetHeight(DOMString& aHeight)
++  {
++    GetHTMLAttr(nsGkAtoms::height, aHeight);
++  }
++  void SetHeight(const nsAString& aHeight, ErrorResult& aError)
++  {
++    SetHTMLAttr(nsGkAtoms::height, aHeight, aError);
++  }
++  uint32_t Hspace()
++  {
++    return GetIntAttr(nsGkAtoms::hspace, 0);
++  }
++  void SetHspace(uint32_t aValue, ErrorResult& aError)
++  {
++    SetUnsignedIntAttr(nsGkAtoms::hspace, aValue, 0, aError);
++  }
++  int32_t Loop()
++  {
++    int loop = GetIntAttr(nsGkAtoms::loop, kDefaultLoop);
++    if (loop <= 0) {
++      loop = -1;
++    }
++
++    return loop;
++  }
++  void SetLoop(int32_t aValue, ErrorResult& aError)
++  {
++    if (aValue == -1 || aValue > 0) {
++      SetHTMLIntAttr(nsGkAtoms::loop, aValue, aError);
++    }
++  }
++  uint32_t ScrollAmount()
++  {
++    return GetUnsignedIntAttr(nsGkAtoms::scrollamount, kDefaultScrollAmount);
++  }
++  void SetScrollAmount(uint32_t aValue, ErrorResult& aError)
++  {
++    SetUnsignedIntAttr(nsGkAtoms::scrollamount, aValue, kDefaultScrollAmount, aError);
++  }
++  uint32_t ScrollDelay()
++  {
++    return GetUnsignedIntAttr(nsGkAtoms::scrolldelay, kDefaultScrollDelayMS);
++  }
++  void SetScrollDelay(uint32_t aValue, ErrorResult& aError)
++  {
++    SetUnsignedIntAttr(nsGkAtoms::scrolldelay, aValue, kDefaultScrollDelayMS, aError);
++  }
++  bool TrueSpeed() const
++  {
++    return GetBoolAttr(nsGkAtoms::truespeed);
++  }
++  void SetTrueSpeed(bool aValue, ErrorResult& aError)
++  {
++    SetHTMLBoolAttr(nsGkAtoms::truespeed, aValue, aError);
++  }
++  void GetWidth(DOMString& aWidth)
++  {
++    GetHTMLAttr(nsGkAtoms::width, aWidth);
++  }
++  void SetWidth(const nsAString& aWidth, ErrorResult& aError)
++  {
++    SetHTMLAttr(nsGkAtoms::width, aWidth, aError);
++  }
++  uint32_t Vspace()
++  {
++    return GetIntAttr(nsGkAtoms::vspace, 0);
++  }
++  void SetVspace(uint32_t aValue, ErrorResult& aError)
++  {
++    SetUnsignedIntAttr(nsGkAtoms::vspace, aValue, 0, aError);
++  }
++
++  void Start();
++  void Stop();
++
++  bool ParseAttribute(int32_t aNamespaceID,
++                              nsAtom* aAttribute,
++                              const nsAString& aValue,
++                              nsIPrincipal* aMaybeScriptedPrincipal,
++                              nsAttrValue& aResult) override;
++  NS_IMETHOD_(bool) IsAttributeMapped(const nsAtom* aAttribute) const override;
++  nsMapRuleToAttributesFunc GetAttributeMappingFunction() const override;
++
++  nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
++
++protected:
++  virtual ~HTMLMarqueeElement();
++
++  JSObject* WrapNode(JSContext *aCx, JS::Handle<JSObject*> aGivenProto) override;
++
++private:
++  static void MapAttributesIntoRule(const nsMappedAttributes* aAttributes,
++                                    MappedDeclarations&);
++};
++
++} // namespace dom
++} // namespace mozilla
++
++#endif /* HTMLMarqueeElement_h___ */
+diff --git a/dom/html/HTMLTrackElement.cpp b/dom/html/HTMLTrackElement.cpp
+--- a/dom/html/HTMLTrackElement.cpp
++++ b/dom/html/HTMLTrackElement.cpp
+@@ -2,16 +2,20 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "mozilla/dom/Element.h"
+ #include "mozilla/dom/HTMLMediaElement.h"
+ #include "mozilla/dom/HTMLTrackElement.h"
++#ifdef XP_WIN
++// HTMLTrackElement.webidl defines ERROR, but so does windows.h:
++#undef ERROR
++#endif
+ #include "mozilla/dom/HTMLTrackElementBinding.h"
+ #include "mozilla/dom/HTMLUnknownElement.h"
+ #include "nsIContentPolicy.h"
+ #include "mozilla/LoadInfo.h"
+ #include "WebVTTListener.h"
+ #include "nsAttrValueInlines.h"
+ #include "nsCOMPtr.h"
+ #include "nsContentPolicyUtils.h"
+diff --git a/dom/html/moz.build b/dom/html/moz.build
+--- a/dom/html/moz.build
++++ b/dom/html/moz.build
+@@ -80,16 +80,17 @@ EXPORTS.mozilla.dom += [
+     'HTMLIFrameElement.h',
+     'HTMLImageElement.h',
+     'HTMLInputElement.h',
+     'HTMLLabelElement.h',
+     'HTMLLegendElement.h',
+     'HTMLLIElement.h',
+     'HTMLLinkElement.h',
+     'HTMLMapElement.h',
++    'HTMLMarqueeElement.h',
+     'HTMLMediaElement.h',
+     'HTMLMenuElement.h',
+     'HTMLMenuItemElement.h',
+     'HTMLMetaElement.h',
+     'HTMLMeterElement.h',
+     'HTMLModElement.h',
+     'HTMLObjectElement.h',
+     'HTMLOptGroupElement.h',
+@@ -160,16 +161,17 @@ UNIFIED_SOURCES += [
+     'HTMLIFrameElement.cpp',
+     'HTMLImageElement.cpp',
+     'HTMLInputElement.cpp',
+     'HTMLLabelElement.cpp',
+     'HTMLLegendElement.cpp',
+     'HTMLLIElement.cpp',
+     'HTMLLinkElement.cpp',
+     'HTMLMapElement.cpp',
++    'HTMLMarqueeElement.cpp',
+     'HTMLMediaElement.cpp',
+     'HTMLMenuElement.cpp',
+     'HTMLMenuItemElement.cpp',
+     'HTMLMetaElement.cpp',
+     'HTMLMeterElement.cpp',
+     'HTMLModElement.cpp',
+     'HTMLObjectElement.cpp',
+     'HTMLOptGroupElement.cpp',
+diff --git a/dom/html/nsGenericHTMLElement.h b/dom/html/nsGenericHTMLElement.h
+--- a/dom/html/nsGenericHTMLElement.h
++++ b/dom/html/nsGenericHTMLElement.h
+@@ -1303,16 +1303,17 @@ NS_DECLARE_NS_NEW_HTML_ELEMENT(Heading)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT_AS_SHARED(Html)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(IFrame)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(Image)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(Input)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(LI)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(Label)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(Legend)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(Link)
++NS_DECLARE_NS_NEW_HTML_ELEMENT(Marquee)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(Map)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(Menu)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(MenuItem)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(Meta)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(Meter)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(Object)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(OptGroup)
+ NS_DECLARE_NS_NEW_HTML_ELEMENT(Option)
+diff --git a/dom/html/test/test_bug389797.html b/dom/html/test/test_bug389797.html
+--- a/dom/html/test/test_bug389797.html
++++ b/dom/html/test/test_bug389797.html
+@@ -145,17 +145,17 @@ HTML_TAG("keygen", "Span");
+ HTML_TAG("label", "Label");
+ HTML_TAG("legend", "Legend");
+ HTML_TAG("li", "LI");
+ HTML_TAG("link", "Link");
+ HTML_TAG("listing", "Pre");
+ HTML_TAG("main", "");
+ HTML_TAG("map", "Map");
+ HTML_TAG("mark", "");
+-HTML_TAG("marquee", "Div");
++HTML_TAG("marquee", "Marquee");
+ HTML_TAG("menu", "Menu");
+ HTML_TAG("meta", "Meta");
+ HTML_TAG("meter", "Meter");
+ HTML_TAG("multicol", "Unknown");
+ HTML_TAG("nav", "")
+ HTML_TAG("nobr", "");
+ HTML_TAG("noembed", "");
+ HTML_TAG("noframes", "");
+diff --git a/dom/tests/mochitest/bugs/test_bug1160342_marquee.html b/dom/tests/mochitest/bugs/test_bug1160342_marquee.html
+--- a/dom/tests/mochitest/bugs/test_bug1160342_marquee.html
++++ b/dom/tests/mochitest/bugs/test_bug1160342_marquee.html
+@@ -37,42 +37,29 @@ https://bugzilla.mozilla.org/show_bug.cg
+     is(x.behavior, "scroll", "Wrong behavior value");
+     x.setAttribute('behavior', 'slide');
+     x.removeAttribute('behavior');
+     is(x.behavior, "scroll", "Wrong behavior value");
+     is(x.getAttribute('behavior'), null, "Wrong behavior attribute");
+ 
+     x.behavior = 'alternate';
+     is(x.behavior, "alternate", "Wrong behavior value");
+-    try {
+-      x.behavior = 'invalid';
+-      todo_is(false, true, "marquee.behavior = 'invalid' should throw");
+-    } catch(e) {
+-      ok(true, "Exception was raised");
+-    }
+-    is(x.behavior, "alternate", "Wrong behavior value");
+-    is(x.getAttribute('behavior'), "alternate", "Wrong behavior attribute");
++    x.behavior = 'invalid';
++    is(x.behavior, "scroll", "Wrong behavior value");
++    is(x.getAttribute('behavior'), "invalid", "Wrong behavior attribute");
+     x.behavior = 'Slide';
+     is(x.behavior, "slide", "Wrong behavior value");
+-    is(x.getAttribute('behavior'), "slide", "Wrong behavior attribute");
+-    try {
+-      x.behavior = 'invalid';
+-      todo_is(false, true, "marquee.behavior = 'invalid' should throw");
+-    } catch(e) {
+-      ok(true, "Exception was raised");
+-    }
+-    try {
+-      x.behavior = null;
+-      x.behavior = undefined;
+-      todo_is(false, true, "marquee.behavior = 'invalid' should throw");
+-    } catch(e) {
+-      ok(true, "Exception was raised");
+-    }
+-    is(x.behavior, "slide", "Wrong behavior value");
+-    is(x.getAttribute('behavior'), "slide", "Wrong behavior attribute");
++    is(x.getAttribute('behavior'), "Slide", "Wrong behavior attribute");
++    x.behavior = 'invalid';
++    is(x.behavior, "scroll", "Wrong behavior value");
++    x.behavior = null;
++    is(x.behavior, "scroll", "Wrong behavior value");
++    x.behavior = undefined;
++    is(x.behavior, "scroll", "Wrong behavior value");
++    is(x.getAttribute('behavior'), 'undefined', "Wrong behavior attribute");
+     // This doesn't work in Mozilla due to chrome XBL security issues
+     x.behavior = { toString: function _toString() { return "scroll"} }
+     is(x.behavior, x.getAttribute('behavior'), "Wrong behavior value");
+     x.behavior = 'scroll';
+     is(x.behavior, "scroll", "Wrong behavior value");
+ 
+     is(x.loop, -1, "Wrong loop value");
+     x.setAttribute('loop', '1');
+@@ -81,17 +68,17 @@ https://bugzilla.mozilla.org/show_bug.cg
+     is(x.loop, -1, "Wrong loop value");
+     x.setAttribute('loop', '');
+     is(x.loop, -1, "Wrong loop value");
+     x.setAttribute('loop', '0');
+     is(x.loop, -1, "Wrong loop value");
+     x.setAttribute('loop', '1000');
+     is(x.loop, 1000, "Wrong loop value");
+     x.setAttribute('loop', '-0.123');
+-    is(x.loop, 1000, "Wrong loop value");
++    is(x.loop, -1, "Wrong loop value");
+     x.setAttribute('loop', '-1.123');
+     is(x.loop, -1, "Wrong loop value");
+     x.setAttribute('loop', '-1');
+     is(x.loop, -1, "Wrong loop value");
+     x.setAttribute('loop', '1000');
+     is(x.loop, 1000, "Wrong loop value");
+     x.removeAttribute('loop');
+     is(x.loop, -1, "Wrong loop value");
+@@ -127,25 +114,25 @@ https://bugzilla.mozilla.org/show_bug.cg
+     x.loop = -1;
+     is(x.loop, -1, "Wrong loop value");
+     is(x.getAttribute('loop'), "-1", "Wrong loop attribute");
+     x.loop = '100';
+     is(x.loop, 100, "Wrong loop value");
+     is(x.getAttribute('loop'), "100", "Wrong loop attribute");
+     try {
+       x.loop = -0.123;
+-      todo_is(false, true, "marquee.loop = null should throw");
++      todo_is(false, true, "marquee.loop = -0.123 should throw");
+     } catch(e) {
+       ok(true, "Exception was raised");
+     }
+     is(x.loop, 100, "Wrong loop value");
+     is(x.getAttribute('loop'), "100", "Wrong loop attribute");
+     try {
+       x.loop = 0;
+-      todo_is(false, true, "marquee.loop = null should throw");
++      todo_is(false, true, "marquee.loop = 0 should throw");
+     } catch(e) {
+       ok(true, "Exception was raised");
+     }
+     is(x.loop, 100, "Wrong loop value");
+     is(x.getAttribute('loop'), "100", "Wrong loop attribute");
+     x.loop = -1.123;
+     is(x.loop, -1, "Wrong loop value");
+     is(x.getAttribute('loop'), "-1", "Wrong loop attribute");
+@@ -154,104 +141,78 @@ https://bugzilla.mozilla.org/show_bug.cg
+     is(x.scrollAmount, 6, "Wrong scrollAmount value");
+     x.setAttribute('scrollAmount', '1');
+     is(x.scrollAmount, 1, "Wrong scrollAmount value");
+     x.setAttribute('scrollAmount', 'invalid');
+     is(x.scrollAmount, 6, "Wrong scrollAmount value");
+     x.setAttribute('scrollAmount', '1000');
+     is(x.scrollAmount, 1000, "Wrong scrollAmount value");
+     x.setAttribute('scrollAmount', '-1');
+-    is(x.scrollAmount, 1000, "Wrong scrollAmount value");
++    is(x.scrollAmount, 6, "Wrong scrollAmount value");
+     x.setAttribute('scrollAmount', '999');
+     is(x.scrollAmount, 999, "Wrong scrollAmount value");
+     x.setAttribute('scrollAmount', '');
+     is(x.scrollAmount, 6, "Wrong scrollAmount value");
+     x.setAttribute('scrollAmount', '999');
+     x.removeAttribute('scrollAmount');
+     is(x.scrollAmount, 6, "Wrong scrollAmount value");
+     is(x.getAttribute('scrollamount'), null, "Wrong scrollamount attribute");
+ 
+     x.scrollAmount = 1;
+     is(x.scrollAmount, 1, "Wrong scrollAmount value");
+-    is(x.getAttribute('scrollamount'), "1", "Wrong scrolldelay attribute");
+-    try {
+-      x.scrollAmount = -2;
+-      todo_is(false, true, "marquee.scrollAmount = -2 should throw");
+-    } catch(e) {
+-      ok(true, "Exception was raised");
+-    }
+-    is(x.scrollAmount, 1, "Wrong scrollAmount value");
+-    is(x.getAttribute('scrollamount'), "1", "Wrong scrolldelay attribute");
++    is(x.getAttribute('scrollamount'), "1", "Wrong scrollamount attribute");
++    x.scrollAmount = -2;
++    is(x.scrollAmount, 6, "Wrong scrollAmount value");
++    is(x.getAttribute('scrollamount'), "6", "Wrong scrollamount attribute");
+     x.scrollAmount = 'invalid';
+     is(x.scrollAmount, 0, "Wrong scrollAmount value");
+-    is(x.getAttribute('scrollamount'), "0", "Wrong scrolldelay attribute");
++    is(x.getAttribute('scrollamount'), "0", "Wrong scrollamount attribute");
+     x.scrollAmount = 1;
+     x.scrollAmount = null;
+     is(x.scrollAmount, 0, "Wrong scrollAmount value");
+-    is(x.getAttribute('scrollamount'), "0", "Wrong scrolldelay attribute");
++    is(x.getAttribute('scrollamount'), "0", "Wrong scrollamount attribute");
+     x.scrollAmount = '2';
+     is(x.scrollAmount, 2, "Wrong scrollAmount value");
+-    is(x.getAttribute('scrollamount'), "2", "Wrong scrolldelay attribute");
+-
++    is(x.getAttribute('scrollamount'), "2", "Wrong scrollamount attribute");
+ 
+     is(x.scrollDelay, 85, "Wrong scrollDelay value");
+     x.setAttribute('scrollDelay', '1');
+     is(x.scrollDelay, 1, "Wrong scrollDelay value");
+     x.setAttribute('scrollDelay', 'invalid');
+     is(x.scrollDelay, 85, "Wrong scrollDelay value");
+     x.setAttribute('scrollDelay', '70');
+     is(x.scrollDelay, 70, "Wrong scrollDelay value");
+     x.setAttribute('scrollDelay', '59');
+     is(x.scrollDelay, 59, "Wrong scrollDelay value");
+     x.setAttribute('scrollDelay', '1000');
+     is(x.scrollDelay, 1000, "Wrong scrollDelay value");
+     x.setAttribute('scrollDelay', '-1');
+-    is(x.scrollDelay, 1000, "Wrong scrollDelay value");
++    is(x.scrollDelay, 85, "Wrong scrollDelay value");
+     x.setAttribute('scrollDelay', '');
+     is(x.scrollDelay, 85, "Wrong scrollDelay value");
+     x.setAttribute('scrollDelay', '1000');
+     x.removeAttribute('scrollDelay');
+     is(x.scrollDelay, 85, "Wrong scrollDelay value");
+     is(x.getAttribute('scrolldelay'), null, "Wrong scrolldelay attribute");
+ 
+     x.scrollDelay = 100;
+     is(x.scrollDelay, 100, "Wrong scrollDelay value");
+     is(x.getAttribute('scrolldelay'), "100", "Wrong scrolldelay attribute");
+-    try {
+-      x.scrollDelay = -2;
+-      todo_is(false, true, "marquee.scrollDelay = -2 should throw");
+-    } catch(e) {
+-      ok(true, "Exception was raised");
+-    }
+-    is(x.scrollDelay, 100, "Wrong scrollDelay value");
+-    is(x.getAttribute('scrolldelay'), "100", "Wrong scrolldelay attribute");
+-    try {
+-      x.scrollDelay = 'invalid';
+-      todo_is(false, true, "marquee.scrollDelay = 'invalid' should throw");
+-    } catch(e) {
+-      ok(true, "Exception was raised");
+-    }
+-    is(x.scrollDelay, 100, "Wrong scrollDelay value");
+-    is(x.getAttribute('scrolldelay'), "100", "Wrong scrolldelay attribute");
+-    try {
+-      x.scrollDelay = null;
+-      todo_is(false, true, "marquee.scrollDelay = null should throw");
+-    } catch(e) {
+-      ok(true, "Exception was raised");
+-    }
+-    is(x.scrollDelay, 100, "Wrong scrollDelay value");
+-    is(x.getAttribute('scrolldelay'), "100", "Wrong scrolldelay attribute");
+-    try {
+-      x.scrollDelay = -1;
+-      todo_is(false, true, "marquee.scrollDelay = -1 should throw");
+-    } catch(e) {
+-      ok(true, "Exception was raised");
+-    }
+-    is(x.scrollDelay, 100, "Wrong scrollDelay value");
+-    is(x.getAttribute('scrolldelay'), "100", "Wrong scrolldelay attribute");
++    x.scrollDelay = -2;
++    is(x.scrollDelay, 85, "Wrong scrollDelay value");
++    is(x.getAttribute('scrolldelay'), "85", "Wrong scrolldelay attribute");
++    x.scrollDelay = 'invalid';
++    is(x.scrollDelay, 0, "Wrong scrollDelay value");
++    is(x.getAttribute('scrolldelay'), "0", "Wrong scrolldelay attribute");
++    x.scrollDelay = null;
++    is(x.scrollDelay, 0, "Wrong scrollDelay value");
++    is(x.getAttribute('scrolldelay'), "0", "Wrong scrolldelay attribute");
++    x.scrollDelay = -1;
++    is(x.scrollDelay, 85, "Wrong scrollDelay value");
++    is(x.getAttribute('scrolldelay'), "85", "Wrong scrolldelay attribute");
+     x.scrollDelay = '50';
+     is(x.scrollDelay, 50, "Wrong scrollDelay value");
+     is(x.getAttribute('scrolldelay'), "50", "Wrong scrolldelay attribute");
+ 
+ 
+     is(x.trueSpeed, false, "Wrong trueSpeed value");
+     x.setAttribute('trueSpeed', '1');
+     is(x.trueSpeed, true, "Wrong trueSpeed value");
+@@ -302,32 +263,22 @@ https://bugzilla.mozilla.org/show_bug.cg
+     is(x.direction, "right", "Wrong direction value");
+     is(x.getAttribute('direction'), "right", "Wrong direction attribute");
+     x.direction = 'up';
+     is(x.direction, "up", "Wrong direction value");
+     is(x.getAttribute('direction'), "up", "Wrong direction attribute");
+     x.direction = 'down';
+     is(x.direction, "down", "Wrong direction value");
+     is(x.getAttribute('direction'), "down", "Wrong direction attribute");
+-    try {
+-      x.direction = 1;
+-      todo_is(false, true, "marquee.direction = 1 should throw");
+-    } catch(e) {
+-      ok(true, "Exception was raised");
+-    }
+-    is(x.direction, "down", "Wrong direction value");
+-    is(x.getAttribute('direction'), "down", "Wrong direction attribute");
+-    try {
+-      x.direction = null;
+-      todo_is(false, true, "marquee.direction = null should throw");
+-    } catch(e) {
+-      ok(true, "Exception was raised");
+-    }
+-    is(x.direction, "down", "Wrong direction value");
+-    is(x.getAttribute('direction'), "down", "Wrong direction attribute");
++    x.direction = 1;
++    is(x.direction, "left", "Wrong direction value");
++    is(x.getAttribute('direction'), "1", "Wrong direction attribute");
++    x.direction = null;
++    is(x.direction, "left", "Wrong direction value");
++    is(x.getAttribute('direction'), "null", "Wrong direction attribute");
+     // This doesn't work in Mozilla due to chrome XBL security issues
+     x.direction = { toString: function _toString() { return "right"} }
+     is(x.direction, x.getAttribute('direction'), "Wrong direction value");
+     x.direction = 'left';
+     is(x.direction, "left", "Wrong direction value");
+     SimpleTest.finish();
+   }, 0);
+ 
+diff --git a/dom/tests/mochitest/general/test_interfaces.js b/dom/tests/mochitest/general/test_interfaces.js
+--- a/dom/tests/mochitest/general/test_interfaces.js
++++ b/dom/tests/mochitest/general/test_interfaces.js
+@@ -468,16 +468,18 @@ var interfaceNamesInGlobalScope =
+     {name: "HTMLLegendElement", insecureContext: true},
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     {name: "HTMLLIElement", insecureContext: true},
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     {name: "HTMLLinkElement", insecureContext: true},
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     {name: "HTMLMapElement", insecureContext: true},
+ // IMPORTANT: Do not change this list without review from a DOM peer!
++    {name: "HTMLMarqueeElement", insecureContext: true},
++// IMPORTANT: Do not change this list without review from a DOM peer!
+     {name: "HTMLMediaElement", insecureContext: true},
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     {name: "HTMLMenuElement", insecureContext: true},
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     {name: "HTMLMenuItemElement", insecureContext: true},
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+     {name: "HTMLMetaElement", insecureContext: true},
+ // IMPORTANT: Do not change this list without review from a DOM peer!
+diff --git a/dom/tests/mochitest/webcomponents/htmlconstructor_builtin_tests.js b/dom/tests/mochitest/webcomponents/htmlconstructor_builtin_tests.js
+--- a/dom/tests/mochitest/webcomponents/htmlconstructor_builtin_tests.js
++++ b/dom/tests/mochitest/webcomponents/htmlconstructor_builtin_tests.js
+@@ -65,17 +65,17 @@
+   ['label', 'Label'],
+   ['legend', 'Legend'],
+   ['li', 'LI'],
+   ['link', 'Link'],
+   ['listing', 'Pre'],
+   ['main', ''],
+   ['map', 'Map'],
+   ['mark', ''],
+-  ['marquee', 'Div'],
++  ['marquee', 'Marquee'],
+   ['menu', 'Menu'],
+   ['menuitem', 'MenuItem'],
+   ['meta', 'Meta'],
+   ['meter', 'Meter'],
+   ['nav', ''],
+   ['nobr', ''],
+   ['noembed', ''],
+   ['noframes', ''],
+diff --git a/layout/style/xbl-marquee/xbl-marquee.xml b/layout/style/xbl-marquee/xbl-marquee.xml
+--- a/layout/style/xbl-marquee/xbl-marquee.xml
++++ b/layout/style/xbl-marquee/xbl-marquee.xml
+@@ -10,136 +10,38 @@
+           xmlns:xbl="http://www.mozilla.org/xbl">
+ 
+ 
+   <binding id="marquee" bindToUntrustedContent="true">
+ 
+     <resources>
+       <stylesheet src="chrome://xbl-marquee/content/xbl-marquee.css"/>
+     </resources>
+-    <implementation>
+-
+-      <property name="scrollAmount" exposeToUntrustedContent="true">
+-        <getter>
+-          <![CDATA[
+-          this._mutationActor(this._mutationObserver.takeRecords());
+-          return this._scrollAmount;
+-          ]]>
+-        </getter>
+-        <setter>
+-          <![CDATA[
+-          var val = parseInt(val);
+-          if (val < 0) {
+-            return;
+-          }
+-          if (isNaN(val)) {
+-            val = 0;
++    <handlers>
++      <handler event="marquee-start" allowuntrusted="false">
++        <![CDATA[
++          if (this.runId == 0) {
++            var lambda = () => this._doMove(false);
++            this.runId = window.setTimeout(lambda, this.scrollDelayWithTruespeed - this._deltaStartStop);
++            this._deltaStartStop = 0;
+           }
+-          this.setAttribute("scrollamount", val);
+-          ]]>
+-        </setter>
+-      </property>
+-
+-      <property name="scrollDelay" exposeToUntrustedContent="true">
+-        <getter>
+-          <![CDATA[
+-          this._mutationActor(this._mutationObserver.takeRecords());
+-          var val = parseInt(this.getAttribute("scrolldelay"));
+-
+-          if (val <= 0 || isNaN(val)) {
+-            return this._scrollDelay;
+-          }
+-
+-          return val;
+-          ]]>
+-        </getter>
+-        <setter>
+-          var val = parseInt(val);
+-          if (val > 0 ) {
+-            this.setAttribute("scrolldelay", val);
+-          }
+-        </setter>
+-      </property>
+-
+-      <property name="trueSpeed" exposeToUntrustedContent="true">
+-        <getter>
+-          <![CDATA[
+-          if (!this.hasAttribute("truespeed")) {
+-            return false;
++        ]]>
++      </handler>
++      <handler event="marquee-stop" allowuntrusted="false">
++        <![CDATA[
++          if (this.runId != 0) {
++            this._deltaStartStop = Date.now()- this._lastMoveDate;
++            clearTimeout(this.runId);
+           }
+ 
+-          return true;
+-          ]]>
+-        </getter>
+-        <setter>
+-          <![CDATA[
+-          if (val) {
+-            this.setAttribute("truespeed", "");
+-          } else {
+-            this.removeAttribute('truespeed');
+-          }
+-          ]]>
+-        </setter>
+-      </property>
+-
+-      <property name="direction" exposeToUntrustedContent="true">
+-        <getter>
+-          this._mutationActor(this._mutationObserver.takeRecords());
+-          return this._direction;
+-        </getter>
+-        <setter>
+-          <![CDATA[
+-          if (typeof val == 'string') {
+-            val = val.toLowerCase();
+-          } else {
+-            return;
+-          }
+-          if (val != 'left' && val != 'right' && val != 'up' && val != 'down') {
+-            val = 'left';
+-          }
+-
+-          this.setAttribute("direction", val);
+-          ]]>
+-        </setter>
+-      </property>
+-
+-      <property name="behavior" exposeToUntrustedContent="true">
+-        <getter>
+-          this._mutationActor(this._mutationObserver.takeRecords());
+-          return this._behavior;
+-        </getter>
+-        <setter>
+-          if (typeof val == 'string') {
+-            val = val.toLowerCase();
+-          }
+-          if (val == "alternate" || val == "slide" || val == 'scroll') {
+-            this.setAttribute("behavior", val);
+-          }
+-        </setter>
+-      </property>
+-
+-
+-      <property name="loop" exposeToUntrustedContent="true">
+-        <getter>
+-          <![CDATA[
+-          this._mutationActor(this._mutationObserver.takeRecords());
+-          return this._loop;
+-          ]]>
+-        </getter>
+-        <setter>
+-          <![CDATA[
+-          var val = parseInt(val);
+-          if (val == -1 || val > 0) {
+-            this.setAttribute("loop", val);
+-          }
+-          ]]>
+-        </setter>
+-      </property>
+-
+-
++          this.runId = 0;
++        ]]>
++      </handler>
++    </handlers>
++    <implementation>
+       <property name="onstart" exposeToUntrustedContent="true">
+         <getter>
+           return this.getAttribute("onstart");
+         </getter>
+         <setter>
+           this._setEventListener("start", val, true);
+           this.setAttribute("onstart", val);
+         </setter>
+@@ -168,114 +70,26 @@
+       <property name="outerDiv"
+         onget="return document.getAnonymousNodes(this)[0]"
+       />
+ 
+       <property name="innerDiv"
+         onget="return document.getAnonymousElementByAttribute(this, 'class', 'innerDiv');"
+       />
+ 
+-      <property name="height" exposeToUntrustedContent="true"
+-        onget="return this.getAttribute('height');"
+-        onset="this.setAttribute('height', val);"
+-      />
+-
+-      <property name="width" exposeToUntrustedContent="true"
+-        onget="return this.getAttribute('width');"
+-        onset="this.setAttribute('width', val);"
+-      />
+-
+-      <method name="_set_scrollDelay">
+-        <parameter name="aValue"/>
+-        <body>
+-        <![CDATA[
+-          aValue = parseInt(aValue);
+-          if (aValue <= 0) {
+-            return;
+-          } else if (isNaN(aValue)) {
+-            this._scrollDelay = 85;
+-          } else if (aValue < 60) {
+-            if (this.trueSpeed == true) {
+-              this._scrollDelay = aValue;
+-            } else {
+-              this._scrollDelay = 60;
+-            }
+-          } else {
+-            this._scrollDelay = aValue;
+-          }
+-        ]]>
+-        </body>
+-      </method>
+-
+-      <method name="_set_scrollAmount">
+-        <parameter name="aValue"/>
+-        <body>
+-        <![CDATA[
+-          aValue = parseInt(aValue);
+-          if (isNaN(aValue)) {
+-            this._scrollAmount = 6;
+-          } else if (aValue < 0) {
+-            return;
+-          } else {
+-            this._scrollAmount = aValue;
++      <property name="scrollDelayWithTruespeed">
++        <getter>
++          <![CDATA[
++          if (this.scrollDelay < 60 && !this.trueSpeed) {
++            return 60;
+           }
+-        ]]>
+-        </body>
+-      </method>
+-
+-      <method name="_set_behavior">
+-        <parameter name="aValue"/>
+-        <body>
+-        <![CDATA[
+-          if (typeof aValue == 'string') {
+-            aValue = aValue.toLowerCase();
+-          }
+-          if (aValue != 'alternate' && aValue != 'slide' && aValue != 'scroll') {
+-            this._behavior = 'scroll';
+-          } else {
+-            this._behavior = aValue;
+-          }
+-        ]]>
+-        </body>
+-      </method>
+-
+-      <method name="_set_direction">
+-        <parameter name="aValue"/>
+-        <body>
+-        <![CDATA[
+-          if (typeof aValue == 'string') {
+-            aValue = aValue.toLowerCase();
+-          }
+-          if (aValue != 'left' && aValue != 'right' && aValue != 'up' && aValue != 'down') {
+-            aValue = 'left';
+-          }
+-
+-          if (aValue != this._direction) {
+-            this.startNewDirection = true;
+-          }
+-          this._direction = aValue;
+-        ]]>
+-        </body>
+-      </method>
+-
+-      <method name="_set_loop">
+-        <parameter name="aValue"/>
+-        <body>
+-          <![CDATA[
+-          var aValue = parseInt(aValue);
+-          if (aValue == 0) {
+-            return;
+-          }
+-          if (isNaN(aValue) || aValue <= -1) {
+-            aValue = -1;
+-          }
+-          this._loop = aValue;
++          return this.scrollDelay;
+           ]]>
+-        </body>
+-      </method>
++        </getter>
++      </property>
+ 
+       <method name="_setEventListener">
+         <parameter name="aName"/>
+         <parameter name="aValue"/>
+         <parameter name="aIgnoreNextCall"/>
+         <body>
+           <![CDATA[
+           // _setEventListener is only used for setting the attribute event
+@@ -347,192 +161,167 @@
+         <![CDATA[
+           var e = document.createEvent("Events");
+           e.initEvent(aName, aBubbles, aCancelable);
+           this.dispatchEvent(e);
+         ]]>
+         </body>
+       </method>
+ 
+-      <method name="start" exposeToUntrustedContent="true">
+-        <body>
+-        <![CDATA[
+-          if (this.runId == 0) {
+-            var myThis = this;
+-            var lambda = function myTimeOutFunction(){myThis._doMove(false);}
+-            this.runId = window.setTimeout(lambda, this._scrollDelay - this._deltaStartStop);
+-            this._deltaStartStop = 0;
+-          }
+-        ]]>
+-        </body>
+-      </method>
+-
+-      <method name="stop" exposeToUntrustedContent="true">
+-        <body>
+-        <![CDATA[
+-          if (this.runId != 0) {
+-            this._deltaStartStop = Date.now()- this._lastMoveDate;
+-            clearTimeout(this.runId);
+-          }
+-
+-          this.runId = 0;
+-        ]]>
+-        </body>
+-      </method>
+-
+       <method name="_doMove">
+         <parameter name="aResetPosition"/>
+         <body>
+         <![CDATA[
+           this._lastMoveDate = Date.now();
+ 
+-          //startNewDirection is true at first load and whenever the direction is changed
+-          if (this.startNewDirection) {
+-            this.startNewDirection = false; //we only want this to run once every scroll direction change
++          // invalidateCache is true at first load and whenever an attribute
++          // is changed
++          if (this.invalidateCache) {
++            this.invalidateCache = false; //we only want this to run once every scroll direction change
+ 
+             var corrvalue = 0;
+ 
+-            switch (this._direction)
++            switch (this._currentDirection)
+             {
+               case "up":
+                 var height = document.defaultView.getComputedStyle(this).height;
+                 this.outerDiv.style.height = height;
+                 if (this.originalHeight > this.outerDiv.offsetHeight) {
+                     corrvalue = this.originalHeight - this.outerDiv.offsetHeight;
+                 }
+                 this.innerDiv.style.padding = height + " 0";
+                 this.dirsign = 1;
+-                this.startAt = (this._behavior == 'alternate') ? (this.originalHeight - corrvalue) : 0;
+-                this.stopAt  = (this._behavior == 'alternate' || this._behavior == 'slide') ? 
++                this.startAt = (this.behavior == 'alternate') ? (this.originalHeight - corrvalue) : 0;
++                this.stopAt  = (this.behavior == 'alternate' || this.behavior == 'slide') ? 
+                                 (parseInt(height) + corrvalue) : (this.originalHeight + parseInt(height));
+               break;
+ 
+               case "down":
+                 var height = document.defaultView.getComputedStyle(this).height;
+                 this.outerDiv.style.height = height;
+                 if (this.originalHeight > this.outerDiv.offsetHeight) {
+                     corrvalue = this.originalHeight - this.outerDiv.offsetHeight;
+                 }
+                 this.innerDiv.style.padding = height + " 0";
+                 this.dirsign = -1;
+-                this.startAt  = (this._behavior == 'alternate') ?
++                this.startAt  = (this.behavior == 'alternate') ?
+                                 (parseInt(height) + corrvalue) : (this.originalHeight + parseInt(height));
+-                this.stopAt = (this._behavior == 'alternate' || this._behavior == 'slide') ? 
++                this.stopAt = (this.behavior == 'alternate' || this.behavior == 'slide') ? 
+                               (this.originalHeight - corrvalue) : 0;
+               break;
+ 
+               case "right":
+                 if (this.innerDiv.offsetWidth > this.outerDiv.offsetWidth) {
+                     corrvalue = this.innerDiv.offsetWidth - this.outerDiv.offsetWidth;
+                 }
+                 this.dirsign = -1;
+-                this.stopAt  = (this._behavior == 'alternate' || this._behavior == 'slide') ? 
++                this.stopAt  = (this.behavior == 'alternate' || this.behavior == 'slide') ? 
+                                (this.innerDiv.offsetWidth - corrvalue) : 0;
+-                this.startAt = this.outerDiv.offsetWidth + ((this._behavior == 'alternate') ? 
++                this.startAt = this.outerDiv.offsetWidth + ((this.behavior == 'alternate') ? 
+                                corrvalue : (this.innerDiv.offsetWidth + this.stopAt));   
+               break;
+ 
+               case "left":
+               default:
+                 if (this.innerDiv.offsetWidth > this.outerDiv.offsetWidth) {
+                     corrvalue = this.innerDiv.offsetWidth - this.outerDiv.offsetWidth;
+                 }
+                 this.dirsign = 1;
+-                this.startAt = (this._behavior == 'alternate') ? (this.innerDiv.offsetWidth - corrvalue) : 0;
++                this.startAt = (this.behavior == 'alternate') ? (this.innerDiv.offsetWidth - corrvalue) : 0;
+                 this.stopAt  = this.outerDiv.offsetWidth + 
+-                               ((this._behavior == 'alternate' || this._behavior == 'slide') ? 
++                               ((this.behavior == 'alternate' || this.behavior == 'slide') ? 
+                                corrvalue : (this.innerDiv.offsetWidth + this.startAt));
+             }
+ 
+             if (aResetPosition) {
+               this.newPosition = this.startAt;
+               this._fireEvent("start", false, false);
+             }
+           } //end if
+ 
+-          this.newPosition = this.newPosition + (this.dirsign * this._scrollAmount);
++          this.newPosition = this.newPosition + (this.dirsign * this.scrollAmount);
+ 
+           if ((this.dirsign == 1 && this.newPosition > this.stopAt) ||
+               (this.dirsign == -1 && this.newPosition < this.stopAt))
+           {
+-            switch (this._behavior) 
++            switch (this.behavior) 
+             {
+               case 'alternate':
+                 // lets start afresh
+-                this.startNewDirection = true;
++                this.invalidateCache = true;
+ 
+                 // swap direction
+                 const swap = {left: "right", down: "up", up: "down", right: "left"};
+-                this._direction = swap[this._direction];
++                this._currentDirection = swap[this._currentDirection] || "left";
+                 this.newPosition = this.stopAt;
+ 
+-                if ((this._direction == "up") || (this._direction == "down")) {
++                if ((this._currentDirection == "up") || (this._currentDirection == "down")) {
+                   this.outerDiv.scrollTop = this.newPosition;
+                 } else {
+                   this.outerDiv.scrollLeft = this.newPosition;
+                 }
+ 
+-                if (this._loop != 1) {
++                if (this._currentLoop != 1) {
+                   this._fireEvent("bounce", false, true);
+                 }
+               break;
+ 
+               case 'slide':
+-                if (this._loop > 1) {
++                if (this._currentLoop > 1) {
+                   this.newPosition = this.startAt;
+                 }
+               break;
+ 
+               default:
+                 this.newPosition = this.startAt;
+ 
+-                if ((this._direction == "up") || (this._direction == "down")) {
++                if ((this._currentDirection == "up") || (this._currentDirection == "down")) {
+                   this.outerDiv.scrollTop = this.newPosition;
+                 } else {
+                   this.outerDiv.scrollLeft = this.newPosition;
+                 }
+ 
+-                //dispatch start event, even when this._loop == 1, comp. with IE6
++                //dispatch start event, even when this._currentLoop == 1, comp. with IE6
+                 this._fireEvent("start", false, false);
+             }
+ 
+-            if (this._loop > 1) {
+-              this._loop--;
+-            } else if (this._loop == 1) {
+-              if ((this._direction == "up") || (this._direction == "down")) {
++            if (this._currentLoop > 1) {
++              this._currentLoop--;
++            } else if (this._currentLoop == 1) {
++              if ((this._currentDirection == "up") || (this._currentDirection == "down")) {
+                 this.outerDiv.scrollTop = this.stopAt;
+               } else {
+                 this.outerDiv.scrollLeft = this.stopAt;
+               }
+               this.stop();
+               this._fireEvent("finish", false, true);
+               return;
+             }
+           }
+           else {
+-            if ((this._direction == "up") || (this._direction == "down")) {
++            if ((this._currentDirection == "up") || (this._currentDirection == "down")) {
+               this.outerDiv.scrollTop = this.newPosition;
+             } else {
+               this.outerDiv.scrollLeft = this.newPosition;
+             }
+           }
+ 
+           var myThis = this;
+           var lambda = function myTimeOutFunction(){myThis._doMove(false);}
+-          this.runId = window.setTimeout(lambda, this._scrollDelay);
++          this.runId = window.setTimeout(lambda, this.scrollDelayWithTruespeed);
+         ]]>
+         </body>
+       </method>
+ 
+       <method name="init">
+         <body>
+         <![CDATA[
+           this.stop();
+ 
+-          if ((this._direction != "up") && (this._direction != "down")) {
++          if ((this._currentDirection != "up") && (this._currentDirection != "down")) {
+             var width = window.getComputedStyle(this).width;
+             this.innerDiv.parentNode.style.margin = '0 ' + width;
+ 
+             //XXX Adding the margin sometimes causes the marquee to widen, 
+             // see testcase from bug bug 364434: 
+             // https://bugzilla.mozilla.org/attachment.cgi?id=249233
+             // Just add a fixed width with current marquee's width for now
+             if (width != window.getComputedStyle(this).width) {
+@@ -559,55 +348,23 @@
+           while (aMutations.length > 0) {
+             var mutation = aMutations.shift();
+             var attrName = mutation.attributeName.toLowerCase();
+             var oldValue = mutation.oldValue;
+             var target = mutation.target;
+             var newValue = target.getAttribute(attrName);
+ 
+             if (oldValue != newValue) {
++              target.invalidateCache = true;
+               switch (attrName) {
+                 case "loop":
+-                  target._set_loop(newValue);
+-                  if (target.rundId == 0) {
+-                    target.start();
+-                  }
+-                  break;
+-                case "scrollamount":
+-                  target._set_scrollAmount(newValue);
+-                  break;
+-                case "scrolldelay":
+-                  target._set_scrollDelay(newValue);
+-                  target.stop();
+-                  target.start();
+-                  break;
+-                case "truespeed":
+-                  //needed to update target._scrollDelay
+-                  var myThis = target;
+-                  var lambda = function() {myThis._set_scrollDelay(myThis.getAttribute('scrolldelay'));}
+-                  window.setTimeout(lambda, 0);
+-                  break;
+-                case "behavior":
+-                  target._set_behavior(newValue);
+-                  target.startNewDirection = true;
+-                  if ((oldValue == "slide" && target.newPosition == target.stopAt) ||
+-                      newValue == "alternate" || newValue == "slide") {
+-                    target.stop();
+-                    target._doMove(true);
+-                  }
++                  target._currentLoop = target.loop;
+                   break;
+                 case "direction":
+-                  if (!newValue) {
+-                    newValue = "left";
+-                  }
+-                  target._set_direction(newValue);
+-                  break;
+-                case "width":
+-                case "height":
+-                  target.startNewDirection = true;
++                  target._currentDirection = target.direction;
+                   break;
+                 case "onstart":
+                   target._setEventListener("start", newValue);
+                   break;
+                 case "onfinish":
+                   target._setEventListener("finish", newValue);
+                   break;
+                 case "onbounce":
+@@ -618,47 +375,38 @@
+           }
+         ]]>
+         </body>
+       </method>
+ 
+       <constructor>
+         <![CDATA[
+           // Set up state.
+-          this._scrollAmount = 6;
+-          this._scrollDelay = 85;
+-          this._direction = "left";
+-          this._behavior = "scroll";
+-          this._loop = -1;
++          this._currentDirection = this.direction || "left";
++          this._currentLoop = this.loop;
+           this.dirsign = 1;
+           this.startAt = 0;
+           this.stopAt = 0;
+           this.newPosition = 0;
+           this.runId = 0;
+           this.originalHeight = 0;
+-          this.startNewDirection = true;
++          this.invalidateCache = true;
+ 
+           // hack needed to fix js error, see bug 386470
+           var myThis = this;
+           var lambda = function myScopeFunction() { if (myThis.init) myThis.init(); }
+ 
+-          this._set_direction(this.getAttribute('direction'));
+-          this._set_behavior(this.getAttribute('behavior'));
+-          this._set_scrollDelay(this.getAttribute('scrolldelay'));
+-          this._set_scrollAmount(this.getAttribute('scrollamount'));
+-          this._set_loop(this.getAttribute('loop'));
+           this._setEventListener("start", this.getAttribute("onstart"));
+           this._setEventListener("finish", this.getAttribute("onfinish"));
+           this._setEventListener("bounce", this.getAttribute("onbounce"));
+-          this.startNewDirection = true;
+ 
+           this._mutationObserver = new MutationObserver(this._mutationActor);
+           this._mutationObserver.observe(this, { attributes: true,
+             attributeOldValue: true,
+-            attributeFilter: ['loop', 'scrollamount', 'scrolldelay', '', 'truespeed', 'behavior',
++            attributeFilter: ['loop', '', 'behavior',
+               'direction', 'width', 'height', 'onstart', 'onfinish', 'onbounce'] });
+ 
+           // init needs to be run after the page has loaded in order to calculate
+           // the correct height/width
+           if (document.readyState == "complete") {
+             lambda();
+           } else {
+             window.addEventListener("load", lambda);
+diff --git a/parser/html/nsHtml5ElementName.cpp b/parser/html/nsHtml5ElementName.cpp
+--- a/parser/html/nsHtml5ElementName.cpp
++++ b/parser/html/nsHtml5ElementName.cpp
+@@ -769,17 +769,17 @@ nsHtml5ElementName::initializeStatics()
+                                       nsHtml5TreeBuilder::IFRAME | SPECIAL);
+   ELT_LINE = new nsHtml5ElementName(nsGkAtoms::line,
+                                     nsGkAtoms::line,
+                                     NS_NewHTMLUnknownElement,
+                                     NS_NewSVGLineElement,
+                                     nsHtml5TreeBuilder::OTHER);
+   ELT_MARQUEE = new nsHtml5ElementName(nsGkAtoms::marquee,
+                                        nsGkAtoms::marquee,
+-                                       NS_NewHTMLDivElement,
++                                       NS_NewHTMLMarqueeElement,
+                                        NS_NewSVGUnknownElement,
+                                        nsHtml5TreeBuilder::MARQUEE_OR_APPLET |
+                                          SPECIAL | SCOPING);
+   ELT_POLYLINE = new nsHtml5ElementName(nsGkAtoms::polyline,
+                                         nsGkAtoms::polyline,
+                                         NS_NewHTMLUnknownElement,
+                                         NS_NewSVGPolylineElement,
+                                         nsHtml5TreeBuilder::OTHER);
+diff --git a/parser/htmlparser/nsHTMLTagList.h b/parser/htmlparser/nsHTMLTagList.h
+--- a/parser/htmlparser/nsHTMLTagList.h
++++ b/parser/htmlparser/nsHTMLTagList.h
+@@ -116,17 +116,17 @@ HTML_TAG(keygen, Span, Span)
+ HTML_TAG(label, Label, Label)
+ HTML_TAG(legend, Legend, Legend)
+ HTML_TAG(li, LI, LI)
+ HTML_TAG(link, Link, Link)
+ HTML_TAG(listing, Pre, Pre)
+ HTML_HTMLELEMENT_TAG(main)
+ HTML_TAG(map, Map, Map)
+ HTML_HTMLELEMENT_TAG(mark)
+-HTML_TAG(marquee, Div, Div)
++HTML_TAG(marquee, Marquee, Marquee)
+ HTML_TAG(menu, Menu, Menu)
+ HTML_TAG(menuitem, MenuItem, MenuItem)
+ HTML_TAG(meta, Meta, Meta)
+ HTML_TAG(meter, Meter, Meter)
+ HTML_TAG(multicol, Unknown, Unknown)
+ HTML_HTMLELEMENT_TAG(nav)
+ HTML_HTMLELEMENT_TAG(nobr)
+ HTML_HTMLELEMENT_TAG(noembed)
+diff --git a/testing/web-platform/meta/html/dom/interfaces.https.html.ini b/testing/web-platform/meta/html/dom/interfaces.https.html.ini
+--- a/testing/web-platform/meta/html/dom/interfaces.https.html.ini
++++ b/testing/web-platform/meta/html/dom/interfaces.https.html.ini
+@@ -611,136 +611,34 @@
+     expected: FAIL
+ 
+   [HTMLCanvasElement interface: operation transferControlToOffscreen()]
+     expected: FAIL
+ 
+   [HTMLCanvasElement interface: document.createElement("canvas") must inherit property "transferControlToOffscreen()" with the proper type]
+     expected: FAIL
+ 
+-  [HTMLMarqueeElement interface: existence and properties of interface object]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface object length]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface object name]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: existence and properties of interface prototype object]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: existence and properties of interface prototype object's "constructor" property]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: existence and properties of interface prototype object's @@unscopables property]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: attribute behavior]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: attribute bgColor]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: attribute direction]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: attribute height]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: attribute hspace]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: attribute loop]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: attribute scrollAmount]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: attribute scrollDelay]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: attribute trueSpeed]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: attribute vspace]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: attribute width]
+-    expected: FAIL
+-
+   [HTMLMarqueeElement interface: attribute onbounce]
+     expected: FAIL
+ 
+   [HTMLMarqueeElement interface: attribute onfinish]
+     expected: FAIL
+ 
+   [HTMLMarqueeElement interface: attribute onstart]
+     expected: FAIL
+ 
+-  [HTMLMarqueeElement interface: operation start()]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: operation stop()]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement must be primary interface of document.createElement("marquee")]
+-    expected: FAIL
+-
+-  [Stringification of document.createElement("marquee")]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "behavior" with the proper type]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "bgColor" with the proper type]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "direction" with the proper type]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "height" with the proper type]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "hspace" with the proper type]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "loop" with the proper type]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "scrollAmount" with the proper type]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "scrollDelay" with the proper type]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "trueSpeed" with the proper type]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "vspace" with the proper type]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "width" with the proper type]
+-    expected: FAIL
+-
+   [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "onbounce" with the proper type]
+     expected: FAIL
+ 
+   [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "onfinish" with the proper type]
+     expected: FAIL
+ 
+   [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "onstart" with the proper type]
+     expected: FAIL
+ 
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "start()" with the proper type]
+-    expected: FAIL
+-
+-  [HTMLMarqueeElement interface: document.createElement("marquee") must inherit property "stop()" with the proper type]
+-    expected: FAIL
+-
+   [HTMLFrameSetElement interface: attribute onrejectionhandled]
+     expected: FAIL
+ 
+   [HTMLFrameSetElement interface: attribute onunhandledrejection]
+     expected: FAIL
+ 
+   [HTMLFrameSetElement interface: document.createElement("frameset") must inherit property "onrejectionhandled" with the proper type]
+     expected: FAIL
+diff --git a/testing/web-platform/meta/html/dom/reflection-obsolete.html.ini b/testing/web-platform/meta/html/dom/reflection-obsolete.html.ini
+--- a/testing/web-platform/meta/html/dom/reflection-obsolete.html.ini
++++ b/testing/web-platform/meta/html/dom/reflection-obsolete.html.ini
+@@ -1,2837 +1,15 @@
+ [reflection-obsolete.html]
+   [applet.tabIndex: setAttribute() to object "3" followed by getAttribute()]
+     expected: FAIL
+ 
+   [applet.tabIndex: setAttribute() to object "3" followed by IDL get]
+     expected: FAIL
+ 
+-  [marquee.tabIndex: setAttribute() to object "3" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.tabIndex: setAttribute() to object "3" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: typeof IDL attribute]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL get with DOM attribute unset]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to "" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to "\\0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to "" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to undefined followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to 7 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to 1.5 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to true followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to false followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to object "[object Object\]" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to NaN followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to Infinity followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to -Infinity followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to "\\0" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to null followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to object "test-toString" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: typeof IDL attribute]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL get with DOM attribute unset]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to "" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to "\\0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to "" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to undefined followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to 7 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to 1.5 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to true followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to false followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to object "[object Object\]" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to NaN followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to Infinity followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to -Infinity followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to "\\0" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to null followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to object "test-toString" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: typeof IDL attribute]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL get with DOM attribute unset]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to "" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to "\\0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to "" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to undefined followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to 7 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to 1.5 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to true followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to false followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to object "[object Object\]" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to NaN followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to Infinity followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to -Infinity followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to "\\0" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to null followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to object "test-toString" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: typeof IDL attribute]
+-    expected: FAIL
+-
+-  [marquee.height: IDL get with DOM attribute unset]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to "" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to "\\0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to "" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to undefined followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to 7 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to 1.5 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to true followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to false followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to object "[object Object\]" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to NaN followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to Infinity followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to -Infinity followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to "\\0" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to null followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to object "test-toString" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: typeof IDL attribute]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL get with DOM attribute unset]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to -2147483649 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to -2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to -36 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to -1 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 0 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 1 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 257 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 2147483647 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 4294967295 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 4294967296 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "-1" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "-0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "1" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\t7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\v7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\f7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "﻿7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\n7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\r7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "᠎7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "　7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to object "2" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to object "3" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 0 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 1 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 257 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 2147483647 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to "-0" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to "-0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: typeof IDL attribute]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL get with DOM attribute unset]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to -2147483649 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to -2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to -36 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to -1 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 0 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 1 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 257 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 2147483647 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 4294967295 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 4294967296 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "-1" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "-0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "1" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\t7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\v7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\f7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "﻿7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\n7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\r7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "᠎7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "　7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to object "2" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to object "3" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 0 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 1 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 257 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 2147483647 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to "-0" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to "-0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: typeof IDL attribute]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL get with DOM attribute unset]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to -2147483649 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to -2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to -36 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to -1 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 0 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 1 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 257 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 2147483647 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 4294967295 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 4294967296 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "-1" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "-0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "1" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\t7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\v7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\f7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "﻿7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\n7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\r7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "᠎7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "　7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to object "2" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to object "3" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 0 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 1 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 257 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 2147483647 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to "-0" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to "-0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: typeof IDL attribute]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL get with DOM attribute unset]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to "" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to " foo " followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to "\\0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to "trueSpeed" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to "" followed by hasAttribute()]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to "" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to " foo " followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to undefined followed by hasAttribute()]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to null followed by hasAttribute()]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to false followed by hasAttribute()]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to NaN followed by hasAttribute()]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to "\\0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: typeof IDL attribute]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL get with DOM attribute unset]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to -2147483649 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to -2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to -36 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to -1 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 0 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 1 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 257 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 2147483647 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 4294967295 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 4294967296 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "-1" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "-0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "1" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\t7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\v7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\f7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "﻿7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\n7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\r7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "᠎7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "　7" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to object "2" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to object "3" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 0 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 1 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 257 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 2147483647 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to "-0" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to "-0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: typeof IDL attribute]
+-    expected: FAIL
+-
+-  [marquee.width: IDL get with DOM attribute unset]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to "" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to "\\0" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to "" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo " followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to undefined followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to undefined followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to 7 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to 7 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to 1.5 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to 1.5 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to true followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to true followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to false followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to false followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to object "[object Object\]" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to object "[object Object\]" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to NaN followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to NaN followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to Infinity followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to -Infinity followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to -Infinity followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to "\\0" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to null followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to null followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to object "test-toString" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to object "test-toString" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to object "test-valueOf" followed by IDL get]
+-    expected: FAIL
+-
+-  [frameset.tabIndex: setAttribute() to object "3" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [frameset.tabIndex: setAttribute() to object "3" followed by IDL get]
+-    expected: FAIL
+-
+-  [frame.tabIndex: setAttribute() to object "3" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [frame.tabIndex: setAttribute() to object "3" followed by IDL get]
+-    expected: FAIL
+-
+-  [dir.tabIndex: setAttribute() to object "3" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [dir.tabIndex: setAttribute() to object "3" followed by IDL get]
+-    expected: FAIL
+-
+-  [font.tabIndex: setAttribute() to object "3" followed by getAttribute()]
+-    expected: FAIL
+-
+-  [font.tabIndex: setAttribute() to object "3" followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 2147483648 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 4294967295 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 4294967295 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 2147483648 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 4294967295 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 4294967295 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 2147483648 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 4294967295 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 4294967295 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 2147483648 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 2147483648 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 4294967295 followed by getAttribute()]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 4294967295 followed by IDL get]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to ""]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to undefined]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to 7]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to 1.5]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to true]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to false]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to NaN]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to Infinity]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to null]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.behavior: setAttribute() to object "test-valueOf"]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to ""]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to undefined]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to 7]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to 1.5]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to true]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to false]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to NaN]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to Infinity]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to null]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.behavior: IDL set to object "test-valueOf"]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to ""]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to undefined]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to 7]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to 1.5]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to true]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to false]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to NaN]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to Infinity]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to null]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.bgColor: setAttribute() to object "test-valueOf"]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to ""]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to undefined]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to 7]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to 1.5]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to true]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to false]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to NaN]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to Infinity]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to null]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.bgColor: IDL set to object "test-valueOf"]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to ""]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to undefined]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to 7]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to 1.5]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to true]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to false]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to NaN]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to Infinity]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to null]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.direction: setAttribute() to object "test-valueOf"]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to ""]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to undefined]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to 7]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to 1.5]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to true]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to false]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to NaN]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to Infinity]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to null]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.direction: IDL set to object "test-valueOf"]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to ""]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to undefined]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to 7]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to 1.5]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to true]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to false]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to NaN]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to Infinity]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to null]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.height: setAttribute() to object "test-valueOf"]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to ""]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to undefined]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to 7]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to 1.5]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to true]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to false]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to NaN]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to Infinity]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to null]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.height: IDL set to object "test-valueOf"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to -2147483649]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to -2147483648]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to -36]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to -1]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 0]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 1]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 257]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 2147483647]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 2147483648]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 4294967295]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 4294967296]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to ""]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "-1"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "-0"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "0"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "1"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\t7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\v7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\f7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "﻿7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\n7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\r7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "᠎7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "　7"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to undefined]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to 1.5]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to true]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to false]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to NaN]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to Infinity]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to object "2"]
+-    expected: FAIL
+-
+-  [marquee.hspace: setAttribute() to object "3"]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 0]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 1]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 257]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 2147483647]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to "-0"]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 2147483648]
+-    expected: FAIL
+-
+-  [marquee.hspace: IDL set to 4294967295]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to -2147483649]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to -2147483648]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to -36]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to -1]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 0]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 1]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 257]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 2147483647]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 2147483648]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 4294967295]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 4294967296]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to ""]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "-1"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "-0"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "0"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "1"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\t7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\v7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\f7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "﻿7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\n7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\r7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "᠎7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "　7"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to undefined]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to 1.5]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to true]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to false]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to NaN]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to Infinity]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to object "2"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: setAttribute() to object "3"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 0]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 1]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 257]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 2147483647]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to "-0"]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 2147483648]
+-    expected: FAIL
+-
+-  [marquee.scrollAmount: IDL set to 4294967295]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to -2147483649]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to -2147483648]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to -36]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to -1]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 0]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 1]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 257]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 2147483647]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 2147483648]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 4294967295]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 4294967296]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to ""]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "-1"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "-0"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "0"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "1"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\t7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\v7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\f7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "﻿7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\n7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\r7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "᠎7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "　7"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to undefined]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to 1.5]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to true]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to false]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to NaN]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to Infinity]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to object "2"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: setAttribute() to object "3"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 0]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 1]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 257]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 2147483647]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to "-0"]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 2147483648]
+-    expected: FAIL
+-
+-  [marquee.scrollDelay: IDL set to 4294967295]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to ""]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to " foo "]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to undefined]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to null]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to 7]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to 1.5]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to true]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to false]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to NaN]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to Infinity]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to object "test-valueOf"]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: setAttribute() to "trueSpeed"]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to ""]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to " foo "]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to undefined]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to null]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to 7]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to 1.5]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to false]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to NaN]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to Infinity]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.trueSpeed: IDL set to object "test-valueOf"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to -2147483649]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to -2147483648]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to -36]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to -1]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 0]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 1]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 257]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 2147483647]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 2147483648]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 4294967295]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 4294967296]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to ""]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "-1"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "-0"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "0"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "1"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\t7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\v7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\f7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "﻿7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\n7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\r7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "᠎7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " 7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "　7"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to undefined]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to 1.5]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to true]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to false]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to NaN]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to Infinity]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to object "2"]
+-    expected: FAIL
+-
+-  [marquee.vspace: setAttribute() to object "3"]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 0]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 1]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 257]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 2147483647]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to "-0"]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 2147483648]
+-    expected: FAIL
+-
+-  [marquee.vspace: IDL set to 4294967295]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to ""]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to undefined]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to 7]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to 1.5]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to true]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to false]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to NaN]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to Infinity]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to null]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.width: setAttribute() to object "test-valueOf"]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to ""]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to undefined]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to 7]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to 1.5]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to true]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to false]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to object "[object Object\]"]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to NaN]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to Infinity]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to -Infinity]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to "\\0"]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to null]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to object "test-toString"]
+-    expected: FAIL
+-
+-  [marquee.width: IDL set to object "test-valueOf"]
+-    expected: FAIL
+ 
+   [applet.align: typeof IDL attribute]
+     expected: FAIL
+ 
+   [applet.align: IDL get with DOM attribute unset]
+     expected: FAIL
+ 
+   [applet.align: setAttribute() to ""]
+@@ -4095,8 +1273,154 @@
+     expected: FAIL
+ 
+   [applet.width: IDL set to object "test-toString"]
+     expected: FAIL
+ 
+   [applet.width: IDL set to object "test-valueOf"]
+     expected: FAIL
+ 
++  [marquee.loop: IDL get with DOM attribute unset]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to -36]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to -2147483648]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to 2147483648]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to -2147483649]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to 4294967295]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to 4294967296]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to 0]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to "-0"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to "0"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to ""]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " \\0\\x01\\x02\\x03\\x04\\x05\\x06\\x07 \\b\\t\\n\\v\\f\\r\\x0e\\x0f \\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17 \\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  foo "]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to "\\v7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to "﻿7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to "᠎7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to "　7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to " 7"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to undefined]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to true]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to false]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to object "[object Object\]"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to NaN]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to Infinity]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to -Infinity]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to "\\0"]
++    expected: FAIL
++
++  [marquee.loop: setAttribute() to object "3"]
++    expected: FAIL
++
++  [marquee.loop: IDL set to -36 followed by getAttribute()]
++    expected: FAIL
++
++  [marquee.loop: IDL set to -36]
++    expected: FAIL
++
++  [marquee.loop: IDL set to 0 followed by getAttribute()]
++    expected: FAIL
++
++  [marquee.loop: IDL set to 0]
++    expected: FAIL
++
++  [marquee.loop: IDL set to -2147483648 followed by getAttribute()]
++    expected: FAIL
++
++  [marquee.loop: IDL set to -2147483648]
++    expected: FAIL
+diff --git a/testing/web-platform/meta/html/obsolete/requirements-for-implementations/the-marquee-element-0/marquee-loop.html.ini b/testing/web-platform/meta/html/obsolete/requirements-for-implementations/the-marquee-element-0/marquee-loop.html.ini
+deleted file mode 100644
+--- a/testing/web-platform/meta/html/obsolete/requirements-for-implementations/the-marquee-element-0/marquee-loop.html.ini
++++ /dev/null
+@@ -1,10 +0,0 @@
+-[marquee-loop.html]
+-  [marquee_loop_string]
+-    expected: FAIL
+-
+-  [marquee_loop_less_than_1]
+-    expected: FAIL
+-
+-  [marquee_loop_normal]
+-    expected: FAIL
+-
+diff --git a/testing/web-platform/meta/html/obsolete/requirements-for-implementations/the-marquee-element-0/marquee-scrollamount.html.ini b/testing/web-platform/meta/html/obsolete/requirements-for-implementations/the-marquee-element-0/marquee-scrollamount.html.ini
+--- a/testing/web-platform/meta/html/obsolete/requirements-for-implementations/the-marquee-element-0/marquee-scrollamount.html.ini
++++ b/testing/web-platform/meta/html/obsolete/requirements-for-implementations/the-marquee-element-0/marquee-scrollamount.html.ini
+@@ -1,10 +1,1 @@
+-[marquee-scrollamount.html]
+-  [The scrollamount is a string]
+-    expected: FAIL
+-
+-  [The scrollamount is a negative]
+-    expected: FAIL
+-
+-  [The scrollamount is a normal value]
+-    expected: FAIL
+-
++[marquee-scrollamount.html]
+\ No newline at end of file
+diff --git a/testing/web-platform/meta/html/obsolete/requirements-for-implementations/the-marquee-element-0/marquee-scrolldelay.html.ini b/testing/web-platform/meta/html/obsolete/requirements-for-implementations/the-marquee-element-0/marquee-scrolldelay.html.ini
+--- a/testing/web-platform/meta/html/obsolete/requirements-for-implementations/the-marquee-element-0/marquee-scrolldelay.html.ini
++++ b/testing/web-platform/meta/html/obsolete/requirements-for-implementations/the-marquee-element-0/marquee-scrolldelay.html.ini
+@@ -1,13 +1,1 @@
+-[marquee-scrolldelay.html]
+-  [The scrolldelay attribute is a string]
+-    expected: FAIL
+-
+-  [The scrolldelay attribute is a negative]
+-    expected: FAIL
+-
+-  [The scrolldelay attribute is less than 60]
+-    expected: FAIL
+-
+-  [The scrolldelay attribute is greater than 60]
+-    expected: FAIL
+-
++[marquee-scrolldelay.html]
+\ No newline at end of file
+diff --git a/testing/web-platform/meta/html/semantics/interfaces.html.ini b/testing/web-platform/meta/html/semantics/interfaces.html.ini
+--- a/testing/web-platform/meta/html/semantics/interfaces.html.ini
++++ b/testing/web-platform/meta/html/semantics/interfaces.html.ini
+@@ -1,23 +1,17 @@
+ [interfaces.html]
+   prefs: [dom.dialog_element.enabled: true, dom.webcomponents.shadowdom.enabled:true]
+   [Interfaces for image]
+     expected: FAIL
+ 
+   [Interfaces for keygen]
+     expected: FAIL
+ 
+-  [Interfaces for marquee]
+-    expected: FAIL
+-
+   [Interfaces for IMAGE]
+     expected: FAIL
+ 
+   [Interfaces for KEYGEN]
+     expected: FAIL
+ 
+-  [Interfaces for MARQUEE]
+-    expected: FAIL
+-
+   [Interfaces for Ã¥-bar]
+     expected: FAIL
+ 
+diff --git a/testing/web-platform/tests/html/dom/elements-obsolete.js b/testing/web-platform/tests/html/dom/elements-obsolete.js
+--- a/testing/web-platform/tests/html/dom/elements-obsolete.js
++++ b/testing/web-platform/tests/html/dom/elements-obsolete.js
+@@ -8,19 +8,32 @@ var obsoleteElements = {
+     height: "string",
+     hspace: "unsigned long",
+     name: "string",
+     object: "url",
+     vspace: "unsigned long",
+     width: "string",
+   },
+   marquee: {
+-    behavior: "string",
++    behavior: {
++      type: {
++        type: "enum",
++        keywords: ["scroll", "slide", "alternate"],
++        defaultVal: "scroll"
++      },
++    },
+     bgColor: "string",
+-    direction: "string",
++    loop: "long",
++    direction: {
++      type: {
++        type: "enum",
++        keywords: ["up", "right", "down", "left"],
++        defaultVal: "left"
++      },
++    },
+     height: "string",
+     hspace: "unsigned long",
+     scrollAmount: {type: "unsigned long", defaultVal: 6},
+     scrollDelay: {type: "unsigned long", defaultVal: 85},
+     trueSpeed: "boolean",
+     vspace: "unsigned long",
+     width: "string",
+   },
+diff --git a/xpcom/ds/StaticAtoms.py b/xpcom/ds/StaticAtoms.py
+--- a/xpcom/ds/StaticAtoms.py
++++ b/xpcom/ds/StaticAtoms.py
+@@ -156,16 +156,17 @@ STATIC_ATOMS = [
+     Atom("b", "b"),
+     Atom("background", "background"),
+     Atom("base", "base"),
+     Atom("basefont", "basefont"),
+     Atom("baseline", "baseline"),
+     Atom("bdi", "bdi"),
+     Atom("bdo", "bdo"),
+     Atom("before", "before"),
++    Atom("behavior", "behavior"),
+     Atom("bgcolor", "bgcolor"),
+     Atom("bgsound", "bgsound"),
+     Atom("big", "big"),
+     Atom("binding", "binding"),
+     Atom("bindings", "bindings"),
+     Atom("bindToUntrustedContent", "bindToUntrustedContent"),
+     Atom("block", "block"),
+     Atom("blockquote", "blockquote"),
+@@ -1009,23 +1010,25 @@ STATIC_ATOMS = [
+     Atom("scope", "scope"),
+     Atom("scoped", "scoped"),
+     Atom("screen", "screen"),
+     Atom("screenX", "screenX"),
+     Atom("screenY", "screenY"),
+     Atom("script", "script"),
+     Atom("scriptEnabledBeforePrintOrPreview", "scriptEnabledBeforePrintOrPreview"),
+     Atom("scrollbar", "scrollbar"),
++    Atom("scrollamount", "scrollamount"),
+     Atom("scrollbarbutton", "scrollbarbutton"),
+     Atom("scrollbarDownBottom", "scrollbar-down-bottom"),
+     Atom("scrollbarDownTop", "scrollbar-down-top"),
+     Atom("scrollbarUpBottom", "scrollbar-up-bottom"),
+     Atom("scrollbarUpTop", "scrollbar-up-top"),
+     Atom("scrollbox", "scrollbox"),
+     Atom("scrollcorner", "scrollcorner"),
++    Atom("scrolldelay", "scrolldelay"),
+     Atom("scrolling", "scrolling"),
+     Atom("scrollPosition", "scroll-position"),
+     Atom("section", "section"),
+     Atom("select", "select"),
+     Atom("selectable", "selectable"),
+     Atom("selected", "selected"),
+     Atom("selectedIndex", "selectedIndex"),
+     Atom("selectedindex", "selectedindex"),
+@@ -1151,16 +1154,17 @@ STATIC_ATOMS = [
+     Atom("treechildren", "treechildren"),
+     Atom("treecol", "treecol"),
+     Atom("treecolpicker", "treecolpicker"),
+     Atom("treecols", "treecols"),
+     Atom("treeitem", "treeitem"),
+     Atom("treerow", "treerow"),
+     Atom("treeseparator", "treeseparator"),
+     Atom("_true", "true"),
++    Atom("truespeed", "truespeed"),
+     Atom("tt", "tt"),
+     Atom("type", "type"),
+     Atom("typemustmatch", "typemustmatch"),
+     Atom("u", "u"),
+     Atom("ul", "ul"),
+     Atom("undetermined", "undetermined"),
+     Atom("unparsedEntityUri", "unparsed-entity-uri"),
+     Atom("upperAlpha", "upper-alpha"),
