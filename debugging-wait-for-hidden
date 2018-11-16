@@ -1,0 +1,146 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  3c951c1fe05d581f85101210c710d37c9690375a
+
+diff --git a/browser/base/content/browser.xul b/browser/base/content/browser.xul
+--- a/browser/base/content/browser.xul
++++ b/browser/base/content/browser.xul
+@@ -91,31 +91,31 @@ xmlns="http://www.w3.org/1999/xhtml"
+   Services.scriptloader.loadSubScript("chrome://global/content/contentAreaUtils.js", this);
+   Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser.js", this);
+ 
+   window.onload = gBrowserInit.onLoad.bind(gBrowserInit);
+   window.onunload = gBrowserInit.onUnload.bind(gBrowserInit);
+   window.onclose = WindowIsClosing;
+ 
+ #ifdef BROWSER_XHTML
+-/*
+   window.addEventListener("readystatechange", () => {
+     // We initially hide the window to prevent layouts during parse. This lets us
+     // avoid accidental XBL construction and better match browser.xul (see Bug 1497975).
+     gBrowserInit.onBeforeInitialXULLayout();
++    document.documentElement.hidden = false;
+   }, { once: true, capture: true });
+-*/
++
+   // XXX: Right now we race with hiddenWindow such that we can't import the markup during readyStateChange
+   // (in b.xhtml only)
+   window.addEventListener("DOMContentLoaded", () => {
+     // We initially hide the window to prevent layouts during parse. This lets us
+     // avoid accidental XBL construction and better match browser.xul (see Bug 1497975).
+-    gBrowserInit.onBeforeInitialXULLayout();
+-    document.documentElement.hidden = false;
+-    document.documentElement.scrollWidth;
++    //gBrowserInit.onBeforeInitialXULLayout();
++    //document.documentElement.hidden = false;
++    //document.documentElement.scrollWidth;
+     gBrowserInit.onDOMContentLoaded();
+   }, { once: true });
+ #else
+   window.addEventListener("MozBeforeInitialXULLayout",
+     gBrowserInit.onBeforeInitialXULLayout.bind(gBrowserInit), { once: true });
+ // The listener of DOMContentLoaded must be set on window, rather than
+ // document, because the window can go away before the event is fired.
+ // In that case, we don't want to initialize anything, otherwise we
+diff --git a/browser/components/nsBrowserContentHandler.js b/browser/components/nsBrowserContentHandler.js
+--- a/browser/components/nsBrowserContentHandler.js
++++ b/browser/components/nsBrowserContentHandler.js
+@@ -175,17 +175,17 @@ function getPostUpdateOverridePage(defau
+  *        This can be a single url to load in the new window, provided as a string.
+  *        postData will be used in this case if provided.
+  * @param postData (optional)
+  *        An nsIInputStream object to use as POST data when loading the provided
+  *        url, or null.
+  * @param forcePrivate (optional)
+  *        Boolean. If set to true, the new window will be a private browsing one.
+  */
+-function openBrowserWindow(cmdLine, triggeringPrincipal, urlOrUrlList, postData = null,
++async function openBrowserWindow(cmdLine, triggeringPrincipal, urlOrUrlList, postData = null,
+                            forcePrivate = false) {
+   let chromeURL = AppConstants.BROWSER_CHROME_URL;
+ 
+   let args;
+   if (!urlOrUrlList) {
+     // Just pass in the defaultArgs directly. We'll use system principal on the other end.
+     args = [gBrowserContentHandler.defaultArgs];
+   } else if (Array.isArray(urlOrUrlList)) {
+@@ -218,16 +218,17 @@ function openBrowserWindow(cmdLine, trig
+             undefined, // user context id
+             null, // origin principal
+             triggeringPrincipal];
+   }
+ 
+   if (cmdLine.state == Ci.nsICommandLine.STATE_INITIAL_LAUNCH) {
+     let win = Services.wm.getMostRecentWindow("navigator:blank");
+     if (win) {
++      console.log("Got win");
+       // Remove the windowtype of our blank window so that we don't close it
+       // later on when seeing cmdLine.preventDefault is true.
+       win.document.documentElement.removeAttribute("windowtype");
+ 
+       if (forcePrivate) {
+         win.docShell
+            .QueryInterface(Ci.nsILoadContext)
+            .usePrivateBrowsing = true;
+@@ -260,17 +261,33 @@ function openBrowserWindow(cmdLine, trig
+     args.forEach(a => { array.appendElement(a); });
+     args = array;
+   }
+ 
+   let features = "chrome,dialog=no,all" + gBrowserContentHandler.getFeatures(cmdLine);
+   if (forcePrivate)
+     features += ",private";
+ 
+-  Services.ww.openWindow(null, chromeURL, "_blank", features, args);
++  console.log(Services.appShell.hiddenDOMWindow.document.readyState);
++  if (Services.appShell.hiddenDOMWindow.document.readyState != "complete") {
++    Services.appShell.hiddenDOMWindow.addEventListener("MozBeforeInitialXULLayout", () => {
++      Services.ww.openWindow(null, chromeURL, "_blank", features, args);
++    }, { once: true });
++
++
++
++    // let d = Date.now(); // This is extremely slow
++    // await new Promise(r =>
++    //   Services.appShell.hiddenDOMWindow.addEventListener("MozBeforeInitialXULLayout", r, { once: true }));
++    // console.log(Date.now() - d);
++  } else {
++    Services.ww.openWindow(null, chromeURL, "_blank", features, args);
++
++  }
++
+ }
+ 
+ function openPreferences(cmdLine, extraArgs) {
+   if (extraArgs && extraArgs.origin) {
+     Services.telemetry.getHistogramById("FX_PREFERENCES_OPENED_VIA").add(extraArgs.origin);
+   } else {
+     Services.telemetry.getHistogramById("FX_PREFERENCES_OPENED_VIA").add("other");
+   }
+diff --git a/toolkit/components/processsingleton/CustomElementsListener.jsm b/toolkit/components/processsingleton/CustomElementsListener.jsm
+--- a/toolkit/components/processsingleton/CustomElementsListener.jsm
++++ b/toolkit/components/processsingleton/CustomElementsListener.jsm
+@@ -6,18 +6,22 @@
+ ChromeUtils.import("resource://gre/modules/Services.jsm");
+ 
+ // Set up Custom Elements for XUL and XHTML documents before anything else
+ // happens. Anything loaded here should be considered part of core XUL functionality.
+ // Any window-specific elements can be registered via <script> tags at the
+ // top of individual documents.
+ Services.obs.addObserver({
+   observe(doc) {
++    let hiddenDOMWindow;
++    try {
++      hiddenDOMWindow = Services.appShell.hiddenDOMWindow;
++    } catch { }
+     if (!doc.nodePrincipal.isSystemPrincipal ||
+-        doc.ownerGlobal == Services.appShell.hiddenDOMWindow) {
++        doc.ownerGlobal == hiddenDOMWindow) {
+       return;
+     }
+ 
+     if (
+       doc.contentType == "application/vnd.mozilla.xul+xml" ||
+       doc.contentType == "application/xhtml+xml"
+     ) {
+       Services.scriptloader.loadSubScript(
