@@ -1,0 +1,176 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  bd4cebdbed4bcd34d449f67d51f139f9bdf75edc
+Bug 1448213 - Require that [accesskey] gets set on <xul:label> to enable formatting;r=Paolo
+
+Previously, if the accesskey attribute was missing then the label would reach up
+to binding parent to find it's accesskey. In practice, bindings already do
+[xbl:inherits=accesskey] to send it down to the label anyway.
+
+The problem with this is that for controls without accesskeys, the attribute doesn't get set,
+so the label will access the control from JS. This is fine for XBL, since typically
+the label XBL will construct at the same time as the control, but when migrating
+to Custom Elements, the label gets connected even when the control is hidden.
+
+diff --git a/toolkit/content/tests/chrome/test_labelcontrol.xul b/toolkit/content/tests/chrome/test_labelcontrol.xul
+--- a/toolkit/content/tests/chrome/test_labelcontrol.xul
++++ b/toolkit/content/tests/chrome/test_labelcontrol.xul
+@@ -6,18 +6,17 @@
+   -->
+ <window title="tabindex" width="500" height="600"
+         onload="runTests()"
+         xmlns="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul">
+   <script type="application/javascript" src="chrome://mochikit/content/tests/SimpleTest/SimpleTest.js"></script>  
+   <script type="application/javascript" src="chrome://mochikit/content/tests/SimpleTest/EventUtils.js"></script>  
+ 
+ <label id="lab" control="ctl"/>
+-<textbox id="ctl" value="Test"/>
+-<checkbox id="chk" value="Checkbox"/>
++<checkbox id="ctl" value="Checkbox"/>
+ 
+ <body xmlns="http://www.w3.org/1999/xhtml">
+ <p id="display"></p>
+ <div id="content" style="display: none">
+ </div>
+ <pre id="test">
+ </pre>
+ </body>
+@@ -27,17 +26,16 @@
+ 
+ SimpleTest.waitForExplicitFinish();
+  
+ function runTests()
+ {
+   is($("lab").control, "ctl", "control");
+   is($("lab").labeledControlElement, $("ctl"), "labeledControlElement");
+   is($("ctl").labelElement, $("lab"), "labelElement");
+-  is($("chk").labelElement.className, "checkbox-label", "labelElement");
+ 
+   SimpleTest.finish();
+ }
+ 
+ ]]>
+ 
+ </script>
+ 
+diff --git a/toolkit/content/widgets/general.xml b/toolkit/content/widgets/general.xml
+--- a/toolkit/content/widgets/general.xml
++++ b/toolkit/content/widgets/general.xml
+@@ -28,33 +28,39 @@
+       <property name="label"      onset="this.setAttribute('label',val); return val;"
+                                   onget="return this.getAttribute('label');"/>
+       <property name="crop"       onset="this.setAttribute('crop',val); return val;"
+                                   onget="return this.getAttribute('crop');"/>
+       <property name="image"      onset="this.setAttribute('image',val); return val;"
+                                   onget="return this.getAttribute('image');"/>
+       <property name="command"    onset="this.setAttribute('command',val); return val;"
+                                   onget="return this.getAttribute('command');"/>
++      <property name="labelElement">
++        <getter>
++          <![CDATA[
++            return document.getElementsByAttribute("control", this.id)[0];
++          ]]>
++        </getter>
++      </property>
+       <property name="accessKey">
+         <getter>
+           <![CDATA[
+-            return this.labelElement ? this.labelElement.accessKey : this.getAttribute("accesskey");
++            let labelElement = this.labelElement;
++            return labelElement ? labelElement.accessKey : this.getAttribute("accesskey");
+           ]]>
+         </getter>
+         <setter>
+           <![CDATA[
+             // Always store on the control
+             this.setAttribute("accesskey", val);
+             // If there is a label, change the accesskey on the labelElement
+             // if it's also set there
+             if (this.labelElement) {
+               this.labelElement.accessKey = val;
+             }
+             return val;
+           ]]>
+         </setter>
+       </property>
+-
+-      <field name="labelElement"/>
+     </implementation>
+   </binding>
+ 
+ </bindings>
+diff --git a/toolkit/content/widgets/text.xml b/toolkit/content/widgets/text.xml
+--- a/toolkit/content/widgets/text.xml
++++ b/toolkit/content/widgets/text.xml
+@@ -19,31 +19,16 @@
+           this.formatAccessKey(true);
+         ]]>
+       </constructor>
+ 
+       <method name="formatAccessKey">
+         <parameter name="firstTime"/>
+         <body>
+           <![CDATA[
+-            var control = this.labeledControlElement;
+-            if (!control) {
+-              var bindingParent = document.getBindingParent(this);
+-              if ("accessKey" in bindingParent) {
+-                control = bindingParent; // For controls that make the <label> an anon child
+-              }
+-            }
+-            if (control) {
+-              control.labelElement = this;
+-              var controlAccessKey = control.getAttribute("accesskey");
+-              if (controlAccessKey) {
+-                this.setAttribute("accesskey", controlAccessKey);
+-              }
+-            }
+-
+             var accessKey = this.accessKey;
+             // No need to remove existing formatting the first time.
+             if (firstTime && !accessKey)
+               return;
+ 
+             if (this.mInsertSeparator === undefined) {
+               try {
+                 var prefs = Cc["@mozilla.org/preferences-service;1"].
+@@ -83,17 +68,17 @@
+ 
+             var oldHiddenSpan =
+               this.getElementsByAttribute("class", "hiddenColon").item(0);
+             if (oldHiddenSpan) {
+               this.mergeElement(oldHiddenSpan);
+             }
+ 
+             var labelText = this.textContent;
+-            if (!accessKey || !labelText || !control) {
++            if (!accessKey || !labelText) {
+               return;
+             }
+             var accessKeyIndex = -1;
+             if (!this.mAlwaysAppendAccessKey) {
+               accessKeyIndex = labelText.indexOf(accessKey);
+               if (accessKeyIndex < 0) { // Try again in upper case
+                 accessKeyIndex =
+                   labelText.toUpperCase().indexOf(accessKey.toUpperCase());
+@@ -216,20 +201,16 @@
+       </property>
+ 
+       <property name="labeledControlElement" readonly="true"
+                 onget="var control = this.control; return control ? document.getElementById(control) : null;" />
+ 
+       <property name="control" onget="return this.getAttribute('control');">
+         <setter>
+           <![CDATA[
+-            var control = this.labeledControlElement;
+-            if (control) {
+-              control.labelElement = null; // No longer pointed to be this label
+-            }
+             this.setAttribute("control", val);
+             this.formatAccessKey(false);
+             return val;
+           ]]>
+         </setter>
+       </property>
+     </implementation>
+ 
