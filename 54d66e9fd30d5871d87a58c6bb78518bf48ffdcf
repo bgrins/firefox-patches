@@ -1,0 +1,215 @@
+
+# HG changeset patch
+# User Brendan Dahl <bdahl@mozilla.com>
+# Date 1543435753 28800
+# Node ID 54d66e9fd30d5871d87a58c6bb78518bf48ffdcf
+# Parent  148217d448156b6186b2dde41cc86f87aee43fc5
+Mimic xul.
+
+diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+--- a/browser/base/content/browser.js
++++ b/browser/base/content/browser.js
+@@ -1284,18 +1284,16 @@ var gBrowserInit = {
+       document.documentElement.setAttribute("width", width);
+       document.documentElement.setAttribute("height", height);
+ 
+       if (width < TARGET_WIDTH && height < TARGET_HEIGHT) {
+         document.documentElement.setAttribute("sizemode", "maximized");
+       }
+     }
+ 
+-    document.documentElement.removeAttribute("hidden");
+-
+     // Run menubar initialization first, to avoid TabsInTitlebar code picking
+     // up mutations from it and causing a reflow.
+     AutoHideMenubar.init();
+     // Update the chromemargin attribute so the window can be sized correctly.
+     window.TabBarVisibility.update();
+     TabsInTitlebar.init();
+ 
+     new LightweightThemeConsumer(document);
+diff --git a/browser/base/content/browser.xul b/browser/base/content/browser.xul
+--- a/browser/base/content/browser.xul
++++ b/browser/base/content/browser.xul
+@@ -67,17 +67,16 @@
+         windowtype="navigator:browser"
+         macanimationtype="document"
+         screenX="4" screenY="4"
+         fullscreenbutton="true"
+         sizemode="normal"
+         retargetdocumentfocus="urlbar"
+         persist="screenX screenY width height sizemode"
+ #ifdef BROWSER_XHTML
+-        hidden="true"
+         mozpersist=""
+ #endif
+         >
+ 
+ # All JS files which are needed by browser.xul and other top level windows to
+ # support MacOS specific features *must* go into the global-scripts.inc file so
+ # that they can be shared with macWindow.inc.xul.
+ #include global-scripts.inc
+@@ -86,27 +85,18 @@
+   Services.scriptloader.loadSubScript("chrome://global/content/contentAreaUtils.js", this);
+   Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser.js", this);
+   Services.scriptloader.loadSubScript("chrome://browser/content/search/searchbar.js", this);
+ 
+   window.onload = gBrowserInit.onLoad.bind(gBrowserInit);
+   window.onunload = gBrowserInit.onUnload.bind(gBrowserInit);
+   window.onclose = WindowIsClosing;
+ 
+-if (!(window.document instanceof XULDocument)) {
+-  window.addEventListener("readystatechange", () => {
+-    // We initially hide the window to prevent layouts during parse. This lets us
+-    // avoid accidental XBL construction and better match browser.xul (see Bug 1497975).
+-    gBrowserInit.onBeforeInitialXULLayout();
+-    document.documentElement.removeAttribute("hidden");
+-  }, { once: true, capture: true });
+-} else {
+   window.addEventListener("MozBeforeInitialXULLayout",
+     gBrowserInit.onBeforeInitialXULLayout.bind(gBrowserInit), { once: true });
+-}
+   // The listener of DOMContentLoaded must be set on window, rather than
+   // document, because the window can go away before the event is fired.
+   // In that case, we don't want to initialize anything, otherwise we
+   // may be leaking things because they will never be destroyed after.
+   window.addEventListener("DOMContentLoaded",
+     gBrowserInit.onDOMContentLoaded.bind(gBrowserInit), { once: true });
+ </script>
+ 
+diff --git a/dom/xml/nsXMLContentSink.cpp b/dom/xml/nsXMLContentSink.cpp
+--- a/dom/xml/nsXMLContentSink.cpp
++++ b/dom/xml/nsXMLContentSink.cpp
+@@ -32,16 +32,17 @@
+ #include "nsIScriptElement.h"
+ #include "nsStyleLinkElement.h"
+ #include "nsReadableUtils.h"
+ #include "nsUnicharUtils.h"
+ #include "nsICookieService.h"
+ #include "nsIPrompt.h"
+ #include "nsIChannel.h"
+ #include "nsIPrincipal.h"
++#include "nsIXULWindow.h"
+ #include "nsXMLPrettyPrinter.h"
+ #include "nsNodeInfoManager.h"
+ #include "nsContentCreatorFunctions.h"
+ #include "nsIContentPolicy.h"
+ #include "nsContentPolicyUtils.h"
+ #include "nsError.h"
+ #include "nsNodeUtils.h"
+ #include "nsIScriptGlobalObject.h"
+@@ -96,16 +97,17 @@ nsXMLContentSink::nsXMLContentSink()
+   : mState(eXMLContentSinkState_InProlog)
+   , mTextLength(0)
+   , mNotifyLevel(0)
+   , mPrettyPrintXML(true)
+   , mPrettyPrintHasSpecialRoot(0)
+   , mPrettyPrintHasFactoredElements(0)
+   , mPrettyPrinting(0)
+   , mPreventScriptExecution(0)
++  , mDelayLayout(false)
+ {
+   PodArrayZero(mText);
+ }
+ 
+ nsXMLContentSink::~nsXMLContentSink()
+ {
+ }
+ 
+@@ -123,16 +125,21 @@ nsXMLContentSink::Init(nsIDocument* aDoc
+ 
+   if (!mDocShell) {
+     mPrettyPrintXML = false;
+   }
+ 
+   mState = eXMLContentSinkState_InProlog;
+   mDocElement = nullptr;
+ 
++  if (Substring(aURI->GetSpecOrDefault(), aURI->GetSpecOrDefault().Length() - 13).EqualsLiteral("browser.xhtml")) {
++    printf(">>> delay layout\n");
++    mDelayLayout = true;
++  }
++
+   return NS_OK;
+ }
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsXMLContentSink)
+   NS_INTERFACE_MAP_ENTRY(nsIContentSink)
+   NS_INTERFACE_MAP_ENTRY(nsIXMLContentSink)
+   NS_INTERFACE_MAP_ENTRY(nsIExpatSink)
+   NS_INTERFACE_MAP_ENTRY(nsITransformObserver)
+@@ -321,16 +328,39 @@ nsXMLContentSink::DidBuildModel(bool aTe
+       // stylesheet loads
+       if (mDocument->CSSLoader()->HasPendingLoads()) {
+         mDocument->CSSLoader()->AddObserver(this);
+         // wait for those sheets to load
+         startLayout = false;
+       }
+     }
+ 
++    // For performance reasons, we want to trigger the DocumentL10n's `TriggerInitialDocumentTranslation` within the same
++    // microtask that will be created for a `MozBeforeInitialXULLayout`
++    // event listener.
++    // AddEventListener(NS_LITERAL_STRING("MozBeforeInitialXULLayout"), mDocumentL10n, true, false);
++
++    nsContentUtils::DispatchTrustedEvent(
++        mDocument,
++        static_cast<nsIDocument*>(mDocument),
++        NS_LITERAL_STRING("MozBeforeInitialXULLayout"),
++        CanBubble::eYes,
++        Cancelable::eNo);
++
++    // RemoveEventListener(NS_LITERAL_STRING("MozBeforeInitialXULLayout"), mDocumentL10n, true);
++
++    // Before starting layout, check whether we're a toplevel chrome
++    // window.  If we are, setup some state so that we don't have to restyle
++    // the whole tree after StartLayout.
++    if (nsCOMPtr<nsIXULWindow> win = mDocument->GetXULWindowIfToplevelChrome()) {
++        // We're the chrome document!
++      win->BeforeStartLayout();
++    }
++
++
+     if (startLayout) {
+       StartLayout(false);
+ 
+       ScrollToRef();
+     }
+ 
+     mDocument->RemoveObserver(this);
+     mIsDocumentObserver = false;
+@@ -921,17 +951,17 @@ nsXMLContentSink::HaveNotifiedForCurrent
+   return true;
+ }
+ 
+ void
+ nsXMLContentSink::MaybeStartLayout(bool aIgnorePendingSheets)
+ {
+   // XXXbz if aIgnorePendingSheets is true, what should we do when
+   // mXSLTProcessor or CanStillPrettyPrint()?
+-  if (mLayoutStarted || mXSLTProcessor || CanStillPrettyPrint()) {
++  if (mLayoutStarted || mXSLTProcessor || CanStillPrettyPrint() || mDelayLayout) {
+     return;
+   }
+   StartLayout(aIgnorePendingSheets);
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////
+ 
+ bool
+diff --git a/dom/xml/nsXMLContentSink.h b/dom/xml/nsXMLContentSink.h
+--- a/dom/xml/nsXMLContentSink.h
++++ b/dom/xml/nsXMLContentSink.h
+@@ -214,11 +214,12 @@ protected:
+   // inserted in the document. However, if we're doing an XSLT transform this will
+   // actually hold all the children of the source document, until the transform is
+   // finished. After the transform is finished we'll just discard the children.
+   nsTArray<nsCOMPtr<nsIContent>> mDocumentChildren;
+ 
+   static const int NS_ACCUMULATION_BUFFER_SIZE = 4096;
+   // Our currently accumulated text that we have not flushed to a textnode yet.
+   char16_t mText[NS_ACCUMULATION_BUFFER_SIZE];
++  bool mDelayLayout;
+ };
+ 
+ #endif // nsXMLContentSink_h__
