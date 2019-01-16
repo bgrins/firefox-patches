@@ -1,0 +1,276 @@
+
+# HG changeset patch
+# User Timothy Guan-tin Chien <timdream@gmail.com>
+# Date 1547660575 28800
+# Node ID 498e4bd093d805357e0023057c705aba2e9ea817
+# Parent  abb8a4bb66a742bc1e31c3e2a2956bedf52be665
+Bug 1520350 - Lazily load about:preferences markups from hidden panes
+
+Because custom elements will be constructed when DOM is constructed,
+construct the DOM in the hidden panels will be expensive as we move
+more and more widgets to custom elements from XBL.
+
+This patch attempts to counter that by moving all the pane markups
+into comment nodes, and use MozXULElement.parseXULToFragment() to
+insert it when it is being asked.
+
+They will be loaded lazily from an requestIdleCallback() in findInPage.js.
+
+diff --git a/browser/components/preferences/in-content/home.xul b/browser/components/preferences/in-content/home.xul
+--- a/browser/components/preferences/in-content/home.xul
++++ b/browser/components/preferences/in-content/home.xul
+@@ -1,17 +1,17 @@
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ <!-- Home panel -->
+ 
+ <script type="application/javascript"
+         src="chrome://browser/content/preferences/in-content/home.js"/>
+-
++<box id="template-paneHome" hidden="true"><![CDATA[
+ <hbox id="firefoxHomeCategory"
+       class="subcategory"
+       hidden="true"
+       data-category="paneHome">
+   <html:h1 style="-moz-box-flex: 1;" data-l10n-id="pane-home-title"/>
+   <button id="restoreDefaultHomePageBtn"
+           class="homepage-button check-home-page-controlled"
+           data-preference-related="browser.startup.homepage"
+@@ -93,8 +93,9 @@
+   <hbox id="browserNewTabExtensionContent"
+         align="center" hidden="true" class="extension-controlled">
+     <description control="disableNewTabExtension" flex="1" />
+     <button id="disableNewTabExtension"
+             class="extension-controlled-button accessory-button"
+             data-l10n-id="disable-extension" />
+   </hbox>
+ </groupbox>
++]]></box>
+diff --git a/browser/components/preferences/in-content/main.xul b/browser/components/preferences/in-content/main.xul
+--- a/browser/components/preferences/in-content/main.xul
++++ b/browser/components/preferences/in-content/main.xul
+@@ -11,16 +11,17 @@
+   <script type="application/javascript" src="chrome://browser/content/aboutDialog-appUpdater.js"/>
+ #endif
+ 
+ <script type="application/javascript"
+         src="chrome://mozapps/content/preferences/fontbuilder.js"/>
+ 
+ <stringbundle id="bundlePreferences" src="chrome://browser/locale/preferences.properties"/>
+ 
++<box id="template-paneGeneral" hidden="true"><![CDATA[
+ <hbox id="generalCategory"
+       class="subcategory"
+       hidden="true"
+       data-category="paneGeneral">
+   <html:h1 data-l10n-id="pane-general-title"/>
+ </hbox>
+ 
+ <!-- Startup -->
+@@ -712,8 +713,9 @@
+                 connection-proxy-socks-remote-dns.label,
+                 connection-dns-over-https,
+                 connection-dns-over-https-url-custom,
+                 connection-dns-over-https-url-default,
+             " />
+     </hbox>
+   </hbox>
+ </groupbox>
++]]></box>
+diff --git a/browser/components/preferences/in-content/preferences.js b/browser/components/preferences/in-content/preferences.js
+--- a/browser/components/preferences/in-content/preferences.js
++++ b/browser/components/preferences/in-content/preferences.js
+@@ -18,16 +18,17 @@
+ 
+ ChromeUtils.import("resource://gre/modules/Services.jsm");
+ ChromeUtils.import("resource://gre/modules/AppConstants.jsm");
+ 
+ ChromeUtils.defineModuleGetter(this, "formAutofillParent",
+                                "resource://formautofill/FormAutofillParent.jsm");
+ 
+ var gLastHash = "";
++const gXULDOMParser = new DOMParser();
+ 
+ var gCategoryInits = new Map();
+ function init_category_if_required(category) {
+   let categoryInfo = gCategoryInits.get(category);
+   if (!categoryInfo) {
+     throw "Unknown in-content prefs category! Can't init " + category;
+   }
+   if (categoryInfo.inited) {
+@@ -35,16 +36,21 @@ function init_category_if_required(categ
+   }
+   categoryInfo.init();
+ }
+ 
+ function register_module(categoryName, categoryObject) {
+   gCategoryInits.set(categoryName, {
+     inited: false,
+     init() {
++      let template = document.getElementById("template-" + categoryName)
++      if (template) {
++        template.replaceWith(
++          MozXULElement.parseXULToFragment(template.firstChild.data));
++      }
+       categoryObject.init();
+       this.inited = true;
+     },
+   });
+ }
+ 
+ document.addEventListener("DOMContentLoaded", init_all, {once: true});
+ 
+@@ -54,17 +60,16 @@ function init_all() {
+   gSubDialog.init();
+   register_module("paneGeneral", gMainPane);
+   register_module("paneHome", gHomePane);
+   register_module("paneSearch", gSearchPane);
+   register_module("panePrivacy", gPrivacyPane);
+   register_module("paneContainers", gContainersPane);
+   if (Services.prefs.getBoolPref("identity.fxaccounts.enabled")) {
+     document.getElementById("category-sync").hidden = false;
+-    document.getElementById("weavePrefsDeck").removeAttribute("data-hidden-from-search");
+     register_module("paneSync", gSyncPane);
+   }
+   register_module("paneSearchResults", gSearchResultsPane);
+   gSearchResultsPane.init();
+   gMainPane.preInit();
+ 
+   let categories = document.getElementById("categories");
+   categories.addEventListener("select", event => gotoPref(event.target.value));
+diff --git a/browser/components/preferences/in-content/privacy.xul b/browser/components/preferences/in-content/privacy.xul
+--- a/browser/components/preferences/in-content/privacy.xul
++++ b/browser/components/preferences/in-content/privacy.xul
+@@ -3,17 +3,17 @@
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ <!-- Privacy panel -->
+ 
+ <script type="application/javascript"
+         src="chrome://browser/content/preferences/in-content/privacy.js"/>
+ <stringbundle id="bundlePreferences" src="chrome://browser/locale/preferences/preferences.properties"/>
+ <stringbundle id="signonBundle" src="chrome://passwordmgr/locale/passwordmgr.properties"/>
+-
++<box id="template-panePrivacy" hidden="true"><![CDATA[
+ <hbox id="browserPrivacyCategory"
+       class="subcategory"
+       hidden="true"
+       data-category="panePrivacy">
+   <html:h1 data-l10n-id="privacy-header"/>
+ </hbox>
+ 
+ <!-- Tracking / Content Blocking -->
+@@ -804,8 +804,9 @@
+                   devmgr-button-changepw.label,
+                   devmgr-button-load.label,
+                   devmgr-button-unload.label
+                 "/>
+       </hbox>
+     </vbox>
+   </hbox>
+ </groupbox>
++]]></box>
+diff --git a/browser/components/preferences/in-content/search.xul b/browser/components/preferences/in-content/search.xul
+--- a/browser/components/preferences/in-content/search.xul
++++ b/browser/components/preferences/in-content/search.xul
+@@ -1,11 +1,11 @@
+     <script type="application/javascript"
+             src="chrome://browser/content/preferences/in-content/search.js"/>
+-
++    <box id="template-paneSearch" hidden="true"><![CDATA[
+     <hbox id="searchCategory"
+           class="subcategory"
+           hidden="true"
+           data-category="paneSearch">
+       <html:h1 data-l10n-id="pane-search-title"/>
+     </hbox>
+ 
+     <groupbox id="searchbarGroup" data-category="paneSearch">
+@@ -76,8 +76,9 @@
+                 data-l10n-id="search-remove-engine"
+                 disabled="true"
+                 />
+       </hbox>
+       <hbox id="addEnginesBox" pack="start">
+         <label id="addEngines" class="text-link" data-l10n-id="search-find-more-link"></label>
+       </hbox>
+     </groupbox>
++    ]]></box>
+diff --git a/browser/components/preferences/in-content/sync.js b/browser/components/preferences/in-content/sync.js
+--- a/browser/components/preferences/in-content/sync.js
++++ b/browser/components/preferences/in-content/sync.js
+@@ -47,16 +47,18 @@ var gSyncPane = {
+   set page(val) {
+     document.getElementById("weavePrefsDeck").selectedIndex = val;
+   },
+ 
+   init() {
+     this._setupEventListeners();
+     this._adjustForPrefs();
+ 
++    document.getElementById("weavePrefsDeck").removeAttribute("data-hidden-from-search");
++
+     // If the Service hasn't finished initializing, wait for it.
+     let xps = Cc["@mozilla.org/weave/service;1"]
+       .getService(Ci.nsISupports)
+       .wrappedJSObject;
+ 
+     if (xps.ready) {
+       this._init();
+       return;
+diff --git a/browser/components/preferences/in-content/sync.xul b/browser/components/preferences/in-content/sync.xul
+--- a/browser/components/preferences/in-content/sync.xul
++++ b/browser/components/preferences/in-content/sync.xul
+@@ -1,17 +1,17 @@
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ <!-- Sync panel -->
+ 
+ <script type="application/javascript"
+         src="chrome://browser/content/preferences/in-content/sync.js"/>
+-
++<box id="template-paneSync" hidden="true"><![CDATA[
+ <hbox id="firefoxAccountCategory"
+       class="subcategory"
+       hidden="true"
+       data-category="paneSync">
+   <html:h1 data-l10n-id="pane-sync-title"/>
+ </hbox>
+ 
+ <deck id="weavePrefsDeck" data-category="paneSync" hidden="true"
+@@ -191,8 +191,9 @@
+              class="text-link fxaMobilePromo" data-l10n-id="sync-mobilepromo-multi"/>
+     </vbox>
+     <vbox id="tosPP-small" align="start">
+       <label id="tosPP-small-ToS" class="text-link" data-l10n-id="sync-tos-link"/>
+       <label id="tosPP-small-PP" class="text-link" data-l10n-id="sync-fxa-privacy-notice"/>
+     </vbox>
+   </vbox>
+ </deck>
++]]></box>
+diff --git a/toolkit/content/widgets/radio.xml b/toolkit/content/widgets/radio.xml
+--- a/toolkit/content/widgets/radio.xml
++++ b/toolkit/content/widgets/radio.xml
+@@ -19,16 +19,17 @@
+       </xul:hbox>
+     </content>
+ 
+     <implementation implements="nsIDOMXULSelectControlItemElement">
+       <constructor>
+         <![CDATA[
+           // Just clear out the parent's cached list of radio children
+           var control = this.control;
++          window.customElements.upgrade(control);
+           if (control)
+             control.radioChildConstructed(this);
+         ]]>
+       </constructor>
+       <destructor>
+         <![CDATA[
+           if (!this.control)
+             return;
+
