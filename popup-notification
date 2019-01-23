@@ -1,12 +1,165 @@
 # HG changeset patch
 # User Brian Grinstead <bgrinstead@mozilla.com>
-# Parent  a559b84032a8d570a64f0bb67ce917c9d696d4fc
+# Parent  4f1ff0e34dd59539c8c0d133ecdff5660ec4e263
 Bug 1487065 - Implement popup-notification as a Custom Element
 
+diff --git a/browser/base/content/browser-addons.js b/browser/base/content/browser-addons.js
+--- a/browser/base/content/browser-addons.js
++++ b/browser/base/content/browser-addons.js
+@@ -1,16 +1,149 @@
+ /* -*- indent-tabs-mode: nil; js-indent-level: 2 -*-
+  * This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ // This file is loaded into the browser window scope.
+ /* eslint-env mozilla/browser-window */
+ 
++customElements.define("addon-progress-notification", class MozAddonProgressNotification extends customElements.get("popupnotification") {
++  show() {
++    super.show();
++    this.progressmeter = document.getElementById("addon-progress-notification-progressmeter");
++
++    this.progresstext = document.getElementById("addon-progress-notification-progresstext");
++
++    if (!this.notification)
++      return;
++
++    this.notification.options.installs.forEach(function(aInstall) {
++      aInstall.addListener(this);
++    }, this);
++
++    // Calling updateProgress can sometimes cause this notification to be
++    // removed in the middle of refreshing the notification panel which
++    // makes the panel get refreshed again. Just initialise to the
++    // undetermined state and then schedule a proper check at the next
++    // opportunity
++    this.setProgress(0, -1);
++    this._updateProgressTimeout = setTimeout(this.updateProgress.bind(this), 0);
++  }
++
++  disconnectedCallback() {
++    this.destroy();
++  }
++
++  destroy() {
++    if (!this.notification)
++      return;
++    this.notification.options.installs.forEach(function(aInstall) {
++      aInstall.removeListener(this);
++    }, this);
++
++    clearTimeout(this._updateProgressTimeout);
++  }
++
++  setProgress(aProgress, aMaxProgress) {
++    ChromeUtils.import("resource://gre/modules/DownloadUtils.jsm");
++    if (aMaxProgress == -1) {
++      this.progressmeter.removeAttribute("value");
++    } else {
++      this.progressmeter.setAttribute("value", (aProgress * 100) / aMaxProgress);
++    }
++
++    let now = Date.now();
++
++    if (!this.notification.lastUpdate) {
++      this.notification.lastUpdate = now;
++      this.notification.lastProgress = aProgress;
++      return;
++    }
++
++    let delta = now - this.notification.lastUpdate;
++    if ((delta < 400) && (aProgress < aMaxProgress))
++      return;
++
++    delta /= 1000;
++
++    // This algorithm is the same used by the downloads code.
++    let speed = (aProgress - this.notification.lastProgress) / delta;
++    if (this.notification.speed)
++      speed = speed * 0.9 + this.notification.speed * 0.1;
++
++    this.notification.lastUpdate = now;
++    this.notification.lastProgress = aProgress;
++    this.notification.speed = speed;
++
++    let status = null;
++    [status, this.notification.last] = DownloadUtils.getDownloadStatus(aProgress, aMaxProgress, speed, this.notification.last);
++    this.progresstext.setAttribute("value", status);
++    this.progresstext.setAttribute("tooltiptext", status);
++  }
++
++  cancel() {
++    let installs = this.notification.options.installs;
++    installs.forEach(function(aInstall) {
++      try {
++        aInstall.cancel();
++      } catch (e) {
++        // Cancel will throw if the download has already failed
++      }
++    }, this);
++
++    PopupNotifications.remove(this.notification);
++  }
++
++  updateProgress() {
++    if (!this.notification)
++      return;
++
++    let downloadingCount = 0;
++    let progress = 0;
++    let maxProgress = 0;
++
++    this.notification.options.installs.forEach(function(aInstall) {
++      if (aInstall.maxProgress == -1)
++        maxProgress = -1;
++      progress += aInstall.progress;
++      if (maxProgress >= 0)
++        maxProgress += aInstall.maxProgress;
++      if (aInstall.state < AddonManager.STATE_DOWNLOADED)
++        downloadingCount++;
++    });
++
++    if (downloadingCount == 0) {
++      this.destroy();
++      this.progressmeter.removeAttribute("value");
++      let status = gNavigatorBundle.getString("addonDownloadVerifying");
++      this.progresstext.setAttribute("value", status);
++      this.progresstext.setAttribute("tooltiptext", status);
++    } else {
++      this.setProgress(progress, maxProgress);
++    }
++  }
++
++  onDownloadProgress() {
++    this.updateProgress();
++  }
++
++  onDownloadFailed() {
++    this.updateProgress();
++  }
++
++  onDownloadCancelled() {
++    this.updateProgress();
++  }
++
++  onDownloadEnded() {
++    this.updateProgress();
++  }
++});
++
+ // Removes a doorhanger notification if all of the installs it was notifying
+ // about have ended in some way.
+ function removeNotificationOnEnd(notification, installs) {
+   let count = installs.length;
+ 
+   function maybeRemove(install) {
+     install.removeListener(this);
+ 
 diff --git a/browser/base/content/browser.css b/browser/base/content/browser.css
 --- a/browser/base/content/browser.css
 +++ b/browser/base/content/browser.css
-@@ -974,20 +974,16 @@ html|*#fullscreen-exit-button {
+@@ -988,20 +988,16 @@ html|*#fullscreen-exit-button {
  
  .popup-anchor {
    /* should occupy space but not be visible */
@@ -27,6 +180,28 @@ diff --git a/browser/base/content/browser.css b/browser/base/content/browser.css
  
  #statuspanel {
    position: fixed;
+diff --git a/browser/base/content/popup-notifications.inc b/browser/base/content/popup-notifications.inc
+--- a/browser/base/content/popup-notifications.inc
++++ b/browser/base/content/popup-notifications.inc
+@@ -56,17 +56,17 @@
+       <popupnotificationcontent orient="vertical">
+         <textbox id="password-notification-username"/>
+         <textbox id="password-notification-password" type="password" show-content=""/>
+         <checkbox id="password-notification-visibilityToggle" hidden="true"/>
+       </popupnotificationcontent>
+     </popupnotification>
+ 
+ 
+-    <popupnotification id="addon-progress-notification" hidden="true">
++    <popupnotification id="addon-progress-notification" is="addon-progress-notification" hidden="true">
+       <popupnotificationcontent orient="vertical">
+         <html:progress id="addon-progress-notification-progressmeter" max="100"/>
+         <label id="addon-progress-notification-progresstext" crop="end"/>
+       </popupnotificationcontent>
+     </popupnotification>
+ 
+     <popupnotification id="addon-install-confirmation-notification" hidden="true">
+       <popupnotificationcontent id="addon-install-confirmation-content" orient="vertical"/>
 diff --git a/browser/base/content/test/popupNotifications/browser_displayURI.js b/browser/base/content/test/popupNotifications/browser_displayURI.js
 --- a/browser/base/content/test/popupNotifications/browser_displayURI.js
 +++ b/browser/base/content/test/popupNotifications/browser_displayURI.js
@@ -154,6 +329,186 @@ diff --git a/browser/base/content/test/popupNotifications/head.js b/browser/base
         "label for extra secondary action " + i + " matches");
      is(actualExtraSecondaryActions[i].getAttribute("accesskey"), a.accessKey,
         "accessKey for extra secondary action " + i + " matches");
+diff --git a/browser/base/content/urlbarBindings.xml b/browser/base/content/urlbarBindings.xml
+--- a/browser/base/content/urlbarBindings.xml
++++ b/browser/base/content/urlbarBindings.xml
+@@ -2745,176 +2745,9 @@ file, You can obtain one at http://mozil
+             this.maybeSetupSpeculativeConnect(decodeURIComponent(params.url));
+           }
+         }
+ 
+       ]]></handler>
+ 
+     </handlers>
+   </binding>
+-
+-  <binding id="addon-progress-notification" extends="chrome://global/content/bindings/notification.xml#popup-notification">
+-    <implementation>
+-      <constructor><![CDATA[
+-        if (!this.notification)
+-          return;
+-
+-        this.notification.options.installs.forEach(function(aInstall) {
+-          aInstall.addListener(this);
+-        }, this);
+-
+-        // Calling updateProgress can sometimes cause this notification to be
+-        // removed in the middle of refreshing the notification panel which
+-        // makes the panel get refreshed again. Just initialise to the
+-        // undetermined state and then schedule a proper check at the next
+-        // opportunity
+-        this.setProgress(0, -1);
+-        this._updateProgressTimeout = setTimeout(this.updateProgress.bind(this), 0);
+-      ]]></constructor>
+-
+-      <destructor><![CDATA[
+-        this.destroy();
+-      ]]></destructor>
+-
+-      <field name="progressmeter" readonly="true">
+-        document.getElementById("addon-progress-notification-progressmeter");
+-      </field>
+-      <field name="progresstext" readonly="true">
+-        document.getElementById("addon-progress-notification-progresstext");
+-      </field>
+-      <property name="DownloadUtils" readonly="true">
+-        <getter><![CDATA[
+-          let module = {};
+-          ChromeUtils.import("resource://gre/modules/DownloadUtils.jsm", module);
+-          Object.defineProperty(this, "DownloadUtils", {
+-            configurable: true,
+-            enumerable: true,
+-            writable: true,
+-            value: module.DownloadUtils,
+-          });
+-          return module.DownloadUtils;
+-        ]]></getter>
+-      </property>
+-
+-      <method name="destroy">
+-        <body><![CDATA[
+-          if (!this.notification)
+-            return;
+-
+-          this.notification.options.installs.forEach(function(aInstall) {
+-            aInstall.removeListener(this);
+-          }, this);
+-          clearTimeout(this._updateProgressTimeout);
+-        ]]></body>
+-      </method>
+-
+-      <method name="setProgress">
+-        <parameter name="aProgress"/>
+-        <parameter name="aMaxProgress"/>
+-        <body><![CDATA[
+-          if (aMaxProgress == -1) {
+-            this.progressmeter.removeAttribute("value");
+-          } else {
+-            this.progressmeter.setAttribute("value", (aProgress * 100) / aMaxProgress);
+-          }
+-
+-          let now = Date.now();
+-
+-          if (!this.notification.lastUpdate) {
+-            this.notification.lastUpdate = now;
+-            this.notification.lastProgress = aProgress;
+-            return;
+-          }
+-
+-          let delta = now - this.notification.lastUpdate;
+-          if ((delta < 400) && (aProgress < aMaxProgress))
+-            return;
+-
+-          delta /= 1000;
+-
+-          // This algorithm is the same used by the downloads code.
+-          let speed = (aProgress - this.notification.lastProgress) / delta;
+-          if (this.notification.speed)
+-            speed = speed * 0.9 + this.notification.speed * 0.1;
+-
+-          this.notification.lastUpdate = now;
+-          this.notification.lastProgress = aProgress;
+-          this.notification.speed = speed;
+-
+-          let status = null;
+-          [status, this.notification.last] = this.DownloadUtils.getDownloadStatus(aProgress, aMaxProgress, speed, this.notification.last);
+-          this.progresstext.setAttribute("value", status);
+-          this.progresstext.setAttribute("tooltiptext", status);
+-        ]]></body>
+-      </method>
+-
+-      <method name="cancel">
+-        <body><![CDATA[
+-          let installs = this.notification.options.installs;
+-          installs.forEach(function(aInstall) {
+-            try {
+-              aInstall.cancel();
+-            } catch (e) {
+-              // Cancel will throw if the download has already failed
+-            }
+-          }, this);
+-
+-          PopupNotifications.remove(this.notification);
+-        ]]></body>
+-      </method>
+-
+-      <method name="updateProgress">
+-        <body><![CDATA[
+-          if (!this.notification)
+-            return;
+-
+-          let downloadingCount = 0;
+-          let progress = 0;
+-          let maxProgress = 0;
+-
+-          this.notification.options.installs.forEach(function(aInstall) {
+-            if (aInstall.maxProgress == -1)
+-              maxProgress = -1;
+-            progress += aInstall.progress;
+-            if (maxProgress >= 0)
+-              maxProgress += aInstall.maxProgress;
+-            if (aInstall.state < AddonManager.STATE_DOWNLOADED)
+-              downloadingCount++;
+-          });
+-
+-          if (downloadingCount == 0) {
+-            this.destroy();
+-            this.progressmeter.removeAttribute("value");
+-            let status = gNavigatorBundle.getString("addonDownloadVerifying");
+-            this.progresstext.setAttribute("value", status);
+-            this.progresstext.setAttribute("tooltiptext", status);
+-          } else {
+-            this.setProgress(progress, maxProgress);
+-          }
+-        ]]></body>
+-      </method>
+-
+-      <method name="onDownloadProgress">
+-        <body><![CDATA[
+-          this.updateProgress();
+-        ]]></body>
+-      </method>
+-
+-      <method name="onDownloadFailed">
+-        <body><![CDATA[
+-          this.updateProgress();
+-        ]]></body>
+-      </method>
+-
+-      <method name="onDownloadCancelled">
+-        <body><![CDATA[
+-          this.updateProgress();
+-        ]]></body>
+-      </method>
+-
+-      <method name="onDownloadEnded">
+-        <body><![CDATA[
+-          this.updateProgress();
+-        ]]></body>
+-      </method>
+-    </implementation>
+-  </binding>
+ </bindings>
 diff --git a/browser/components/customizableui/content/panelUI.js b/browser/components/customizableui/content/panelUI.js
 --- a/browser/components/customizableui/content/panelUI.js
 +++ b/browser/components/customizableui/content/panelUI.js
@@ -962,7 +1317,7 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
 diff --git a/toolkit/content/jar.mn b/toolkit/content/jar.mn
 --- a/toolkit/content/jar.mn
 +++ b/toolkit/content/jar.mn
-@@ -95,16 +95,17 @@ toolkit.jar:
+@@ -94,16 +94,17 @@ toolkit.jar:
     content/global/elements/editor.js           (widgets/editor.js)
     content/global/elements/general.js          (widgets/general.js)
     content/global/elements/notificationbox.js  (widgets/notificationbox.js)
@@ -985,7 +1340,7 @@ copy from toolkit/content/widgets/notification.xml
 copy to toolkit/content/widgets/popupnotification.js
 --- a/toolkit/content/widgets/notification.xml
 +++ b/toolkit/content/widgets/popupnotification.js
-@@ -1,103 +1,189 @@
+@@ -1,103 +1,198 @@
 -<?xml version="1.0"?>
 -<!-- This Source Code Form is subject to the terms of the Mozilla Public
 -   - License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -1068,6 +1423,32 @@ copy to toolkit/content/widgets/popupnotification.js
 +
 +  constructor() {
 +    super();
++
++    XPCOMUtils.defineLazyGetter(this, "button", () => {
++      this.slotContents();
++      return this.querySelector("[anonid=button]");
++    });
++    XPCOMUtils.defineLazyGetter(this, "secondaryButton", () => {
++      this.slotContents();
++      return this.querySelector("[anonid=secondarybutton]");
++    });
++    XPCOMUtils.defineLazyGetter(this, "checkbox", () => {
++      this.slotContents();
++      return this.querySelector("[anonid=checkbox]");
++    });
++    XPCOMUtils.defineLazyGetter(this, "closebutton", () => {
++      this.slotContents();
++      return this.querySelector("[anonid=closebutton]");
++    });
++    XPCOMUtils.defineLazyGetter(this, "menubutton", () => {
++      this.slotContents();
++      return this.querySelector("[anonid=menubutton]");
++    });
++    XPCOMUtils.defineLazyGetter(this, "menupopup", () => {
++      this.slotContents();
++      return this.querySelector("[anonid=menupopup]");
++    });
++  }
  
 -  <binding id="popup-notification">
 -    <content orient="vertical">
@@ -1155,30 +1536,13 @@ copy to toolkit/content/widgets/popupnotification.js
 -    </implementation>
 -  </binding>
 -</bindings>
-+    XPCOMUtils.defineLazyGetter(this, "button", () => {
-+      this.slotContents();
-+      return this.querySelector("[anonid=button]");
-+    });
-+    XPCOMUtils.defineLazyGetter(this, "secondaryButton", () => {
-+      this.slotContents();
-+      return this.querySelector("[anonid=secondarybutton]");
-+    });
-+    XPCOMUtils.defineLazyGetter(this, "checkbox", () => {
-+      this.slotContents();
-+      return this.querySelector("[anonid=checkbox]");
-+    });
-+    XPCOMUtils.defineLazyGetter(this, "closebutton", () => {
-+      this.slotContents();
-+      return this.querySelector("[anonid=closebutton]");
-+    });
-+    XPCOMUtils.defineLazyGetter(this, "menubutton", () => {
-+      this.slotContents();
-+      return this.querySelector("[anonid=menubutton]");
-+    });
-+    XPCOMUtils.defineLazyGetter(this, "menupopup", () => {
-+      this.slotContents();
-+      return this.querySelector("[anonid=menupopup]");
-+    });
++  show() {
++    this.slotContents();
++    this.hidden = false;
++  }
++
++  hide() {
++    this.hidden = true;
 +  }
 +
 +  // get menupopup() {
@@ -1330,7 +1694,7 @@ diff --git a/toolkit/modules/PopupNotifications.jsm b/toolkit/modules/PopupNotif
   * @see PopupNotifications.show()
   */
  function Notification(id, message, anchorID, mainAction, secondaryActions,
-@@ -739,26 +734,17 @@ PopupNotifications.prototype = {
+@@ -754,26 +749,17 @@ PopupNotifications.prototype = {
        this.panel.removeChild(popupnotification);
  
        // If this notification was provided by the chrome document rather than
@@ -1358,7 +1722,7 @@ diff --git a/toolkit/modules/PopupNotifications.jsm b/toolkit/modules/PopupNotif
          originalParent.appendChild(popupnotification);
        }
      }
-@@ -902,17 +888,17 @@ PopupNotifications.prototype = {
+@@ -917,17 +903,17 @@ PopupNotifications.prototype = {
          for (let i = 1; i < n.secondaryActions.length; i++) {
            let action = n.secondaryActions[i];
            let item = doc.createXULElement("menuitem");
@@ -1377,25 +1741,26 @@ diff --git a/toolkit/modules/PopupNotifications.jsm b/toolkit/modules/PopupNotif
              telemetryStatId++;
            }
          }
-@@ -940,16 +926,17 @@ PopupNotifications.prototype = {
-         } else {
-           this._setNotificationUIState(popupnotification, checkbox.uncheckedState);
-         }
-       } else {
+@@ -959,17 +945,17 @@ PopupNotifications.prototype = {
          popupnotification.setAttribute("checkboxhidden", "true");
          popupnotification.setAttribute("warninghidden", "true");
        }
  
-+      popupnotification.slotContents();
        this.panel.appendChild(popupnotification);
  
        // The popupnotification may be hidden if we got it from the chrome
        // document rather than creating it ad hoc.
-       popupnotification.hidden = false;
+-      popupnotification.hidden = false;
++      popupnotification.show();
      }, this);
    },
  
-@@ -1040,16 +1027,17 @@ PopupNotifications.prototype = {
+   _setNotificationUIState(notification, state = {}) {
+     if (state.disableMainAction ||
+         notification.hasAttribute("invalidselection")) {
+       notification.setAttribute("mainactiondisabled", "true");
+     } else {
+@@ -1055,16 +1041,17 @@ PopupNotifications.prototype = {
          this.panel.setAttribute("noautohide", "true");
        } else {
          this.panel.removeAttribute("noautohide");
@@ -1413,7 +1778,7 @@ diff --git a/toolkit/modules/PopupNotifications.jsm b/toolkit/modules/PopupNotif
          // Remember the time the notification was shown for the security delay.
          n.timeShown = this.window.performance.now();
        }, this);
-@@ -1482,25 +1470,17 @@ PopupNotifications.prototype = {
+@@ -1497,25 +1484,17 @@ PopupNotifications.prototype = {
      event.stopPropagation();
    },
  
@@ -1440,7 +1805,7 @@ diff --git a/toolkit/modules/PopupNotifications.jsm b/toolkit/modules/PopupNotif
        } else {
          this._setNotificationUIState(notificationEl, notification.options.checkbox.uncheckedState);
        }
-@@ -1588,17 +1568,17 @@ PopupNotifications.prototype = {
+@@ -1603,17 +1582,17 @@ PopupNotifications.prototype = {
      this._update();
    },
  
@@ -1459,54 +1824,10 @@ diff --git a/toolkit/modules/PopupNotifications.jsm b/toolkit/modules/PopupNotif
        target.action.callback.call(undefined, {
          checkboxChecked: notificationEl.checkbox.checked,
          source: "menucommand",
-diff --git a/toolkit/mozapps/update/tests/browser/browser_updatesBackgroundWindow.js b/toolkit/mozapps/update/tests/browser/browser_updatesBackgroundWindow.js
---- a/toolkit/mozapps/update/tests/browser/browser_updatesBackgroundWindow.js
-+++ b/toolkit/mozapps/update/tests/browser/browser_updatesBackgroundWindow.js
-@@ -17,17 +17,17 @@ add_task(async function testUpdatesBackg
-       is(PanelUI.menuButton.getAttribute("badge-status"), "update-available",
-          "The badge is showing for the background window");
-       let popupShownPromise = BrowserTestUtils.waitForEvent(PanelUI.notificationPanel, "popupshown");
-       await BrowserTestUtils.closeWindow(extraWindow);
-       await SimpleTest.promiseFocus(window);
-       await popupShownPromise;
- 
-       checkWhatsNewLink(window, "update-available-whats-new");
--      let buttonEl = getNotificationButton(window, "update-available", "button");
-+      let buttonEl = getNotificationButton(window, "update-available");
-       buttonEl.click();
-     },
-     {
-       notificationId: "update-restart",
-       button: "secondarybutton",
-       cleanup() {
-         AppMenuNotifications.removeNotification(/.*/);
-       },
-diff --git a/toolkit/mozapps/update/tests/browser/browser_updatesBackgroundWindowFailures.js b/toolkit/mozapps/update/tests/browser/browser_updatesBackgroundWindowFailures.js
---- a/toolkit/mozapps/update/tests/browser/browser_updatesBackgroundWindowFailures.js
-+++ b/toolkit/mozapps/update/tests/browser/browser_updatesBackgroundWindowFailures.js
-@@ -15,17 +15,17 @@ add_task(async function testBackgroundWi
-                                               "Background window has a badge.");
- 
-       is(PanelUI.notificationPanel.state, "closed",
-          "The doorhanger is not showing for the background window");
-       is(PanelUI.menuButton.getAttribute("badge-status"), "update-available",
-          "The badge is showing for the background window");
- 
-       checkWhatsNewLink(extraWindow, "update-available-whats-new");
--      let buttonEl = getNotificationButton(extraWindow, "update-available", "button");
-+      let buttonEl = getNotificationButton(extraWindow, "update-available");
-       buttonEl.click();
- 
-       if (destroyWindow) {
-         await BrowserTestUtils.closeWindow(extraWindow);
-         await SimpleTest.promiseFocus(window);
-       }
-     };
-   }
 diff --git a/toolkit/mozapps/update/tests/browser/head.js b/toolkit/mozapps/update/tests/browser/head.js
 --- a/toolkit/mozapps/update/tests/browser/head.js
 +++ b/toolkit/mozapps/update/tests/browser/head.js
-@@ -289,17 +289,17 @@ function waitForEvent(topic, status = nu
+@@ -369,17 +369,17 @@ function waitForEvent(topic, status = nu
   *         The ID of the notification to get the button for.
   * @param  button
   *         The anonid of the button to get.
