@@ -1,0 +1,121 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  d5549e46baed9340deb0b67c9dd9a61de432ab83
+Bug 1523429 - Skip updating child attributes in MozElement.inheritAttribute if the host attribute hasn't changed
+
+diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.js
+--- a/toolkit/content/customElements.js
++++ b/toolkit/content/customElements.js
+@@ -58,29 +58,54 @@ const MozElementMixin = Base => class Mo
+    * @param {string} attr
+    *        An attribute to inherit. Optionally in the form of |to=from|, where
+    *        |to| is an attribute defined on custom element, whose value will be
+    *        inherited to |from| attribute, defined a child element. Note |from| may
+    *        take a special value of "text" to propogate attribute value as
+    *        a child's text.
+    */
+   inheritAttribute(child, attr) {
++    if (!this.inheritedAttributesMap) {
++      this.inheritedAttributesMap = new WeakMap();
++    }
++    let storedChildAttributes = this.inheritedAttributesMap.get(child);
++    if (!storedChildAttributes) {
++      this.inheritedAttributesMap.set(child, {});
++      storedChildAttributes = this.inheritedAttributesMap.get(child);
++    }
++
+     let attrName = attr;
+     let attrNewName = attr;
+     let split = attrName.split("=");
+     if (split.length == 2) {
+       attrName = split[1];
+       attrNewName = split[0];
+     }
+ 
++    let hasAttr = this.hasAttribute(attrName);
++    let attrValue = this.getAttribute(attrName);
++
++    // If the attribute hasn't changed on this since we last inherited, then don't
++    // propagate it down to the child. This prevents overriding an attribute that's
++    // been changed on the child (for instance, [checked]).
++    if ((hasAttr && attrValue === storedChildAttributes[attrName]) ||
++        (!hasAttr && !storedChildAttributes.hasOwnProperty(attrName))) {
++      return;
++    }
++
++    if (hasAttr) {
++      storedChildAttributes[attrName] = this.getAttribute(attrName);
++    } else {
++      delete storedChildAttributes[attrName];
++    }
++
+     if (attrNewName === "text") {
+-      child.textContent =
+-        this.hasAttribute(attrName) ? this.getAttribute(attrName) : "";
+-    } else if (this.hasAttribute(attrName)) {
+-      child.setAttribute(attrNewName, this.getAttribute(attrName));
++      child.textContent = hasAttr ? attrValue : "";
++    } else if (hasAttr) {
++      child.setAttribute(attrNewName, attrValue);
+     } else {
+       child.removeAttribute(attrNewName);
+     }
+   }
+ 
+   /**
+    * Sometimes an element may not want to run connectedCallback logic during
+    * parse. This could be because we don't want to initialize the element before
+diff --git a/toolkit/content/tests/chrome/test_custom_element_base.xul b/toolkit/content/tests/chrome/test_custom_element_base.xul
+--- a/toolkit/content/tests/chrome/test_custom_element_base.xul
++++ b/toolkit/content/tests/chrome/test_custom_element_base.xul
+@@ -84,16 +84,17 @@
+ 
+       connectedCallback() {
+         this.append(MozXULElement.parseXULToFragment(`<label />`));
+         this.label = this.querySelector("label");
+         this.inherit();
+       }
+     }
+ 
++
+     customElements.define("inherited-element", InheritsElement);
+     let el = document.querySelector("inherited-element");
+     ok(el, "element exists");
+ 
+     is(el.label.getAttribute("foo"), "fuagra", "predefined attribute @foo");
+     ok(!el.label.hasAttribute("boo"), "predefined attribute @boo");
+     ok(!el.label.hasAttribute("bardo"), "predefined attribute @bardo");
+     ok(!el.label.textContent, "predefined attribute @label");
+@@ -103,17 +104,31 @@
+        "attribute inheritance: boo");
+ 
+     el.setAttribute("label", "label-test");
+     is(el.label.textContent, "label-test",
+        "attribute inheritance: text=label attribute change");
+ 
+     el.setAttribute("bar", "bar-test");
+     is(el.label.getAttribute("bardo"), "bar-test",
+-       "attribute inheritance: bardo=bar");
++       "attribute inheritance: `=` mapping");
++
++    el.label.setAttribute("bardo", "changed-from-child");
++    el.inherit();
++    is(el.label.getAttribute("bardo"), "changed-from-child",
++       "attribute inheritance: doesn't apply when host attr hasn't changed and child has changed");
++
++    el.label.removeAttribute("bardo");
++    el.inherit();
++    ok(!el.label.hasAttribute("bardo"),
++       "attribute inheritance: doesn't apply when host attr hasn't changed and child has removed");
++
++    el.setAttribute("bar", "changed-from-host");
++    is(el.label.getAttribute("bardo"), "changed-from-host",
++       "attribute inheritance: does apply when host attr has changed and so has child attr");
+   }
+ 
+   async function testCustomInterface() {
+     class SimpleElement extends MozXULElement {
+       get disabled() {
+         return this.getAttribute("disabled") == "true";
+       }
+ 
