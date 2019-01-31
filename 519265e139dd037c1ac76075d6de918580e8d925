@@ -1,0 +1,226 @@
+
+# HG changeset patch
+# User Brendan Dahl <bdahl@mozilla.com>
+# Date 1548725569 28800
+# Node ID 519265e139dd037c1ac76075d6de918580e8d925
+# Parent  bab0e9b97b329ca7d12d609cfb866b93af75392b
+Don't block inline scripts while loading CSS.
+
+
+diff --git a/dom/base/nsContentSink.cpp b/dom/base/nsContentSink.cpp
+--- a/dom/base/nsContentSink.cpp
++++ b/dom/base/nsContentSink.cpp
+@@ -255,18 +255,19 @@ nsContentSink::StyleSheetLoaded(StyleShe
+         // StartLayout() stuff that needs to happen has already happened, so we
+         // don't need to worry about it.
+         StartLayout(false);
+       }
+ 
+       // Go ahead and try to scroll to our ref if we have one
+       ScrollToRef();
+     }
+-
+-    mScriptLoader->RemoveParserBlockingScriptExecutionBlocker();
++    if (!mFastLoad) {
++      mScriptLoader->RemoveParserBlockingScriptExecutionBlocker();
++    }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ nsresult nsContentSink::ProcessHTTPHeaders(nsIChannel* aChannel) {
+   nsCOMPtr<nsIHttpChannel> httpchannel(do_QueryInterface(aChannel));
+ 
+@@ -774,17 +775,19 @@ nsresult nsContentSink::ProcessStyleLink
+   auto loadResultOrErr =
+       mCSSLoader->LoadStyleLink(info, mRunsToCompletion ? nullptr : this);
+   if (loadResultOrErr.isErr()) {
+     return loadResultOrErr.unwrapErr();
+   }
+ 
+   if (loadResultOrErr.unwrap().ShouldBlock() && !mRunsToCompletion) {
+     ++mPendingSheetCount;
+-    mScriptLoader->AddParserBlockingScriptExecutionBlocker();
++    if (!mFastLoad) {
++      mScriptLoader->AddParserBlockingScriptExecutionBlocker();
++    }
+   }
+ 
+   return NS_OK;
+ }
+ 
+ nsresult nsContentSink::ProcessMETATag(nsIContent* aContent) {
+   NS_ASSERTION(aContent, "missing meta-element");
+   MOZ_ASSERT(aContent->IsElement());
+diff --git a/dom/xml/nsXMLContentSink.cpp b/dom/xml/nsXMLContentSink.cpp
+--- a/dom/xml/nsXMLContentSink.cpp
++++ b/dom/xml/nsXMLContentSink.cpp
+@@ -91,17 +91,18 @@ nsresult NS_NewXMLContentSink(nsIXMLCont
+ nsXMLContentSink::nsXMLContentSink()
+     : mState(eXMLContentSinkState_InProlog),
+       mTextLength(0),
+       mNotifyLevel(0),
+       mPrettyPrintXML(true),
+       mPrettyPrintHasSpecialRoot(0),
+       mPrettyPrintHasFactoredElements(0),
+       mPrettyPrinting(0),
+-      mPreventScriptExecution(0) {
++      mPreventScriptExecution(0),
++      mStillWalking(true) {
+   PodArrayZero(mText);
+ }
+ 
+ nsXMLContentSink::~nsXMLContentSink() {}
+ 
+ nsresult nsXMLContentSink::Init(Document* aDoc, nsIURI* aURI,
+                                 nsISupports* aContainer, nsIChannel* aChannel) {
+   nsresult rv = nsContentSink::Init(aDoc, aURI, aContainer, aChannel);
+@@ -296,16 +297,17 @@ nsXMLContentSink::DidBuildModel(bool aTe
+       // stylesheet loads
+       if (mDocument->CSSLoader()->HasPendingLoads()) {
+         mDocument->CSSLoader()->AddObserver(this);
+         // wait for those sheets to load
+         startLayout = false;
+       }
+     }
+ 
++    mStillWalking = false;
+     KickTheTires();
+   }
+ 
+   return NS_OK;
+ }
+ 
+ void nsXMLContentSink::KickTheTires() {
+     if (mPendingSheetCount > 0) {
+@@ -404,30 +406,36 @@ nsXMLContentSink::OnTransformDone(nsresu
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ nsXMLContentSink::StyleSheetLoaded(StyleSheet* aSheet, bool aWasDeferred,
+                                    nsresult aStatus) {
+   if (!mPrettyPrinting) {
+-    return nsContentSink::StyleSheetLoaded(aSheet, aWasDeferred, aStatus);
++    nsresult rv = nsContentSink::StyleSheetLoaded(aSheet, aWasDeferred, aStatus);
++    if (!mPendingSheetCount && !mStillWalking) {
++      KickTheTires();
++    }
++    return rv;
+   }
+ 
+   if (!mDocument->CSSLoader()->HasPendingLoads()) {
+     mDocument->CSSLoader()->RemoveObserver(this);
+     StartLayout(false);
+     ScrollToRef();
+   }
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+-nsXMLContentSink::WillInterrupt(void) { return WillInterruptImpl(); }
++nsXMLContentSink::WillInterrupt(void) {
++  return WillInterruptImpl();
++}
+ 
+ NS_IMETHODIMP
+ nsXMLContentSink::WillResume(void) { return WillResumeImpl(); }
+ 
+ NS_IMETHODIMP
+ nsXMLContentSink::SetParser(nsParserBase* aParser) {
+   MOZ_ASSERT(aParser, "Should have a parser here!");
+   mParser = aParser;
+@@ -842,23 +850,26 @@ bool nsXMLContentSink::HaveNotifiedForCu
+     const StackNode& stackNode = mContentStack[stackLength - 1];
+     nsIContent* parent = stackNode.mContent;
+     return stackNode.mNumFlushed == parent->GetChildCount();
+   }
+   return true;
+ }
+ 
+ void nsXMLContentSink::MaybeStartLayout(bool aIgnorePendingSheets) {
+-  return;
+   // XXXbz if aIgnorePendingSheets is true, what should we do when
+   // mXSLTProcessor or CanStillPrettyPrint()?
+-  // if (mLayoutStarted || mXSLTProcessor || CanStillPrettyPrint()) {
+-  //   return;
+-  // }
+-  // StartLayout(aIgnorePendingSheets);
++  if (mFastLoad) {
++    // The end of style loads or parsing will kick off layout.
++    return;
++  }
++  if (mLayoutStarted || mXSLTProcessor || CanStillPrettyPrint()) {
++    return;
++  }
++  StartLayout(aIgnorePendingSheets);
+ }
+ 
+ ////////////////////////////////////////////////////////////////////////
+ 
+ bool nsXMLContentSink::SetDocElement(int32_t aNameSpaceID, nsAtom* aTagName,
+                                      nsIContent* aContent) {
+   if (mDocElement) return false;
+ 
+@@ -1214,17 +1225,19 @@ nsXMLContentSink::HandleProcessingInstru
+ 
+ 
+ 
+     auto update = updateOrError.unwrap();
+     if (update.WillNotify()) {
+       // Successfully started a stylesheet load
+       if (update.ShouldBlock() && !mRunsToCompletion) {
+         ++mPendingSheetCount;
+-        mScriptLoader->AddParserBlockingScriptExecutionBlocker();
++        if (!mFastLoad) {
++          mScriptLoader->AddParserBlockingScriptExecutionBlocker();
++        }
+       }
+       return NS_OK;
+     }
+   }
+ 
+   // Check whether this is a CSS stylesheet PI.  Make sure the type
+   // handling here matches
+   // XMLStylesheetProcessingInstruction::GetStyleSheetInfo.
+diff --git a/dom/xml/nsXMLContentSink.h b/dom/xml/nsXMLContentSink.h
+--- a/dom/xml/nsXMLContentSink.h
++++ b/dom/xml/nsXMLContentSink.h
+@@ -205,11 +205,12 @@ class nsXMLContentSink : public nsConten
+   // transform this will actually hold all the children of the source document,
+   // until the transform is finished. After the transform is finished we'll just
+   // discard the children.
+   nsTArray<nsCOMPtr<nsIContent>> mDocumentChildren;
+ 
+   static const int NS_ACCUMULATION_BUFFER_SIZE = 4096;
+   // Our currently accumulated text that we have not flushed to a textnode yet.
+   char16_t mText[NS_ACCUMULATION_BUFFER_SIZE];
++  bool mStillWalking;
+ };
+ 
+ #endif  // nsXMLContentSink_h__
+diff --git a/toolkit/content/editMenuCommands.inc.xul b/toolkit/content/editMenuCommands.inc.xul
+--- a/toolkit/content/editMenuCommands.inc.xul
++++ b/toolkit/content/editMenuCommands.inc.xul
+@@ -1,13 +1,15 @@
+-<script type="application/javascript" src="chrome://global/content/editMenuOverlay.js"
++<script type="application/javascript"
+ #ifdef BROWSER_XHTML
+ xmlns="http://www.w3.org/1999/xhtml"
+ #endif
+-/>
++>
++  Services.scriptloader.loadSubScript("chrome://global/content/editMenuOverlay.js", this);
++</script>
+ <commandset id="editMenuCommands">
+   <commandset id="editMenuCommandSetAll" commandupdater="true" events="focus,select"
+               oncommandupdate="goUpdateGlobalEditMenuItems()"/>
+   <commandset id="editMenuCommandSetUndo" commandupdater="true" events="undo"
+               oncommandupdate="goUpdateUndoEditMenuItems()"/>
+   <commandset id="editMenuCommandSetPaste" commandupdater="true" events="clipboard"
+               oncommandupdate="goUpdatePasteMenuItems()"/>
+   <command id="cmd_undo" oncommand="goDoCommand('cmd_undo')"/>
+

@@ -1,0 +1,189 @@
+
+# HG changeset patch
+# User Brendan Dahl <bdahl@mozilla.com>
+# Date 1548789607 28800
+# Node ID d3d6a9fabdebc1b8dd52038ada102dba89d5a818
+# Parent  519265e139dd037c1ac76075d6de918580e8d925
+Use mozBeforeInitialXULLayout and delay frame loader init.
+
+
+diff --git a/browser/base/content/browser.xul b/browser/base/content/browser.xul
+--- a/browser/base/content/browser.xul
++++ b/browser/base/content/browser.xul
+@@ -67,17 +67,16 @@
+         windowtype="navigator:browser"
+         macanimationtype="document"
+         screenX="4" screenY="4"
+         fullscreenbutton="true"
+         sizemode="normal"
+         retargetdocumentfocus="urlbar"
+         persist="screenX screenY width height sizemode"
+ #ifdef BROWSER_XHTML
+-        hidden="true"
+         mozpersist=""
+ #endif
+         >
+ 
+ # All JS files which are needed by browser.xul and other top level windows to
+ # support MacOS specific features *must* go into the global-scripts.inc file so
+ # that they can be shared with macWindow.inc.xul.
+ #include global-scripts.inc
+@@ -104,27 +103,18 @@ xmlns="http://www.w3.org/1999/xhtml"
+   Services.scriptloader.loadSubScript("chrome://browser/content/browser-tabsintitlebar.js", this);
+   Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser.js", this);
+   Services.scriptloader.loadSubScript("chrome://browser/content/search/searchbar.js", this);
+ 
+   window.onload = gBrowserInit.onLoad.bind(gBrowserInit);
+   window.onunload = gBrowserInit.onUnload.bind(gBrowserInit);
+   window.onclose = WindowIsClosing;
+ 
+-#ifdef BROWSER_XHTML
+-  window.addEventListener("readystatechange", () => {
+-    // We initially hide the window to prevent layouts during parse. This lets us
+-    // avoid accidental XBL construction and better match browser.xul (see Bug 1497975).
+-    gBrowserInit.onBeforeInitialXULLayout();
+-    document.documentElement.removeAttribute("hidden");
+-  }, { once: true, capture: true });
+-#else
+   window.addEventListener("MozBeforeInitialXULLayout",
+     gBrowserInit.onBeforeInitialXULLayout.bind(gBrowserInit), { once: true });
+-#endif
+   // The listener of DOMContentLoaded must be set on window, rather than
+   // document, because the window can go away before the event is fired.
+   // In that case, we don't want to initialize anything, otherwise we
+   // may be leaking things because they will never be destroyed after.
+   window.addEventListener("DOMContentLoaded",
+     gBrowserInit.onDOMContentLoaded.bind(gBrowserInit), { once: true });
+ </script>
+ 
+diff --git a/dom/base/Document.h b/dom/base/Document.h
+--- a/dom/base/Document.h
++++ b/dom/base/Document.h
+@@ -3509,17 +3509,19 @@ class Document : public nsINode,
+   void SendToConsole(nsCOMArray<nsISecurityConsoleMessage>& aMessages);
+ 
+   // Returns true if the scheme for the url for this document is "about".
+   bool IsAboutPage() const;
+ 
+   bool ContainsEMEContent();
+   bool ContainsMSEContent();
+ 
++public:
+   void MaybeInitializeFinalizeFrameLoaders();
++protected:
+ 
+   /**
+    * Returns the title element of the document as defined by the HTML
+    * specification, or null if there isn't one.  For documents whose root
+    * element is an <svg:svg>, this is the first <svg:title> element that's a
+    * child of the root.  For other documents, it's the first HTML title element
+    * in the document.
+    */
+@@ -3965,17 +3967,19 @@ class Document : public nsINode,
+   bool mDOMCompleteSet : 1;
+   bool mAutoFocusFired : 1;
+ 
+   bool mScrolledToRefAlready : 1;
+   bool mChangeScrollPosWhenScrollingToRef : 1;
+ 
+   bool mHasWarnedAboutBoxObjects : 1;
+ 
++public:
+   bool mDelayFrameLoaderInitialization : 1;
++protected:
+ 
+   bool mSynchronousDOMContentLoaded : 1;
+ 
+   // Set to true when the document is possibly controlled by the ServiceWorker.
+   // Used to prevent multiple requests to ServiceWorkerManager.
+   bool mMaybeServiceWorkerControlled : 1;
+ 
+   // These member variables cache information about the viewport so we don't
+diff --git a/dom/xml/nsXMLContentSink.cpp b/dom/xml/nsXMLContentSink.cpp
+--- a/dom/xml/nsXMLContentSink.cpp
++++ b/dom/xml/nsXMLContentSink.cpp
+@@ -54,16 +54,17 @@
+ #include "mozilla/dom/Comment.h"
+ #include "mozilla/dom/DocumentType.h"
+ #include "mozilla/dom/Element.h"
+ #include "mozilla/dom/HTMLTemplateElement.h"
+ #include "mozilla/dom/ProcessingInstruction.h"
+ #include "mozilla/dom/ScriptLoader.h"
+ #include "mozilla/dom/txMozillaXSLTProcessor.h"
+ #include "mozilla/LoadInfo.h"
++#include "mozilla/dom/DocumentL10n.h"
+ 
+ using namespace mozilla;
+ using namespace mozilla::dom;
+ 
+ // XXX Open Issues:
+ // 1) what's not allowed - We need to figure out which HTML tags
+ //    (prefixed with a HTML namespace qualifier) are explicitly not
+ //    allowed (if any).
+@@ -102,16 +103,19 @@ nsXMLContentSink::nsXMLContentSink()
+ }
+ 
+ nsXMLContentSink::~nsXMLContentSink() {}
+ 
+ nsresult nsXMLContentSink::Init(Document* aDoc, nsIURI* aURI,
+                                 nsISupports* aContainer, nsIChannel* aChannel) {
+   nsresult rv = nsContentSink::Init(aDoc, aURI, aContainer, aChannel);
+   NS_ENSURE_SUCCESS(rv, rv);
++  if (mFastLoad) {
++    mDocument->mDelayFrameLoaderInitialization = true;
++  }
+ 
+   aDoc->AddObserver(this);
+   mIsDocumentObserver = true;
+ 
+   if (!mDocShell) {
+     mPrettyPrintXML = false;
+   }
+ 
+@@ -310,24 +314,45 @@ nsXMLContentSink::DidBuildModel(bool aTe
+ }
+ 
+ void nsXMLContentSink::KickTheTires() {
+     if (mPendingSheetCount > 0) {
+       // Style sheet load will kick off layout.
+       return;
+     }
+ 
++    RefPtr<mozilla::dom::DocumentL10n> l10n = mDocument->GetL10n();
++    // For performance reasons, we want to trigger the DocumentL10n's
++    // `TriggerInitialDocumentTranslation` within the same microtask that will
++    // be created for a `MozBeforeInitialXULLayout` event listener.
++    mDocument->AddEventListener(NS_LITERAL_STRING("MozBeforeInitialXULLayout"),
++                     l10n, true, false);
++
++    nsContentUtils::DispatchTrustedEvent(
++        mDocument, ToSupports(mDocument), NS_LITERAL_STRING("MozBeforeInitialXULLayout"),
++        CanBubble::eYes, Cancelable::eNo);
++
++    mDocument->RemoveEventListener(NS_LITERAL_STRING("MozBeforeInitialXULLayout"),
++                        l10n, true);
++
+     mDeferredLayoutStart = true;
+     StartLayout(false);
+ 
+     ScrollToRef();
+ 
+     mDocument->RemoveObserver(this);
+     mIsDocumentObserver = false;
+ 
++    if (mFastLoad) {
++      NS_ASSERTION(mDelayFrameLoaderInitialization,
++                   "mDelayFrameLoaderInitialization should be true!");
++      mDocument->mDelayFrameLoaderInitialization = false;
++      mDocument->MaybeInitializeFinalizeFrameLoaders();
++    }
++
+     mDocument->EndLoad();
+ 
+     DropParserAndPerfHint();
+ }
+ 
+ NS_IMETHODIMP
+ nsXMLContentSink::OnDocumentCreated(Document* aResultDocument) {
+   NS_ENSURE_ARG(aResultDocument);
+
