@@ -2,9 +2,16 @@
 # User Brian Grinstead <bgrinstead@mozilla.com>
 # Date 1550090013 28800
 #      Wed Feb 13 12:33:33 2019 -0800
-# Node ID 6020460cec8e8dcc93f23247990c82110f5704c2
-# Parent  0a9a4f8d79e97d6de743d4a95c915388906dde3b
-Bug 1527680 - WIP - Add helper for automatically inheriting attributes based on a map of selectors to attributes
+# Node ID 55a86d1a75e20acce229f2d5a0a8315c811cec86
+# Parent  dbbadd12f84945d8236d61074fadc07e5e0deaa1
+Bug 1527680 - Add MozElement `inheritedAttributes` helper for automatically inheriting attributes based on a Map of selectors to attributes
+
+This allows elements to skip explicitly declaring `observedAttributes` and then imperatively
+calling `inheritAttribute` on the appropriate child nodes. For simple cases this means less
+boilerplate and moving this logic into the base class.
+
+This is an opt-in feature, so more complex cases can continue to manually implement inheriting
+behavior as before.
 
 Differential Revision: https://phabricator.services.mozilla.com/D19702
 
@@ -117,7 +124,7 @@ diff --git a/browser/components/search/content/searchbar.js b/browser/components
 diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.js
 --- a/toolkit/content/customElements.js
 +++ b/toolkit/content/customElements.js
-@@ -43,18 +43,119 @@ window.addEventListener("DOMContentLoade
+@@ -43,18 +43,133 @@ window.addEventListener("DOMContentLoade
  
  const gXULDOMParser = new DOMParser();
  gXULDOMParser.forceEnableXULXBL();
@@ -179,16 +186,31 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
 +    this.inheritAttributes();
 +  }
 +
++  /*
++  * After setting content, calling this will cache the elements from selectors in the
++  * static `inheritedAttributes` Map. It'll also do an initial call to `this.inheritAttributes()`,
++  * so in the simple case, this is the only function you need to call.
++  *
++  * This should be called any time the children that are inheriting attributes changes. For instance,
++  * it's common in a connectedCallback to do something like:
++  *
++  *   this.textContent = "";
++  *   this.append(MozXULElement.parseXULToFragment(`<label />`))
++  *   this.initializeAttributeInheritance();
++  *
++  */
 +  initializeAttributeInheritance() {
 +    let {inheritedAttributes} = this.constructor;
 +    if (!inheritedAttributes) {
 +      return;
 +    }
++    this._inheritedAttributesValuesCache = null;
 +    this.inheritedAttributesCache = new Map();
 +    for (let [selector, attr] of inheritedAttributes) {
 +      let el = this.querySelector(selector);
++      // Skip unmatched selectors in case an element omits some elements in certain cases:
 +      if (!el) {
-+        console.error(`Error: no element encountered with ${selector}`);
++        continue;
 +      }
 +      if (this.inheritedAttributesCache.has(el)) {
 +        console.error(`Error: duplicate element encountered with ${selector}`);
@@ -202,9 +224,8 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
 +  /*
 +   * Loop through the static `inheritedAttributes` Map and inherit attributes to child elements.
 +   *
-+   * This will cache the results of querySelector for each key, to avoid needing to do this
-+   * many times, since will be called any time any attribute we care about changes. The cache
-+   * can be cleared manually in case you change the DOM with `this.inheritedAttributesCache = null`
++   * This usually won't need to be called directly - `this.initializeAttributeInheritance()` and
++   * `this.attributeChangedCallback` will call it for you when appropriate.
 +   */
 +  inheritAttributes() {
 +    let {inheritedAttributes} = this.constructor;
@@ -238,7 +259,7 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
     *        |to| is an attribute defined on custom element, whose value will be
     *        inherited to |from| attribute, defined a child element. Note |from| may
     *        take a special value of "text" to propogate attribute value as
-@@ -69,23 +170,23 @@ const MozElementMixin = Base => class Mo
+@@ -69,23 +184,23 @@ const MozElementMixin = Base => class Mo
        attrNewName = split[0];
      }
      let hasAttr = this.hasAttribute(attrName);
@@ -317,12 +338,12 @@ diff --git a/toolkit/content/tests/chrome/test_custom_element_base.xul b/toolkit
  
 -  function testInherits() {
 -    class InheritsElement extends MozXULElement {
-+
 +  function testInheritAttributes() {
 +    class InheritsElementDeclarative extends MozXULElement {
 +      static get inheritedAttributes() {
 +        return new Map([
-+          ["label", "text=label,foo,boo,bardo=bar"]
++          ["label", "text=label,foo,boo,bardo=bar"],
++          ["unmatched", "foo"], // Make sure we don't throw on unmatched selectors
 +        ]);
 +      }
 +
@@ -677,12 +698,12 @@ diff --git a/toolkit/content/widgets/menulist.js b/toolkit/content/widgets/menul
 +    ]);
 +  }
 +
-+  attributeChangedCallback() {
++  attributeChangedCallback(name, oldValue, newValue) {
 +    if (!this._labelBox) {
 +      return;
 +    }
 +
-+    super.attributeChangedCallback();
++    super.attributeChangedCallback(name, oldValue, newValue);
 +  }
 +
    connectedCallback() {
@@ -857,7 +878,62 @@ diff --git a/toolkit/content/widgets/popupnotification.js b/toolkit/content/widg
      if (this.checkboxState) {
        this.checkbox.checked = this.checkboxState.checked;
        this.checkbox.setAttribute("label", this.checkboxState.label);
-@@ -135,17 +106,17 @@ class MozPopupNotification extends MozXU
+@@ -84,43 +55,42 @@ class MozPopupNotification extends MozXU
+   slotContents() {
+     if (this._hasSlotted) {
+       return;
+     }
+     this._hasSlotted = true;
+     this.appendChild(MozXULElement.parseXULToFragment(`
+       <hbox class="popup-notification-header-container"></hbox>
+       <hbox align="start" class="popup-notification-body-container">
+-        <image class="popup-notification-icon"
+-               inherits="popupid,src=icon,class=iconclass"/>
++        <image class="popup-notification-icon"/>
+         <vbox flex="1" pack="start" class="popup-notification-body">
+           <hbox align="start">
+             <vbox flex="1">
+-              <label class="popup-notification-origin header" inherits="value=origin,tooltiptext=origin" crop="center"></label>
++              <label class="popup-notification-origin header" crop="center"></label>
+               <!-- These need to be on the same line to avoid creating
+                   whitespace between them (whitespace is added in the
+                   localization file, if necessary). -->
+-              <description class="popup-notification-description" inherits="popupid"><html:span inherits="text=label,popupid"></html:span><html:b inherits="text=name,popupid"></html:b><html:span inherits="text=endlabel,popupid"></html:span><html:b inherits="text=secondname,popupid"></html:b><html:span inherits="text=secondendlabel,popupid"></html:span></description>
++              <description class="popup-notification-description"><html:span></html:span><html:b></html:b><html:span></html:span><html:b></html:b><html:span></html:span></description>
+             </vbox>
+-            <toolbarbutton class="messageCloseButton close-icon popup-notification-closebutton tabbable" inherits="oncommand=closebuttoncommand,hidden=closebuttonhidden" tooltiptext="&closeNotification.tooltip;"></toolbarbutton>
++            <toolbarbutton class="messageCloseButton close-icon popup-notification-closebutton tabbable" tooltiptext="&closeNotification.tooltip;"></toolbarbutton>
+           </hbox>
+-          <label class="text-link popup-notification-learnmore-link" inherits="onclick=learnmoreclick,href=learnmoreurl">&learnMore;</label>
++          <label class="text-link popup-notification-learnmore-link">&learnMore;</label>
+           <checkbox class="popup-notification-checkbox" oncommand="PopupNotifications._onCheckboxCommand(event)"></checkbox>
+-          <description class="popup-notification-warning" inherits="hidden=warninghidden,text=warninglabel"></description>
++          <description class="popup-notification-warning"></description>
+         </vbox>
+       </hbox>
+       <hbox class="popup-notification-footer-container"></hbox>
+       <hbox class="popup-notification-button-container panel-footer">
+-        <button class="popup-notification-button popup-notification-secondary-button" inherits="oncommand=secondarybuttoncommand,label=secondarybuttonlabel,accesskey=secondarybuttonaccesskey,hidden=secondarybuttonhidden"></button>
+-        <toolbarseparator inherits="hidden=dropmarkerhidden"></toolbarseparator>
+-        <button type="menu" class="popup-notification-button popup-notification-dropmarker" aria-label="&moreActionsButton.accessibleLabel;" inherits="onpopupshown=dropmarkerpopupshown,hidden=dropmarkerhidden">
+-          <menupopup position="after_end" aria-label="&moreActionsButton.accessibleLabel;" inherits="oncommand=menucommand">
++        <button class="popup-notification-button popup-notification-secondary-button"></button>
++        <toolbarseparator></toolbarseparator>
++        <button type="menu" class="popup-notification-button popup-notification-dropmarker" aria-label="&moreActionsButton.accessibleLabel;">
++          <menupopup position="after_end" aria-label="&moreActionsButton.accessibleLabel;">
+           </menupopup>
+         </button>
+-        <button class="popup-notification-button popup-notification-primary-button" label="&defaultButton.label;" accesskey="&defaultButton.accesskey;" inherits="oncommand=buttoncommand,label=buttonlabel,accesskey=buttonaccesskey,default=buttonhighlight,disabled=mainactiondisabled"></button>
++        <button class="popup-notification-button popup-notification-primary-button" label="&defaultButton.label;" accesskey="&defaultButton.accesskey;"></button>
+       </hbox>
+     `, ["chrome://global/locale/notification.dtd"]));
+ 
+     this.button = this.querySelector(".popup-notification-primary-button");
+     this.secondaryButton =  this.querySelector(".popup-notification-secondary-button");
+     this.checkbox = this.querySelector(".popup-notification-checkbox");
+     this.closebutton = this.querySelector(".popup-notification-closebutton");
+     this.menubutton = this.querySelector(".popup-notification-dropmarker");
+@@ -135,17 +105,17 @@ class MozPopupNotification extends MozXU
      if (popupnotificationheader) {
        this.querySelector(".popup-notification-header-container").append(popupnotificationheader);
      }
