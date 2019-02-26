@@ -1,0 +1,4534 @@
+
+# HG changeset patch
+# User Brendan Dahl <bdahl@mozilla.com>
+# Date 1543278074 28800
+# Node ID 343371fe29170f45c6621b8a493bb27710cba2de
+# Parent  e376ef5bf4536d5c6670040ef28d218b806b91e9
+Bug 1527977 - Share XUL prototype cache with XUL and XHTML. r=smaug
+
+Summary:
+Create a new parser (PrototypeDocumentParser) and content sink
+(PrototypeDocumentContentSink) that can be used by both XUL and XHTML.
+
+The new parser moves the code from XULDocument that handles creating and
+loading a nsXULPrototypeDocument from either the cache or the source
+file. Once the parser has finished loading the prototype it notifies the
+content sink. The parser is largely a stub and would be better suited
+for use as a nsBaseParser, but nsHTMLDocument unfortunately needs an
+nsIParser.
+
+The new content sink has the XULDocument code responsible for the
+prototype traversal that creates the DOM (XULDocument::ResumeWalk and
+friends) and fires off various events.
+
+To unify XUL and XHTML, the XHTML readystate event sequence is used in
+XUL. However, the layout path of XHTML loaded from the prototype cache
+more closely follows XUL, where frame initializers and layout don't
+start until the entire DOM is built.
+
+Tags: #secure-revision
+
+Bug #: 1527977
+
+Differential Revision: https://phabricator.services.mozilla.com/D21236
+
+
+diff --git a/browser/base/content/browser.xul b/browser/base/content/browser.xul
+--- a/browser/base/content/browser.xul
++++ b/browser/base/content/browser.xul
+@@ -67,31 +67,26 @@
+         windowtype="navigator:browser"
+         macanimationtype="document"
+         screenX="4" screenY="4"
+         fullscreenbutton="true"
+         sizemode="normal"
+         retargetdocumentfocus="urlbar"
+         persist="screenX screenY width height sizemode"
+ #ifdef BROWSER_XHTML
+-        hidden="true"
+         mozpersist=""
+ #endif
+         >
+ 
+ # All JS files which are needed by browser.xul and other top level windows to
+ # support MacOS specific features *must* go into the global-scripts.inc file so
+ # that they can be shared with macWindow.inc.xul.
+ #include global-scripts.inc
+ 
+-<script type="application/javascript"
+-#ifdef BROWSER_XHTML
+-xmlns="http://www.w3.org/1999/xhtml"
+-#endif
+->
++<script type="application/javascript">
+   Services.scriptloader.loadSubScript("chrome://global/content/contentAreaUtils.js", this);
+   Services.scriptloader.loadSubScript("chrome://browser/content/browser-captivePortal.js", this);
+   Services.scriptloader.loadSubScript("chrome://browser/content/browser-compacttheme.js", this);
+   Services.scriptloader.loadSubScript("chrome://browser/content/browser-contentblocking.js", this);
+ #ifdef MOZ_DATA_REPORTING
+   Services.scriptloader.loadSubScript("chrome://browser/content/browser-data-submission-info-bar.js", this);
+ #endif
+ #ifndef MOZILLA_OFFICIAL
+@@ -104,27 +99,19 @@ xmlns="http://www.w3.org/1999/xhtml"
+   Services.scriptloader.loadSubScript("chrome://browser/content/browser-tabsintitlebar.js", this);
+   Services.scriptloader.loadSubScript("chrome://browser/content/tabbrowser.js", this);
+   Services.scriptloader.loadSubScript("chrome://browser/content/search/searchbar.js", this);
+ 
+   window.onload = gBrowserInit.onLoad.bind(gBrowserInit);
+   window.onunload = gBrowserInit.onUnload.bind(gBrowserInit);
+   window.onclose = WindowIsClosing;
+ 
+-#ifdef BROWSER_XHTML
+-  window.addEventListener("readystatechange", () => {
+-    // We initially hide the window to prevent layouts during parse. This lets us
+-    // avoid accidental XBL construction and better match browser.xul (see Bug 1497975).
+-    gBrowserInit.onBeforeInitialXULLayout();
+-    document.documentElement.removeAttribute("hidden");
+-  }, { once: true, capture: true });
+-#else
+   window.addEventListener("MozBeforeInitialXULLayout",
+     gBrowserInit.onBeforeInitialXULLayout.bind(gBrowserInit), { once: true });
+-#endif
++
+   // The listener of DOMContentLoaded must be set on window, rather than
+   // document, because the window can go away before the event is fired.
+   // In that case, we don't want to initialize anything, otherwise we
+   // may be leaking things because they will never be destroyed after.
+   window.addEventListener("DOMContentLoaded",
+     gBrowserInit.onDOMContentLoaded.bind(gBrowserInit), { once: true });
+ </script>
+ 
+diff --git a/browser/base/content/global-scripts.inc b/browser/base/content/global-scripts.inc
+--- a/browser/base/content/global-scripts.inc
++++ b/browser/base/content/global-scripts.inc
+@@ -6,21 +6,17 @@
+ # JS files which are needed by browser.xul but no other top level windows to
+ # support MacOS specific features should be loaded directly from browser.xul
+ # rather than this file.
+ 
+ # If you update this list, you may need to add a mapping within the following
+ # file so that ESLint works correctly:
+ # tools/lint/eslint/eslint-plugin-mozilla/lib/environments/browser-window.js
+ 
+-<script type="text/javascript"
+-#ifdef BROWSER_XHTML
+-xmlns="http://www.w3.org/1999/xhtml"
+-#endif
+->
++<script type="text/javascript">
+ var {Services} = ChromeUtils.import("resource://gre/modules/Services.jsm");
+ 
+ Services.scriptloader.loadSubScript("chrome://browser/content/browser.js", this);
+ Services.scriptloader.loadSubScript("chrome://browser/content/browser-places.js", this);
+ Services.scriptloader.loadSubScript("chrome://global/content/globalOverlay.js", this);
+ Services.scriptloader.loadSubScript("chrome://browser/content/utilityOverlay.js", this);
+ #ifdef XP_MACOSX
+ Services.scriptloader.loadSubScript("chrome://global/content/macWindowMenu.js", this);
+diff --git a/dom/base/Document.cpp b/dom/base/Document.cpp
+--- a/dom/base/Document.cpp
++++ b/dom/base/Document.cpp
+@@ -264,16 +264,17 @@
+ #include "mozilla/dom/SVGDocument.h"
+ #include "mozilla/dom/SVGSVGElement.h"
+ #include "mozilla/dom/DocGroup.h"
+ #include "mozilla/dom/TabGroup.h"
+ #ifdef MOZ_XUL
+ #  include "mozilla/dom/XULBroadcastManager.h"
+ #  include "mozilla/dom/XULPersist.h"
+ #  include "nsIXULWindow.h"
++#  include "nsXULPrototypeDocument.h"
+ #  include "nsXULCommandDispatcher.h"
+ #  include "nsXULPopupManager.h"
+ #  include "nsIDocShellTreeOwner.h"
+ #endif
+ #include "nsIPresShellInlines.h"
+ #include "mozilla/dom/BoxObject.h"
+ 
+ #include "mozilla/DocLoadingTimelineMarker.h"
+@@ -1741,16 +1742,17 @@ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mForms);
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mScripts);
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mApplets);
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAnchors);
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAnonymousContents)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mCommandDispatcher)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mFeaturePolicy)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mSuppressedEventListener)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mDocumentPrototype)
+ 
+   // Traverse all our nsCOMArrays.
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mStyleSheets)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPreloadingImages)
+ 
+   for (uint32_t i = 0; i < tmp->mFrameRequestCallbacks.Length(); ++i) {
+     NS_CYCLE_COLLECTION_NOTE_EDGE_NAME(cb, "mFrameRequestCallbacks[i]");
+     cb.NoteXPCOMChild(tmp->mFrameRequestCallbacks[i].mCallback);
+@@ -1833,16 +1835,17 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(Do
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mAnchors);
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mOrientationPendingPromise)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mFontFaceSet)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mReadyForIdle);
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mCommandDispatcher)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocumentL10n);
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mFeaturePolicy)
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mSuppressedEventListener)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK(mDocumentPrototype)
+ 
+   tmp->mParentDocument = nullptr;
+ 
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mPreloadingImages)
+ 
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mIntersectionObservers)
+ 
+   tmp->ClearAllBoxObjects();
+@@ -4881,17 +4884,18 @@ static void AssertAboutPageHasCSP(nsIURI
+   MOZ_ASSERT(parsedPolicyStr.Find("default-src") >= 0,
+              "about: page must contain a CSP including default-src");
+ }
+ #endif
+ 
+ void Document::EndLoad() {
+ #if defined(DEBUG) && !defined(ANDROID)
+   // only assert if nothing stopped the load on purpose
+-  if (!mParserAborted) {
++  // TODO: we probably also want to check XUL documents here too
++  if (!mParserAborted && !IsXULDocument()) {
+     AssertAboutPageHasCSP(mDocumentURI, NodePrincipal());
+   }
+ #endif
+ 
+   // EndLoad may have been called without a matching call to BeginLoad, in the
+   // case of a failed parse (for example, due to timeout). In such a case, we
+   // still want to execute part of this code to do appropriate cleanup, but we
+   // gate part of it because it is intended to match 1-for-1 with calls to
+@@ -8197,17 +8201,18 @@ void Document::SetReadyStateInternal(Rea
+         break;
+     }
+   }
+   // At the time of loading start, we don't have timing object, record time.
+ 
+   if (READYSTATE_INTERACTIVE == rs) {
+     if (nsContentUtils::IsSystemPrincipal(NodePrincipal())) {
+       Element* root = GetRootElement();
+-      if (root && root->HasAttr(kNameSpaceID_None, nsGkAtoms::mozpersist)) {
++      if ((root && root->HasAttr(kNameSpaceID_None, nsGkAtoms::mozpersist)) ||
++          IsXULDocument()) {
+         mXULPersist = new XULPersist(this);
+         mXULPersist->Init();
+       }
+     }
+   }
+ 
+   RecordNavigationTiming(rs);
+ 
+@@ -12038,16 +12043,22 @@ Document* Document::GetSameTypeParentDoc
+   current->GetSameTypeParent(getter_AddRefs(parent));
+   if (!parent) {
+     return nullptr;
+   }
+ 
+   return parent->GetDocument();
+ }
+ 
++void Document::TraceProtos(JSTracer* aTrc) {
++  if (mDocumentPrototype) {
++    mDocumentPrototype->TraceProtos(aTrc);
++  }
++}
++
+ /**
+  * Retrieves the classification of the Flash plugins in the document based on
+  * the classification lists. For more information, see
+  * toolkit/components/url-classifier/flash-block-lists.rst
+  */
+ FlashClassification Document::DocumentFlashClassification() {
+   // If neither pref is on, skip the null-principal and principal URI checks.
+   if (!StaticPrefs::plugins_http_https_only() &&
+diff --git a/dom/base/Document.h b/dom/base/Document.h
+--- a/dom/base/Document.h
++++ b/dom/base/Document.h
+@@ -118,16 +118,17 @@ class nsPresContext;
+ class nsRange;
+ class nsSimpleContentList;
+ class nsTextNode;
+ class nsWindowSizes;
+ class nsDOMCaretPosition;
+ class nsViewportInfo;
+ class nsIGlobalObject;
+ class nsIXULWindow;
++class nsXULPrototypeDocument;
+ struct nsFont;
+ 
+ namespace mozilla {
+ class AbstractThread;
+ class CSSStyleSheet;
+ class Encoding;
+ class ErrorResult;
+ class EventStates;
+@@ -3673,34 +3674,38 @@ class Document : public nsINode,
+   void MaybeNotifyAutoplayBlocked();
+ 
+   // Sets flags for media autoplay telemetry.
+   void SetDocTreeHadAudibleMedia();
+   void SetDocTreeHadPlayRevoked();
+ 
+   mozilla::dom::XPathEvaluator* XPathEvaluator();
+ 
++  void MaybeInitializeFinalizeFrameLoaders();
++
++  void SetDelayFrameLoaderInitialization(bool aDelayFrameLoaderInitialization) {
++    mDelayFrameLoaderInitialization = aDelayFrameLoaderInitialization;
++  }
++
+  protected:
+   void DoUpdateSVGUseElementShadowTrees();
+ 
+   already_AddRefed<nsIPrincipal> MaybeDowngradePrincipal(
+       nsIPrincipal* aPrincipal);
+ 
+   void EnsureOnloadBlocker();
+ 
+   void SendToConsole(nsCOMArray<nsISecurityConsoleMessage>& aMessages);
+ 
+   // Returns true if the scheme for the url for this document is "about".
+   bool IsAboutPage() const;
+ 
+   bool ContainsEMEContent();
+   bool ContainsMSEContent();
+ 
+-  void MaybeInitializeFinalizeFrameLoaders();
+-
+   /**
+    * Returns the title element of the document as defined by the HTML
+    * specification, or null if there isn't one.  For documents whose root
+    * element is an <svg:svg>, this is the first <svg:title> element that's a
+    * child of the root.  For other documents, it's the first HTML title element
+    * in the document.
+    */
+   Element* GetTitleElement();
+@@ -4431,16 +4436,20 @@ class Document : public nsINode,
+   nsTArray<nsCOMPtr<nsIPrincipal>> mAncestorPrincipals;
+   // List of ancestor outerWindowIDs that correspond to the ancestor principals.
+   nsTArray<uint64_t> mAncestorOuterWindowIDs;
+ 
+   // Pointer to our parser if we're currently in the process of being
+   // parsed into.
+   nsCOMPtr<nsIParser> mParser;
+ 
++  // If the document was created from the the prototype cache there will be a
++  // reference to the prototype document to allow tracing.
++  RefPtr<nsXULPrototypeDocument> mDocumentPrototype;
++
+   nsrefcnt mStackRefCnt;
+ 
+   // Weak reference to our sink for in case we no longer have a parser.  This
+   // will allow us to flush out any pending stuff from the sink even if
+   // EndLoad() has already happened.
+   nsWeakPtr mWeakSink;
+ 
+   // Our update nesting level
+@@ -4641,16 +4650,18 @@ class Document : public nsINode,
+ 
+   bool mPendingInitialTranslation;
+ 
+  public:
+   // Needs to be public because the bindings code pokes at it.
+   js::ExpandoAndGeneration mExpandoAndGeneration;
+ 
+   bool HasPendingInitialTranslation() { return mPendingInitialTranslation; }
++
++  void TraceProtos(JSTracer* aTrc);
+ };
+ 
+ NS_DEFINE_STATIC_IID_ACCESSOR(Document, NS_IDOCUMENT_IID)
+ 
+ /**
+  * mozAutoSubtreeModified batches DOM mutations so that a DOMSubtreeModified
+  * event is dispatched, if necessary, when the outermost mozAutoSubtreeModified
+  * object is deleted.
+diff --git a/dom/base/nsCCUncollectableMarker.cpp b/dom/base/nsCCUncollectableMarker.cpp
+--- a/dom/base/nsCCUncollectableMarker.cpp
++++ b/dom/base/nsCCUncollectableMarker.cpp
+@@ -498,17 +498,16 @@ void mozilla::dom::TraceBlackJS(JSTracer
+                 // As of now there isn't an easy way to trace message listeners.
+               }
+             }
+           }
+         }
+ 
+ #ifdef MOZ_XUL
+         Document* doc = window->GetExtantDoc();
+-        if (doc && doc->IsXULDocument()) {
+-          XULDocument* xulDoc = static_cast<XULDocument*>(doc);
+-          xulDoc->TraceProtos(aTrc);
++        if (doc) {
++          doc->TraceProtos(aTrc);
+         }
+ #endif
+       }
+     }
+   }
+ }
+diff --git a/dom/base/test/chrome/test_document-element-inserted.xul b/dom/base/test/chrome/test_document-element-inserted.xul
+--- a/dom/base/test/chrome/test_document-element-inserted.xul
++++ b/dom/base/test/chrome/test_document-element-inserted.xul
+@@ -22,17 +22,17 @@ https://bugzilla.mozilla.org/show_bug.cg
+ 
+     const OUTER_URL = "chrome://mochitests/content/chrome/dom/base/test/chrome/file_document-element-inserted.xul";
+     const INNER_URL = "chrome://mochitests/content/chrome/dom/base/test/chrome/file_document-element-inserted-inner.xul";
+ 
+     async function waitForEvent(url) {
+       return new Promise(resolve => {
+         SpecialPowers.addObserver(function inserted(document) {
+           is(document.documentURI, url, "Correct URL");
+-          is(document.readyState, "uninitialized", "Correct readyState");
++          is(document.readyState, "loading", "Correct readyState");
+           SpecialPowers.removeObserver(inserted, "document-element-inserted");
+           resolve();
+         }, "document-element-inserted");
+       })
+     }
+ 
+     // Load a XUL document that also has an iframe to a subdocument, and
+     // expect both events to fire with the docs in the correct state.
+diff --git a/dom/html/nsHTMLDocument.cpp b/dom/html/nsHTMLDocument.cpp
+--- a/dom/html/nsHTMLDocument.cpp
++++ b/dom/html/nsHTMLDocument.cpp
+@@ -48,16 +48,18 @@
+ 
+ #include "nsNetCID.h"
+ #include "nsICookieService.h"
+ 
+ #include "nsIServiceManager.h"
+ #include "nsIConsoleService.h"
+ #include "nsIComponentManager.h"
+ #include "nsParserCIID.h"
++#include "mozilla/parser/PrototypeDocumentParser.h"
++#include "mozilla/dom/PrototypeDocumentContentSink.h"
+ #include "nsNameSpaceManager.h"
+ #include "nsGenericHTMLElement.h"
+ #include "mozilla/css/Loader.h"
+ #include "nsIHttpChannel.h"
+ #include "nsIFile.h"
+ #include "nsFrameSelection.h"
+ 
+ #include "nsContentUtils.h"
+@@ -451,16 +453,27 @@ void nsHTMLDocument::SetDocumentCharacte
+   if (wyciwygChannel) {
+     nsAutoCString charset;
+     aEncoding->Name(charset);
+     wyciwygChannel->SetCharsetAndSource(GetDocumentCharacterSetSource(),
+                                         charset);
+   }
+ }
+ 
++bool ShouldUsePrototypeDocument(nsIChannel* aChannel) {
++  if (!aChannel) {
++    return false;
++  }
++  nsCOMPtr<nsIURI> originalURI;
++  aChannel->GetOriginalURI(getter_AddRefs(originalURI));
++  return IsChromeURI(originalURI) &&
++         originalURI->GetSpecOrDefault().EqualsLiteral(
++             BROWSER_CHROME_URL_QUOTED);
++}
++
+ nsresult nsHTMLDocument::StartDocumentLoad(const char* aCommand,
+                                            nsIChannel* aChannel,
+                                            nsILoadGroup* aLoadGroup,
+                                            nsISupports* aContainer,
+                                            nsIStreamListener** aDocListener,
+                                            bool aReset, nsIContentSink* aSink) {
+   if (!aCommand) {
+     MOZ_ASSERT(false, "Command is mandatory");
+@@ -552,16 +565,20 @@ nsresult nsHTMLDocument::StartDocumentLo
+       } else {
+         mParser->MarkAsNotScriptCreated("plain-text");
+       }
+     } else if (viewSource && !html) {
+       mParser->MarkAsNotScriptCreated("view-source-xml");
+     } else {
+       mParser->MarkAsNotScriptCreated(aCommand);
+     }
++  } else if (ShouldUsePrototypeDocument(aChannel)) {
++    nsCOMPtr<nsIURI> originalURI;
++    aChannel->GetOriginalURI(getter_AddRefs(originalURI));
++    mParser = new mozilla::parser::PrototypeDocumentParser(originalURI, this);
+   } else {
+     mParser = do_CreateInstance(kCParserCID, &rv);
+     NS_ENSURE_SUCCESS(rv, rv);
+   }
+ 
+   // Look for the parent document.  Note that at this point we don't have our
+   // content viewer set up yet, and therefore do not have a useful
+   // mParentDocument.
+@@ -716,20 +733,27 @@ nsresult nsHTMLDocument::StartDocumentLo
+ #ifdef DEBUG_charset
+   printf(" charset = %s source %d\n", charset.get(), charsetSource);
+ #endif
+   mParser->SetDocumentCharset(parserCharset, parserCharsetSource);
+   mParser->SetCommand(aCommand);
+ 
+   if (!IsHTMLDocument()) {
+     MOZ_ASSERT(!loadAsHtml5);
+-    nsCOMPtr<nsIXMLContentSink> xmlsink;
+-    NS_NewXMLContentSink(getter_AddRefs(xmlsink), this, uri, docShell,
+-                         aChannel);
+-    mParser->SetContentSink(xmlsink);
++    if (ShouldUsePrototypeDocument(aChannel)) {
++      nsCOMPtr<nsIContentSink> sink;
++      NS_NewPrototypeDocumentContentSink(getter_AddRefs(sink), this, uri,
++                                         docShell, aChannel);
++      mParser->SetContentSink(sink);
++    } else {
++      nsCOMPtr<nsIXMLContentSink> xmlsink;
++      NS_NewXMLContentSink(getter_AddRefs(xmlsink), this, uri, docShell,
++                           aChannel);
++      mParser->SetContentSink(xmlsink);
++    }
+   } else {
+     if (loadAsHtml5) {
+       nsHtml5Module::Initialize(mParser, this, uri, docShell, aChannel);
+     } else {
+       // about:blank *only*
+       nsCOMPtr<nsIHTMLContentSink> htmlsink;
+       NS_NewHTMLContentSink(getter_AddRefs(htmlsink), this, uri, docShell,
+                             aChannel);
+diff --git a/dom/moz.build b/dom/moz.build
+--- a/dom/moz.build
++++ b/dom/moz.build
+@@ -68,16 +68,17 @@ DIRS += [
+     'security',
+     'storage',
+     'svg',
+     'locales',
+     'network',
+     'permission',
+     'plugins/base',
+     'plugins/ipc',
++    'prototype',
+     'indexedDB',
+     'system',
+     'ipc',
+     'workers',
+     'audiochannel',
+     'broadcastchannel',
+     'messagechannel',
+     'promise',
+diff --git a/dom/xul/XULDocument.cpp b/dom/prototype/PrototypeDocumentContentSink.cpp
+copy from dom/xul/XULDocument.cpp
+copy to dom/prototype/PrototypeDocumentContentSink.cpp
+--- a/dom/xul/XULDocument.cpp
++++ b/dom/prototype/PrototypeDocumentContentSink.cpp
+@@ -1,675 +1,353 @@
+-/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+-/* vim: set ts=4 sw=2 et tw=80: */
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+-
+-/*
+-
+-  An implementation for the XUL document. This implementation serves
+-  as the basis for generating an NGLayout content model.
+-
+-  Notes
+-  -----
+-
+-  1. We do some monkey business in the document observer methods to
+-     keep the element map in sync for HTML elements. Why don't we just
+-     do it for _all_ elements? Well, in the case of XUL elements,
+-     which may be lazily created during frame construction, the
+-     document observer methods will never be called because we'll be
+-     adding the XUL nodes into the content model "quietly".
+-
+-*/
+-
+-#include "mozilla/ArrayUtils.h"
+-
+-#include <algorithm>
+-
+-#include "XULDocument.h"
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-#include "nsError.h"
+-#include "nsIBoxObject.h"
+-#include "nsIChromeRegistry.h"
+-#include "nsView.h"
+-#include "nsViewManager.h"
+-#include "nsIContentViewer.h"
+-#include "nsIStreamListener.h"
+-#include "nsITimer.h"
+-#include "nsDocShell.h"
+-#include "nsGkAtoms.h"
+-#include "nsXMLContentSink.h"
+-#include "nsXULContentSink.h"
+-#include "nsXULContentUtils.h"
+-#include "nsIStringEnumerator.h"
+-#include "nsDocElementCreatedNotificationRunner.h"
++#include "nsCOMPtr.h"
++#include "mozilla/dom/PrototypeDocumentContentSink.h"
++#include "nsIParser.h"
++#include "mozilla/dom/Document.h"
++#include "nsIContent.h"
++#include "nsIURI.h"
+ #include "nsNetUtil.h"
+-#include "nsParserCIID.h"
+-#include "nsPIBoxObject.h"
+-#include "mozilla/dom/BoxObject.h"
+-#include "nsString.h"
+-#include "nsPIDOMWindow.h"
+-#include "nsPIWindowRoot.h"
+-#include "nsXULElement.h"
+-#include "nsXULPrototypeCache.h"
++#include "nsIDocShell.h"
++#include "nsIStyleSheetLinkingElement.h"
++#include "nsHTMLParts.h"
++#include "nsCRT.h"
++#include "mozilla/StyleSheetInlines.h"
++#include "mozilla/css/Loader.h"
++#include "nsGkAtoms.h"
++#include "nsContentUtils.h"
++#include "nsDocElementCreatedNotificationRunner.h"
++#include "nsIScriptContext.h"
++#include "nsNameSpaceManager.h"
++#include "nsIServiceManager.h"
++#include "nsIScriptSecurityManager.h"
++#include "nsIContentViewer.h"
++#include "nsIScriptError.h"
++#include "prtime.h"
+ #include "mozilla/Logging.h"
+-#include "nsIFrame.h"
+-#include "nsXBLService.h"
+-#include "nsCExternalHandlerService.h"
+-#include "nsMimeTypes.h"
+-#include "nsIObjectInputStream.h"
+-#include "nsIObjectOutputStream.h"
+-#include "nsContentList.h"
+-#include "nsISimpleEnumerator.h"
+-#include "nsIScriptGlobalObject.h"
+-#include "nsIScriptSecurityManager.h"
++#include "nsRect.h"
++#include "nsIWebNavigation.h"
++#include "nsIScriptElement.h"
++#include "nsStyleLinkElement.h"
++#include "nsReadableUtils.h"
++#include "nsUnicharUtils.h"
++#include "nsICookieService.h"
++#include "nsIPrompt.h"
++#include "nsIChannel.h"
++#include "nsIPrincipal.h"
+ #include "nsNodeInfoManager.h"
+ #include "nsContentCreatorFunctions.h"
+-#include "nsContentUtils.h"
+-#include "nsIParser.h"
+-#include "nsCharsetSource.h"
+-#include "mozilla/StyleSheetInlines.h"
+-#include "mozilla/css/Loader.h"
+-#include "nsIScriptError.h"
+-#include "nsIStyleSheetLinkingElement.h"
+-#include "nsIObserverService.h"
++#include "nsIContentPolicy.h"
++#include "nsContentPolicyUtils.h"
++#include "nsError.h"
+ #include "nsNodeUtils.h"
+-#include "nsIXULWindow.h"
+-#include "nsXULPopupManager.h"
+-#include "nsCCUncollectableMarker.h"
+-#include "nsURILoader.h"
+-#include "mozilla/BasicEvents.h"
+-#include "mozilla/CycleCollectedJSContext.h"
+-#include "mozilla/dom/DocumentL10n.h"
++#include "nsIScriptGlobalObject.h"
++#include "nsIHTMLDocument.h"
++#include "mozAutoDocUpdate.h"
++#include "nsMimeTypes.h"
++#include "nsHtml5SVGLoadDispatcher.h"
++#include "nsTextNode.h"
++#include "mozilla/dom/CDATASection.h"
++#include "mozilla/dom/Comment.h"
++#include "mozilla/dom/DocumentType.h"
+ #include "mozilla/dom/Element.h"
+-#include "mozilla/dom/NodeInfoInlines.h"
++#include "mozilla/dom/HTMLTemplateElement.h"
+ #include "mozilla/dom/ProcessingInstruction.h"
+-#include "mozilla/dom/ScriptSettings.h"
+-#include "mozilla/dom/XULDocumentBinding.h"
+-#include "mozilla/dom/XULPersist.h"
+-#include "mozilla/EventDispatcher.h"
++#include "mozilla/dom/ScriptLoader.h"
+ #include "mozilla/LoadInfo.h"
+-#include "mozilla/Preferences.h"
+-#include "nsTextNode.h"
+-#include "nsJSUtils.h"
++
++#include "nsXULPrototypeCache.h"
++#include "nsXULElement.h"
++#include "mozilla/CycleCollectedJSContext.h"
+ #include "js/CompilationAndEvaluation.h"
+-#include "js/SourceText.h"
+-#include "mozilla/dom/URL.h"
+-#include "nsIContentPolicy.h"
+-#include "mozAutoDocUpdate.h"
+-#include "xpcpublic.h"
+-#include "mozilla/StyleSheet.h"
+-#include "mozilla/StyleSheetInlines.h"
+-#include "nsIConsoleService.h"
+ 
+ using namespace mozilla;
+ using namespace mozilla::dom;
+ 
+-//----------------------------------------------------------------------
+-//
+-// CIDs
+-//
+-
+-static NS_DEFINE_CID(kParserCID, NS_PARSER_CID);
+-
+-//----------------------------------------------------------------------
+-//
+-// Statics
+-//
+-
+-int32_t XULDocument::gRefCnt = 0;
+-
+-LazyLogModule XULDocument::gXULLog("XULDocument");
+-
+-//----------------------------------------------------------------------
+-//
+-// ctors & dtors
+-//
+-
+-namespace mozilla {
+-namespace dom {
++LazyLogModule PrototypeDocumentContentSink::gLog("PrototypeDocument");
+ 
+-XULDocument::XULDocument(void)
+-    : XMLDocument("application/vnd.mozilla.xul+xml"),
+-      mNextSrcLoadWaiter(nullptr),
+-      mIsWritingFastLoad(false),
+-      mDocumentLoaded(false),
+-      mStillWalking(false),
+-      mPendingSheets(0),
+-      mCurrentScriptProto(nullptr),
+-      mOffThreadCompiling(false),
+-      mOffThreadCompileStringBuf(nullptr),
+-      mOffThreadCompileStringLength(0),
+-      mInitialLayoutComplete(false) {
+-  // Override the default in Document
+-  mCharacterSet = UTF_8_ENCODING;
+-
+-  mDefaultElementType = kNameSpaceID_XUL;
+-  mType = eXUL;
+-
+-  mDelayFrameLoaderInitialization = true;
+-
+-  mAllowXULXBL = eTriTrue;
+-}
++nsresult NS_NewPrototypeDocumentContentSink(nsIContentSink** aResult,
++                                            Document* aDoc, nsIURI* aURI,
++                                            nsISupports* aContainer,
++                                            nsIChannel* aChannel) {
++  MOZ_ASSERT(nullptr != aResult, "null ptr");
++  if (nullptr == aResult) {
++    return NS_ERROR_NULL_POINTER;
++  }
++  RefPtr<PrototypeDocumentContentSink> it = new PrototypeDocumentContentSink();
+ 
+-XULDocument::~XULDocument() {
+-  NS_ASSERTION(
+-      mNextSrcLoadWaiter == nullptr,
+-      "unreferenced document still waiting for script source to load?");
+-
+-  Preferences::UnregisterCallback(XULDocument::DirectionChanged,
+-                                  "intl.uidirection", this);
+-
+-  if (mOffThreadCompileStringBuf) {
+-    js_free(mOffThreadCompileStringBuf);
+-  }
+-}
++  nsresult rv = it->Init(aDoc, aURI, aContainer, aChannel);
++  NS_ENSURE_SUCCESS(rv, rv);
+ 
+-}  // namespace dom
+-}  // namespace mozilla
+-
+-nsresult NS_NewXULDocument(Document** result) {
+-  MOZ_ASSERT(result != nullptr, "null ptr");
+-  if (!result) return NS_ERROR_NULL_POINTER;
+-
+-  RefPtr<XULDocument> doc = new XULDocument();
+-
+-  nsresult rv;
+-  if (NS_FAILED(rv = doc->Init())) {
+-    return rv;
+-  }
+-
+-  doc.forget(result);
++  it.forget(aResult);
+   return NS_OK;
+ }
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+-//----------------------------------------------------------------------
+-//
+-// nsISupports interface
+-//
+-
+-NS_IMPL_CYCLE_COLLECTION_CLASS(XULDocument)
+-
+-NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(XULDocument, XMLDocument)
+-  NS_ASSERTION(
+-      !nsCCUncollectableMarker::InGeneration(cb, tmp->GetMarkedCCGeneration()),
+-      "Shouldn't traverse XULDocument!");
+-  // XXX tmp->mContextStack?
+-
+-  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mCurrentPrototype)
+-  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPrototypes)
++PrototypeDocumentContentSink::PrototypeDocumentContentSink()
++    : mNextSrcLoadWaiter(nullptr),
++      mCurrentScriptProto(nullptr),
++      mOffThreadCompiling(false),
++      mOffThreadCompileStringBuf(nullptr),
++      mOffThreadCompileStringLength(0),
++      mStillWalking(false),
++      mPendingSheets(0) {}
+ 
+-NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+-
+-NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(XULDocument, XMLDocument)
+-  // XXX We should probably unlink all the objects we traverse.
+-NS_IMPL_CYCLE_COLLECTION_UNLINK_END
++PrototypeDocumentContentSink::~PrototypeDocumentContentSink() {
++  NS_ASSERTION(
++      mNextSrcLoadWaiter == nullptr,
++      "unreferenced document still waiting for script source to load?");
+ 
+-NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED(XULDocument, XMLDocument,
+-                                             nsIStreamLoaderObserver,
+-                                             nsICSSLoaderObserver,
+-                                             nsIOffThreadScriptReceiver)
+-
+-//----------------------------------------------------------------------
+-//
+-// Document interface
+-//
+-
+-void XULDocument::Reset(nsIChannel* aChannel, nsILoadGroup* aLoadGroup) {
+-  MOZ_ASSERT_UNREACHABLE("Reset");
++  if (mOffThreadCompileStringBuf) {
++    js_free(mOffThreadCompileStringBuf);
++  }
+ }
+ 
+-void XULDocument::ResetToURI(nsIURI* aURI, nsILoadGroup* aLoadGroup,
+-                             nsIPrincipal* aPrincipal) {
+-  MOZ_ASSERT_UNREACHABLE("ResetToURI");
+-}
+-
+-void XULDocument::SetContentType(const nsAString& aContentType) {
+-  NS_ASSERTION(
+-      aContentType.EqualsLiteral("application/vnd.mozilla.xul+xml"),
+-      "xul-documents always has content-type application/vnd.mozilla.xul+xml");
+-  // Don't do anything, xul always has the mimetype
+-  // application/vnd.mozilla.xul+xml
+-}
++nsresult PrototypeDocumentContentSink::Init(Document* aDoc, nsIURI* aURI,
++                                            nsISupports* aContainer,
++                                            nsIChannel* aChannel) {
++  MOZ_ASSERT(aDoc, "null ptr");
++  MOZ_ASSERT(aURI, "null ptr");
+ 
+-// This is called when the master document begins loading, whether it's
+-// being cached or not.
+-nsresult XULDocument::StartDocumentLoad(const char* aCommand,
+-                                        nsIChannel* aChannel,
+-                                        nsILoadGroup* aLoadGroup,
+-                                        nsISupports* aContainer,
+-                                        nsIStreamListener** aDocListener,
+-                                        bool aReset, nsIContentSink* aSink) {
+-  if (MOZ_LOG_TEST(gXULLog, LogLevel::Warning)) {
+-    nsCOMPtr<nsIURI> uri;
+-    nsresult rv = aChannel->GetOriginalURI(getter_AddRefs(uri));
+-    if (NS_SUCCEEDED(rv)) {
+-      nsAutoCString urlspec;
+-      rv = uri->GetSpec(urlspec);
+-      if (NS_SUCCEEDED(rv)) {
+-        MOZ_LOG(gXULLog, LogLevel::Warning,
+-                ("xul: load document '%s'", urlspec.get()));
+-      }
+-    }
+-  }
+-  // NOTE: If this ever starts calling Document::StartDocumentLoad
+-  // we'll possibly need to reset our content type afterwards.
+-  mStillWalking = true;
+-  mMayStartLayout = false;
+-  mDocumentLoadGroup = do_GetWeakReference(aLoadGroup);
++  mDocument = aDoc;
+ 
+-  mChannel = aChannel;
++  mDocument->SetDelayFrameLoaderInitialization(true);
++  mDocument->SetMayStartLayout(false);
+ 
+   // Get the URI.  Note that this should match nsDocShell::OnLoadingSite
+   nsresult rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(mDocumentURI));
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+-  mOriginalURI = mDocumentURI;
+-
+-  // Get the document's principal
+-  nsCOMPtr<nsIPrincipal> principal;
+-  nsContentUtils::GetSecurityManager()->GetChannelResultPrincipal(
+-      mChannel, getter_AddRefs(principal));
+-  principal = MaybeDowngradePrincipal(principal);
+-
+-  ResetStylesheetsToURI(mDocumentURI);
+-
+-  RetrieveRelevantHeaders(aChannel);
+-
+-  // Look in the chrome cache: we've got this puppy loaded
+-  // already.
+-  nsXULPrototypeDocument* proto =
+-      IsChromeURI(mDocumentURI)
+-          ? nsXULPrototypeCache::GetInstance()->GetPrototype(mDocumentURI)
+-          : nullptr;
+-
+-  // Same comment as nsChromeProtocolHandler::NewChannel and
+-  // XULDocument::ResumeWalk
+-  // - Ben Goodger
+-  //
+-  // We don't abort on failure here because there are too many valid
+-  // cases that can return failure, and the null-ness of |proto| is enough
+-  // to trigger the fail-safe parse-from-disk solution. Example failure cases
+-  // (for reference) include:
+-  //
+-  // NS_ERROR_NOT_AVAILABLE: the URI cannot be found in the startup cache,
+-  //                         parse from disk
+-  // other: the startup cache file could not be found, probably
+-  //        due to being accessed before a profile has been selected (e.g.
+-  //        loading chrome for the profile manager itself). This must be
+-  //        parsed from disk.
+-
+-  if (proto) {
+-    // If we're racing with another document to load proto, wait till the
+-    // load has finished loading before trying to add cloned style sheets.
+-    // XULDocument::EndLoad will call proto->NotifyLoadDone, which will
+-    // find all racing documents and notify them via OnPrototypeLoadDone,
+-    // which will add style sheet clones to each document.
+-    bool loaded;
+-    rv = proto->AwaitLoadDone(this, &loaded);
+-    if (NS_FAILED(rv)) return rv;
++  mScriptLoader = mDocument->ScriptLoader();
+ 
+-    mCurrentPrototype = proto;
+-
+-    // Set up the right principal on ourselves.
+-    SetPrincipal(proto->DocumentPrincipal());
+-
+-    // We need a listener, even if proto is not yet loaded, in which
+-    // event the listener's OnStopRequest method does nothing, and all
+-    // the interesting work happens below XULDocument::EndLoad, from
+-    // the call there to mCurrentPrototype->NotifyLoadDone().
+-    *aDocListener = new CachedChromeStreamListener(this, loaded);
+-  } else {
+-    bool useXULCache = nsXULPrototypeCache::GetInstance()->IsEnabled();
+-    bool fillXULCache = (useXULCache && IsChromeURI(mDocumentURI));
+-
+-    // It's just a vanilla document load. Create a parser to deal
+-    // with the stream n' stuff.
+-
+-    nsCOMPtr<nsIParser> parser;
+-    rv = PrepareToLoadPrototype(mDocumentURI, aCommand, principal,
+-                                getter_AddRefs(parser));
+-    if (NS_FAILED(rv)) return rv;
++  mNodeInfoManager = aDoc->NodeInfoManager();
+ 
+-    // Predicate mIsWritingFastLoad on the XUL cache being enabled,
+-    // so we don't have to re-check whether the cache is enabled all
+-    // the time.
+-    mIsWritingFastLoad = useXULCache;
+-
+-    nsCOMPtr<nsIStreamListener> listener = do_QueryInterface(parser, &rv);
+-    NS_ASSERTION(NS_SUCCEEDED(rv), "parser doesn't support nsIStreamListener");
+-    if (NS_FAILED(rv)) return rv;
+-
+-    *aDocListener = listener;
+-
+-    parser->Parse(mDocumentURI);
+-
+-    // Put the current prototype, created under PrepareToLoad, into the
+-    // XUL prototype cache now.  We can't do this under PrepareToLoad or
+-    // overlay loading will break; search for PutPrototype in ResumeWalk
+-    // and see the comment there.
+-    if (fillXULCache) {
+-      nsXULPrototypeCache::GetInstance()->PutPrototype(mCurrentPrototype);
+-    }
+-  }
+-
+-  NS_IF_ADDREF(*aDocListener);
+   return NS_OK;
+ }
+ 
+-// This gets invoked after the prototype for this document is fully built in the
+-// content sink.
+-void XULDocument::EndLoad() {
+-  nsresult rv;
++NS_IMPL_CYCLE_COLLECTION(PrototypeDocumentContentSink, mParser, mDocumentURI,
++                         mDocument, mNodeInfoManager, mScriptLoader,
++                         mCurrentPrototype)
+ 
+-  // Whack the prototype document into the cache so that the next
+-  // time somebody asks for it, they don't need to load it by hand.
+-
+-  nsCOMPtr<nsIURI> uri = mCurrentPrototype->GetURI();
+-  bool isChrome = IsChromeURI(uri);
+-
+-  // Remember if the XUL cache is on
+-  bool useXULCache = nsXULPrototypeCache::GetInstance()->IsEnabled();
++NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(PrototypeDocumentContentSink)
++  NS_INTERFACE_MAP_ENTRY_AMBIGUOUS(nsISupports, nsIContentSink)
++  NS_INTERFACE_MAP_ENTRY(nsIContentSink)
++  NS_INTERFACE_MAP_ENTRY(nsIStreamLoaderObserver)
++  NS_INTERFACE_MAP_ENTRY(nsICSSLoaderObserver)
++  NS_INTERFACE_MAP_ENTRY(nsIOffThreadScriptReceiver)
++NS_INTERFACE_MAP_END
+ 
+-  if (isChrome && useXULCache) {
+-    // If it's a chrome prototype document, then notify any
+-    // documents that raced to load the prototype, and awaited
+-    // its load completion via proto->AwaitLoadDone().
+-    rv = mCurrentPrototype->NotifyLoadDone();
+-    if (NS_FAILED(rv)) return;
+-  }
++NS_IMPL_CYCLE_COLLECTING_ADDREF(PrototypeDocumentContentSink)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(PrototypeDocumentContentSink)
+ 
+-  OnPrototypeLoadDone(true);
+-  if (MOZ_LOG_TEST(gXULLog, LogLevel::Warning)) {
+-    nsAutoCString urlspec;
+-    rv = uri->GetSpec(urlspec);
+-    if (NS_SUCCEEDED(rv)) {
+-      MOZ_LOG(gXULLog, LogLevel::Warning,
+-              ("xul: Finished loading document '%s'", urlspec.get()));
+-    }
++//----------------------------------------------------------------------
++//
++// nsIContentSink interface
++//
++
++void PrototypeDocumentContentSink::SetDocumentCharset(
++    NotNull<const Encoding*> aEncoding) {
++  if (mDocument) {
++    mDocument->SetDocumentCharacterSet(aEncoding);
+   }
+ }
+ 
+-nsresult XULDocument::OnPrototypeLoadDone(bool aResumeWalk) {
+-  nsresult rv;
++nsISupports* PrototypeDocumentContentSink::GetTarget() {
++  return ToSupports(mDocument);
++}
++
++bool PrototypeDocumentContentSink::IsScriptExecuting() {
++  return !!mScriptLoader->GetCurrentScript();
++}
++
++NS_IMETHODIMP
++PrototypeDocumentContentSink::SetParser(nsParserBase* aParser) {
++  MOZ_ASSERT(aParser, "Should have a parser here!");
++  mParser = aParser;
++  return NS_OK;
++}
+ 
+-  rv = PrepareToWalk();
+-  NS_ASSERTION(NS_SUCCEEDED(rv), "unable to prepare for walk");
+-  if (NS_FAILED(rv)) return rv;
++nsIParser* PrototypeDocumentContentSink::GetParser() {
++  return static_cast<nsIParser*>(mParser.get());
++}
+ 
+-  if (aResumeWalk) {
+-    rv = ResumeWalk();
++void PrototypeDocumentContentSink::ContinueInterruptedParsingIfEnabled() {
++  if (mParser && mParser->IsParserEnabled()) {
++    GetParser()->ContinueInterruptedParsing();
+   }
+-  return rv;
++}
++
++void PrototypeDocumentContentSink::ContinueInterruptedParsingAsync() {
++  nsCOMPtr<nsIRunnable> ev = NewRunnableMethod(
++      "PrototypeDocumentContentSink::ContinueInterruptedParsingIfEnabled", this,
++      &PrototypeDocumentContentSink::ContinueInterruptedParsingIfEnabled);
++
++  mDocument->Dispatch(mozilla::TaskCategory::Other, ev.forget());
+ }
+ 
+ //----------------------------------------------------------------------
+ //
+-// Document interface
+-//
+-
+-void XULDocument::InitialDocumentTranslationCompleted() {
+-  mPendingInitialTranslation = false;
+-  MaybeDoneWalking();
+-}
+-
+-//----------------------------------------------------------------------
+-//
+-// nsINode interface
+-//
+-
+-nsresult XULDocument::Clone(mozilla::dom::NodeInfo* aNodeInfo,
+-                            nsINode** aResult) const {
+-  // We don't allow cloning of a XUL document
+-  *aResult = nullptr;
+-  return NS_ERROR_DOM_NOT_SUPPORTED_ERR;
+-}
+-
+-//----------------------------------------------------------------------
+-//
+-// Implementation methods
++// PrototypeDocumentContentSink::ContextStack
+ //
+ 
+-nsresult XULDocument::Init() {
+-  nsresult rv = XMLDocument::Init();
+-  NS_ENSURE_SUCCESS(rv, rv);
+-
+-  if (gRefCnt++ == 0) {
+-    // ensure that the XUL prototype cache is instantiated successfully,
+-    // so that we can use nsXULPrototypeCache::GetInstance() without
+-    // null-checks in the rest of the class.
+-    nsXULPrototypeCache* cache = nsXULPrototypeCache::GetInstance();
+-    if (!cache) {
+-      NS_ERROR("Could not instantiate nsXULPrototypeCache");
+-      return NS_ERROR_FAILURE;
+-    }
+-  }
+-
+-  Preferences::RegisterCallback(XULDocument::DirectionChanged,
+-                                "intl.uidirection", this);
+-
+-  return NS_OK;
+-}
+-
+-nsresult XULDocument::StartLayout(void) {
+-  mMayStartLayout = true;
+-  nsCOMPtr<nsIPresShell> shell = GetShell();
+-  if (shell) {
+-    // Resize-reflow this time
+-    nsPresContext* cx = shell->GetPresContext();
+-    NS_ASSERTION(cx != nullptr, "no pres context");
+-    if (!cx) return NS_ERROR_UNEXPECTED;
+-
+-    nsCOMPtr<nsIDocShell> docShell = cx->GetDocShell();
+-    NS_ASSERTION(docShell != nullptr, "container is not a docshell");
+-    if (!docShell) return NS_ERROR_UNEXPECTED;
+-
+-    nsresult rv = shell->Initialize();
+-    NS_ENSURE_SUCCESS(rv, rv);
+-  }
+-
+-  return NS_OK;
+-}
+-
+-nsresult XULDocument::PrepareToLoadPrototype(nsIURI* aURI, const char* aCommand,
+-                                             nsIPrincipal* aDocumentPrincipal,
+-                                             nsIParser** aResult) {
+-  nsresult rv;
+-
+-  // Create a new prototype document.
+-  rv = NS_NewXULPrototypeDocument(getter_AddRefs(mCurrentPrototype));
+-  if (NS_FAILED(rv)) return rv;
++PrototypeDocumentContentSink::ContextStack::ContextStack()
++    : mTop(nullptr), mDepth(0) {}
+ 
+-  rv = mCurrentPrototype->InitPrincipal(aURI, aDocumentPrincipal);
+-  if (NS_FAILED(rv)) {
+-    mCurrentPrototype = nullptr;
+-    return rv;
+-  }
+-
+-  SetPrincipal(aDocumentPrincipal);
+-
+-  // Create a XUL content sink, a parser, and kick off a load for
+-  // the document.
+-  RefPtr<XULContentSinkImpl> sink = new XULContentSinkImpl();
+-
+-  rv = sink->Init(this, mCurrentPrototype);
+-  NS_ASSERTION(NS_SUCCEEDED(rv), "Unable to initialize datasource sink");
+-  if (NS_FAILED(rv)) return rv;
+-
+-  nsCOMPtr<nsIParser> parser = do_CreateInstance(kParserCID, &rv);
+-  NS_ASSERTION(NS_SUCCEEDED(rv), "unable to create parser");
+-  if (NS_FAILED(rv)) return rv;
+-
+-  parser->SetCommand(nsCRT::strcmp(aCommand, "view-source") ? eViewNormal
+-                                                            : eViewSource);
+-
+-  parser->SetDocumentCharset(UTF_8_ENCODING, kCharsetFromDocTypeDefault);
+-  parser->SetContentSink(sink);  // grabs a reference to the parser
+-
+-  parser.forget(aResult);
+-  return NS_OK;
+-}
+-
+-void XULDocument::TraceProtos(JSTracer* aTrc) {
+-  uint32_t i, count = mPrototypes.Length();
+-  for (i = 0; i < count; ++i) {
+-    mPrototypes[i]->TraceProtos(aTrc);
+-  }
+-
+-  if (mCurrentPrototype) {
+-    mCurrentPrototype->TraceProtos(aTrc);
+-  }
+-}
+-
+-//----------------------------------------------------------------------
+-//
+-// XULDocument::ContextStack
+-//
+-
+-XULDocument::ContextStack::ContextStack() : mTop(nullptr), mDepth(0) {}
+-
+-XULDocument::ContextStack::~ContextStack() {
++PrototypeDocumentContentSink::ContextStack::~ContextStack() {
+   while (mTop) {
+     Entry* doomed = mTop;
+     mTop = mTop->mNext;
+     NS_IF_RELEASE(doomed->mElement);
+     delete doomed;
+   }
+ }
+ 
+-nsresult XULDocument::ContextStack::Push(nsXULPrototypeElement* aPrototype,
+-                                         nsIContent* aElement) {
++nsresult PrototypeDocumentContentSink::ContextStack::Push(
++    nsXULPrototypeElement* aPrototype, nsIContent* aElement) {
+   Entry* entry = new Entry;
+   entry->mPrototype = aPrototype;
+   entry->mElement = aElement;
+   NS_IF_ADDREF(entry->mElement);
+   entry->mIndex = 0;
+ 
+   entry->mNext = mTop;
+   mTop = entry;
+ 
+   ++mDepth;
+   return NS_OK;
+ }
+ 
+-nsresult XULDocument::ContextStack::Pop() {
++nsresult PrototypeDocumentContentSink::ContextStack::Pop() {
+   if (mDepth == 0) return NS_ERROR_UNEXPECTED;
+ 
+   Entry* doomed = mTop;
+   mTop = mTop->mNext;
+   --mDepth;
+ 
+   NS_IF_RELEASE(doomed->mElement);
+   delete doomed;
+   return NS_OK;
+ }
+ 
+-nsresult XULDocument::ContextStack::Peek(nsXULPrototypeElement** aPrototype,
+-                                         nsIContent** aElement,
+-                                         int32_t* aIndex) {
++nsresult PrototypeDocumentContentSink::ContextStack::Peek(
++    nsXULPrototypeElement** aPrototype, nsIContent** aElement,
++    int32_t* aIndex) {
+   if (mDepth == 0) return NS_ERROR_UNEXPECTED;
+ 
+   *aPrototype = mTop->mPrototype;
+   *aElement = mTop->mElement;
+   NS_IF_ADDREF(*aElement);
+   *aIndex = mTop->mIndex;
+ 
+   return NS_OK;
+ }
+ 
+-nsresult XULDocument::ContextStack::SetTopIndex(int32_t aIndex) {
++nsresult PrototypeDocumentContentSink::ContextStack::SetTopIndex(
++    int32_t aIndex) {
+   if (mDepth == 0) return NS_ERROR_UNEXPECTED;
+ 
+   mTop->mIndex = aIndex;
+   return NS_OK;
+ }
+ 
+ //----------------------------------------------------------------------
+ //
+ // Content model walking routines
+ //
+ 
+-nsresult XULDocument::PrepareToWalk() {
+-  // Prepare to walk the mCurrentPrototype
++nsresult PrototypeDocumentContentSink::OnPrototypeLoadDone(
++    nsXULPrototypeDocument* aPrototype) {
++  mCurrentPrototype = aPrototype;
++
++  nsresult rv = PrepareToWalk();
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  rv = ResumeWalk();
++
++  return rv;
++}
++
++nsresult PrototypeDocumentContentSink::PrepareToWalk() {
++  MOZ_ASSERT(mCurrentPrototype);
+   nsresult rv;
+ 
+-  // Keep an owning reference to the prototype document so that its
+-  // elements aren't yanked from beneath us.
+-  mPrototypes.AppendElement(mCurrentPrototype);
++  mStillWalking = true;
++
++  // Notify document that the load is beginning
++  mDocument->BeginLoad();
+ 
+   // Get the prototype's root element and initialize the context
+   // stack for the prototype walk.
+   nsXULPrototypeElement* proto = mCurrentPrototype->GetRootElement();
+ 
+   if (!proto) {
+-    if (MOZ_LOG_TEST(gXULLog, LogLevel::Error)) {
++    if (MOZ_LOG_TEST(gLog, LogLevel::Error)) {
+       nsCOMPtr<nsIURI> url = mCurrentPrototype->GetURI();
+ 
+       nsAutoCString urlspec;
+       rv = url->GetSpec(urlspec);
+       if (NS_FAILED(rv)) return rv;
+ 
+-      MOZ_LOG(gXULLog, LogLevel::Error,
+-              ("xul: error parsing '%s'", urlspec.get()));
++      MOZ_LOG(gLog, LogLevel::Error,
++              ("prototype: error parsing '%s'", urlspec.get()));
+     }
+ 
+     return NS_OK;
+   }
+ 
+-  nsINode* nodeToInsertBefore = nsINode::GetFirstChild();
++  nsINode* nodeToInsertBefore = mDocument->GetFirstChild();
+ 
+   const nsTArray<RefPtr<nsXULPrototypePI> >& processingInstructions =
+       mCurrentPrototype->GetProcessingInstructions();
+ 
+   uint32_t total = processingInstructions.Length();
+   for (uint32_t i = 0; i < total; ++i) {
+-    rv = CreateAndInsertPI(processingInstructions[i], this, nodeToInsertBefore);
++    rv = CreateAndInsertPI(processingInstructions[i], mDocument,
++                           nodeToInsertBefore);
+     if (NS_FAILED(rv)) return rv;
+   }
+ 
+   // Do one-time initialization.
+   RefPtr<Element> root;
+ 
+   // Add the root element
+   rv = CreateElementFromPrototype(proto, getter_AddRefs(root), true);
+   if (NS_FAILED(rv)) return rv;
+ 
+-  rv = AppendChildTo(root, false);
++  rv = mDocument->AppendChildTo(root, false);
+   if (NS_FAILED(rv)) return rv;
+ 
+-  ResetDocumentDirection();
+-
+-  // Block onload until we've finished building the complete
+-  // document content model.
+-  BlockOnload();
++  mDocument->DocumentStatesChanged(NS_DOCUMENT_STATE_RTL_LOCALE);
+ 
+   nsContentUtils::AddScriptRunner(
+-      new nsDocElementCreatedNotificationRunner(this));
++      new nsDocElementCreatedNotificationRunner(mDocument));
+ 
+   // There'd better not be anything on the context stack at this
+   // point! This is the basis case for our "induction" in
+   // ResumeWalk(), below, which'll assume that there's always a
+   // content element on the context stack if we're in the document.
+   NS_ASSERTION(mContextStack.Depth() == 0,
+                "something's on the context stack already");
+   if (mContextStack.Depth() != 0) return NS_ERROR_UNEXPECTED;
+ 
+   rv = mContextStack.Push(proto, root);
+   if (NS_FAILED(rv)) return rv;
+ 
+   return NS_OK;
+ }
+ 
+-nsresult XULDocument::CreateAndInsertPI(const nsXULPrototypePI* aProtoPI,
+-                                        nsINode* aParent,
+-                                        nsINode* aBeforeThis) {
++nsresult PrototypeDocumentContentSink::CreateAndInsertPI(
++    const nsXULPrototypePI* aProtoPI, nsINode* aParent, nsINode* aBeforeThis) {
+   MOZ_ASSERT(aProtoPI, "null ptr");
+   MOZ_ASSERT(aParent, "null ptr");
+ 
+   RefPtr<ProcessingInstruction> node = NS_NewXMLProcessingInstruction(
+       mNodeInfoManager, aProtoPI->mTarget, aProtoPI->mData);
+ 
+   nsresult rv;
+   if (aProtoPI->mTarget.EqualsLiteral("xml-stylesheet")) {
+@@ -679,20 +357,19 @@ nsresult XULDocument::CreateAndInsertPI(
+     rv = aParent->InsertChildBefore(
+         node->AsContent(), aBeforeThis ? aBeforeThis->AsContent() : nullptr,
+         false);
+   }
+ 
+   return rv;
+ }
+ 
+-nsresult XULDocument::InsertXMLStylesheetPI(const nsXULPrototypePI* aProtoPI,
+-                                            nsINode* aParent,
+-                                            nsINode* aBeforeThis,
+-                                            nsIContent* aPINode) {
++nsresult PrototypeDocumentContentSink::InsertXMLStylesheetPI(
++    const nsXULPrototypePI* aProtoPI, nsINode* aParent, nsINode* aBeforeThis,
++    nsIContent* aPINode) {
+   nsCOMPtr<nsIStyleSheetLinkingElement> ssle(do_QueryInterface(aPINode));
+   NS_ASSERTION(ssle,
+                "passed XML Stylesheet node does not "
+                "implement nsIStyleSheetLinkingElement!");
+ 
+   nsresult rv;
+ 
+   ssle->InitStyleLinkElement(false);
+@@ -724,23 +401,24 @@ nsresult XULDocument::InsertXMLStyleshee
+   auto update = result.unwrap();
+   if (update.ShouldBlock()) {
+     ++mPendingSheets;
+   }
+ 
+   return NS_OK;
+ }
+ 
+-void XULDocument::CloseElement(Element* aElement) {
++void PrototypeDocumentContentSink::CloseElement(Element* aElement) {
+   if (aElement->IsXULElement(nsGkAtoms::linkset)) {
+     aElement->DoneAddingChildren(false);
+   }
+ }
+ 
+-nsresult XULDocument::ResumeWalk() {
++nsresult PrototypeDocumentContentSink::ResumeWalk() {
++  MOZ_ASSERT(mStillWalking);
+   // Walk the prototype and build the delegate content model. The
+   // walk is performed in a top-down, left-to-right fashion. That
+   // is, a parent is built before any of its children; a node is
+   // only built after all of its siblings to the left are fully
+   // constructed.
+   //
+   // It is interruptable so that transcluded documents (e.g.,
+   // <html:script src="..." />) can be properly re-loaded if the
+@@ -887,116 +565,114 @@ nsresult XULDocument::ResumeWalk() {
+     }
+ 
+     // Once we get here, the context stack will have been
+     // depleted. That means that the entire prototype has been
+     // walked and content has been constructed.
+     break;
+   }
+ 
+-  // If we get here, there is nothing left for us to walk. The content
+-  // model is built and ready for layout.
+-
+-  mXULPersist = new XULPersist(this);
+-  mXULPersist->Init();
+-
+   mStillWalking = false;
+   return MaybeDoneWalking();
+ }
+ 
+-nsresult XULDocument::MaybeDoneWalking() {
++void PrototypeDocumentContentSink::InitialDocumentTranslationCompleted() {
++  MaybeDoneWalking();
++}
++
++nsresult PrototypeDocumentContentSink::MaybeDoneWalking() {
+   if (mPendingSheets > 0 || mStillWalking) {
+     return NS_OK;
+   }
+ 
+-  if (mPendingInitialTranslation) {
+-    TriggerInitialDocumentTranslation();
++  if (mDocument->HasPendingInitialTranslation()) {
++    mDocument->TriggerInitialDocumentTranslation();
+     return NS_OK;
+   }
+ 
+   return DoneWalking();
+ }
+ 
+-nsresult XULDocument::DoneWalking() {
++nsresult PrototypeDocumentContentSink::DoneWalking() {
+   MOZ_ASSERT(mPendingSheets == 0, "there are sheets to be loaded");
+   MOZ_ASSERT(!mStillWalking, "walk not done");
+-  MOZ_ASSERT(!mPendingInitialTranslation, "translation pending");
+-
+-  // XXXldb This is where we should really be setting the chromehidden
+-  // attribute.
++  MOZ_ASSERT(!mDocument->HasPendingInitialTranslation(), "translation pending");
+ 
+-  if (!mDocumentLoaded) {
+-    // Make sure we don't reenter here from StartLayout().  Note that
+-    // setting mDocumentLoaded to true here means that if StartLayout()
+-    // causes ResumeWalk() to be reentered, we'll take the other branch of
+-    // the |if (!mDocumentLoaded)| check above and since
+-    // mInitialLayoutComplete will be false will follow the else branch
+-    // there too.  See the big comment there for how such reentry can
+-    // happen.
+-    mDocumentLoaded = true;
+-
+-    NotifyPossibleTitleChange(false);
++  if (mDocument) {
++    MOZ_ASSERT(mDocument->GetReadyStateEnum() == Document::READYSTATE_LOADING,
++               "Bad readyState");
++    mDocument->SetReadyStateInternal(Document::READYSTATE_INTERACTIVE);
++    mDocument->NotifyPossibleTitleChange(false);
+ 
+     nsContentUtils::DispatchTrustedEvent(
+-        this, ToSupports(this), NS_LITERAL_STRING("MozBeforeInitialXULLayout"),
+-        CanBubble::eYes, Cancelable::eNo);
++        mDocument, ToSupports(mDocument),
++        NS_LITERAL_STRING("MozBeforeInitialXULLayout"), CanBubble::eYes,
++        Cancelable::eNo);
++  }
+ 
+-    // Before starting layout, check whether we're a toplevel chrome
+-    // window.  If we are, setup some state so that we don't have to restyle
+-    // the whole tree after StartLayout.
+-    if (nsCOMPtr<nsIXULWindow> win = GetXULWindowIfToplevelChrome()) {
+-      // We're the chrome document!
+-      win->BeforeStartLayout();
+-    }
++  if (mScriptLoader) {
++    mScriptLoader->ParsingComplete(false);
++  }
+ 
+-    StartLayout();
+-
+-    if (mIsWritingFastLoad && IsChromeURI(mDocumentURI))
+-      nsXULPrototypeCache::GetInstance()->WritePrototype(mCurrentPrototype);
++  StartLayout();
+ 
+-    NS_ASSERTION(mDelayFrameLoaderInitialization,
+-                 "mDelayFrameLoaderInitialization should be true!");
+-    mDelayFrameLoaderInitialization = false;
+-    NS_WARNING_ASSERTION(mUpdateNestLevel == 0,
+-                         "Constructing XUL document in middle of an update?");
+-    if (mUpdateNestLevel == 0) {
+-      MaybeInitializeFinalizeFrameLoaders();
++  if (IsChromeURI(mDocumentURI) &&
++      nsXULPrototypeCache::GetInstance()->IsEnabled()) {
++    bool isCachedOnDisk;
++    nsXULPrototypeCache::GetInstance()->HasData(mDocumentURI, &isCachedOnDisk);
++    if (!isCachedOnDisk) {
++      nsXULPrototypeCache::GetInstance()->WritePrototype(mCurrentPrototype);
+     }
++  }
+ 
+-    NS_DOCUMENT_NOTIFY_OBSERVERS(EndLoad, (this));
++  mDocument->SetDelayFrameLoaderInitialization(false);
++  mDocument->MaybeInitializeFinalizeFrameLoaders();
+ 
+-    // DispatchContentLoadedEvents undoes the onload-blocking we
+-    // did in PrepareToWalk().
+-    DispatchContentLoadedEvents();
++  // If the document we are loading has a reference or it is a
++  // frameset document, disable the scroll bars on the views.
+ 
+-    mInitialLayoutComplete = true;
+-  }
++  mDocument->SetScrollToRef(mDocument->GetDocumentURI());
++
++  mDocument->EndLoad();
+ 
+   return NS_OK;
+ }
+ 
++void PrototypeDocumentContentSink::StartLayout() {
++  AUTO_PROFILER_LABEL_DYNAMIC_NSCSTRING(
++      "PrototypeDocumentContentSink::StartLayout", LAYOUT,
++      mDocumentURI->GetSpecOrDefault());
++  mDocument->SetMayStartLayout(true);
++  nsCOMPtr<nsIPresShell> shell = mDocument->GetShell();
++  if (shell && !shell->DidInitialize()) {
++    nsresult rv = shell->Initialize();
++    if (NS_FAILED(rv)) {
++      return;
++    }
++  }
++}
++
+ NS_IMETHODIMP
+-XULDocument::StyleSheetLoaded(StyleSheet* aSheet, bool aWasDeferred,
+-                              nsresult aStatus) {
++PrototypeDocumentContentSink::StyleSheetLoaded(StyleSheet* aSheet,
++                                               bool aWasDeferred,
++                                               nsresult aStatus) {
+   if (!aWasDeferred) {
+     // Don't care about when alternate sheets finish loading
+     MOZ_ASSERT(mPendingSheets > 0, "Unexpected StyleSheetLoaded notification");
+ 
+     --mPendingSheets;
+ 
+     return MaybeDoneWalking();
+   }
+ 
+   return NS_OK;
+ }
+ 
+-void XULDocument::EndUpdate() { XMLDocument::EndUpdate(); }
+-
+-nsresult XULDocument::LoadScript(nsXULPrototypeScript* aScriptProto,
+-                                 bool* aBlock) {
++nsresult PrototypeDocumentContentSink::LoadScript(
++    nsXULPrototypeScript* aScriptProto, bool* aBlock) {
+   // Load a transcluded script
+   nsresult rv;
+ 
+   bool isChromeDoc = IsChromeURI(mDocumentURI);
+ 
+   if (isChromeDoc && aScriptProto->HasScriptObject()) {
+     rv = ExecuteScript(aScriptProto);
+ 
+@@ -1039,23 +715,26 @@ nsresult XULDocument::LoadScript(nsXULPr
+ 
+   if (isChromeDoc && aScriptProto->mSrcLoading) {
+     // Another XULDocument load has started, which is still in progress.
+     // Remember to ResumeWalk this document when the load completes.
+     mNextSrcLoadWaiter = aScriptProto->mSrcLoadWaiters;
+     aScriptProto->mSrcLoadWaiters = this;
+     NS_ADDREF_THIS();
+   } else {
+-    nsCOMPtr<nsILoadGroup> group = do_QueryReferent(mDocumentLoadGroup);
++    nsCOMPtr<nsILoadGroup> group =
++        mDocument
++            ->GetDocumentLoadGroup();  // found in
++                                       // mozilla::dom::Document::SetScriptGlobalObject
+ 
+     // Note: the loader will keep itself alive while it's loading.
+     nsCOMPtr<nsIStreamLoader> loader;
+     rv = NS_NewStreamLoader(getter_AddRefs(loader), aScriptProto->mSrcURI,
+-                            this,  // aObserver
+-                            this,  // aRequestingContext
++                            this,       // aObserver
++                            mDocument,  // aRequestingContext
+                             nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_DATA_INHERITS,
+                             nsIContentPolicy::TYPE_INTERNAL_SCRIPT, group);
+ 
+     if (NS_FAILED(rv)) {
+       mCurrentScriptProto = nullptr;
+       return rv;
+     }
+ 
+@@ -1063,19 +742,21 @@ nsresult XULDocument::LoadScript(nsXULPr
+   }
+ 
+   // Block until OnStreamComplete resumes us.
+   *aBlock = true;
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+-XULDocument::OnStreamComplete(nsIStreamLoader* aLoader, nsISupports* context,
+-                              nsresult aStatus, uint32_t stringLen,
+-                              const uint8_t* string) {
++PrototypeDocumentContentSink::OnStreamComplete(nsIStreamLoader* aLoader,
++                                               nsISupports* context,
++                                               nsresult aStatus,
++                                               uint32_t stringLen,
++                                               const uint8_t* string) {
+   nsCOMPtr<nsIRequest> request;
+   aLoader->GetRequest(getter_AddRefs(request));
+   nsCOMPtr<nsIChannel> channel = do_QueryInterface(request);
+ 
+ #ifdef DEBUG
+   // print a load error on bad status
+   if (NS_FAILED(aStatus)) {
+     if (channel) {
+@@ -1113,53 +794,54 @@ XULDocument::OnStreamComplete(nsIStreamL
+ 
+     // XXX should also check nsIHttpChannel::requestSucceeded
+ 
+     MOZ_ASSERT(!mOffThreadCompiling && (mOffThreadCompileStringLength == 0 &&
+                                         !mOffThreadCompileStringBuf),
+                "XULDocument can't load multiple scripts at once");
+ 
+     rv = ScriptLoader::ConvertToUTF16(channel, string, stringLen, EmptyString(),
+-                                      this, mOffThreadCompileStringBuf,
++                                      mDocument, mOffThreadCompileStringBuf,
+                                       mOffThreadCompileStringLength);
+     if (NS_SUCCEEDED(rv)) {
+       // Pass ownership of the buffer, carefully emptying the existing
+       // fields in the process.  Note that the |Compile| function called
+       // below always takes ownership of the buffer.
+       char16_t* units = nullptr;
+       size_t unitsLength = 0;
+ 
+       std::swap(units, mOffThreadCompileStringBuf);
+       std::swap(unitsLength, mOffThreadCompileStringLength);
+ 
+       rv = mCurrentScriptProto->Compile(units, unitsLength,
+                                         JS::SourceOwnership::TakeOwnership, uri,
+-                                        1, this, this);
++                                        1, mDocument, this);
+       if (NS_SUCCEEDED(rv) && !mCurrentScriptProto->HasScriptObject()) {
+         mOffThreadCompiling = true;
+-        BlockOnload();
++        mDocument->BlockOnload();
+         return NS_OK;
+       }
+     }
+   }
+ 
+   return OnScriptCompileComplete(mCurrentScriptProto->GetScriptObject(), rv);
+ }
+ 
+ NS_IMETHODIMP
+-XULDocument::OnScriptCompileComplete(JSScript* aScript, nsresult aStatus) {
++PrototypeDocumentContentSink::OnScriptCompileComplete(JSScript* aScript,
++                                                      nsresult aStatus) {
+   // When compiling off thread the script will not have been attached to the
+   // script proto yet.
+   if (aScript && !mCurrentScriptProto->HasScriptObject())
+     mCurrentScriptProto->Set(aScript);
+ 
+   // Allow load events to be fired once off thread compilation finishes.
+   if (mOffThreadCompiling) {
+     mOffThreadCompiling = false;
+-    UnblockOnload(false);
++    mDocument->UnblockOnload(false);
+   }
+ 
+   // After compilation finishes the script's characters are no longer needed.
+   if (mOffThreadCompileStringBuf) {
+     js_free(mOffThreadCompileStringBuf);
+     mOffThreadCompileStringBuf = nullptr;
+     mOffThreadCompileStringLength = 0;
+   }
+@@ -1210,21 +892,21 @@ XULDocument::OnScriptCompileComplete(JSS
+     }
+     // ignore any evaluation errors
+   }
+ 
+   rv = ResumeWalk();
+ 
+   // Load a pointer to the prototype-script's list of XULDocuments who
+   // raced to load the same script
+-  XULDocument** docp = &scriptProto->mSrcLoadWaiters;
++  PrototypeDocumentContentSink** docp = &scriptProto->mSrcLoadWaiters;
+ 
+   // Resume walking other documents that waited for this one's load, first
+   // executing the script we just compiled, in each doc's script context
+-  XULDocument* doc;
++  PrototypeDocumentContentSink* doc;
+   while ((doc = *docp) != nullptr) {
+     NS_ASSERTION(doc->mCurrentScriptProto == scriptProto,
+                  "waiting for wrong script to load?");
+     doc->mCurrentScriptProto = nullptr;
+ 
+     // Unlink doc from scriptProto's list before executing and resuming
+     *docp = doc->mNextSrcLoadWaiter;
+     doc->mNextSrcLoadWaiter = nullptr;
+@@ -1245,31 +927,38 @@ XULDocument::OnScriptCompileComplete(JSS
+     }
+     doc->ResumeWalk();
+     NS_RELEASE(doc);
+   }
+ 
+   return rv;
+ }
+ 
+-nsresult XULDocument::ExecuteScript(nsXULPrototypeScript* aScript) {
++nsresult PrototypeDocumentContentSink::ExecuteScript(
++    nsXULPrototypeScript* aScript) {
+   MOZ_ASSERT(aScript != nullptr, "null ptr");
+   NS_ENSURE_TRUE(aScript, NS_ERROR_NULL_POINTER);
+-  NS_ENSURE_TRUE(mScriptGlobalObject, NS_ERROR_NOT_INITIALIZED);
++
++  nsIScriptGlobalObject* scriptGlobalObject;
++  bool aHasHadScriptHandlingObject;
++  scriptGlobalObject =
++      mDocument->GetScriptHandlingObject(aHasHadScriptHandlingObject);
++
++  NS_ENSURE_TRUE(scriptGlobalObject, NS_ERROR_NOT_INITIALIZED);
+ 
+   nsresult rv;
+-  rv = mScriptGlobalObject->EnsureScriptEnvironment();
++  rv = scriptGlobalObject->EnsureScriptEnvironment();
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   // Execute the precompiled script with the given version
+   nsAutoMicroTask mt;
+ 
+   // We're about to run script via JS::CloneAndExecuteScript, so we need an
+   // AutoEntryScript. This is Gecko specific and not in any spec.
+-  AutoEntryScript aes(mScriptGlobalObject, "precompiled XUL <script> element");
++  AutoEntryScript aes(scriptGlobalObject, "precompiled XUL <script> element");
+   JSContext* cx = aes.cx();
+ 
+   JS::Rooted<JSScript*> scriptObject(cx, aScript->GetScriptObject());
+   NS_ENSURE_TRUE(scriptObject, NS_ERROR_UNEXPECTED);
+ 
+   JS::Rooted<JSObject*> global(cx, JS::CurrentGlobalOrNull(cx));
+   NS_ENSURE_TRUE(xpc::Scriptability::Get(global).Allowed(), NS_OK);
+ 
+@@ -1280,50 +969,50 @@ nsresult XULDocument::ExecuteScript(nsXU
+   // and execute it. On failure, ~AutoScriptEntry will handle exceptions, so
+   // there is no need to manually check the return value.
+   JS::RootedValue rval(cx);
+   JS::CloneAndExecuteScript(cx, scriptObject, &rval);
+ 
+   return NS_OK;
+ }
+ 
+-nsresult XULDocument::CreateElementFromPrototype(
++nsresult PrototypeDocumentContentSink::CreateElementFromPrototype(
+     nsXULPrototypeElement* aPrototype, Element** aResult, bool aIsRoot) {
+   // Create a content model element from a prototype element.
+   MOZ_ASSERT(aPrototype != nullptr, "null ptr");
+   if (!aPrototype) return NS_ERROR_NULL_POINTER;
+ 
+   *aResult = nullptr;
+   nsresult rv = NS_OK;
+ 
+-  if (MOZ_LOG_TEST(gXULLog, LogLevel::Debug)) {
++  if (MOZ_LOG_TEST(gLog, LogLevel::Debug)) {
+     MOZ_LOG(
+-        gXULLog, LogLevel::Debug,
+-        ("xul: creating <%s> from prototype",
++        gLog, LogLevel::Debug,
++        ("prototype: creating <%s> from prototype",
+          NS_ConvertUTF16toUTF8(aPrototype->mNodeInfo->QualifiedName()).get()));
+   }
+ 
+   RefPtr<Element> result;
+ 
+   if (aPrototype->mNodeInfo->NamespaceEquals(kNameSpaceID_XUL)) {
+     // If it's a XUL element, it'll be lightweight until somebody
+     // monkeys with it.
+-    rv = nsXULElement::CreateFromPrototype(aPrototype, this, true, aIsRoot,
++    rv = nsXULElement::CreateFromPrototype(aPrototype, mDocument, true, aIsRoot,
+                                            getter_AddRefs(result));
+     if (NS_FAILED(rv)) return rv;
+   } else {
+     // If it's not a XUL element, it's gonna be heavyweight no matter
+     // what. So we need to copy everything out of the prototype
+     // into the element.  Get a nodeinfo from our nodeinfo manager
+     // for this node.
+     RefPtr<mozilla::dom::NodeInfo> newNodeInfo;
+     newNodeInfo = mNodeInfoManager->GetNodeInfo(
+         aPrototype->mNodeInfo->NameAtom(),
+         aPrototype->mNodeInfo->GetPrefixAtom(),
+-        aPrototype->mNodeInfo->NamespaceID(), ELEMENT_NODE);
++        aPrototype->mNodeInfo->NamespaceID(), nsINode::ELEMENT_NODE);
+     if (!newNodeInfo) return NS_ERROR_OUT_OF_MEMORY;
+     RefPtr<mozilla::dom::NodeInfo> xtfNi = newNodeInfo;
+     if (aPrototype->mIsAtom &&
+         newNodeInfo->NamespaceID() == kNameSpaceID_XHTML) {
+       rv = NS_NewHTMLElement(getter_AddRefs(result), newNodeInfo.forget(),
+                              NOT_FROM_PARSER, aPrototype->mIsAtom);
+     } else {
+       rv = NS_NewElement(getter_AddRefs(result), newNodeInfo.forget(),
+@@ -1335,130 +1024,28 @@ nsresult XULDocument::CreateElementFromP
+     if (NS_FAILED(rv)) return rv;
+   }
+ 
+   result.forget(aResult);
+ 
+   return NS_OK;
+ }
+ 
+-nsresult XULDocument::AddAttributes(nsXULPrototypeElement* aPrototype,
+-                                    Element* aElement) {
++nsresult PrototypeDocumentContentSink::AddAttributes(
++    nsXULPrototypeElement* aPrototype, Element* aElement) {
+   nsresult rv;
+ 
+   for (uint32_t i = 0; i < aPrototype->mNumAttributes; ++i) {
+     nsXULPrototypeAttribute* protoattr = &(aPrototype->mAttributes[i]);
+     nsAutoString valueStr;
+     protoattr->mValue.ToString(valueStr);
+ 
+     rv = aElement->SetAttr(protoattr->mName.NamespaceID(),
+                            protoattr->mName.LocalName(),
+                            protoattr->mName.GetPrefix(), valueStr, false);
+     if (NS_FAILED(rv)) return rv;
+   }
+ 
+   return NS_OK;
+ }
+ 
+-//----------------------------------------------------------------------
+-//
+-// CachedChromeStreamListener
+-//
+-
+-XULDocument::CachedChromeStreamListener::CachedChromeStreamListener(
+-    XULDocument* aDocument, bool aProtoLoaded)
+-    : mDocument(aDocument), mProtoLoaded(aProtoLoaded) {}
+-
+-XULDocument::CachedChromeStreamListener::~CachedChromeStreamListener() {}
+-
+-NS_IMPL_ISUPPORTS(XULDocument::CachedChromeStreamListener, nsIRequestObserver,
+-                  nsIStreamListener)
+-
+-NS_IMETHODIMP
+-XULDocument::CachedChromeStreamListener::OnStartRequest(nsIRequest* request,
+-                                                        nsISupports* acontext) {
+-  return NS_ERROR_PARSED_DATA_CACHED;
+-}
+-
+-NS_IMETHODIMP
+-XULDocument::CachedChromeStreamListener::OnStopRequest(nsIRequest* request,
+-                                                       nsISupports* aContext,
+-                                                       nsresult aStatus) {
+-  if (!mProtoLoaded) return NS_OK;
+-
+-  return mDocument->OnPrototypeLoadDone(true);
+-}
+-
+-NS_IMETHODIMP
+-XULDocument::CachedChromeStreamListener::OnDataAvailable(nsIRequest* request,
+-                                                         nsISupports* aContext,
+-                                                         nsIInputStream* aInStr,
+-                                                         uint64_t aSourceOffset,
+-                                                         uint32_t aCount) {
+-  MOZ_ASSERT_UNREACHABLE("CachedChromeStream doesn't receive data");
+-  return NS_ERROR_UNEXPECTED;
+-}
+-
+-bool XULDocument::IsDocumentRightToLeft() {
+-  // setting the localedir attribute on the root element forces a
+-  // specific direction for the document.
+-  Element* element = GetRootElement();
+-  if (element) {
+-    static Element::AttrValuesArray strings[] = {nsGkAtoms::ltr, nsGkAtoms::rtl,
+-                                                 nullptr};
+-    switch (element->FindAttrValueIn(kNameSpaceID_None, nsGkAtoms::localedir,
+-                                     strings, eCaseMatters)) {
+-      case 0:
+-        return false;
+-      case 1:
+-        return true;
+-      default:
+-        break;  // otherwise, not a valid value, so fall through
+-    }
+-  }
+-
+-  // otherwise, get the locale from the chrome registry and
+-  // look up the intl.uidirection.<locale> preference
+-  nsCOMPtr<nsIXULChromeRegistry> reg =
+-      mozilla::services::GetXULChromeRegistryService();
+-  if (!reg) return false;
+-
+-  nsAutoCString package;
+-  bool isChrome;
+-  if (NS_SUCCEEDED(mDocumentURI->SchemeIs("chrome", &isChrome)) && isChrome) {
+-    mDocumentURI->GetHostPort(package);
+-  } else {
+-    // use the 'global' package for about and resource uris.
+-    // otherwise, just default to left-to-right.
+-    bool isAbout, isResource;
+-    if (NS_SUCCEEDED(mDocumentURI->SchemeIs("about", &isAbout)) && isAbout) {
+-      package.AssignLiteral("global");
+-    } else if (NS_SUCCEEDED(mDocumentURI->SchemeIs("resource", &isResource)) &&
+-               isResource) {
+-      package.AssignLiteral("global");
+-    } else {
+-      return false;
+-    }
+-  }
+-
+-  bool isRTL = false;
+-  reg->IsLocaleRTL(package, &isRTL);
+-  return isRTL;
+-}
+-
+-void XULDocument::ResetDocumentDirection() {
+-  DocumentStatesChanged(NS_DOCUMENT_STATE_RTL_LOCALE);
+-}
+-
+-void XULDocument::DirectionChanged(const char* aPrefName, XULDocument* aDoc) {
+-  // Reset the direction and restyle the document if necessary.
+-  if (aDoc) {
+-    aDoc->ResetDocumentDirection();
+-  }
+-}
+-
+-JSObject* XULDocument::WrapNode(JSContext* aCx,
+-                                JS::Handle<JSObject*> aGivenProto) {
+-  return XULDocument_Binding::Wrap(aCx, this, aGivenProto);
+-}
+-
+ }  // namespace dom
+ }  // namespace mozilla
+diff --git a/dom/prototype/PrototypeDocumentContentSink.h b/dom/prototype/PrototypeDocumentContentSink.h
+new file mode 100644
+--- /dev/null
++++ b/dom/prototype/PrototypeDocumentContentSink.h
+@@ -0,0 +1,242 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_PrototypeDocumentContentSink_h__
++#define mozilla_dom_PrototypeDocumentContentSink_h__
++
++#include "mozilla/Attributes.h"
++#include "nsIContentSink.h"
++#include "nsTArray.h"
++#include "nsCOMPtr.h"
++#include "nsCRT.h"
++#include "nsCycleCollectionParticipant.h"
++#include "nsIDTD.h"
++#include "mozilla/dom/FromParser.h"
++#include "nsXULPrototypeDocument.h"
++#include "nsIStreamLoader.h"
++#include "nsIScriptContext.h"
++#include "nsICSSLoaderObserver.h"
++#include "mozilla/Logging.h"
++
++class nsIURI;
++class nsIChannel;
++class nsIContent;
++class nsIParser;
++class nsTextNode;
++class nsINode;
++class nsXULPrototypeElement;
++class nsXULPrototypePI;
++class nsXULPrototypeScript;
++
++namespace mozilla {
++namespace dom {
++class Element;
++class ScriptLoader;
++class Document;
++}  // namespace dom
++}  // namespace mozilla
++
++nsresult NS_NewPrototypeDocumentContentSink(nsIContentSink** aResult,
++                                            mozilla::dom::Document* aDoc,
++                                            nsIURI* aURI,
++                                            nsISupports* aContainer,
++                                            nsIChannel* aChannel);
++
++namespace mozilla {
++namespace dom {
++
++class PrototypeDocumentContentSink final : public nsIStreamLoaderObserver,
++                                           public nsIContentSink,
++                                           public nsICSSLoaderObserver,
++                                           public nsIOffThreadScriptReceiver {
++ public:
++  PrototypeDocumentContentSink();
++
++  nsresult Init(Document* aDoc, nsIURI* aURL, nsISupports* aContainer,
++                nsIChannel* aChannel);
++
++  // nsISupports
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_NSISTREAMLOADEROBSERVER
++
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(PrototypeDocumentContentSink,
++                                           nsIContentSink)
++
++  // nsIContentSink
++  NS_IMETHOD WillParse(void) override { return NS_OK; };
++  NS_IMETHOD WillBuildModel(nsDTDMode aDTDMode) override { return NS_OK; };
++  NS_IMETHOD DidBuildModel(bool aTerminated) override { return NS_OK; };
++  NS_IMETHOD WillInterrupt(void) override { return NS_OK; };
++  NS_IMETHOD WillResume(void) override { return NS_OK; };
++  NS_IMETHOD SetParser(nsParserBase* aParser) override;
++  virtual void InitialDocumentTranslationCompleted() override;
++  virtual void FlushPendingNotifications(FlushType aType) override{};
++  virtual void SetDocumentCharset(NotNull<const Encoding*> aEncoding) override;
++  virtual nsISupports* GetTarget() override;
++  virtual bool IsScriptExecuting() override;
++  virtual void ContinueInterruptedParsingAsync() override;
++
++  // nsICSSLoaderObserver
++  NS_IMETHOD StyleSheetLoaded(StyleSheet* aSheet, bool aWasAlternate,
++                              nsresult aStatus) override;
++
++  // nsIOffThreadScriptReceiver
++  NS_IMETHOD OnScriptCompileComplete(JSScript* aScript,
++                                     nsresult aStatus) override;
++
++  nsresult OnPrototypeLoadDone(nsXULPrototypeDocument* aPrototype);
++
++ protected:
++  virtual ~PrototypeDocumentContentSink();
++
++  static LazyLogModule gLog;
++
++  nsIParser* GetParser();
++
++  void ContinueInterruptedParsingIfEnabled();
++  void StartLayout();
++
++  virtual nsresult AddAttributes(nsXULPrototypeElement* aPrototype,
++                                 Element* aElement);
++
++  RefPtr<nsParserBase> mParser;
++  nsCOMPtr<nsIURI> mDocumentURI;
++  RefPtr<Document> mDocument;
++  RefPtr<nsNodeInfoManager> mNodeInfoManager;
++  RefPtr<ScriptLoader> mScriptLoader;
++
++  PrototypeDocumentContentSink* mNextSrcLoadWaiter;  // [OWNER] but not COMPtr
++
++  /**
++   * The prototype-script of the current transcluded script that is being
++   * loaded.  For document.write('<script src="nestedwrite.js"><\/script>')
++   * to work, these need to be in a stack element type, and we need to hold
++   * the top of stack here.
++   */
++  nsXULPrototypeScript* mCurrentScriptProto;
++
++  /**
++   * Whether the current transcluded script is being compiled off thread.
++   * The load event is blocked while this is in progress.
++   */
++  bool mOffThreadCompiling;
++
++  /**
++   * If the current transcluded script is being compiled off thread, the
++   * source for that script.
++   */
++  char16_t* mOffThreadCompileStringBuf;
++  size_t mOffThreadCompileStringLength;
++
++  /**
++   * Wether the prototype document is still be traversed to create the DOM.
++   * Layout will not be started until false.
++   */
++  bool mStillWalking;
++
++  /**
++   * Number of style sheets still loading. Layout will not start until zero.
++   */
++  uint32_t mPendingSheets;
++
++  /**
++   * Context stack, which maintains the state of the Builder and allows
++   * it to be interrupted.
++   */
++  class ContextStack {
++   protected:
++    struct Entry {
++      nsXULPrototypeElement* mPrototype;
++      nsIContent* mElement;
++      int32_t mIndex;
++      Entry* mNext;
++    };
++
++    Entry* mTop;
++    int32_t mDepth;
++
++   public:
++    ContextStack();
++    ~ContextStack();
++
++    int32_t Depth() { return mDepth; }
++
++    nsresult Push(nsXULPrototypeElement* aPrototype, nsIContent* aElement);
++    nsresult Pop();
++    nsresult Peek(nsXULPrototypeElement** aPrototype, nsIContent** aElement,
++                  int32_t* aIndex);
++
++    nsresult SetTopIndex(int32_t aIndex);
++  };
++
++  friend class ContextStack;
++  ContextStack mContextStack;
++
++  /**
++   * The current prototype that we are walking to construct the
++   * content model.
++   */
++  RefPtr<nsXULPrototypeDocument> mCurrentPrototype;
++  nsresult CreateAndInsertPI(const nsXULPrototypePI* aProtoPI);
++  nsresult ExecuteScript(nsXULPrototypeScript* aScript);
++  nsresult LoadScript(nsXULPrototypeScript* aScriptProto, bool* aBlock);
++  /**
++   * Resume (or initiate) an interrupted (or newly prepared)
++   * prototype walk.
++   */
++  nsresult ResumeWalk();
++
++  /**
++   * Called at the end of ResumeWalk(), from StyleSheetLoaded(),
++   * and from DocumentL10n.
++   * If walking, stylesheets and l10n are not blocking, it
++   * will trigger `DoneWalking()`.
++   */
++  nsresult MaybeDoneWalking();
++
++  /**
++   * Called from `MaybeDoneWalking()`.
++   * Expects that both the prototype document walk is complete and
++   * all referenced stylesheets finished loading.
++   */
++  nsresult DoneWalking();
++
++  /**
++   * Create a delegate content model element from a prototype.
++   * Note that the resulting content node is not bound to any tree
++   */
++  nsresult CreateElementFromPrototype(nsXULPrototypeElement* aPrototype,
++                                      Element** aResult, bool aIsRoot);
++  /**
++   * Prepare to walk the current prototype.
++   */
++  nsresult PrepareToWalk();
++  /**
++   * Creates a processing instruction based on aProtoPI and inserts
++   * it to the DOM.
++   */
++  nsresult CreateAndInsertPI(const nsXULPrototypePI* aProtoPI, nsINode* aParent,
++                             nsINode* aBeforeThis);
++
++  /**
++   * Inserts the passed <?xml-stylesheet ?> PI at the specified
++   * index. Loads and applies the associated stylesheet
++   * asynchronously.
++   * The prototype document walk can happen before the stylesheets
++   * are loaded, but the final steps in the load process (see
++   * DoneWalking()) are not run before all the stylesheets are done
++   * loading.
++   */
++  nsresult InsertXMLStylesheetPI(const nsXULPrototypePI* aProtoPI,
++                                 nsINode* aParent, nsINode* aBeforeThis,
++                                 nsIContent* aPINode);
++  void CloseElement(Element* aElement);
++};
++
++}  // namespace dom
++}  // namespace mozilla
++
++#endif  // mozilla_dom_PrototypeDocumentContentSink_h__
+diff --git a/parser/moz.build b/dom/prototype/moz.build
+copy from parser/moz.build
+copy to dom/prototype/moz.build
+--- a/parser/moz.build
++++ b/dom/prototype/moz.build
+@@ -1,15 +1,24 @@
+ # -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+-with Files('**'):
+-    BUG_COMPONENT = ('Core', 'HTML: Parser')
++with Files("**"):
++    BUG_COMPONENT = ("Core", "XUL")
+ 
+-DIRS += ['expat', 'xml', 'htmlparser', 'html']
+-
+-EXPORTS += [
+-    'nsCharsetSource.h',
++EXPORTS.mozilla.dom += [
++    'PrototypeDocumentContentSink.h',
+ ]
+ 
++SOURCES += [
++    'PrototypeDocumentContentSink.cpp',
++]
++
++LOCAL_INCLUDES += [
++    '/dom/base',
++    '/dom/xbl',
++    '/dom/xul',
++]
++
++FINAL_LIBRARY = 'xul'
+diff --git a/dom/xul/XULDocument.cpp b/dom/xul/XULDocument.cpp
+--- a/dom/xul/XULDocument.cpp
++++ b/dom/xul/XULDocument.cpp
+@@ -96,16 +96,19 @@
+ #include "mozilla/dom/URL.h"
+ #include "nsIContentPolicy.h"
+ #include "mozAutoDocUpdate.h"
+ #include "xpcpublic.h"
+ #include "mozilla/StyleSheet.h"
+ #include "mozilla/StyleSheetInlines.h"
+ #include "nsIConsoleService.h"
+ 
++#include "mozilla/parser/PrototypeDocumentParser.h"
++#include "mozilla/dom/PrototypeDocumentContentSink.h"
++
+ using namespace mozilla;
+ using namespace mozilla::dom;
+ 
+ //----------------------------------------------------------------------
+ //
+ // CIDs
+ //
+ 
+@@ -124,49 +127,29 @@ LazyLogModule XULDocument::gXULLog("XULD
+ //
+ // ctors & dtors
+ //
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ XULDocument::XULDocument(void)
+-    : XMLDocument("application/vnd.mozilla.xul+xml"),
+-      mNextSrcLoadWaiter(nullptr),
+-      mIsWritingFastLoad(false),
+-      mDocumentLoaded(false),
+-      mStillWalking(false),
+-      mPendingSheets(0),
+-      mCurrentScriptProto(nullptr),
+-      mOffThreadCompiling(false),
+-      mOffThreadCompileStringBuf(nullptr),
+-      mOffThreadCompileStringLength(0),
+-      mInitialLayoutComplete(false) {
++    : XMLDocument("application/vnd.mozilla.xul+xml") {
+   // Override the default in Document
+   mCharacterSet = UTF_8_ENCODING;
+ 
+   mDefaultElementType = kNameSpaceID_XUL;
+   mType = eXUL;
+ 
+-  mDelayFrameLoaderInitialization = true;
+-
+   mAllowXULXBL = eTriTrue;
+ }
+ 
+ XULDocument::~XULDocument() {
+-  NS_ASSERTION(
+-      mNextSrcLoadWaiter == nullptr,
+-      "unreferenced document still waiting for script source to load?");
+-
+   Preferences::UnregisterCallback(XULDocument::DirectionChanged,
+                                   "intl.uidirection", this);
+-
+-  if (mOffThreadCompileStringBuf) {
+-    js_free(mOffThreadCompileStringBuf);
+-  }
+ }
+ 
+ }  // namespace dom
+ }  // namespace mozilla
+ 
+ nsresult NS_NewXULDocument(Document** result) {
+   MOZ_ASSERT(result != nullptr, "null ptr");
+   if (!result) return NS_ERROR_NULL_POINTER;
+@@ -191,31 +174,23 @@ namespace dom {
+ //
+ 
+ NS_IMPL_CYCLE_COLLECTION_CLASS(XULDocument)
+ 
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN_INHERITED(XULDocument, XMLDocument)
+   NS_ASSERTION(
+       !nsCCUncollectableMarker::InGeneration(cb, tmp->GetMarkedCCGeneration()),
+       "Shouldn't traverse XULDocument!");
+-  // XXX tmp->mContextStack?
+-
+-  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mCurrentPrototype)
+-  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPrototypes)
+-
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN_INHERITED(XULDocument, XMLDocument)
+   // XXX We should probably unlink all the objects we traverse.
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ 
+-NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED(XULDocument, XMLDocument,
+-                                             nsIStreamLoaderObserver,
+-                                             nsICSSLoaderObserver,
+-                                             nsIOffThreadScriptReceiver)
++NS_IMPL_ISUPPORTS_CYCLE_COLLECTION_INHERITED_0(XULDocument, XMLDocument)
+ 
+ //----------------------------------------------------------------------
+ //
+ // Document interface
+ //
+ 
+ void XULDocument::Reset(nsIChannel* aChannel, nsILoadGroup* aLoadGroup) {
+   MOZ_ASSERT_UNREACHABLE("Reset");
+@@ -249,175 +224,60 @@ nsresult XULDocument::StartDocumentLoad(
+       nsAutoCString urlspec;
+       rv = uri->GetSpec(urlspec);
+       if (NS_SUCCEEDED(rv)) {
+         MOZ_LOG(gXULLog, LogLevel::Warning,
+                 ("xul: load document '%s'", urlspec.get()));
+       }
+     }
+   }
+-  // NOTE: If this ever starts calling Document::StartDocumentLoad
+-  // we'll possibly need to reset our content type afterwards.
+-  mStillWalking = true;
+-  mMayStartLayout = false;
++
++  MOZ_ASSERT(GetReadyStateEnum() == Document::READYSTATE_UNINITIALIZED,
++             "Bad readyState");
++  SetReadyStateInternal(READYSTATE_LOADING);
++
+   mDocumentLoadGroup = do_GetWeakReference(aLoadGroup);
+ 
+   mChannel = aChannel;
+ 
+   // Get the URI.  Note that this should match nsDocShell::OnLoadingSite
+   nsresult rv = NS_GetFinalChannelURI(aChannel, getter_AddRefs(mDocumentURI));
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   mOriginalURI = mDocumentURI;
+ 
+   // Get the document's principal
+   nsCOMPtr<nsIPrincipal> principal;
+   nsContentUtils::GetSecurityManager()->GetChannelResultPrincipal(
+       mChannel, getter_AddRefs(principal));
+   principal = MaybeDowngradePrincipal(principal);
++  SetPrincipal(principal);
+ 
+   ResetStylesheetsToURI(mDocumentURI);
+ 
+   RetrieveRelevantHeaders(aChannel);
+ 
+-  // Look in the chrome cache: we've got this puppy loaded
+-  // already.
+-  nsXULPrototypeDocument* proto =
+-      IsChromeURI(mDocumentURI)
+-          ? nsXULPrototypeCache::GetInstance()->GetPrototype(mDocumentURI)
+-          : nullptr;
+-
+-  // Same comment as nsChromeProtocolHandler::NewChannel and
+-  // XULDocument::ResumeWalk
+-  // - Ben Goodger
+-  //
+-  // We don't abort on failure here because there are too many valid
+-  // cases that can return failure, and the null-ness of |proto| is enough
+-  // to trigger the fail-safe parse-from-disk solution. Example failure cases
+-  // (for reference) include:
+-  //
+-  // NS_ERROR_NOT_AVAILABLE: the URI cannot be found in the startup cache,
+-  //                         parse from disk
+-  // other: the startup cache file could not be found, probably
+-  //        due to being accessed before a profile has been selected (e.g.
+-  //        loading chrome for the profile manager itself). This must be
+-  //        parsed from disk.
+-
+-  if (proto) {
+-    // If we're racing with another document to load proto, wait till the
+-    // load has finished loading before trying to add cloned style sheets.
+-    // XULDocument::EndLoad will call proto->NotifyLoadDone, which will
+-    // find all racing documents and notify them via OnPrototypeLoadDone,
+-    // which will add style sheet clones to each document.
+-    bool loaded;
+-    rv = proto->AwaitLoadDone(this, &loaded);
+-    if (NS_FAILED(rv)) return rv;
+-
+-    mCurrentPrototype = proto;
+-
+-    // Set up the right principal on ourselves.
+-    SetPrincipal(proto->DocumentPrincipal());
++  mParser = new mozilla::parser::PrototypeDocumentParser(mDocumentURI, this);
++  nsCOMPtr<nsIStreamListener> listener = mParser->GetStreamListener();
++  listener.forget(aDocListener);
+ 
+-    // We need a listener, even if proto is not yet loaded, in which
+-    // event the listener's OnStopRequest method does nothing, and all
+-    // the interesting work happens below XULDocument::EndLoad, from
+-    // the call there to mCurrentPrototype->NotifyLoadDone().
+-    *aDocListener = new CachedChromeStreamListener(this, loaded);
+-  } else {
+-    bool useXULCache = nsXULPrototypeCache::GetInstance()->IsEnabled();
+-    bool fillXULCache = (useXULCache && IsChromeURI(mDocumentURI));
+-
+-    // It's just a vanilla document load. Create a parser to deal
+-    // with the stream n' stuff.
+-
+-    nsCOMPtr<nsIParser> parser;
+-    rv = PrepareToLoadPrototype(mDocumentURI, aCommand, principal,
+-                                getter_AddRefs(parser));
+-    if (NS_FAILED(rv)) return rv;
++  nsCOMPtr<nsIDocShell> docShell(do_QueryInterface(aContainer));
++  nsCOMPtr<nsIContentSink> sink;
++  NS_NewPrototypeDocumentContentSink(getter_AddRefs(sink), this, mDocumentURI,
++                                     docShell, aChannel);
++  mParser->SetContentSink(sink);
+ 
+-    // Predicate mIsWritingFastLoad on the XUL cache being enabled,
+-    // so we don't have to re-check whether the cache is enabled all
+-    // the time.
+-    mIsWritingFastLoad = useXULCache;
+-
+-    nsCOMPtr<nsIStreamListener> listener = do_QueryInterface(parser, &rv);
+-    NS_ASSERTION(NS_SUCCEEDED(rv), "parser doesn't support nsIStreamListener");
+-    if (NS_FAILED(rv)) return rv;
+-
+-    *aDocListener = listener;
++  mParser->Parse(mDocumentURI, nullptr, (void*)this);
+ 
+-    parser->Parse(mDocumentURI);
+-
+-    // Put the current prototype, created under PrepareToLoad, into the
+-    // XUL prototype cache now.  We can't do this under PrepareToLoad or
+-    // overlay loading will break; search for PutPrototype in ResumeWalk
+-    // and see the comment there.
+-    if (fillXULCache) {
+-      nsXULPrototypeCache::GetInstance()->PutPrototype(mCurrentPrototype);
+-    }
+-  }
+-
+-  NS_IF_ADDREF(*aDocListener);
+   return NS_OK;
+ }
+ 
+-// This gets invoked after the prototype for this document is fully built in the
+-// content sink.
+ void XULDocument::EndLoad() {
+-  nsresult rv;
+-
+-  // Whack the prototype document into the cache so that the next
+-  // time somebody asks for it, they don't need to load it by hand.
+-
+-  nsCOMPtr<nsIURI> uri = mCurrentPrototype->GetURI();
+-  bool isChrome = IsChromeURI(uri);
+-
+-  // Remember if the XUL cache is on
+-  bool useXULCache = nsXULPrototypeCache::GetInstance()->IsEnabled();
+-
+-  if (isChrome && useXULCache) {
+-    // If it's a chrome prototype document, then notify any
+-    // documents that raced to load the prototype, and awaited
+-    // its load completion via proto->AwaitLoadDone().
+-    rv = mCurrentPrototype->NotifyLoadDone();
+-    if (NS_FAILED(rv)) return;
+-  }
+-
+-  OnPrototypeLoadDone(true);
+-  if (MOZ_LOG_TEST(gXULLog, LogLevel::Warning)) {
+-    nsAutoCString urlspec;
+-    rv = uri->GetSpec(urlspec);
+-    if (NS_SUCCEEDED(rv)) {
+-      MOZ_LOG(gXULLog, LogLevel::Warning,
+-              ("xul: Finished loading document '%s'", urlspec.get()));
+-    }
+-  }
+-}
+-
+-nsresult XULDocument::OnPrototypeLoadDone(bool aResumeWalk) {
+-  nsresult rv;
+-
+-  rv = PrepareToWalk();
+-  NS_ASSERTION(NS_SUCCEEDED(rv), "unable to prepare for walk");
+-  if (NS_FAILED(rv)) return rv;
+-
+-  if (aResumeWalk) {
+-    rv = ResumeWalk();
+-  }
+-  return rv;
+-}
+-
+-//----------------------------------------------------------------------
+-//
+-// Document interface
+-//
+-
+-void XULDocument::InitialDocumentTranslationCompleted() {
+-  mPendingInitialTranslation = false;
+-  MaybeDoneWalking();
++  mSynchronousDOMContentLoaded = true;
++  Document::EndLoad();
+ }
+ 
+ //----------------------------------------------------------------------
+ //
+ // nsINode interface
+ //
+ 
+ nsresult XULDocument::Clone(mozilla::dom::NodeInfo* aNodeInfo,
+@@ -448,960 +308,16 @@ nsresult XULDocument::Init() {
+   }
+ 
+   Preferences::RegisterCallback(XULDocument::DirectionChanged,
+                                 "intl.uidirection", this);
+ 
+   return NS_OK;
+ }
+ 
+-nsresult XULDocument::StartLayout(void) {
+-  mMayStartLayout = true;
+-  nsCOMPtr<nsIPresShell> shell = GetShell();
+-  if (shell) {
+-    // Resize-reflow this time
+-    nsPresContext* cx = shell->GetPresContext();
+-    NS_ASSERTION(cx != nullptr, "no pres context");
+-    if (!cx) return NS_ERROR_UNEXPECTED;
+-
+-    nsCOMPtr<nsIDocShell> docShell = cx->GetDocShell();
+-    NS_ASSERTION(docShell != nullptr, "container is not a docshell");
+-    if (!docShell) return NS_ERROR_UNEXPECTED;
+-
+-    nsresult rv = shell->Initialize();
+-    NS_ENSURE_SUCCESS(rv, rv);
+-  }
+-
+-  return NS_OK;
+-}
+-
+-nsresult XULDocument::PrepareToLoadPrototype(nsIURI* aURI, const char* aCommand,
+-                                             nsIPrincipal* aDocumentPrincipal,
+-                                             nsIParser** aResult) {
+-  nsresult rv;
+-
+-  // Create a new prototype document.
+-  rv = NS_NewXULPrototypeDocument(getter_AddRefs(mCurrentPrototype));
+-  if (NS_FAILED(rv)) return rv;
+-
+-  rv = mCurrentPrototype->InitPrincipal(aURI, aDocumentPrincipal);
+-  if (NS_FAILED(rv)) {
+-    mCurrentPrototype = nullptr;
+-    return rv;
+-  }
+-
+-  SetPrincipal(aDocumentPrincipal);
+-
+-  // Create a XUL content sink, a parser, and kick off a load for
+-  // the document.
+-  RefPtr<XULContentSinkImpl> sink = new XULContentSinkImpl();
+-
+-  rv = sink->Init(this, mCurrentPrototype);
+-  NS_ASSERTION(NS_SUCCEEDED(rv), "Unable to initialize datasource sink");
+-  if (NS_FAILED(rv)) return rv;
+-
+-  nsCOMPtr<nsIParser> parser = do_CreateInstance(kParserCID, &rv);
+-  NS_ASSERTION(NS_SUCCEEDED(rv), "unable to create parser");
+-  if (NS_FAILED(rv)) return rv;
+-
+-  parser->SetCommand(nsCRT::strcmp(aCommand, "view-source") ? eViewNormal
+-                                                            : eViewSource);
+-
+-  parser->SetDocumentCharset(UTF_8_ENCODING, kCharsetFromDocTypeDefault);
+-  parser->SetContentSink(sink);  // grabs a reference to the parser
+-
+-  parser.forget(aResult);
+-  return NS_OK;
+-}
+-
+-void XULDocument::TraceProtos(JSTracer* aTrc) {
+-  uint32_t i, count = mPrototypes.Length();
+-  for (i = 0; i < count; ++i) {
+-    mPrototypes[i]->TraceProtos(aTrc);
+-  }
+-
+-  if (mCurrentPrototype) {
+-    mCurrentPrototype->TraceProtos(aTrc);
+-  }
+-}
+-
+-//----------------------------------------------------------------------
+-//
+-// XULDocument::ContextStack
+-//
+-
+-XULDocument::ContextStack::ContextStack() : mTop(nullptr), mDepth(0) {}
+-
+-XULDocument::ContextStack::~ContextStack() {
+-  while (mTop) {
+-    Entry* doomed = mTop;
+-    mTop = mTop->mNext;
+-    NS_IF_RELEASE(doomed->mElement);
+-    delete doomed;
+-  }
+-}
+-
+-nsresult XULDocument::ContextStack::Push(nsXULPrototypeElement* aPrototype,
+-                                         nsIContent* aElement) {
+-  Entry* entry = new Entry;
+-  entry->mPrototype = aPrototype;
+-  entry->mElement = aElement;
+-  NS_IF_ADDREF(entry->mElement);
+-  entry->mIndex = 0;
+-
+-  entry->mNext = mTop;
+-  mTop = entry;
+-
+-  ++mDepth;
+-  return NS_OK;
+-}
+-
+-nsresult XULDocument::ContextStack::Pop() {
+-  if (mDepth == 0) return NS_ERROR_UNEXPECTED;
+-
+-  Entry* doomed = mTop;
+-  mTop = mTop->mNext;
+-  --mDepth;
+-
+-  NS_IF_RELEASE(doomed->mElement);
+-  delete doomed;
+-  return NS_OK;
+-}
+-
+-nsresult XULDocument::ContextStack::Peek(nsXULPrototypeElement** aPrototype,
+-                                         nsIContent** aElement,
+-                                         int32_t* aIndex) {
+-  if (mDepth == 0) return NS_ERROR_UNEXPECTED;
+-
+-  *aPrototype = mTop->mPrototype;
+-  *aElement = mTop->mElement;
+-  NS_IF_ADDREF(*aElement);
+-  *aIndex = mTop->mIndex;
+-
+-  return NS_OK;
+-}
+-
+-nsresult XULDocument::ContextStack::SetTopIndex(int32_t aIndex) {
+-  if (mDepth == 0) return NS_ERROR_UNEXPECTED;
+-
+-  mTop->mIndex = aIndex;
+-  return NS_OK;
+-}
+-
+-//----------------------------------------------------------------------
+-//
+-// Content model walking routines
+-//
+-
+-nsresult XULDocument::PrepareToWalk() {
+-  // Prepare to walk the mCurrentPrototype
+-  nsresult rv;
+-
+-  // Keep an owning reference to the prototype document so that its
+-  // elements aren't yanked from beneath us.
+-  mPrototypes.AppendElement(mCurrentPrototype);
+-
+-  // Get the prototype's root element and initialize the context
+-  // stack for the prototype walk.
+-  nsXULPrototypeElement* proto = mCurrentPrototype->GetRootElement();
+-
+-  if (!proto) {
+-    if (MOZ_LOG_TEST(gXULLog, LogLevel::Error)) {
+-      nsCOMPtr<nsIURI> url = mCurrentPrototype->GetURI();
+-
+-      nsAutoCString urlspec;
+-      rv = url->GetSpec(urlspec);
+-      if (NS_FAILED(rv)) return rv;
+-
+-      MOZ_LOG(gXULLog, LogLevel::Error,
+-              ("xul: error parsing '%s'", urlspec.get()));
+-    }
+-
+-    return NS_OK;
+-  }
+-
+-  nsINode* nodeToInsertBefore = nsINode::GetFirstChild();
+-
+-  const nsTArray<RefPtr<nsXULPrototypePI> >& processingInstructions =
+-      mCurrentPrototype->GetProcessingInstructions();
+-
+-  uint32_t total = processingInstructions.Length();
+-  for (uint32_t i = 0; i < total; ++i) {
+-    rv = CreateAndInsertPI(processingInstructions[i], this, nodeToInsertBefore);
+-    if (NS_FAILED(rv)) return rv;
+-  }
+-
+-  // Do one-time initialization.
+-  RefPtr<Element> root;
+-
+-  // Add the root element
+-  rv = CreateElementFromPrototype(proto, getter_AddRefs(root), true);
+-  if (NS_FAILED(rv)) return rv;
+-
+-  rv = AppendChildTo(root, false);
+-  if (NS_FAILED(rv)) return rv;
+-
+-  ResetDocumentDirection();
+-
+-  // Block onload until we've finished building the complete
+-  // document content model.
+-  BlockOnload();
+-
+-  nsContentUtils::AddScriptRunner(
+-      new nsDocElementCreatedNotificationRunner(this));
+-
+-  // There'd better not be anything on the context stack at this
+-  // point! This is the basis case for our "induction" in
+-  // ResumeWalk(), below, which'll assume that there's always a
+-  // content element on the context stack if we're in the document.
+-  NS_ASSERTION(mContextStack.Depth() == 0,
+-               "something's on the context stack already");
+-  if (mContextStack.Depth() != 0) return NS_ERROR_UNEXPECTED;
+-
+-  rv = mContextStack.Push(proto, root);
+-  if (NS_FAILED(rv)) return rv;
+-
+-  return NS_OK;
+-}
+-
+-nsresult XULDocument::CreateAndInsertPI(const nsXULPrototypePI* aProtoPI,
+-                                        nsINode* aParent,
+-                                        nsINode* aBeforeThis) {
+-  MOZ_ASSERT(aProtoPI, "null ptr");
+-  MOZ_ASSERT(aParent, "null ptr");
+-
+-  RefPtr<ProcessingInstruction> node = NS_NewXMLProcessingInstruction(
+-      mNodeInfoManager, aProtoPI->mTarget, aProtoPI->mData);
+-
+-  nsresult rv;
+-  if (aProtoPI->mTarget.EqualsLiteral("xml-stylesheet")) {
+-    rv = InsertXMLStylesheetPI(aProtoPI, aParent, aBeforeThis, node);
+-  } else {
+-    // No special processing, just add the PI to the document.
+-    rv = aParent->InsertChildBefore(
+-        node->AsContent(), aBeforeThis ? aBeforeThis->AsContent() : nullptr,
+-        false);
+-  }
+-
+-  return rv;
+-}
+-
+-nsresult XULDocument::InsertXMLStylesheetPI(const nsXULPrototypePI* aProtoPI,
+-                                            nsINode* aParent,
+-                                            nsINode* aBeforeThis,
+-                                            nsIContent* aPINode) {
+-  nsCOMPtr<nsIStyleSheetLinkingElement> ssle(do_QueryInterface(aPINode));
+-  NS_ASSERTION(ssle,
+-               "passed XML Stylesheet node does not "
+-               "implement nsIStyleSheetLinkingElement!");
+-
+-  nsresult rv;
+-
+-  ssle->InitStyleLinkElement(false);
+-  // We want to be notified when the style sheet finishes loading, so
+-  // disable style sheet loading for now.
+-  ssle->SetEnableUpdates(false);
+-  ssle->OverrideBaseURI(mCurrentPrototype->GetURI());
+-
+-  rv = aParent->InsertChildBefore(
+-      aPINode->AsContent(), aBeforeThis ? aBeforeThis->AsContent() : nullptr,
+-      false);
+-  if (NS_FAILED(rv)) return rv;
+-
+-  ssle->SetEnableUpdates(true);
+-
+-  // load the stylesheet if necessary, passing ourselves as
+-  // nsICSSObserver
+-  auto result = ssle->UpdateStyleSheet(this);
+-  if (result.isErr()) {
+-    // Ignore errors from UpdateStyleSheet; we don't want failure to
+-    // do that to break the XUL document load.  But do propagate out
+-    // NS_ERROR_OUT_OF_MEMORY.
+-    if (result.unwrapErr() == NS_ERROR_OUT_OF_MEMORY) {
+-      return result.unwrapErr();
+-    }
+-    return NS_OK;
+-  }
+-
+-  auto update = result.unwrap();
+-  if (update.ShouldBlock()) {
+-    ++mPendingSheets;
+-  }
+-
+-  return NS_OK;
+-}
+-
+-void XULDocument::CloseElement(Element* aElement) {
+-  if (aElement->IsXULElement(nsGkAtoms::linkset)) {
+-    aElement->DoneAddingChildren(false);
+-  }
+-}
+-
+-nsresult XULDocument::ResumeWalk() {
+-  // Walk the prototype and build the delegate content model. The
+-  // walk is performed in a top-down, left-to-right fashion. That
+-  // is, a parent is built before any of its children; a node is
+-  // only built after all of its siblings to the left are fully
+-  // constructed.
+-  //
+-  // It is interruptable so that transcluded documents (e.g.,
+-  // <html:script src="..." />) can be properly re-loaded if the
+-  // cached copy of the document becomes stale.
+-  nsresult rv;
+-  nsCOMPtr<nsIURI> docURI =
+-      mCurrentPrototype ? mCurrentPrototype->GetURI() : nullptr;
+-
+-  while (1) {
+-    // Begin (or resume) walking the current prototype.
+-
+-    while (mContextStack.Depth() > 0) {
+-      // Look at the top of the stack to determine what we're
+-      // currently working on.
+-      // This will always be a node already constructed and
+-      // inserted to the actual document.
+-      nsXULPrototypeElement* proto;
+-      nsCOMPtr<nsIContent> element;
+-      int32_t indx;  // all children of proto before indx (not
+-                     // inclusive) have already been constructed
+-      rv = mContextStack.Peek(&proto, getter_AddRefs(element), &indx);
+-      if (NS_FAILED(rv)) return rv;
+-
+-      if (indx >= (int32_t)proto->mChildren.Length()) {
+-        if (element) {
+-          // We've processed all of the prototype's children.
+-          CloseElement(element->AsElement());
+-          if (element->NodeInfo()->Equals(nsGkAtoms::style,
+-                                          kNameSpaceID_XHTML) ||
+-              element->NodeInfo()->Equals(nsGkAtoms::style, kNameSpaceID_SVG)) {
+-            // XXX sucks that we have to do this -
+-            // see bug 370111
+-            nsCOMPtr<nsIStyleSheetLinkingElement> ssle =
+-                do_QueryInterface(element);
+-            NS_ASSERTION(ssle,
+-                         "<html:style> doesn't implement "
+-                         "nsIStyleSheetLinkingElement?");
+-            Unused << ssle->UpdateStyleSheet(nullptr);
+-          }
+-        }
+-        // Now pop the context stack back up to the parent
+-        // element and continue the prototype walk.
+-        mContextStack.Pop();
+-        continue;
+-      }
+-
+-      // Grab the next child, and advance the current context stack
+-      // to the next sibling to our right.
+-      nsXULPrototypeNode* childproto = proto->mChildren[indx];
+-      mContextStack.SetTopIndex(++indx);
+-
+-      NS_ASSERTION(element, "no element on context stack");
+-
+-      switch (childproto->mType) {
+-        case nsXULPrototypeNode::eType_Element: {
+-          // An 'element', which may contain more content.
+-          nsXULPrototypeElement* protoele =
+-              static_cast<nsXULPrototypeElement*>(childproto);
+-
+-          RefPtr<Element> child;
+-
+-          rv = CreateElementFromPrototype(protoele, getter_AddRefs(child),
+-                                          false);
+-          if (NS_FAILED(rv)) return rv;
+-
+-          // ...and append it to the content model.
+-          rv = element->AppendChildTo(child, false);
+-          if (NS_FAILED(rv)) return rv;
+-
+-          // If it has children, push the element onto the context
+-          // stack and begin to process them.
+-          if (protoele->mChildren.Length() > 0) {
+-            rv = mContextStack.Push(protoele, child);
+-            if (NS_FAILED(rv)) return rv;
+-          } else {
+-            // If there are no children, close the element immediately.
+-            CloseElement(child);
+-          }
+-        } break;
+-
+-        case nsXULPrototypeNode::eType_Script: {
+-          // A script reference. Execute the script immediately;
+-          // this may have side effects in the content model.
+-          nsXULPrototypeScript* scriptproto =
+-              static_cast<nsXULPrototypeScript*>(childproto);
+-
+-          if (scriptproto->mSrcURI) {
+-            // A transcluded script reference; this may
+-            // "block" our prototype walk if the script isn't
+-            // cached, or the cached copy of the script is
+-            // stale and must be reloaded.
+-            bool blocked;
+-            rv = LoadScript(scriptproto, &blocked);
+-            // If the script cannot be loaded, just keep going!
+-
+-            if (NS_SUCCEEDED(rv) && blocked) return NS_OK;
+-          } else if (scriptproto->HasScriptObject()) {
+-            // An inline script
+-            rv = ExecuteScript(scriptproto);
+-            if (NS_FAILED(rv)) return rv;
+-          }
+-        } break;
+-
+-        case nsXULPrototypeNode::eType_Text: {
+-          // A simple text node.
+-          RefPtr<nsTextNode> text = new nsTextNode(mNodeInfoManager);
+-
+-          nsXULPrototypeText* textproto =
+-              static_cast<nsXULPrototypeText*>(childproto);
+-          text->SetText(textproto->mValue, false);
+-
+-          rv = element->AppendChildTo(text, false);
+-          NS_ENSURE_SUCCESS(rv, rv);
+-        } break;
+-
+-        case nsXULPrototypeNode::eType_PI: {
+-          nsXULPrototypePI* piProto =
+-              static_cast<nsXULPrototypePI*>(childproto);
+-
+-          // <?xml-stylesheet?> doesn't have an effect
+-          // outside the prolog, like it used to. Issue a warning.
+-
+-          if (piProto->mTarget.EqualsLiteral("xml-stylesheet")) {
+-            const char16_t* params[] = {piProto->mTarget.get()};
+-
+-            nsContentUtils::ReportToConsole(
+-                nsIScriptError::warningFlag, NS_LITERAL_CSTRING("XUL Document"),
+-                nullptr, nsContentUtils::eXUL_PROPERTIES, "PINotInProlog",
+-                params, ArrayLength(params), docURI);
+-          }
+-
+-          nsIContent* parent = element.get();
+-
+-          if (parent) {
+-            // an inline script could have removed the root element
+-            rv = CreateAndInsertPI(piProto, parent, nullptr);
+-            NS_ENSURE_SUCCESS(rv, rv);
+-          }
+-        } break;
+-
+-        default:
+-          MOZ_ASSERT_UNREACHABLE("Unexpected nsXULPrototypeNode::Type");
+-      }
+-    }
+-
+-    // Once we get here, the context stack will have been
+-    // depleted. That means that the entire prototype has been
+-    // walked and content has been constructed.
+-    break;
+-  }
+-
+-  // If we get here, there is nothing left for us to walk. The content
+-  // model is built and ready for layout.
+-
+-  mXULPersist = new XULPersist(this);
+-  mXULPersist->Init();
+-
+-  mStillWalking = false;
+-  return MaybeDoneWalking();
+-}
+-
+-nsresult XULDocument::MaybeDoneWalking() {
+-  if (mPendingSheets > 0 || mStillWalking) {
+-    return NS_OK;
+-  }
+-
+-  if (mPendingInitialTranslation) {
+-    TriggerInitialDocumentTranslation();
+-    return NS_OK;
+-  }
+-
+-  return DoneWalking();
+-}
+-
+-nsresult XULDocument::DoneWalking() {
+-  MOZ_ASSERT(mPendingSheets == 0, "there are sheets to be loaded");
+-  MOZ_ASSERT(!mStillWalking, "walk not done");
+-  MOZ_ASSERT(!mPendingInitialTranslation, "translation pending");
+-
+-  // XXXldb This is where we should really be setting the chromehidden
+-  // attribute.
+-
+-  if (!mDocumentLoaded) {
+-    // Make sure we don't reenter here from StartLayout().  Note that
+-    // setting mDocumentLoaded to true here means that if StartLayout()
+-    // causes ResumeWalk() to be reentered, we'll take the other branch of
+-    // the |if (!mDocumentLoaded)| check above and since
+-    // mInitialLayoutComplete will be false will follow the else branch
+-    // there too.  See the big comment there for how such reentry can
+-    // happen.
+-    mDocumentLoaded = true;
+-
+-    NotifyPossibleTitleChange(false);
+-
+-    nsContentUtils::DispatchTrustedEvent(
+-        this, ToSupports(this), NS_LITERAL_STRING("MozBeforeInitialXULLayout"),
+-        CanBubble::eYes, Cancelable::eNo);
+-
+-    // Before starting layout, check whether we're a toplevel chrome
+-    // window.  If we are, setup some state so that we don't have to restyle
+-    // the whole tree after StartLayout.
+-    if (nsCOMPtr<nsIXULWindow> win = GetXULWindowIfToplevelChrome()) {
+-      // We're the chrome document!
+-      win->BeforeStartLayout();
+-    }
+-
+-    StartLayout();
+-
+-    if (mIsWritingFastLoad && IsChromeURI(mDocumentURI))
+-      nsXULPrototypeCache::GetInstance()->WritePrototype(mCurrentPrototype);
+-
+-    NS_ASSERTION(mDelayFrameLoaderInitialization,
+-                 "mDelayFrameLoaderInitialization should be true!");
+-    mDelayFrameLoaderInitialization = false;
+-    NS_WARNING_ASSERTION(mUpdateNestLevel == 0,
+-                         "Constructing XUL document in middle of an update?");
+-    if (mUpdateNestLevel == 0) {
+-      MaybeInitializeFinalizeFrameLoaders();
+-    }
+-
+-    NS_DOCUMENT_NOTIFY_OBSERVERS(EndLoad, (this));
+-
+-    // DispatchContentLoadedEvents undoes the onload-blocking we
+-    // did in PrepareToWalk().
+-    DispatchContentLoadedEvents();
+-
+-    mInitialLayoutComplete = true;
+-  }
+-
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-XULDocument::StyleSheetLoaded(StyleSheet* aSheet, bool aWasDeferred,
+-                              nsresult aStatus) {
+-  if (!aWasDeferred) {
+-    // Don't care about when alternate sheets finish loading
+-    MOZ_ASSERT(mPendingSheets > 0, "Unexpected StyleSheetLoaded notification");
+-
+-    --mPendingSheets;
+-
+-    return MaybeDoneWalking();
+-  }
+-
+-  return NS_OK;
+-}
+-
+-void XULDocument::EndUpdate() { XMLDocument::EndUpdate(); }
+-
+-nsresult XULDocument::LoadScript(nsXULPrototypeScript* aScriptProto,
+-                                 bool* aBlock) {
+-  // Load a transcluded script
+-  nsresult rv;
+-
+-  bool isChromeDoc = IsChromeURI(mDocumentURI);
+-
+-  if (isChromeDoc && aScriptProto->HasScriptObject()) {
+-    rv = ExecuteScript(aScriptProto);
+-
+-    // Ignore return value from execution, and don't block
+-    *aBlock = false;
+-    return NS_OK;
+-  }
+-
+-  // Try the XUL script cache, in case two XUL documents source the same
+-  // .js file (e.g., strres.js from navigator.xul and utilityOverlay.xul).
+-  // XXXbe the cache relies on aScriptProto's GC root!
+-  bool useXULCache = nsXULPrototypeCache::GetInstance()->IsEnabled();
+-
+-  if (isChromeDoc && useXULCache) {
+-    JSScript* newScriptObject =
+-        nsXULPrototypeCache::GetInstance()->GetScript(aScriptProto->mSrcURI);
+-    if (newScriptObject) {
+-      // The script language for a proto must remain constant - we
+-      // can't just change it for this unexpected language.
+-      aScriptProto->Set(newScriptObject);
+-    }
+-
+-    if (aScriptProto->HasScriptObject()) {
+-      rv = ExecuteScript(aScriptProto);
+-
+-      // Ignore return value from execution, and don't block
+-      *aBlock = false;
+-      return NS_OK;
+-    }
+-  }
+-
+-  // Release script objects from FastLoad since we decided against using them
+-  aScriptProto->UnlinkJSObjects();
+-
+-  // Set the current script prototype so that OnStreamComplete can report
+-  // the right file if there are errors in the script.
+-  NS_ASSERTION(!mCurrentScriptProto,
+-               "still loading a script when starting another load?");
+-  mCurrentScriptProto = aScriptProto;
+-
+-  if (isChromeDoc && aScriptProto->mSrcLoading) {
+-    // Another XULDocument load has started, which is still in progress.
+-    // Remember to ResumeWalk this document when the load completes.
+-    mNextSrcLoadWaiter = aScriptProto->mSrcLoadWaiters;
+-    aScriptProto->mSrcLoadWaiters = this;
+-    NS_ADDREF_THIS();
+-  } else {
+-    nsCOMPtr<nsILoadGroup> group = do_QueryReferent(mDocumentLoadGroup);
+-
+-    // Note: the loader will keep itself alive while it's loading.
+-    nsCOMPtr<nsIStreamLoader> loader;
+-    rv = NS_NewStreamLoader(getter_AddRefs(loader), aScriptProto->mSrcURI,
+-                            this,  // aObserver
+-                            this,  // aRequestingContext
+-                            nsILoadInfo::SEC_REQUIRE_SAME_ORIGIN_DATA_INHERITS,
+-                            nsIContentPolicy::TYPE_INTERNAL_SCRIPT, group);
+-
+-    if (NS_FAILED(rv)) {
+-      mCurrentScriptProto = nullptr;
+-      return rv;
+-    }
+-
+-    aScriptProto->mSrcLoading = true;
+-  }
+-
+-  // Block until OnStreamComplete resumes us.
+-  *aBlock = true;
+-  return NS_OK;
+-}
+-
+-NS_IMETHODIMP
+-XULDocument::OnStreamComplete(nsIStreamLoader* aLoader, nsISupports* context,
+-                              nsresult aStatus, uint32_t stringLen,
+-                              const uint8_t* string) {
+-  nsCOMPtr<nsIRequest> request;
+-  aLoader->GetRequest(getter_AddRefs(request));
+-  nsCOMPtr<nsIChannel> channel = do_QueryInterface(request);
+-
+-#ifdef DEBUG
+-  // print a load error on bad status
+-  if (NS_FAILED(aStatus)) {
+-    if (channel) {
+-      nsCOMPtr<nsIURI> uri;
+-      channel->GetURI(getter_AddRefs(uri));
+-      if (uri) {
+-        printf("Failed to load %s\n", uri->GetSpecOrDefault().get());
+-      }
+-    }
+-  }
+-#endif
+-
+-  // This is the completion routine that will be called when a
+-  // transcluded script completes. Compile and execute the script
+-  // if the load was successful, then continue building content
+-  // from the prototype.
+-  nsresult rv = aStatus;
+-
+-  NS_ASSERTION(mCurrentScriptProto && mCurrentScriptProto->mSrcLoading,
+-               "script source not loading on unichar stream complete?");
+-  if (!mCurrentScriptProto) {
+-    // XXX Wallpaper for bug 270042
+-    return NS_OK;
+-  }
+-
+-  if (NS_SUCCEEDED(aStatus)) {
+-    // If the including XUL document is a FastLoad document, and we're
+-    // compiling an out-of-line script (one with src=...), then we must
+-    // be writing a new FastLoad file.  If we were reading this script
+-    // from the FastLoad file, XULContentSinkImpl::OpenScript (over in
+-    // nsXULContentSink.cpp) would have already deserialized a non-null
+-    // script->mScriptObject, causing control flow at the top of LoadScript
+-    // not to reach here.
+-    nsCOMPtr<nsIURI> uri = mCurrentScriptProto->mSrcURI;
+-
+-    // XXX should also check nsIHttpChannel::requestSucceeded
+-
+-    MOZ_ASSERT(!mOffThreadCompiling && (mOffThreadCompileStringLength == 0 &&
+-                                        !mOffThreadCompileStringBuf),
+-               "XULDocument can't load multiple scripts at once");
+-
+-    rv = ScriptLoader::ConvertToUTF16(channel, string, stringLen, EmptyString(),
+-                                      this, mOffThreadCompileStringBuf,
+-                                      mOffThreadCompileStringLength);
+-    if (NS_SUCCEEDED(rv)) {
+-      // Pass ownership of the buffer, carefully emptying the existing
+-      // fields in the process.  Note that the |Compile| function called
+-      // below always takes ownership of the buffer.
+-      char16_t* units = nullptr;
+-      size_t unitsLength = 0;
+-
+-      std::swap(units, mOffThreadCompileStringBuf);
+-      std::swap(unitsLength, mOffThreadCompileStringLength);
+-
+-      rv = mCurrentScriptProto->Compile(units, unitsLength,
+-                                        JS::SourceOwnership::TakeOwnership, uri,
+-                                        1, this, this);
+-      if (NS_SUCCEEDED(rv) && !mCurrentScriptProto->HasScriptObject()) {
+-        mOffThreadCompiling = true;
+-        BlockOnload();
+-        return NS_OK;
+-      }
+-    }
+-  }
+-
+-  return OnScriptCompileComplete(mCurrentScriptProto->GetScriptObject(), rv);
+-}
+-
+-NS_IMETHODIMP
+-XULDocument::OnScriptCompileComplete(JSScript* aScript, nsresult aStatus) {
+-  // When compiling off thread the script will not have been attached to the
+-  // script proto yet.
+-  if (aScript && !mCurrentScriptProto->HasScriptObject())
+-    mCurrentScriptProto->Set(aScript);
+-
+-  // Allow load events to be fired once off thread compilation finishes.
+-  if (mOffThreadCompiling) {
+-    mOffThreadCompiling = false;
+-    UnblockOnload(false);
+-  }
+-
+-  // After compilation finishes the script's characters are no longer needed.
+-  if (mOffThreadCompileStringBuf) {
+-    js_free(mOffThreadCompileStringBuf);
+-    mOffThreadCompileStringBuf = nullptr;
+-    mOffThreadCompileStringLength = 0;
+-  }
+-
+-  // Clear mCurrentScriptProto now, but save it first for use below in
+-  // the execute code, and in the while loop that resumes walks of other
+-  // documents that raced to load this script.
+-  nsXULPrototypeScript* scriptProto = mCurrentScriptProto;
+-  mCurrentScriptProto = nullptr;
+-
+-  // Clear the prototype's loading flag before executing the script or
+-  // resuming document walks, in case any of those control flows starts a
+-  // new script load.
+-  scriptProto->mSrcLoading = false;
+-
+-  nsresult rv = aStatus;
+-  if (NS_SUCCEEDED(rv)) {
+-    rv = ExecuteScript(scriptProto);
+-
+-    // If the XUL cache is enabled, save the script object there in
+-    // case different XUL documents source the same script.
+-    //
+-    // But don't save the script in the cache unless the master XUL
+-    // document URL is a chrome: URL.  It is valid for a URL such as
+-    // about:config to translate into a master document URL, whose
+-    // prototype document nodes -- including prototype scripts that
+-    // hold GC roots protecting their mJSObject pointers -- are not
+-    // cached in the XUL prototype cache.  See StartDocumentLoad,
+-    // the fillXULCache logic.
+-    //
+-    // A document such as about:config is free to load a script via
+-    // a URL such as chrome://global/content/config.js, and we must
+-    // not cache that script object without a prototype cache entry
+-    // containing a companion nsXULPrototypeScript node that owns a
+-    // GC root protecting the script object.  Otherwise, the script
+-    // cache entry will dangle once the uncached prototype document
+-    // is released when its owning XULDocument is unloaded.
+-    //
+-    // (See http://bugzilla.mozilla.org/show_bug.cgi?id=98207 for
+-    // the true crime story.)
+-    bool useXULCache = nsXULPrototypeCache::GetInstance()->IsEnabled();
+-
+-    if (useXULCache && IsChromeURI(mDocumentURI) &&
+-        scriptProto->HasScriptObject()) {
+-      JS::Rooted<JSScript*> script(RootingCx(), scriptProto->GetScriptObject());
+-      nsXULPrototypeCache::GetInstance()->PutScript(scriptProto->mSrcURI,
+-                                                    script);
+-    }
+-    // ignore any evaluation errors
+-  }
+-
+-  rv = ResumeWalk();
+-
+-  // Load a pointer to the prototype-script's list of XULDocuments who
+-  // raced to load the same script
+-  XULDocument** docp = &scriptProto->mSrcLoadWaiters;
+-
+-  // Resume walking other documents that waited for this one's load, first
+-  // executing the script we just compiled, in each doc's script context
+-  XULDocument* doc;
+-  while ((doc = *docp) != nullptr) {
+-    NS_ASSERTION(doc->mCurrentScriptProto == scriptProto,
+-                 "waiting for wrong script to load?");
+-    doc->mCurrentScriptProto = nullptr;
+-
+-    // Unlink doc from scriptProto's list before executing and resuming
+-    *docp = doc->mNextSrcLoadWaiter;
+-    doc->mNextSrcLoadWaiter = nullptr;
+-
+-    if (aStatus == NS_BINDING_ABORTED && !scriptProto->HasScriptObject()) {
+-      // If the previous doc load was aborted, we want to try loading
+-      // again for the next doc. Otherwise, one abort would lead to all
+-      // subsequent waiting docs to abort as well.
+-      bool block = false;
+-      doc->LoadScript(scriptProto, &block);
+-      NS_RELEASE(doc);
+-      return rv;
+-    }
+-
+-    // Execute only if we loaded and compiled successfully, then resume
+-    if (NS_SUCCEEDED(aStatus) && scriptProto->HasScriptObject()) {
+-      doc->ExecuteScript(scriptProto);
+-    }
+-    doc->ResumeWalk();
+-    NS_RELEASE(doc);
+-  }
+-
+-  return rv;
+-}
+-
+-nsresult XULDocument::ExecuteScript(nsXULPrototypeScript* aScript) {
+-  MOZ_ASSERT(aScript != nullptr, "null ptr");
+-  NS_ENSURE_TRUE(aScript, NS_ERROR_NULL_POINTER);
+-  NS_ENSURE_TRUE(mScriptGlobalObject, NS_ERROR_NOT_INITIALIZED);
+-
+-  nsresult rv;
+-  rv = mScriptGlobalObject->EnsureScriptEnvironment();
+-  NS_ENSURE_SUCCESS(rv, rv);
+-
+-  // Execute the precompiled script with the given version
+-  nsAutoMicroTask mt;
+-
+-  // We're about to run script via JS::CloneAndExecuteScript, so we need an
+-  // AutoEntryScript. This is Gecko specific and not in any spec.
+-  AutoEntryScript aes(mScriptGlobalObject, "precompiled XUL <script> element");
+-  JSContext* cx = aes.cx();
+-
+-  JS::Rooted<JSScript*> scriptObject(cx, aScript->GetScriptObject());
+-  NS_ENSURE_TRUE(scriptObject, NS_ERROR_UNEXPECTED);
+-
+-  JS::Rooted<JSObject*> global(cx, JS::CurrentGlobalOrNull(cx));
+-  NS_ENSURE_TRUE(xpc::Scriptability::Get(global).Allowed(), NS_OK);
+-
+-  JS::ExposeObjectToActiveJS(global);
+-  JSAutoRealm ar(cx, global);
+-
+-  // The script is in the compilation scope. Clone it into the target scope
+-  // and execute it. On failure, ~AutoScriptEntry will handle exceptions, so
+-  // there is no need to manually check the return value.
+-  JS::RootedValue rval(cx);
+-  JS::CloneAndExecuteScript(cx, scriptObject, &rval);
+-
+-  return NS_OK;
+-}
+-
+-nsresult XULDocument::CreateElementFromPrototype(
+-    nsXULPrototypeElement* aPrototype, Element** aResult, bool aIsRoot) {
+-  // Create a content model element from a prototype element.
+-  MOZ_ASSERT(aPrototype != nullptr, "null ptr");
+-  if (!aPrototype) return NS_ERROR_NULL_POINTER;
+-
+-  *aResult = nullptr;
+-  nsresult rv = NS_OK;
+-
+-  if (MOZ_LOG_TEST(gXULLog, LogLevel::Debug)) {
+-    MOZ_LOG(
+-        gXULLog, LogLevel::Debug,
+-        ("xul: creating <%s> from prototype",
+-         NS_ConvertUTF16toUTF8(aPrototype->mNodeInfo->QualifiedName()).get()));
+-  }
+-
+-  RefPtr<Element> result;
+-
+-  if (aPrototype->mNodeInfo->NamespaceEquals(kNameSpaceID_XUL)) {
+-    // If it's a XUL element, it'll be lightweight until somebody
+-    // monkeys with it.
+-    rv = nsXULElement::CreateFromPrototype(aPrototype, this, true, aIsRoot,
+-                                           getter_AddRefs(result));
+-    if (NS_FAILED(rv)) return rv;
+-  } else {
+-    // If it's not a XUL element, it's gonna be heavyweight no matter
+-    // what. So we need to copy everything out of the prototype
+-    // into the element.  Get a nodeinfo from our nodeinfo manager
+-    // for this node.
+-    RefPtr<mozilla::dom::NodeInfo> newNodeInfo;
+-    newNodeInfo = mNodeInfoManager->GetNodeInfo(
+-        aPrototype->mNodeInfo->NameAtom(),
+-        aPrototype->mNodeInfo->GetPrefixAtom(),
+-        aPrototype->mNodeInfo->NamespaceID(), ELEMENT_NODE);
+-    if (!newNodeInfo) return NS_ERROR_OUT_OF_MEMORY;
+-    RefPtr<mozilla::dom::NodeInfo> xtfNi = newNodeInfo;
+-    if (aPrototype->mIsAtom &&
+-        newNodeInfo->NamespaceID() == kNameSpaceID_XHTML) {
+-      rv = NS_NewHTMLElement(getter_AddRefs(result), newNodeInfo.forget(),
+-                             NOT_FROM_PARSER, aPrototype->mIsAtom);
+-    } else {
+-      rv = NS_NewElement(getter_AddRefs(result), newNodeInfo.forget(),
+-                         NOT_FROM_PARSER);
+-    }
+-    if (NS_FAILED(rv)) return rv;
+-
+-    rv = AddAttributes(aPrototype, result);
+-    if (NS_FAILED(rv)) return rv;
+-  }
+-
+-  result.forget(aResult);
+-
+-  return NS_OK;
+-}
+-
+-nsresult XULDocument::AddAttributes(nsXULPrototypeElement* aPrototype,
+-                                    Element* aElement) {
+-  nsresult rv;
+-
+-  for (uint32_t i = 0; i < aPrototype->mNumAttributes; ++i) {
+-    nsXULPrototypeAttribute* protoattr = &(aPrototype->mAttributes[i]);
+-    nsAutoString valueStr;
+-    protoattr->mValue.ToString(valueStr);
+-
+-    rv = aElement->SetAttr(protoattr->mName.NamespaceID(),
+-                           protoattr->mName.LocalName(),
+-                           protoattr->mName.GetPrefix(), valueStr, false);
+-    if (NS_FAILED(rv)) return rv;
+-  }
+-
+-  return NS_OK;
+-}
+-
+-//----------------------------------------------------------------------
+-//
+-// CachedChromeStreamListener
+-//
+-
+-XULDocument::CachedChromeStreamListener::CachedChromeStreamListener(
+-    XULDocument* aDocument, bool aProtoLoaded)
+-    : mDocument(aDocument), mProtoLoaded(aProtoLoaded) {}
+-
+-XULDocument::CachedChromeStreamListener::~CachedChromeStreamListener() {}
+-
+-NS_IMPL_ISUPPORTS(XULDocument::CachedChromeStreamListener, nsIRequestObserver,
+-                  nsIStreamListener)
+-
+-NS_IMETHODIMP
+-XULDocument::CachedChromeStreamListener::OnStartRequest(nsIRequest* request,
+-                                                        nsISupports* acontext) {
+-  return NS_ERROR_PARSED_DATA_CACHED;
+-}
+-
+-NS_IMETHODIMP
+-XULDocument::CachedChromeStreamListener::OnStopRequest(nsIRequest* request,
+-                                                       nsISupports* aContext,
+-                                                       nsresult aStatus) {
+-  if (!mProtoLoaded) return NS_OK;
+-
+-  return mDocument->OnPrototypeLoadDone(true);
+-}
+-
+-NS_IMETHODIMP
+-XULDocument::CachedChromeStreamListener::OnDataAvailable(nsIRequest* request,
+-                                                         nsISupports* aContext,
+-                                                         nsIInputStream* aInStr,
+-                                                         uint64_t aSourceOffset,
+-                                                         uint32_t aCount) {
+-  MOZ_ASSERT_UNREACHABLE("CachedChromeStream doesn't receive data");
+-  return NS_ERROR_UNEXPECTED;
+-}
+-
+ bool XULDocument::IsDocumentRightToLeft() {
+   // setting the localedir attribute on the root element forces a
+   // specific direction for the document.
+   Element* element = GetRootElement();
+   if (element) {
+     static Element::AttrValuesArray strings[] = {nsGkAtoms::ltr, nsGkAtoms::rtl,
+                                                  nullptr};
+     switch (element->FindAttrValueIn(kNameSpaceID_None, nsGkAtoms::localedir,
+diff --git a/dom/xul/XULDocument.h b/dom/xul/XULDocument.h
+--- a/dom/xul/XULDocument.h
++++ b/dom/xul/XULDocument.h
+@@ -44,289 +44,68 @@ class nsIObjectOutputStream;
+  */
+ 
+ // Factory function.
+ nsresult NS_NewXULDocument(mozilla::dom::Document** result);
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+-class XULDocument final : public XMLDocument,
+-                          public nsIStreamLoaderObserver,
+-                          public nsICSSLoaderObserver,
+-                          public nsIOffThreadScriptReceiver {
++class XULDocument final : public XMLDocument {
+  public:
+   XULDocument();
+ 
+   // nsISupports interface
+   NS_DECL_ISUPPORTS_INHERITED
+-  NS_DECL_NSISTREAMLOADEROBSERVER
+ 
+   // Document interface
+   virtual void Reset(nsIChannel* aChannel, nsILoadGroup* aLoadGroup) override;
+   virtual void ResetToURI(nsIURI* aURI, nsILoadGroup* aLoadGroup,
+                           nsIPrincipal* aPrincipal) override;
+ 
+   virtual nsresult StartDocumentLoad(const char* aCommand, nsIChannel* channel,
+                                      nsILoadGroup* aLoadGroup,
+                                      nsISupports* aContainer,
+                                      nsIStreamListener** aDocListener,
+                                      bool aReset = true,
+                                      nsIContentSink* aSink = nullptr) override;
++  virtual void EndLoad() override;
+ 
+   virtual void SetContentType(const nsAString& aContentType) override;
+ 
+-  virtual void EndLoad() override;
+-
+-  virtual void InitialDocumentTranslationCompleted() override;
+-
+-  /**
+-   * This is invoked whenever the prototype for this document is loaded
+-   * and should be walked, regardless of whether the XUL cache is
+-   * disabled, whether the protototype was loaded, whether the
+-   * prototype was loaded from the cache or created by parsing the
+-   * actual XUL source, etc.
+-   *
+-   * @param aResumeWalk whether this should also call ResumeWalk().
+-   * Sometimes the caller of OnPrototypeLoadDone resumes the walk itself
+-   */
+-  nsresult OnPrototypeLoadDone(bool aResumeWalk);
+-
+   // nsINode interface overrides
+   virtual nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+ 
+-  // nsICSSLoaderObserver
+-  NS_IMETHOD StyleSheetLoaded(mozilla::StyleSheet* aSheet, bool aWasAlternate,
+-                              nsresult aStatus) override;
+-
+-  virtual void EndUpdate() override;
+-
+   virtual bool IsDocumentRightToLeft() override;
+ 
+   /**
+    * Reset the document direction so that it is recomputed.
+    */
+   void ResetDocumentDirection();
+ 
+-  NS_IMETHOD OnScriptCompileComplete(JSScript* aScript,
+-                                     nsresult aStatus) override;
+-
+   NS_DECL_CYCLE_COLLECTION_CLASS_INHERITED(XULDocument, XMLDocument)
+ 
+-  void TraceProtos(JSTracer* aTrc);
+-
+  protected:
+   virtual ~XULDocument();
+ 
+   // Implementation methods
+   friend nsresult(::NS_NewXULDocument(Document** aResult));
+ 
+   nsresult Init(void) override;
+-  nsresult StartLayout(void);
+-
+-  nsresult PrepareToLoad(nsISupports* aContainer, const char* aCommand,
+-                         nsIChannel* aChannel, nsILoadGroup* aLoadGroup,
+-                         nsIParser** aResult);
+-
+-  nsresult PrepareToLoadPrototype(nsIURI* aURI, const char* aCommand,
+-                                  nsIPrincipal* aDocumentPrincipal,
+-                                  nsIParser** aResult);
+-
+-  void CloseElement(Element* aElement);
+ 
+   static void DirectionChanged(const char* aPrefName, XULDocument* aData);
+ 
+   // pseudo constants
+   static int32_t gRefCnt;
+ 
+   static LazyLogModule gXULLog;
+ 
+   virtual JSObject* WrapNode(JSContext* aCx,
+                              JS::Handle<JSObject*> aGivenProto) override;
+ 
+-  // IMPORTANT: The ownership implicit in the following member
+-  // variables has been explicitly checked and set using nsCOMPtr
+-  // for owning pointers and raw COM interface pointers for weak
+-  // (ie, non owning) references. If you add any members to this
+-  // class, please make the ownership explicit (pinkerton, scc).
+-  // NOTE, THIS IS STILL IN PROGRESS, TALK TO PINK OR SCC BEFORE
+-  // CHANGING
+-
+-  XULDocument* mNextSrcLoadWaiter;  // [OWNER] but not COMPtr
+-
+-  bool mIsWritingFastLoad;
+-  bool mDocumentLoaded;
+-  /**
+-   * Since ResumeWalk is interruptible, it's possible that last
+-   * stylesheet finishes loading while the PD walk is still in
+-   * progress (waiting for an overlay to finish loading).
+-   * mStillWalking prevents DoneLoading (and StartLayout) from being
+-   * called in this situation.
+-   */
+-  bool mStillWalking;
+-
+-  uint32_t mPendingSheets;
+-
+-  /**
+-   * Context stack, which maintains the state of the Builder and allows
+-   * it to be interrupted.
+-   */
+-  class ContextStack {
+-   protected:
+-    struct Entry {
+-      nsXULPrototypeElement* mPrototype;
+-      nsIContent* mElement;
+-      int32_t mIndex;
+-      Entry* mNext;
+-    };
+-
+-    Entry* mTop;
+-    int32_t mDepth;
+-
+-   public:
+-    ContextStack();
+-    ~ContextStack();
+-
+-    int32_t Depth() { return mDepth; }
+-
+-    nsresult Push(nsXULPrototypeElement* aPrototype, nsIContent* aElement);
+-    nsresult Pop();
+-    nsresult Peek(nsXULPrototypeElement** aPrototype, nsIContent** aElement,
+-                  int32_t* aIndex);
+-
+-    nsresult SetTopIndex(int32_t aIndex);
+-  };
+-
+-  friend class ContextStack;
+-  ContextStack mContextStack;
+-
+-  /**
+-   * Load the transcluded script at the specified URI. If the
+-   * prototype construction must 'block' until the load has
+-   * completed, aBlock will be set to true.
+-   */
+-  nsresult LoadScript(nsXULPrototypeScript* aScriptProto, bool* aBlock);
+-
+-  /**
+-   * Execute the precompiled script object scoped by this XUL document's
+-   * containing window object.
+-   */
+-  nsresult ExecuteScript(nsXULPrototypeScript* aScript);
+-
+-  /**
+-   * Create a delegate content model element from a prototype.
+-   * Note that the resulting content node is not bound to any tree
+-   */
+-  nsresult CreateElementFromPrototype(nsXULPrototypeElement* aPrototype,
+-                                      Element** aResult, bool aIsRoot);
+-
+-  /**
+-   * Add attributes from the prototype to the element.
+-   */
+-  nsresult AddAttributes(nsXULPrototypeElement* aPrototype, Element* aElement);
+-
+-  /**
+-   * The prototype-script of the current transcluded script that is being
+-   * loaded.  For document.write('<script src="nestedwrite.js"><\/script>')
+-   * to work, these need to be in a stack element type, and we need to hold
+-   * the top of stack here.
+-   */
+-  nsXULPrototypeScript* mCurrentScriptProto;
+-
+-  /**
+-   * Whether the current transcluded script is being compiled off thread.
+-   * The load event is blocked while this is in progress.
+-   */
+-  bool mOffThreadCompiling;
+-
+-  /**
+-   * If the current transcluded script is being compiled off thread, the
+-   * source for that script.
+-   */
+-  char16_t* mOffThreadCompileStringBuf;
+-  size_t mOffThreadCompileStringLength;
+-
+- protected:
+-  /**
+-   * The current prototype that we are walking to construct the
+-   * content model.
+-   */
+-  RefPtr<nsXULPrototypeDocument> mCurrentPrototype;
+-
+-  /**
+-   * Owning references to all of the prototype documents that were
+-   * used to construct this document.
+-   */
+-  nsTArray<RefPtr<nsXULPrototypeDocument> > mPrototypes;
+-
+-  /**
+-   * Prepare to walk the current prototype.
+-   */
+-  nsresult PrepareToWalk();
+-
+-  /**
+-   * Creates a processing instruction based on aProtoPI and inserts
+-   * it to the DOM.
+-   */
+-  nsresult CreateAndInsertPI(const nsXULPrototypePI* aProtoPI, nsINode* aParent,
+-                             nsINode* aBeforeThis);
+-
+-  /**
+-   * Inserts the passed <?xml-stylesheet ?> PI at the specified
+-   * index. Loads and applies the associated stylesheet
+-   * asynchronously.
+-   * The prototype document walk can happen before the stylesheets
+-   * are loaded, but the final steps in the load process (see
+-   * DoneWalking()) are not run before all the stylesheets are done
+-   * loading.
+-   */
+-  nsresult InsertXMLStylesheetPI(const nsXULPrototypePI* aProtoPI,
+-                                 nsINode* aParent, nsINode* aBeforeThis,
+-                                 nsIContent* aPINode);
+-
+-  /**
+-   * Resume (or initiate) an interrupted (or newly prepared)
+-   * prototype walk.
+-   */
+-  nsresult ResumeWalk();
+-
+-  /**
+-   * Called at the end of ResumeWalk(), from StyleSheetLoaded(),
+-   * and from DocumentL10n.
+-   * If walking, stylesheets and l10n are not blocking, it
+-   * will trigger `DoneWalking()`.
+-   */
+-  nsresult MaybeDoneWalking();
+-
+-  /**
+-   * Called from `MaybeDoneWalking()`.
+-   * Expects that both the prototype document walk is complete and
+-   * all referenced stylesheets finished loading.
+-   */
+-  nsresult DoneWalking();
+-
+-  class CachedChromeStreamListener : public nsIStreamListener {
+-   protected:
+-    RefPtr<XULDocument> mDocument;
+-    bool mProtoLoaded;
+-
+-    virtual ~CachedChromeStreamListener();
+-
+-   public:
+-    CachedChromeStreamListener(XULDocument* aDocument, bool aProtoLoaded);
+-
+-    NS_DECL_ISUPPORTS
+-    NS_DECL_NSIREQUESTOBSERVER
+-    NS_DECL_NSISTREAMLISTENER
+-  };
+-
+-  friend class CachedChromeStreamListener;
+-
+-  bool mInitialLayoutComplete;
+-
+  private:
+   // helpers
+ };
+ 
+ inline XULDocument* Document::AsXULDocument() {
+   MOZ_ASSERT(IsXULDocument());
+   return static_cast<mozilla::dom::XULDocument*>(this);
+ }
+diff --git a/dom/xul/nsXULContentSink.cpp b/dom/xul/nsXULContentSink.cpp
+--- a/dom/xul/nsXULContentSink.cpp
++++ b/dom/xul/nsXULContentSink.cpp
+@@ -189,17 +189,17 @@ XULContentSinkImpl::WillBuildModel(nsDTD
+ 
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
+ XULContentSinkImpl::DidBuildModel(bool aTerminated) {
+   nsCOMPtr<Document> doc = do_QueryReferent(mDocument);
+   if (doc) {
+-    doc->EndLoad();
++    mPrototype->NotifyLoadDone();
+     mDocument = nullptr;
+   }
+ 
+   // Drop our reference to the parser to get rid of a circular
+   // reference.
+   mParser = nullptr;
+   return NS_OK;
+ }
+diff --git a/dom/xul/nsXULElement.h b/dom/xul/nsXULElement.h
+--- a/dom/xul/nsXULElement.h
++++ b/dom/xul/nsXULElement.h
+@@ -43,16 +43,17 @@ namespace mozilla {
+ class EventChainPreVisitor;
+ class EventListenerManager;
+ namespace css {
+ class StyleRule;
+ }  // namespace css
+ namespace dom {
+ class BoxObject;
+ class HTMLIFrameElement;
++class PrototypeDocumentContentSink;
+ enum class CallerType : uint32_t;
+ }  // namespace dom
+ }  // namespace mozilla
+ 
+ ////////////////////////////////////////////////////////////////////////
+ 
+ #ifdef XUL_PROTOTYPE_ATTRIBUTE_METERING
+ #  define XUL_PROTOTYPE_ATTRIBUTE_METER(counter) \
+@@ -228,17 +229,18 @@ class nsXULPrototypeScript : public nsXU
+       aCallbacks.Trace(&mScriptObject, "mScriptObject", aClosure);
+     }
+   }
+ 
+   nsCOMPtr<nsIURI> mSrcURI;
+   uint32_t mLineNo;
+   bool mSrcLoading;
+   bool mOutOfLine;
+-  mozilla::dom::XULDocument* mSrcLoadWaiters;  // [OWNER] but not COMPtr
++  mozilla::dom::PrototypeDocumentContentSink*
++      mSrcLoadWaiters;  // [OWNER] but not COMPtr
+  private:
+   JS::Heap<JSScript*> mScriptObject;
+ };
+ 
+ class nsXULPrototypeText : public nsXULPrototypeNode {
+  public:
+   nsXULPrototypeText() : nsXULPrototypeNode(eType_Text) {}
+ 
+diff --git a/dom/xul/nsXULPrototypeCache.cpp b/dom/xul/nsXULPrototypeCache.cpp
+--- a/dom/xul/nsXULPrototypeCache.cpp
++++ b/dom/xul/nsXULPrototypeCache.cpp
+@@ -390,18 +390,20 @@ nsresult nsXULPrototypeCache::HasData(ns
+   return NS_OK;
+ }
+ 
+ nsresult nsXULPrototypeCache::BeginCaching(nsIURI* aURI) {
+   nsresult rv, tmp;
+ 
+   nsAutoCString path;
+   aURI->GetPathQueryRef(path);
+-  if (!StringEndsWith(path, NS_LITERAL_CSTRING(".xul")))
++  if (!(StringEndsWith(path, NS_LITERAL_CSTRING(".xul")) ||
++        StringEndsWith(path, NS_LITERAL_CSTRING(".xhtml")))) {
+     return NS_ERROR_NOT_AVAILABLE;
++  }
+ 
+   StartupCache* startupCache = StartupCache::GetSingleton();
+   if (!startupCache) return NS_ERROR_FAILURE;
+ 
+   if (gDisableXULCache) return NS_ERROR_NOT_AVAILABLE;
+ 
+   // Get the chrome directory to validate against the one stored in the
+   // cache file, or to store there if we're generating a new file.
+diff --git a/dom/xul/nsXULPrototypeDocument.cpp b/dom/xul/nsXULPrototypeDocument.cpp
+--- a/dom/xul/nsXULPrototypeDocument.cpp
++++ b/dom/xul/nsXULPrototypeDocument.cpp
+@@ -58,17 +58,16 @@ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(ns
+   NS_IMPL_CYCLE_COLLECTION_UNLINK(mPrototypeWaiters)
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(nsXULPrototypeDocument)
+   if (nsCCUncollectableMarker::InGeneration(cb, tmp->mCCGeneration)) {
+     return NS_SUCCESS_INTERRUPTED_TRAVERSE;
+   }
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mRoot)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mNodeInfoManager)
+-  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPrototypeWaiters)
+ NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+ NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(nsXULPrototypeDocument)
+   NS_INTERFACE_MAP_ENTRY(nsISerializable)
+   NS_INTERFACE_MAP_ENTRY(nsISupports)
+ NS_INTERFACE_MAP_END
+ 
+ NS_IMPL_CYCLE_COLLECTING_ADDREF(nsXULPrototypeDocument)
+@@ -371,51 +370,46 @@ void nsXULPrototypeDocument::SetDocument
+ void nsXULPrototypeDocument::MarkInCCGeneration(uint32_t aCCGeneration) {
+   mCCGeneration = aCCGeneration;
+ }
+ 
+ nsNodeInfoManager* nsXULPrototypeDocument::GetNodeInfoManager() {
+   return mNodeInfoManager;
+ }
+ 
+-nsresult nsXULPrototypeDocument::AwaitLoadDone(XULDocument* aDocument,
++nsresult nsXULPrototypeDocument::AwaitLoadDone(Callback&& aCallback,
+                                                bool* aResult) {
+   nsresult rv = NS_OK;
+ 
+   *aResult = mLoaded;
+ 
+   if (!mLoaded) {
+-    rv = mPrototypeWaiters.AppendElement(aDocument)
++    rv = mPrototypeWaiters.AppendElement(std::move(aCallback))
+              ? NS_OK
+              : NS_ERROR_OUT_OF_MEMORY;  // addrefs
+   }
+ 
+   return rv;
+ }
+ 
+ nsresult nsXULPrototypeDocument::NotifyLoadDone() {
+   // Call back to each XUL document that raced to start the same
+   // prototype document load, lost the race, but hit the XUL
+   // prototype cache because the winner filled the cache with
+   // the not-yet-loaded prototype object.
+ 
+-  nsresult rv = NS_OK;
+-
+   mLoaded = true;
+ 
+   for (uint32_t i = mPrototypeWaiters.Length(); i > 0;) {
+     --i;
+-    // true means that OnPrototypeLoadDone will also
+-    // call ResumeWalk().
+-    rv = mPrototypeWaiters[i]->OnPrototypeLoadDone(true);
+-    if (NS_FAILED(rv)) break;
++    mPrototypeWaiters[i]();
+   }
+   mPrototypeWaiters.Clear();
+ 
+-  return rv;
++  return NS_OK;
+ }
+ 
+ void nsXULPrototypeDocument::TraceProtos(JSTracer* aTrc) {
+   // Only trace the protos once per GC if we are marking.
+   if (aTrc->isMarkingTracer()) {
+     uint32_t currentGCNumber = aTrc->gcNumberForMarking();
+     if (mGCNumber == currentGCNumber) {
+       return;
+diff --git a/dom/xul/nsXULPrototypeDocument.h b/dom/xul/nsXULPrototypeDocument.h
+--- a/dom/xul/nsXULPrototypeDocument.h
++++ b/dom/xul/nsXULPrototypeDocument.h
+@@ -8,41 +8,38 @@
+ 
+ #include "js/TracingAPI.h"
+ #include "mozilla/Attributes.h"
+ #include "nsCOMArray.h"
+ #include "nsCOMPtr.h"
+ #include "nsTArray.h"
+ #include "nsISerializable.h"
+ #include "nsCycleCollectionParticipant.h"
++#include <functional>
+ 
+ class nsAtom;
+ class nsIPrincipal;
+ class nsIURI;
+ class nsNodeInfoManager;
+ class nsXULPrototypeElement;
+ class nsXULPrototypePI;
+ 
+-namespace mozilla {
+-namespace dom {
+-class XULDocument;
+-}  // namespace dom
+-}  // namespace mozilla
+-
+ /**
+  * A "prototype" document that stores shared document information
+  * for the XUL cache.
+  * Among other things, stores the tree of nsXULPrototype*
+  * objects, from which the real DOM tree is built later in
+  * XULDocument::ResumeWalk.
+  */
+ class nsXULPrototypeDocument final : public nsISerializable {
+  public:
+   static nsresult Create(nsIURI* aURI, nsXULPrototypeDocument** aResult);
+ 
++  typedef std::function<void()> Callback;
++
+   // nsISupports interface
+   NS_DECL_CYCLE_COLLECTING_ISUPPORTS
+ 
+   // nsISerializable interface
+   NS_DECL_NSISERIALIZABLE
+ 
+   nsresult InitPrincipal(nsIURI* aURI, nsIPrincipal* aPrincipal);
+   nsIURI* GetURI();
+@@ -73,17 +70,17 @@ class nsXULPrototypeDocument final : pub
+   void SetDocumentPrincipal(nsIPrincipal* aPrincipal);
+ 
+   /**
+    * If current prototype document has not yet finished loading,
+    * appends aDocument to the list of documents to notify (via
+    * XULDocument::OnPrototypeLoadDone()) and sets aLoaded to false.
+    * Otherwise sets aLoaded to true.
+    */
+-  nsresult AwaitLoadDone(mozilla::dom::XULDocument* aDocument, bool* aResult);
++  nsresult AwaitLoadDone(Callback&& aCallback, bool* aResult);
+ 
+   /**
+    * Notifies each document registered via AwaitLoadDone on this
+    * prototype document that the prototype has finished loading.
+    * The notification is performed by calling
+    * XULDocument::OnPrototypeLoadDone on the registered documents.
+    */
+   nsresult NotifyLoadDone();
+@@ -97,17 +94,17 @@ class nsXULPrototypeDocument final : pub
+   void TraceProtos(JSTracer* aTrc);
+ 
+  protected:
+   nsCOMPtr<nsIURI> mURI;
+   RefPtr<nsXULPrototypeElement> mRoot;
+   nsTArray<RefPtr<nsXULPrototypePI> > mProcessingInstructions;
+ 
+   bool mLoaded;
+-  nsTArray<RefPtr<mozilla::dom::XULDocument> > mPrototypeWaiters;
++  nsTArray<Callback> mPrototypeWaiters;
+ 
+   RefPtr<nsNodeInfoManager> mNodeInfoManager;
+ 
+   uint32_t mCCGeneration;
+   uint32_t mGCNumber;
+ 
+   nsXULPrototypeDocument();
+   virtual ~nsXULPrototypeDocument();
+diff --git a/parser/moz.build b/parser/moz.build
+--- a/parser/moz.build
++++ b/parser/moz.build
+@@ -2,14 +2,14 @@
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ with Files('**'):
+     BUG_COMPONENT = ('Core', 'HTML: Parser')
+ 
+-DIRS += ['expat', 'xml', 'htmlparser', 'html']
++DIRS += ['expat', 'prototype', 'xml', 'htmlparser', 'html']
+ 
+ EXPORTS += [
+     'nsCharsetSource.h',
+ ]
+ 
+diff --git a/parser/prototype/PrototypeDocumentParser.cpp b/parser/prototype/PrototypeDocumentParser.cpp
+new file mode 100644
+--- /dev/null
++++ b/parser/prototype/PrototypeDocumentParser.cpp
+@@ -0,0 +1,216 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++#include "PrototypeDocumentParser.h"
++
++#include "nsXULPrototypeCache.h"
++#include "nsXULContentSink.h"
++#include "nsParserCIID.h"
++#include "mozilla/Encoding.h"
++#include "nsCharsetSource.h"
++#include "mozilla/dom/PrototypeDocumentContentSink.h"
++
++using namespace mozilla::dom;
++
++static NS_DEFINE_CID(kParserCID, NS_PARSER_CID);
++
++namespace mozilla {
++namespace parser {
++
++PrototypeDocumentParser::PrototypeDocumentParser(nsIURI* aDocumentURI,
++                                                 dom::Document* aDocument)
++    : mDocumentURI(aDocumentURI),
++      mDocument(aDocument),
++      mPrototypeAlreadyLoaded(false),
++      mIsComplete(false) {}
++
++PrototypeDocumentParser::~PrototypeDocumentParser() {}
++
++NS_INTERFACE_TABLE_HEAD(PrototypeDocumentParser)
++  NS_INTERFACE_TABLE(PrototypeDocumentParser, nsIParser, nsIStreamListener,
++                     nsIRequestObserver)
++  NS_INTERFACE_TABLE_TO_MAP_SEGUE_CYCLE_COLLECTION(PrototypeDocumentParser)
++NS_INTERFACE_MAP_END
++
++NS_IMPL_CYCLE_COLLECTING_ADDREF(PrototypeDocumentParser)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(PrototypeDocumentParser)
++
++NS_IMPL_CYCLE_COLLECTION(PrototypeDocumentParser, mDocumentURI, mOriginalSink,
++                         mDocument, mStreamListener, mCurrentPrototype)
++
++NS_IMETHODIMP_(void)
++PrototypeDocumentParser::SetContentSink(nsIContentSink* aSink) {
++  MOZ_ASSERT(aSink, "sink cannot be null!");
++  mOriginalSink = static_cast<PrototypeDocumentContentSink*>(aSink);
++  MOZ_ASSERT(mOriginalSink);
++
++  aSink->SetParser(this);
++}
++
++NS_IMETHODIMP_(nsIContentSink*)
++PrototypeDocumentParser::GetContentSink() { return mOriginalSink; }
++
++nsIStreamListener* PrototypeDocumentParser::GetStreamListener() { return this; }
++
++NS_IMETHODIMP_(bool)
++PrototypeDocumentParser::IsComplete() { return mIsComplete; }
++
++NS_IMETHODIMP
++PrototypeDocumentParser::Parse(nsIURI* aURL, nsIRequestObserver* aListener,
++                               void* aKey, nsDTDMode aMode) {
++  // Look in the chrome cache: we've got this puppy loaded
++  // already.
++  nsXULPrototypeDocument* proto =
++      IsChromeURI(mDocumentURI)
++          ? nsXULPrototypeCache::GetInstance()->GetPrototype(mDocumentURI)
++          : nullptr;
++
++  // We don't abort on failure here because there are too many valid
++  // cases that can return failure, and the null-ness of |proto| is enough
++  // to trigger the fail-safe parse-from-disk solution. Example failure cases
++  // (for reference) include:
++  //
++  // NS_ERROR_NOT_AVAILABLE: the URI cannot be found in the startup cache,
++  //                         parse from disk
++  // other: the startup cache file could not be found, probably
++  //        due to being accessed before a profile has been selected (e.g.
++  //        loading chrome for the profile manager itself). This must be
++  //        parsed from disk.
++  nsresult rv;
++  if (proto) {
++    mCurrentPrototype = proto;
++
++    // Set up the right principal on the document.
++    mDocument->SetPrincipal(proto->DocumentPrincipal());
++  } else {
++    // It's just a vanilla document load. Create a parser to deal
++    // with the stream n' stuff.
++
++    nsCOMPtr<nsIParser> parser;
++    // Get the document's principal
++    nsCOMPtr<nsIPrincipal> principal = mDocument->NodePrincipal();
++    rv =
++        PrepareToLoadPrototype(mDocumentURI, principal, getter_AddRefs(parser));
++    if (NS_FAILED(rv)) return rv;
++
++    nsCOMPtr<nsIStreamListener> listener = do_QueryInterface(parser, &rv);
++    NS_ASSERTION(NS_SUCCEEDED(rv), "parser doesn't support nsIStreamListener");
++    if (NS_FAILED(rv)) return rv;
++
++    mStreamListener = listener;
++
++    parser->Parse(mDocumentURI);
++  }
++
++  // If we're racing with another document to load proto, wait till the
++  // load has finished loading before trying build the document.
++  // Either the nsXULContentSink finishing to load the XML or
++  // the nsXULPrototypeDocument completing deserialization will trigger the
++  // OnPrototypeLoadDone callback.
++  // If the prototype is already loaded, OnPrototypeLoadDone will be called
++  // in OnStopRequest.
++  RefPtr<PrototypeDocumentParser> self = this;
++  rv = mCurrentPrototype->AwaitLoadDone(
++      [self]() { self->OnPrototypeLoadDone(); }, &mPrototypeAlreadyLoaded);
++  if (NS_FAILED(rv)) return rv;
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PrototypeDocumentParser::OnStartRequest(nsIRequest* request,
++                                        nsISupports* acontext) {
++  if (mStreamListener) {
++    return mStreamListener->OnStartRequest(request, acontext);
++  }
++  // There's already a prototype cached, so return cached here so the original
++  // request will be aborted. Either OnStopRequest or the prototype load
++  // finishing will notify the content sink that we're done loading the
++  // prototype.
++  return NS_ERROR_PARSED_DATA_CACHED;
++}
++
++NS_IMETHODIMP
++PrototypeDocumentParser::OnStopRequest(nsIRequest* request,
++                                       nsISupports* aContext,
++                                       nsresult aStatus) {
++  if (mStreamListener) {
++    return mStreamListener->OnStopRequest(request, aContext, aStatus);
++  }
++  if (mPrototypeAlreadyLoaded) {
++    return this->OnPrototypeLoadDone();
++  }
++  // The prototype will handle calling OnPrototypeLoadDone when it is ready.
++  return NS_OK;
++}
++
++NS_IMETHODIMP
++PrototypeDocumentParser::OnDataAvailable(nsIRequest* request,
++                                         nsISupports* aContext,
++                                         nsIInputStream* aInStr,
++                                         uint64_t aSourceOffset,
++                                         uint32_t aCount) {
++  if (mStreamListener) {
++    return mStreamListener->OnDataAvailable(request, aContext, aInStr,
++                                            aSourceOffset, aCount);
++  }
++  MOZ_ASSERT_UNREACHABLE("Cached prototype doesn't receive data");
++  return NS_ERROR_UNEXPECTED;
++}
++
++nsresult PrototypeDocumentParser::OnPrototypeLoadDone() {
++  MOZ_ASSERT(!mIsComplete, "Should not be called more than once.");
++  mIsComplete = true;
++
++  return mOriginalSink->OnPrototypeLoadDone(mCurrentPrototype);
++}
++
++nsresult PrototypeDocumentParser::PrepareToLoadPrototype(
++    nsIURI* aURI, nsIPrincipal* aDocumentPrincipal, nsIParser** aResult) {
++  nsresult rv;
++
++  // Create a new prototype document.
++  rv = NS_NewXULPrototypeDocument(getter_AddRefs(mCurrentPrototype));
++  if (NS_FAILED(rv)) return rv;
++
++  rv = mCurrentPrototype->InitPrincipal(aURI, aDocumentPrincipal);
++  if (NS_FAILED(rv)) {
++    mCurrentPrototype = nullptr;
++    return rv;
++  }
++
++  // Store the new prototype right away so if there are multiple requests
++  // for the same document they all get the same prototype.
++  if (IsChromeURI(mDocumentURI) &&
++      nsXULPrototypeCache::GetInstance()->IsEnabled()) {
++    nsXULPrototypeCache::GetInstance()->PutPrototype(mCurrentPrototype);
++  }
++
++  mDocument->SetPrincipal(aDocumentPrincipal);
++
++  // Create a XUL content sink, a parser, and kick off a load for
++  // the document.
++  RefPtr<XULContentSinkImpl> sink = new XULContentSinkImpl();
++
++  rv = sink->Init(mDocument, mCurrentPrototype);
++  NS_ASSERTION(NS_SUCCEEDED(rv), "Unable to initialize datasource sink");
++  if (NS_FAILED(rv)) return rv;
++
++  nsCOMPtr<nsIParser> parser = do_CreateInstance(kParserCID, &rv);
++  NS_ASSERTION(NS_SUCCEEDED(rv), "unable to create parser");
++  if (NS_FAILED(rv)) return rv;
++
++  parser->SetCommand(eViewNormal);
++
++  parser->SetDocumentCharset(UTF_8_ENCODING, kCharsetFromDocTypeDefault);
++  parser->SetContentSink(sink);  // grabs a reference to the parser
++
++  parser.forget(aResult);
++  return NS_OK;
++}
++
++}  // namespace parser
++}  // namespace mozilla
+diff --git a/parser/prototype/PrototypeDocumentParser.h b/parser/prototype/PrototypeDocumentParser.h
+new file mode 100644
+--- /dev/null
++++ b/parser/prototype/PrototypeDocumentParser.h
+@@ -0,0 +1,149 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_parser_PrototypeDocumentParser_h
++#define mozilla_parser_PrototypeDocumentParser_h
++
++#include "nsCycleCollectionParticipant.h"
++#include "nsIContentSink.h"
++#include "nsIParser.h"
++#include "nsXULPrototypeDocument.h"
++
++class nsIExpatSink;
++
++namespace mozilla {
++namespace dom {
++class PrototypeDocumentContentSink;
++}  // namespace dom
++}  // namespace mozilla
++
++namespace mozilla {
++namespace parser {
++
++// The PrototypeDocumentParser is more of a stub than a real parser. It is
++// responsible for loading an nsXULPrototypeDocument either from the startup
++// cache or creating a new prototype from the original source if a cached
++// version does not exist. Once the parser finishes loading the prototype it
++// will notify the content sink.
++class PrototypeDocumentParser final : public nsIParser,
++                                      public nsIStreamListener {
++ public:
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++
++  NS_DECL_CYCLE_COLLECTION_CLASS_AMBIGUOUS(PrototypeDocumentParser, nsIParser)
++
++  explicit PrototypeDocumentParser(nsIURI* aDocumentURI,
++                                   dom::Document* aDocument);
++
++  NS_DECL_NSIREQUESTOBSERVER
++  NS_DECL_NSISTREAMLISTENER
++
++  // Start nsIParser
++  // Ideally, this would just implement nsBaseParser since most of these are
++  // stubs, but Document.h expects an nsIParser.
++  NS_IMETHOD_(void) SetContentSink(nsIContentSink* aSink) override;
++
++  NS_IMETHOD_(nsIContentSink*) GetContentSink() override;
++
++  NS_IMETHOD_(void) GetCommand(nsCString& aCommand) override {}
++
++  NS_IMETHOD_(void) SetCommand(const char* aCommand) override {}
++
++  NS_IMETHOD_(void) SetCommand(eParserCommands aParserCommand) override {}
++
++  virtual void SetDocumentCharset(NotNull<const Encoding*> aEncoding,
++                                  int32_t aSource) override {}
++
++  NS_IMETHOD GetChannel(nsIChannel** aChannel) override {
++    return NS_ERROR_NOT_IMPLEMENTED;
++  }
++
++  NS_IMETHOD GetDTD(nsIDTD** aDTD) override { return NS_ERROR_NOT_IMPLEMENTED; }
++
++  virtual nsIStreamListener* GetStreamListener() override;
++
++  NS_IMETHOD ContinueInterruptedParsing() override {
++    return NS_ERROR_NOT_IMPLEMENTED;
++  }
++
++  NS_IMETHOD_(void) BlockParser() override {}
++
++  NS_IMETHOD_(void) UnblockParser() override {}
++
++  NS_IMETHOD_(void) ContinueInterruptedParsingAsync() override {}
++
++  NS_IMETHOD_(bool) IsParserEnabled() override { return true; }
++
++  NS_IMETHOD_(bool) IsComplete() override;
++
++  NS_IMETHOD Parse(nsIURI* aURL, nsIRequestObserver* aListener = nullptr,
++                   void* aKey = 0,
++                   nsDTDMode aMode = eDTDMode_autodetect) override;
++
++  NS_IMETHOD Terminate() override { return NS_ERROR_NOT_IMPLEMENTED; }
++
++  NS_IMETHOD ParseFragment(const nsAString& aSourceBuffer,
++                           nsTArray<nsString>& aTagStack) override {
++    return NS_ERROR_NOT_IMPLEMENTED;
++  }
++
++  NS_IMETHOD BuildModel() override { return NS_ERROR_NOT_IMPLEMENTED; }
++
++  NS_IMETHOD CancelParsingEvents() override { return NS_ERROR_NOT_IMPLEMENTED; }
++
++  virtual void Reset() override {}
++
++  virtual bool IsInsertionPointDefined() override { return false; }
++
++  virtual void PushDefinedInsertionPoint() override {}
++
++  virtual void PopDefinedInsertionPoint() override {}
++
++  virtual void MarkAsNotScriptCreated(const char* aCommand) override {}
++
++  virtual bool IsScriptCreated() override { return false; }
++
++  // End nsIParser
++
++ private:
++  virtual ~PrototypeDocumentParser();
++
++ protected:
++  nsresult PrepareToLoadPrototype(nsIURI* aURI,
++                                  nsIPrincipal* aDocumentPrincipal,
++                                  nsIParser** aResult);
++
++  // This is invoked whenever the prototype for this document is loaded
++  // and should be walked, regardless of whether the XUL cache is
++  // disabled, whether the protototype was loaded, whether the
++  // prototype was loaded from the cache or created by parsing the
++  // actual XUL source, etc.
++  nsresult OnPrototypeLoadDone();
++
++  nsCOMPtr<nsIURI> mDocumentURI;
++  RefPtr<dom::PrototypeDocumentContentSink> mOriginalSink;
++  RefPtr<dom::Document> mDocument;
++
++  // The XML parser that data is forwarded to when the prototype does not exist
++  // and must be parsed from disk.
++  nsCOMPtr<nsIStreamListener> mStreamListener;
++
++  // The current prototype that we are walking to construct the
++  // content model.
++  RefPtr<nsXULPrototypeDocument> mCurrentPrototype;
++
++  // True if there was a prototype in the cache and it finished loading
++  // already.
++  bool mPrototypeAlreadyLoaded;
++
++  // True after the parser has notified the content sink that it is done.
++  bool mIsComplete;
++};
++
++}  // namespace parser
++}  // namespace mozilla
++
++#endif  // mozilla_parser_PrototypeDocumentParser_h
+diff --git a/parser/moz.build b/parser/prototype/moz.build
+copy from parser/moz.build
+copy to parser/prototype/moz.build
+--- a/parser/moz.build
++++ b/parser/prototype/moz.build
+@@ -1,15 +1,24 @@
+ # -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ with Files('**'):
+-    BUG_COMPONENT = ('Core', 'HTML: Parser')
++    BUG_COMPONENT = ('Core', 'XML')
+ 
+-DIRS += ['expat', 'xml', 'htmlparser', 'html']
+-
+-EXPORTS += [
+-    'nsCharsetSource.h',
++EXPORTS.mozilla.parser += [
++    'PrototypeDocumentParser.h',
+ ]
+ 
++
++UNIFIED_SOURCES += [
++    'PrototypeDocumentParser.cpp',
++]
++
++FINAL_LIBRARY = 'xul'
++
++LOCAL_INCLUDES += [
++    '/dom/xbl',
++    '/dom/xul',
++]
+diff --git a/toolkit/content/editMenuCommands.inc.xul b/toolkit/content/editMenuCommands.inc.xul
+--- a/toolkit/content/editMenuCommands.inc.xul
++++ b/toolkit/content/editMenuCommands.inc.xul
+@@ -1,13 +1,9 @@
+-<script type="application/javascript" src="chrome://global/content/editMenuOverlay.js"
+-#ifdef BROWSER_XHTML
+-xmlns="http://www.w3.org/1999/xhtml"
+-#endif
+-/>
++<script type="application/javascript" src="chrome://global/content/editMenuOverlay.js"/>
+ <commandset id="editMenuCommands">
+   <commandset id="editMenuCommandSetAll" commandupdater="true" events="focus,select"
+               oncommandupdate="goUpdateGlobalEditMenuItems()"/>
+   <commandset id="editMenuCommandSetUndo" commandupdater="true" events="undo"
+               oncommandupdate="goUpdateUndoEditMenuItems()"/>
+   <commandset id="editMenuCommandSetPaste" commandupdater="true" events="clipboard"
+               oncommandupdate="goUpdatePasteMenuItems()"/>
+   <command id="cmd_undo" oncommand="goDoCommand('cmd_undo')"/>
+diff --git a/toolkit/content/tests/chrome/test_bug437844.xul b/toolkit/content/tests/chrome/test_bug437844.xul
+--- a/toolkit/content/tests/chrome/test_bug437844.xul
++++ b/toolkit/content/tests/chrome/test_bug437844.xul
+@@ -32,17 +32,17 @@ https://bugzilla.mozilla.org/show_bug.cg
+     </div>
+     <pre id="test">
+     </pre>
+   </body>
+ 
+   <script class="testbody" type="application/javascript">
+     <![CDATA[
+ 
+-      SimpleTest.expectAssertions(17, 38);
++      SimpleTest.expectAssertions(14, 38);
+ 
+       /** Test for Bug 437844 and Bug 348233 **/
+       SimpleTest.waitForExplicitFinish();
+ 
+       let prefs = Cc["@mozilla.org/preferences-service;1"]
+                     .getService(Ci.nsIPrefBranch);
+       prefs.setIntPref("intl.uidirection", 1);
+ 
+
