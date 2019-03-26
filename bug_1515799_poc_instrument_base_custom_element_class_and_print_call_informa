@@ -1,0 +1,196 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Date 1553628413 25200
+#      Tue Mar 26 12:26:53 2019 -0700
+# Node ID dd8c76dd040f942615c5af11c535bd8750bae999
+# Parent  4572f6055a6a9377d213afe14a26556e6c410344
+Bug 1515799 - POC - Instrument base custom element class and print call information in a table at startup
+
+This isn't intended to land, just a demonstration of a way we could get more insight into how much
+time we are spending inside of individual classes.
+
+Differential Revision: https://phabricator.services.mozilla.com/D24953
+
+diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.js
+--- a/toolkit/content/customElements.js
++++ b/toolkit/content/customElements.js
+@@ -15,16 +15,93 @@
+ // from MainProcessSingleton, to handle pages that can open both before and after
+ // MainProcessSingleton starts. See Bug 1501845.
+ if (window.MozXULElement) {
+   return;
+ }
+ 
+ const {Services} = ChromeUtils.import("resource://gre/modules/Services.jsm");
+ const {AppConstants} = ChromeUtils.import("resource://gre/modules/AppConstants.jsm");
++const instrumentedClassesToLogAtStartup = new Set();
++
++function instrumentClass(c) {
++  let data = {};
++  instrumentedClassesToLogAtStartup.add(c);
++
++  function overrideFunction(p, fn) {
++    return function() {
++      if (!data[p]) {
++        data[p] = {time: 0, calls: 0};
++      }
++      data[p].calls++;
++      let n = performance.now();
++      let r = fn.apply(this, arguments);
++      data[p].time += performance.now() - n;
++      return r;
++    };
++  }
++
++  // Handle static properties
++  for (let p of Object.getOwnPropertyNames(c)) {
++    if (p == "implementCustomInterface") {
++      continue;
++    }
++    let prop = Object.getOwnPropertyDescriptor(c, p);
++    if (prop.get) {
++      prop.get = overrideFunction("<get> " + p, prop.get);
++    }
++    if (prop.set) {
++      prop.set = overrideFunction("<set> " + p, prop.set);
++    }
++    if (prop.writable && prop.value && prop.value.apply) {
++      prop.value = overrideFunction(p, prop.value);
++    }
++    Object.defineProperty(c, p, prop);
++  }
++
++  // Handle instance properties
++  for (let p of Object.getOwnPropertyNames(c.prototype)) {
++    let prop = Object.getOwnPropertyDescriptor(c.prototype, p);
++    if (prop.get) {
++      prop.get = overrideFunction("<get> " + p, prop.get);
++    }
++    if (prop.set) {
++      prop.set = overrideFunction("<set> " + p, prop.set);
++    }
++    if (prop.writable && prop.value && prop.value.apply) {
++      prop.value = overrideFunction(p, prop.value);
++    }
++    Object.defineProperty(c.prototype, p, prop);
++  }
++
++  Object.defineProperty(c, "stats", {
++    enumerable: false,
++    configurable: false,
++    get() {
++      if (!Object.keys(data).length) {
++        return null;
++      }
++
++      let clonedData = Object.assign({}, data);
++      let totalCalls = 0;
++      let totalTime = 0;
++      for (let d in clonedData) {
++        totalCalls += clonedData[d].calls;
++        totalTime += clonedData[d].time;
++        clonedData[d].timePerCall = clonedData[d].time / clonedData[d].calls;
++      }
++
++      // Add a spaced-out final row with summed up totals
++      clonedData["\ntotals"]  = { time: `\n${totalTime}`, calls: `\n${totalCalls}`, timePerCall: `\n${totalTime / totalCalls}` };
++      return clonedData;
++    },
++  });
++
++  return c;
++}
+ 
+ // The listener of DOMContentLoaded must be set on window, rather than
+ // document, because the window can go away before the event is fired.
+ // In that case, we don't want to initialize anything, otherwise we
+ // may be leaking things because they will never be destroyed after.
+ let gIsDOMContentLoaded = false;
+ const gElementsPendingConnection = new Set();
+ window.addEventListener("DOMContentLoaded", () => {
+@@ -34,23 +111,45 @@ window.addEventListener("DOMContentLoade
+       if (element.isConnected) {
+         element.isRunningDelayedConnectedCallback = true;
+         element.connectedCallback();
+       }
+     } catch (ex) { console.error(ex); }
+     element.isRunningDelayedConnectedCallback = false;
+   }
+   gElementsPendingConnection.clear();
++
++  let hasInstrumentedClasses = false;
++  for (let c of instrumentedClassesToLogAtStartup) {
++    if (c.stats) {
++      hasInstrumentedClasses = true;
++      break;
++    }
++  }
++  if (hasInstrumentedClasses) {
++    console.group(`Startup data for custom elements in ${document.documentURI}`);
++    for (let c of instrumentedClassesToLogAtStartup) {
++      let stats = c.stats;
++      if (stats) {
++        console.log(`${c.name}`);
++        console.table(stats);
++      }
++    }
++    console.groupEnd(`Startup data for custom elements in ${document.documentURI}`);
++    instrumentedClassesToLogAtStartup.clear();
++  }
+ }, { once: true, capture: true });
+ 
+ const gXULDOMParser = new DOMParser();
+ gXULDOMParser.forceEnableXULXBL();
+ 
+ const MozElements = {};
+ 
++MozElements.instrumentClass = instrumentClass;
++
+ const MozElementMixin = Base => class MozElement extends Base {
+   /*
+    * A declarative way to wire up attribute inheritance and automatically generate
+    * the `observedAttributes` getter.  For example, if you returned:
+    *    {
+    *      ".foo": "bar,baz=bat"
+    *    }
+    *
+@@ -369,17 +468,17 @@ const MozElementMixin = Base => class Mo
+       if (cls.prototype.customInterfaces.some(iface => iface.equals(ifaceToCheck))) {
+         return getInterfaceProxy(this);
+       }
+       return null;
+     };
+   }
+ };
+ 
+-const MozXULElement = MozElementMixin(XULElement);
++const MozXULElement = instrumentClass(MozElementMixin(XULElement));
+ 
+ /**
+  * Given an object, add a proxy that reflects interface implementations
+  * onto the object itself.
+  */
+ function getInterfaceProxy(obj) {
+   /* globals MozQueryInterface */
+   if (!obj._customInterfaceProxy) {
+diff --git a/toolkit/content/widgets/radio.js b/toolkit/content/widgets/radio.js
+--- a/toolkit/content/widgets/radio.js
++++ b/toolkit/content/widgets/radio.js
+@@ -382,15 +382,17 @@ class MozRadiogroup extends MozElements.
+     var radio = document.createXULElement("radio");
+     radio.setAttribute("label", label);
+     radio.setAttribute("value", value);
+     this.appendChild(radio);
+     return radio;
+   }
+ }
+ 
++MozRadiogroup = MozElements.instrumentClass(MozRadiogroup);
++
+ MozXULElement.implementCustomInterface(MozRadiogroup, [
+   Ci.nsIDOMXULSelectControlElement,
+   Ci.nsIDOMXULRadioGroupElement,
+ ]);
+ 
+ customElements.define("radiogroup", MozRadiogroup);
+ }
