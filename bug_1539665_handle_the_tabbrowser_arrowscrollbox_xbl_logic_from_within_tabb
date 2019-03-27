@@ -1,0 +1,200 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Date 1553724922 25200
+#      Wed Mar 27 15:15:22 2019 -0700
+# Node ID d3444f7c85e5e1aa5d488043d9ae05362d6a1892
+# Parent  4572f6055a6a9377d213afe14a26556e6c410344
+Bug 1539665 - Handle the tabbrowser-arrowscrollbox XBL logic from within tabbrowser-tabs
+
+Differential Revision: https://phabricator.services.mozilla.com/D25153
+
+diff --git a/browser/base/content/tabbrowser.css b/browser/base/content/tabbrowser.css
+--- a/browser/base/content/tabbrowser.css
++++ b/browser/base/content/tabbrowser.css
+@@ -1,16 +1,12 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-.tabbrowser-arrowscrollbox {
+-  -moz-binding: url("chrome://browser/content/tabbrowser.xml#tabbrowser-arrowscrollbox");
+-}
+-
+ .tab-close-button[pinned],
+ #tabbrowser-tabs[closebuttons="activetab"] > .tabbrowser-tab > .tab-stack > .tab-content > .tab-close-button:not([selected="true"]),
+ .tab-icon-pending:not([pendingicon]),
+ .tab-icon-pending[busy],
+ .tab-icon-pending[pinned],
+ .tab-icon-image:not([src]):not([pinned]):not([crashed])[selected],
+ .tab-icon-image:not([src]):not([pinned]):not([crashed]):not([sharing]),
+ .tab-icon-image[busy],
+diff --git a/browser/base/content/tabbrowser.xml b/browser/base/content/tabbrowser.xml
+--- a/browser/base/content/tabbrowser.xml
++++ b/browser/base/content/tabbrowser.xml
+@@ -3,77 +3,16 @@
+ <!-- This Source Code Form is subject to the terms of the Mozilla Public
+    - License, v. 2.0. If a copy of the MPL was not distributed with this
+    - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
+ 
+ <bindings id="tabBrowserBindings"
+           xmlns="http://www.mozilla.org/xbl"
+           xmlns:xul="http://www.mozilla.org/keymaster/gatekeeper/there.is.only.xul"
+           xmlns:xbl="http://www.mozilla.org/xbl">
+-
+-  <binding id="tabbrowser-arrowscrollbox" extends="chrome://global/content/bindings/scrollbox.xml#arrowscrollbox">
+-    <implementation>
+-      <!-- Override scrollbox.xml method, since our scrollbox's children are
+-           inherited from the binding parent -->
+-      <method name="_getScrollableElements">
+-        <body><![CDATA[
+-          return Array.filter(document.getBindingParent(this).children,
+-                              this._canScrollToElement, this);
+-        ]]></body>
+-      </method>
+-      <method name="_canScrollToElement">
+-        <parameter name="tab"/>
+-        <body><![CDATA[
+-          return !tab._pinnedUnscrollable && !tab.hidden;
+-        ]]></body>
+-      </method>
+-    </implementation>
+-
+-    <handlers>
+-      <handler event="underflow" phase="capturing"><![CDATA[
+-        // Ignore underflow events:
+-        // - from nested scrollable elements
+-        // - for vertical orientation
+-        // - corresponding to an overflow event that we ignored
+-        let tabs = document.getBindingParent(this);
+-        if (event.originalTarget != this.scrollbox ||
+-            event.detail == 0 ||
+-            !tabs.hasAttribute("overflow")) {
+-          return;
+-        }
+-
+-        tabs.removeAttribute("overflow");
+-
+-        if (tabs._lastTabClosedByMouse) {
+-          tabs._expandSpacerBy(this._scrollButtonDown.clientWidth);
+-        }
+-
+-        for (let tab of Array.from(gBrowser._removingTabs)) {
+-          gBrowser.removeTab(tab);
+-        }
+-
+-        tabs._positionPinnedTabs();
+-      ]]></handler>
+-      <handler event="overflow"><![CDATA[
+-        // Ignore overflow events:
+-        // - from nested scrollable elements
+-        // - for vertical orientation
+-        if (event.originalTarget != this.scrollbox ||
+-            event.detail == 0) {
+-          return;
+-        }
+-
+-        var tabs = document.getBindingParent(this);
+-        tabs.setAttribute("overflow", "true");
+-        tabs._positionPinnedTabs();
+-        tabs._handleTabSelect(true);
+-      ]]></handler>
+-    </handlers>
+-  </binding>
+-
+   <binding id="tabbrowser-tabs"
+            extends="chrome://global/content/bindings/tabbox.xml#tabs">
+     <content>
+       <xul:hbox class="tab-drop-indicator-box">
+         <xul:image class="tab-drop-indicator" anonid="tab-drop-indicator" collapsed="true"/>
+       </xul:hbox>
+       <xul:arrowscrollbox anonid="arrowscrollbox" orient="horizontal" flex="1"
+                           style="min-width: 1px;"
+@@ -136,16 +75,17 @@
+             "browser.tabs.multiselect", null,
+             (pref, prevValue, newValue) => this._multiselectEnabled = newValue);
+           this._multiselectEnabled = this._multiselectEnabledPref;
+ 
+           this._setPositionalAttributes();
+ 
+           CustomizableUI.addListener(this);
+           this._updateNewTabVisibility();
++          this._initializeArrowScrollbox();
+ 
+           XPCOMUtils.defineLazyPreferenceGetter(this, "_closeTabByDblclick",
+             "browser.tabs.closeTabByDblclick", false);
+ 
+           if (gMultiProcessBrowser) {
+             this.tabbox.tabpanels.setAttribute("async", "true");
+           }
+         ]]>
+@@ -191,16 +131,70 @@
+           this.setAttribute("aria-multiselectable", !!val);
+           return val;
+         </setter>
+         <getter>
+           return this.getAttribute("aria-multiselectable") == "true";
+         </getter>
+       </property>
+ 
++      <method name="_initializeArrowScrollbox">
++        <body><![CDATA[
++          let tabs = this;
++          this.arrowScrollbox.addEventListener("underflow", (event) => {
++            // Ignore underflow events:
++            // - from nested scrollable elements
++            // - for vertical orientation
++            // - corresponding to an overflow event that we ignored
++            if (event.originalTarget != this.scrollbox ||
++              event.detail == 0 ||
++              !tabs.hasAttribute("overflow")) {
++              return;
++            }
++
++            tabs.removeAttribute("overflow");
++
++            if (tabs._lastTabClosedByMouse) {
++              tabs._expandSpacerBy(this._scrollButtonDown.clientWidth);
++            }
++
++            for (let tab of Array.from(gBrowser._removingTabs)) {
++              gBrowser.removeTab(tab);
++            }
++
++            tabs._positionPinnedTabs();
++          }, true);
++
++          this.arrowScrollbox.addEventListener("overflow", (event) => {
++            // Ignore overflow events:
++            // - from nested scrollable elements
++            // - for vertical orientation
++            if (event.originalTarget != this.scrollbox ||
++              event.detail == 0) {
++              return;
++            }
++
++            tabs.setAttribute("overflow", "true");
++            tabs._positionPinnedTabs();
++            tabs._handleTabSelect(true);
++          }, true);
++
++          /**
++          * Override scrollbox.xml method, since our scrollbox's children are
++          * inherited from the scrollbox binding parent (this).
++          */
++          this.arrowScrollbox._getScrollableElements = function() {
++            return Array.filter(tabs.children, this._canScrollToElement, this);
++          };
++          this.arrowScrollbox._canScrollToElement = function(tab) {
++            return !tab._pinnedUnscrollable && !tab.hidden;
++          };
++        ]]></body>
++      </method>
++
+       <method name="observe">
+         <parameter name="aSubject"/>
+         <parameter name="aTopic"/>
+         <parameter name="aData"/>
+         <body><![CDATA[
+           switch (aTopic) {
+             case "nsPref:changed":
+               // This is has to deal with changes in
