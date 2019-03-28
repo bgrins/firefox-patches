@@ -2,8 +2,8 @@
 # User Brian Grinstead <bgrinstead@mozilla.com>
 # Date 1553628413 25200
 #      Tue Mar 26 12:26:53 2019 -0700
-# Node ID e3ddcd910c534c2a00afadf9f631ba74642a398f
-# Parent  4572f6055a6a9377d213afe14a26556e6c410344
+# Node ID 2d3f230a14b1c7856fed9a84c7ea41a3a0aac942
+# Parent  4e2ea1a75e878ae392e4775f2eddd9f83d1b008e
 Bug 1515799 - POC - Instrument base custom element class and print call information in a table at startup
 
 This isn't intended to land, just a demonstration of a way we could get more insight into how much
@@ -14,75 +14,118 @@ Differential Revision: https://phabricator.services.mozilla.com/D24953
 diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.js
 --- a/toolkit/content/customElements.js
 +++ b/toolkit/content/customElements.js
-@@ -15,16 +15,103 @@
+@@ -13,18 +13,144 @@
+ (() => {
+ // Handle customElements.js being loaded as a script in addition to the subscriptLoader
  // from MainProcessSingleton, to handle pages that can open both before and after
  // MainProcessSingleton starts. See Bug 1501845.
  if (window.MozXULElement) {
    return;
  }
  
++const MozElements = {};
++window.MozElements = MozElements;
++
  const {Services} = ChromeUtils.import("resource://gre/modules/Services.jsm");
  const {AppConstants} = ChromeUtils.import("resource://gre/modules/AppConstants.jsm");
 +const instrumentClasses = false; // Flip this to get logging for perf data at startup
-+const instrumentedClassesToLogAtStartup = new Set();
++const instrumentedClasses = new Set();
++const baseClasses = new WeakSet();
 +
++// Wrap the normal customElements.define to give us a chance to modify the
++// class so we can instrument function calls in local development:
 +let define = window.customElements.define;
 +window.customElements.define = function(name, c, opts) {
-+  instrumentClass(c);
++  instrumentCustomElementClass(c);
 +  return define.call(this, name, c, opts);
 +};
 +
-+function instrumentClass(c) {
++MozElements.printInstrumentation = function(collapsed) {
++  if (instrumentedClasses.size) {
++    let groupName = `Instrumentation data for custom elements in ${document.documentURI}`;
++    console[collapsed ? "groupCollapsed" : "group"](groupName);
++    for (let c of instrumentedClasses) {
++      let stats = c.stats;
++      if (stats) {
++        console.log(`${c.name}`);
++        console.table(stats);
++      }
++    }
++    console.groupEnd(groupName);
++  }
++};
++
++function instrumentCustomElementClass(c) {
 +  if (!instrumentClasses) {
 +    return;
 +  }
-+  let data = {};
-+  instrumentedClassesToLogAtStartup.add(c);
 +
-+  function overrideFunction(p, fn) {
++  // Climb up prototype chain to see if we inherit from a MozElement.
++  // Keep track of classes to instrument, for example:
++  //   MozMenuCaption->MozMenuBase->BaseText->BaseControl->MozXULElement
++  let inheritsFromBase = baseClasses.has(c);
++  let classesToInstrument = [c];
++  let proto = Object.getPrototypeOf(c);
++  while (proto) {
++    classesToInstrument.push(proto);
++    if (baseClasses.has(proto)) {
++      inheritsFromBase = true;
++      break;
++    }
++    proto = Object.getPrototypeOf(proto);
++  }
++
++  if (inheritsFromBase) {
++    for (let c of classesToInstrument.reverse()) {
++      instrumentIndividualClass(c);
++    }
++  }
++}
++
++function instrumentIndividualClass(c) {
++  if (instrumentedClasses.has((c))) {
++    return;
++  }
++  instrumentedClasses.add((c));
++  let data = {};
++
++  function wrapFunction(name, fn) {
 +    return function() {
-+      if (!data[p]) {
-+        data[p] = {time: 0, calls: 0};
++      if (!data[name]) {
++        data[name] = {time: 0, calls: 0};
 +      }
-+      data[p].calls++;
++      data[name].calls++;
 +      let n = performance.now();
 +      let r = fn.apply(this, arguments);
-+      data[p].time += performance.now() - n;
++      data[name].time += performance.now() - n;
 +      return r;
 +    };
 +  }
-+
-+  // Handle static properties
-+  for (let p of Object.getOwnPropertyNames(c)) {
-+    if (p == "implementCustomInterface") {
-+      continue;
-+    }
-+    let prop = Object.getOwnPropertyDescriptor(c, p);
++  function wrapPropertyDescriptor(obj, name) {
++    let prop = Object.getOwnPropertyDescriptor(obj, name);
 +    if (prop.get) {
-+      prop.get = overrideFunction("<get> " + p, prop.get);
++      prop.get = wrapFunction(`<get> ${name}`, prop.get);
 +    }
 +    if (prop.set) {
-+      prop.set = overrideFunction("<set> " + p, prop.set);
++      prop.set = wrapFunction(`<set> ${name}`, prop.set);
 +    }
 +    if (prop.writable && prop.value && prop.value.apply) {
-+      prop.value = overrideFunction(p, prop.value);
++      prop.value = wrapFunction(name, prop.value);
 +    }
-+    Object.defineProperty(c, p, prop);
++    Object.defineProperty(obj, name, prop);
++  }
++
++  // Handle static properties
++  for (let name of Object.getOwnPropertyNames((c))) {
++    if (name == "implementCustomInterface") {
++      continue;
++    }
++    wrapPropertyDescriptor(c, name);
 +  }
 +
 +  // Handle instance properties
-+  for (let p of Object.getOwnPropertyNames(c.prototype)) {
-+    let prop = Object.getOwnPropertyDescriptor(c.prototype, p);
-+    if (prop.get) {
-+      prop.get = overrideFunction("<get> " + p, prop.get);
-+    }
-+    if (prop.set) {
-+      prop.set = overrideFunction("<set> " + p, prop.set);
-+    }
-+    if (prop.writable && prop.value && prop.value.apply) {
-+      prop.value = overrideFunction(p, prop.value);
-+    }
-+    Object.defineProperty(c.prototype, p, prop);
++  for (let name of Object.getOwnPropertyNames(c.prototype)) {
++    wrapPropertyDescriptor(c.prototype, name);
 +  }
 +
 +  Object.defineProperty(c, "stats", {
@@ -93,7 +136,7 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
 +        return null;
 +      }
 +
-+      let clonedData = Object.assign({}, data);
++      let clonedData = JSON.parse(JSON.stringify(data));
 +      let totalCalls = 0;
 +      let totalTime = 0;
 +      for (let d in clonedData) {
@@ -107,8 +150,6 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
 +      return clonedData;
 +    },
 +  });
-+
-+  return c;
 +}
  
  // The listener of DOMContentLoaded must be set on window, rather than
@@ -118,7 +159,7 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
  let gIsDOMContentLoaded = false;
  const gElementsPendingConnection = new Set();
  window.addEventListener("DOMContentLoaded", () => {
-@@ -34,24 +121,47 @@ window.addEventListener("DOMContentLoade
+@@ -34,24 +160,24 @@ window.addEventListener("DOMContentLoade
        if (element.isConnected) {
          element.isRunningDelayedConnectedCallback = true;
          element.connectedCallback();
@@ -127,38 +168,17 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
      element.isRunningDelayedConnectedCallback = false;
    }
    gElementsPendingConnection.clear();
-+
-+  let hasInstrumentedClasses = false;
-+  for (let c of instrumentedClassesToLogAtStartup) {
-+    if (c.stats) {
-+      hasInstrumentedClasses = true;
-+      break;
-+    }
-+  }
-+  if (hasInstrumentedClasses) {
-+    console.group(`Startup data for custom elements in ${document.documentURI}`);
-+    for (let c of instrumentedClassesToLogAtStartup) {
-+      let stats = c.stats;
-+      if (stats) {
-+        console.log(`${c.name}`);
-+        console.table(stats);
-+      }
-+    }
-+    console.groupEnd(`Startup data for custom elements in ${document.documentURI}`);
-+    instrumentedClassesToLogAtStartup.clear();
-+  }
++  MozElements.printInstrumentation(true);
  }, { once: true, capture: true });
  
  const gXULDOMParser = new DOMParser();
  gXULDOMParser.forceEnableXULXBL();
  
- const MozElements = {};
- 
--const MozElementMixin = Base => class MozElement extends Base {
-+MozElements.instrumentClass = instrumentClass;
-+
-+const MozElementMixin = Base => {
-+let c = class extends Base {
+-const MozElements = {};
+-
+-MozElements.MozElementMixin = Base => class MozElement extends Base {
++MozElements.MozElementMixin = Base => {
++  let MozElementBase = class extends Base {
    /*
     * A declarative way to wire up attribute inheritance and automatically generate
     * the `observedAttributes` getter.  For example, if you returned:
@@ -167,7 +187,8 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
     *    }
     *
     * Then the base class will automatically return ["bar", "bat"] from `observedAttributes`,
-@@ -368,16 +478,20 @@ const MozElementMixin = Base => class Mo
+@@ -367,16 +493,22 @@ MozElements.MozElementMixin = Base => cl
+     cls.prototype.QueryInterface = ChromeUtils.generateQI(ifaces);
      cls.prototype.getCustomInterfaceCallback = function getCustomInterfaceCallback(ifaceToCheck) {
        if (cls.prototype.customInterfaces.some(iface => iface.equals(ifaceToCheck))) {
          return getInterfaceProxy(this);
@@ -175,16 +196,54 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
        return null;
      };
    }
++  };
++
++  // Rename the class so we can distinguish between MozXULElement and MozXULPopupElement, for example.
++  Object.defineProperty(MozElementBase, "name", {value: `Moz${Base.name}`});
++  baseClasses.add(MozElementBase);
++  return MozElementBase;
  };
-+Object.defineProperty(c, "name", {value: `Moz${Base.name}`});
-+instrumentClass(c);
-+return c;
-+};
  
- const MozXULElement = MozElementMixin(XULElement);
+ const MozXULElement = MozElements.MozElementMixin(XULElement);
  
  /**
   * Given an object, add a proxy that reflects interface implementations
   * onto the object itself.
   */
- function getInterfaceProxy(obj) {
+@@ -430,17 +562,17 @@ MozElements.BaseControlMixin = Base => {
+   }
+ 
+   Base.implementCustomInterface(BaseControl,
+                                 [Ci.nsIDOMXULControlElement]);
+   return BaseControl;
+ };
+ MozElements.BaseControl = MozElements.BaseControlMixin(MozXULElement);
+ 
+-const BaseTextMixin = Base => class extends MozElements.BaseControlMixin(Base) {
++const BaseTextMixin = Base => class BaseText extends MozElements.BaseControlMixin(Base) {
+   set label(val) {
+     this.setAttribute("label", val);
+     return val;
+   }
+ 
+   get label() {
+     return this.getAttribute("label");
+   }
+@@ -486,17 +618,16 @@ const BaseTextMixin = Base => class exte
+   get accessKey() {
+     return this.labelElement ? this.labelElement.accessKey : this.getAttribute("accesskey");
+   }
+ };
+ MozElements.BaseText = BaseTextMixin(MozXULElement);
+ 
+ // Attach the base class to the window so other scripts can use it:
+ window.MozXULElement = MozXULElement;
+-window.MozElements = MozElements;
+ 
+ customElements.setElementCreationCallback("browser", () => {
+   Services.scriptloader.loadSubScript("chrome://global/content/elements/browser-custom-element.js", window);
+ });
+ 
+ // For now, don't load any elements in the extension dummy document.
+ // We will want to load <browser> when that's migrated (bug 1441935).
+ const isDummyDocument = document.documentURI == "chrome://extensions/content/dummy.xul";
