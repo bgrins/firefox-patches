@@ -3,7 +3,7 @@
 # Date 1553896109 25200
 #      Fri Mar 29 14:48:29 2019 -0700
 # Node ID 1c75c558222ddc5ec2853cda46a3f066c6ef8287
-# Parent  e31357c7759379d2279b6883cb09c91997bfaa5d
+# Parent  a5a5ddfb5178f8a2b30d186d3cf478da38f324ba
 Bug 1540285 - WIP - Move test generator script into `./mach addtest`
 
 This also changes the template files in the following ways:
@@ -33,10 +33,41 @@ But you can also pass in a new file path and let it guess the flavor/doc:
 
 Differential Revision: https://phabricator.services.mozilla.com/D25482
 
+diff --git a/js/xpconnect/tests/chrome/chrome.ini b/js/xpconnect/tests/chrome/chrome.ini
+--- a/js/xpconnect/tests/chrome/chrome.ini
++++ b/js/xpconnect/tests/chrome/chrome.ini
+@@ -115,8 +115,9 @@ skip-if = os == 'win' || os == 'mac' || 
+ [test_weakmap_keys_preserved2.xul]
+ [test_weakref.xul]
+ [test_windowProxyDeadWrapper.html]
+ [test_wrappers.xul]
+ [test_xrayic.xul]
+ [test_xrayToJS.xul]
+ [test_bug1530146.html]
+ support-files = file_bug1530146.html file_bug1530146_inner.html
++[test_zzzzs.html]
 diff --git a/testing/mach_commands.py b/testing/mach_commands.py
 --- a/testing/mach_commands.py
 +++ b/testing/mach_commands.py
-@@ -79,16 +79,108 @@ def get_test_parser():
+@@ -20,16 +20,17 @@ from mach.decorators import (
+ )
+ 
+ from mozbuild.base import (
+     BuildEnvironmentNotFoundException,
+     MachCommandBase,
+     MachCommandConditions as conditions,
+ )
+ from moztest.resolve import TEST_SUITES
++import manifestparser
+ 
+ UNKNOWN_TEST = '''
+ I was unable to find tests from the given argument(s).
+ 
+ You should specify a test directory, filename, test suite name, or
+ abbreviation. If no arguments are given, there must be local file
+ changes and corresponding IMPACTED_TESTS annotations in moz.build
+ files relevant to those files.
+@@ -79,16 +80,148 @@ def get_test_parser():
                          help="Extra arguments to pass to the underlying test command(s). "
                               "If an underlying command doesn't recognize the argument, it "
                               "will fail.")
@@ -54,7 +85,7 @@ diff --git a/testing/mach_commands.py b/testing/mach_commands.py
 +                          'If you pass a `test` argument this will be determined'
 +                          'based on the filename and the folder it is in')
 +    @CommandArgument('-d', '--doc',
-+                     choices=['html', 'xhtml', 'xul'],
++                     choices=['js', 'html', 'xhtml', 'xul'],
 +                     help='Document type for the test (if applicable).'
 +                          'If you pass a `test` argument this will be determined'
 +                          'based on the filename.')
@@ -63,6 +94,8 @@ diff --git a/testing/mach_commands.py b/testing/mach_commands.py
 +                     help=('Test to create.'))
 +    def addtest(self, type=None, doc=None, test=None):
 +        if test and test[0]:
++            # If you pass a filename, try to detect the type based on the name
++            # and folder. This detection can be skipped if you pass the `type` arg.
 +            test = os.path.abspath(test[0])
 +            if os.path.isfile(test):
 +                print("Error: can't generate a test that already exists:", test)
@@ -91,12 +124,12 @@ diff --git a/testing/mach_commands.py b/testing/mach_commands.py
 +            print("Error: type not specified, and couldn't be detected from the test path.")
 +            return 1
 +
-+        if not doc:
-+            print("Error: doc couldn't be detected from the test path.",
-+                  "The test should end in (js|html|xhtml|xul)")
++        if not doc in ['js','html','xhtml','xul']:
++            print("Error: invalid `doc`. Either pass in a test with a valid extension"
++                  "(js|html|xhtml|xul) or pass in the `doc` argument")
 +            return 1
 +
-+        print("Using type ({}) and doc type ({})".format(type, doc))
++        print("Adding a test of type `{}` and doc type `{}`".format(type, doc))
 +
 +        content = self.get_template_contents(type, doc)
 +
@@ -105,36 +138,74 @@ diff --git a/testing/mach_commands.py b/testing/mach_commands.py
 +            return 1
 +
 +        if (test):
++            # write the test to a file and attempt to insert into the appropriate manifest
 +            guessed_ini = "mochitest.ini" if type == "plain" else "{}.ini".format(type)
 +            with open(test, "w") as f:
 +                f.write(content)
-+            print('Please make sure to hg add {} and add it to {}'.format(test, guessed_ini))
++
++            manifest_file = os.path.join(os.path.dirname(test), guessed_ini)
++            filename = os.path.basename(test)
++
++            if os.path.isfile(manifest_file):
++                self.add_test_to_manifest(manifest_file, filename)
++            else:
++                print('Could not open manifest file {}'.format(manifest_file))
++
++            print('Please make sure to `hg add {}`'.format(test))
 +        else:
++            # write to stdout if you passed only type and doc and not a file path
 +            print(content)
 +        return 0
 +
++    def add_test_to_manifest(self, manifest_file, filename):
++        # Insert a new test in the right place within a given manifest file
++        manifest = manifestparser.TestManifest(manifests=[manifest_file])
++        insert_before = None
++        for test in manifest.tests:
++            if test.get('name') > filename:
++                insert_before = test.get('name')
++                break
++
++        with open(manifest_file, "r") as f:
++            contents = f.readlines()
++
++        filename = '[{}]\n'.format(filename)
++
++        if not insert_before:
++            contents.append(filename)
++        else:
++            insert_before = '[{}]'.format(insert_before)
++            for i in range(len(contents)):
++                if contents[i].startswith(insert_before):
++                    contents.insert(i, filename)
++                    break
++
++        with open(manifest_file, "w") as f:
++            f.write("".join(contents))
++
 +    def get_template_contents(self, type, doc):
-+        template_file = None
-+
-+        if type == "browser":
-+            template_file = 'browser.template.txt'
-+
-+        if type == "plain":
-+            template_file = 'plain{}.template.txt'.format(doc)
-+
-+        if type == "chrome":
-+            template_file = 'chrome{}.template.txt'.format(doc)
-+
-+        if template_file is None:
-+            return None
-+
 +        mochitest_templates = os.path.abspath(
 +            os.path.join(os.path.dirname(__file__), 'mochitest', 'static')
 +        )
-+        with open(os.path.join(mochitest_templates, template_file)) as f:
-+            content = f.read()
++        template_file_name = None
++        if type == "browser":
++            template_file_name = 'browser.template.txt'
 +
-+        return content
++        if type == "plain":
++            template_file_name = 'plain{}.template.txt'.format(doc)
++
++        if type == "chrome":
++            template_file_name = 'chrome{}.template.txt'.format(doc)
++
++        if template_file_name is None:
++            return None
++
++        template_file = os.path.join(mochitest_templates, template_file_name)
++        if not os.path.isfile(template_file):
++            return None
++
++        with open(template_file) as f:
++            return f.read()
 +
 +
  class Test(MachCommandBase):
@@ -224,14 +295,14 @@ new file mode 100644
 +"use strict";
 +
 +add_task(async function test_TODO() {() {
-+
++  ok(true, "TODO: implement the test");
 +});
 diff --git a/testing/mochitest/static/chrome.template.txt b/testing/mochitest/static/chromehtml.template.txt
 rename from testing/mochitest/static/chrome.template.txt
 rename to testing/mochitest/static/chromehtml.template.txt
 --- a/testing/mochitest/static/chrome.template.txt
 +++ b/testing/mochitest/static/chromehtml.template.txt
-@@ -1,31 +1,24 @@
+@@ -1,31 +1,23 @@
  <!DOCTYPE HTML>
  <html>
 -<!--
@@ -247,16 +318,16 @@ rename to testing/mochitest/static/chromehtml.template.txt
 +  <script src="chrome://mochikit/content/tests/SimpleTest/AddTask.js"></script>
    <link rel="stylesheet" type="text/css" href="chrome://mochikit/content/tests/SimpleTest/test.css"/>
 -  <script type="application/javascript">
-+  <script>
-+    SimpleTest.waitForExplicitFinish();
-+    add_task(async function test_TODO() {
- 
+-
 -  /** Test for Bug {BUGNUMBER} **/
 -
 -
 -
 -
 -
++  <script>
++    add_task(async function test_TODO() {
++      ok(true, "TODO: implement the test");
 +    });
    </script>
  </head>
@@ -274,7 +345,7 @@ diff --git a/testing/mochitest/static/chromexhtml.template.txt b/testing/mochite
 new file mode 100644
 --- /dev/null
 +++ b/testing/mochitest/static/chromexhtml.template.txt
-@@ -0,0 +1,24 @@
+@@ -0,0 +1,23 @@
 +<!DOCTYPE HTML>
 +<html xmlns="http://www.w3.org/1999/xhtml">
 +<head>
@@ -284,9 +355,8 @@ new file mode 100644
 +  <script src="chrome://mochikit/content/tests/SimpleTest/AddTask.js"></script>
 +  <link rel="stylesheet" type="text/css" href="chrome://mochikit/content/tests/SimpleTest/test.css"/>
 +  <script><![CDATA[
-+    SimpleTest.waitForExplicitFinish();
 +    add_task(async function test_TODO() {
-+
++      ok(true, "TODO: implement the test");
 +    });
 +  ]]></script>
 +</head>
@@ -302,7 +372,7 @@ new file mode 100644
 diff --git a/testing/mochitest/static/chromexul.template.txt b/testing/mochitest/static/chromexul.template.txt
 --- a/testing/mochitest/static/chromexul.template.txt
 +++ b/testing/mochitest/static/chromexul.template.txt
-@@ -1,26 +1,19 @@
+@@ -1,26 +1,18 @@
  <?xml version="1.0"?>
  <?xml-stylesheet type="text/css" href="chrome://global/skin"?>
  <?xml-stylesheet type="text/css" href="chrome://mochikit/content/tests/SimpleTest/test.css"?>
@@ -318,13 +388,12 @@ diff --git a/testing/mochitest/static/chromexul.template.txt b/testing/mochitest
 +<script type="application/javascript"
 +        src="chrome://mochikit/content/tests/SimpleTest/AddTask.js" />
 +  <script type="application/javascript"><![CDATA[
-+    SimpleTest.waitForExplicitFinish();
 +    add_task(async function test_TODO() {
- 
--  <!-- test results are displayed in the html:body -->
++      ok(true, "TODO: implement the test");
 +    });
 +  ]]></script>
-+
+ 
+-  <!-- test results are displayed in the html:body -->
    <body xmlns="http://www.w3.org/1999/xhtml">
 -  <a href="https://bugzilla.mozilla.org/show_bug.cgi?id={BUGNUMBER}"
 -     target="_blank">Mozilla Bug {BUGNUMBER}</a>
@@ -345,7 +414,7 @@ rename from testing/mochitest/static/test.template.txt
 rename to testing/mochitest/static/plainhtml.template.txt
 --- a/testing/mochitest/static/test.template.txt
 +++ b/testing/mochitest/static/plainhtml.template.txt
-@@ -1,30 +1,24 @@
+@@ -1,30 +1,23 @@
  <!DOCTYPE HTML>
  <html>
 -<!--
@@ -360,16 +429,16 @@ rename to testing/mochitest/static/plainhtml.template.txt
 +  <script src="/tests/SimpleTest/AddTask.js"></script>
    <link rel="stylesheet" type="text/css" href="/tests/SimpleTest/test.css"/>
 -  <script type="application/javascript">
-+  <script>
-+    SimpleTest.waitForExplicitFinish();
-+    add_task(async function test_TODO() {
- 
+-
 -  /** Test for Bug {BUGNUMBER} **/
 -
 -
 -
 -
 -
++  <script>
++    add_task(async function test_TODO() {
++      ok(true, "TODO: implement the test");
 +    });
    </script>
  </head>
@@ -388,7 +457,7 @@ rename from testing/mochitest/static/xhtml.template.txt
 rename to testing/mochitest/static/plainxhtml.template.txt
 --- a/testing/mochitest/static/xhtml.template.txt
 +++ b/testing/mochitest/static/plainxhtml.template.txt
-@@ -1,29 +1,24 @@
+@@ -1,29 +1,23 @@
 +<!DOCTYPE HTML>
  <html xmlns="http://www.w3.org/1999/xhtml">
 -<!--
@@ -406,15 +475,15 @@ rename to testing/mochitest/static/plainxhtml.template.txt
 -  <![CDATA[
 -
 -  /** Test for Bug {BUGNUMBER} **/
-+  <script><![CDATA[
-+    SimpleTest.waitForExplicitFinish();
-+    add_task(async function test_TODO() {
- 
+-
 -
 -
 -
 -  ]]>
 -</script>
++  <script><![CDATA[
++    add_task(async function test_TODO() {
++      ok(true, "TODO: implement the test");
 +    });
 +  ]]></script>
  </head>
@@ -433,7 +502,7 @@ rename from testing/mochitest/static/xul.template.txt
 rename to testing/mochitest/static/plainxul.template.txt
 --- a/testing/mochitest/static/xul.template.txt
 +++ b/testing/mochitest/static/plainxul.template.txt
-@@ -1,28 +1,17 @@
+@@ -1,28 +1,16 @@
  <?xml version="1.0"?>
  <?xml-stylesheet type="text/css" href="chrome://global/skin"?>
  <?xml-stylesheet type="text/css" href="/tests/SimpleTest/test.css"?>
@@ -452,15 +521,15 @@ rename to testing/mochitest/static/plainxul.template.txt
 +<script type="application/javascript" src="/tests/SimpleTest/SimpleTest.js"></script>
 +<script type="application/javascript" src="/tests/SimpleTest/AddTask.js"></script>
 +  <script type="application/javascript"><![CDATA[
-+    SimpleTest.waitForExplicitFinish();
 +    add_task(async function test_TODO() {
++      ok(true, "TODO: implement the test");
++    });
++  ]]></script>
  
 -  /** Test for Bug {BUGNUMBER} **/
 -
 -
-+    });
-+  ]]></script>
- 
+-
 -  ]]>
 -  </script>
 -
