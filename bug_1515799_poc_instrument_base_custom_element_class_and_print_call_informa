@@ -2,8 +2,8 @@
 # User Brian Grinstead <bgrinstead@mozilla.com>
 # Date 1553628413 25200
 #      Tue Mar 26 12:26:53 2019 -0700
-# Node ID ff1d6a5608e00765dce1ef9650a1e2ffac675fb6
-# Parent  e31357c7759379d2279b6883cb09c91997bfaa5d
+# Node ID dbe94e861c6cdd5800f1861a91aebe63b7eebc32
+# Parent  e8b3c73b4e328be88aa90f31e1fa9772b537507d
 Bug 1515799 - POC - Instrument base custom element class and print call information in a table at startup
 
 This isn't intended to land, just a demonstration of a way we could get more insight into how much
@@ -14,7 +14,7 @@ Differential Revision: https://phabricator.services.mozilla.com/D24953
 diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.js
 --- a/toolkit/content/customElements.js
 +++ b/toolkit/content/customElements.js
-@@ -13,18 +13,148 @@
+@@ -13,18 +13,171 @@
  (() => {
  // Handle customElements.js being loaded as a script in addition to the subscriptLoader
  // from MainProcessSingleton, to handle pages that can open both before and after
@@ -28,38 +28,48 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
 +
  const {Services} = ChromeUtils.import("resource://gre/modules/Services.jsm");
  const {AppConstants} = ChromeUtils.import("resource://gre/modules/AppConstants.jsm");
-+const instrumentClasses = true; // Flip this to get logging for perf data at startup
++const env = Cc["@mozilla.org/process/environment;1"].getService(Ci.nsIEnvironment);
++const instrumentClasses = !!env.get("MOZ_INSTRUMENT_CUSTOM_ELEMENTS");
 +const instrumentedClasses = new Set();
 +const baseClasses = new WeakSet();
 +
 +// Wrap the normal customElements.define to give us a chance to modify the
 +// class so we can instrument function calls in local development:
-+let define = window.customElements.define;
-+window.customElements.define = function(name, c, opts) {
-+  instrumentCustomElementClass(c);
-+  return define.call(this, name, c, opts);
-+};
++if (instrumentClasses) {
++  let define = window.customElements.define;
++  window.customElements.define = function(name, c, opts) {
++    instrumentCustomElementClass(c);
++    return define.call(this, name, c, opts);
++  };
++}
 +
 +MozElements.printInstrumentation = function(collapsed) {
-+  if (instrumentedClasses.size) {
-+    let groupName = `Instrumentation data for custom elements in ${document.documentURI}`;
-+    console[collapsed ? "groupCollapsed" : "group"](groupName);
-+    for (let c of instrumentedClasses) {
-+      let stats = c.stats;
-+      if (stats) {
-+        console.log(`${c.name}`);
-+        console.table(stats);
-+      }
-+    }
-+    console.groupEnd(groupName);
-+  }
++  // let summaries = [];
++  // let totalCalls = 0;
++  // let totalTime = 0;
++  // for (let c of instrumentedClasses) {
++  //   let summary = c.__instrumentation_summary;
++  //   if (summary) {
++  //     summaries.push(summary);
++  //     totalCalls += summary.totalCalls;
++  //     totalTime += summary.totalTime;
++  //   }
++  // }
++  // if (summaries.length) {
++  //   let groupName = `Instrumentation data for custom elements in ${document.documentURI}`;
++  //   console[collapsed ? "groupCollapsed" : "group"](groupName);
++  //   console.log(`Total function calls ${totalCalls} and total time spent inside ${totalTime.toFixed(2)}`);
++  //   for (let summary of summaries) {
++  //     console.log(`${summary.name} (# instances: ${summary.instances})`);
++  //     if (Object.keys(summary.data).length > 1) {
++  //       console.table(summary.data);
++  //     }
++  //   }
++  //   console.groupEnd(groupName);
++  // }
 +};
 +
 +function instrumentCustomElementClass(c) {
-+  if (!instrumentClasses) {
-+    return;
-+  }
-+
 +  // Climb up prototype chain to see if we inherit from a MozElement.
 +  // Keep track of classes to instrument, for example:
 +  //   MozMenuCaption->MozMenuBase->BaseText->BaseControl->MozXULElement
@@ -87,7 +97,7 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
 +    return;
 +  }
 +  instrumentedClasses.add((c));
-+  let data = {};
++  let data = { instances: 0 };
 +
 +  function wrapFunction(name, fn) {
 +    return function() {
@@ -129,29 +139,42 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
 +    wrapPropertyDescriptor(c.prototype, name);
 +  }
 +
-+  Object.defineProperty(c, "stats", {
++  c.__instrumentation_data = data;
++  Object.defineProperty(c, "__instrumentation_summary", {
 +    enumerable: false,
 +    configurable: false,
 +    get() {
-+      if (!Object.keys(data).length) {
++      // let keys = Object.keys(data);
++      if (data.instances == 0) {
 +        return null;
 +      }
 +
 +      let clonedData = JSON.parse(JSON.stringify(data));
++      delete clonedData.instances;
 +      let totalCalls = 0;
 +      let totalTime = 0;
 +      for (let d in clonedData) {
 +        let {time, calls} = clonedData[d];
++        time = parseFloat(time.toFixed(2));
 +        totalCalls += calls;
 +        totalTime += time;
 +        clonedData[d]["time (ms)"] = time;
 +        delete clonedData[d].time;
-+        clonedData[d].timePerCall = time / calls;
++        clonedData[d].timePerCall = parseFloat((time / calls).toFixed(4));
 +      }
 +
++      let timePerCall =  parseFloat((totalTime / totalCalls).toFixed(4));
++      totalTime = parseFloat(totalTime.toFixed(2));
++
 +      // Add a spaced-out final row with summed up totals
-+      clonedData["\ntotals"]  = { "time (ms)": `\n${totalTime}`, calls: `\n${totalCalls}`, timePerCall: `\n${totalTime / totalCalls}` };
-+      return clonedData;
++      clonedData["\ntotals"]  = { "time (ms)": `\n${totalTime}`, calls: `\n${totalCalls}`, timePerCall: `\n${timePerCall}` };
++      return {
++        instances: data.instances,
++        data: clonedData,
++        name: c.name,
++        totalCalls,
++        totalTime,
++      };
 +    },
 +  });
 +}
@@ -163,7 +186,7 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
  let gIsDOMContentLoaded = false;
  const gElementsPendingConnection = new Set();
  window.addEventListener("DOMContentLoaded", () => {
-@@ -34,24 +164,24 @@ window.addEventListener("DOMContentLoade
+@@ -34,24 +187,37 @@ window.addEventListener("DOMContentLoade
        if (element.isConnected) {
          element.isRunningDelayedConnectedCallback = true;
          element.connectedCallback();
@@ -172,17 +195,29 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
      element.isRunningDelayedConnectedCallback = false;
    }
    gElementsPendingConnection.clear();
-+  MozElements.printInstrumentation(true);
++  if (instrumentClasses) {
++    MozElements.printInstrumentation(true);
++  }
  }, { once: true, capture: true });
  
  const gXULDOMParser = new DOMParser();
  gXULDOMParser.forceEnableXULXBL();
  
 -const MozElements = {};
--
--MozElements.MozElementMixin = Base => class MozElement extends Base {
 +MozElements.MozElementMixin = Base => {
 +  let MozElementBase = class extends Base {
++  constructor() {
++    super();
+ 
+-MozElements.MozElementMixin = Base => class MozElement extends Base {
++    if (instrumentClasses) {
++      let proto = this.constructor;
++      while (proto && proto != Base) {
++        proto.__instrumentation_data.instances++;
++        proto = Object.getPrototypeOf(proto);
++      }
++    }
++  }
    /*
     * A declarative way to wire up attribute inheritance and automatically generate
     * the `observedAttributes` getter.  For example, if you returned:
@@ -191,7 +226,7 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
     *    }
     *
     * Then the base class will automatically return ["bar", "bat"] from `observedAttributes`,
-@@ -110,16 +240,17 @@ MozElements.MozElementMixin = Base => cl
+@@ -110,16 +276,17 @@ MozElements.MozElementMixin = Base => cl
    *   this.initializeAttributeInheritance();
    *
    */
@@ -209,7 +244,7 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
        // Skip unmatched selectors in case an element omits some elements in certain cases:
        if (!el) {
          continue;
-@@ -367,16 +498,22 @@ MozElements.MozElementMixin = Base => cl
+@@ -367,16 +534,22 @@ MozElements.MozElementMixin = Base => cl
      cls.prototype.QueryInterface = ChromeUtils.generateQI(ifaces);
      cls.prototype.getCustomInterfaceCallback = function getCustomInterfaceCallback(ifaceToCheck) {
        if (cls.prototype.customInterfaces.some(iface => iface.equals(ifaceToCheck))) {
@@ -232,7 +267,7 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
   * Given an object, add a proxy that reflects interface implementations
   * onto the object itself.
   */
-@@ -430,17 +567,17 @@ MozElements.BaseControlMixin = Base => {
+@@ -430,17 +603,17 @@ MozElements.BaseControlMixin = Base => {
    }
  
    Base.implementCustomInterface(BaseControl,
@@ -251,7 +286,7 @@ diff --git a/toolkit/content/customElements.js b/toolkit/content/customElements.
    get label() {
      return this.getAttribute("label");
    }
-@@ -486,17 +623,16 @@ const BaseTextMixin = Base => class exte
+@@ -486,17 +659,16 @@ const BaseTextMixin = Base => class exte
    get accessKey() {
      return this.labelElement ? this.labelElement.accessKey : this.getAttribute("accesskey");
    }
