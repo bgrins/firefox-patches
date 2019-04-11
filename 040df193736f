@@ -1,0 +1,743 @@
+
+# HG changeset patch
+# User James Graham <james@hoppipolla.co.uk>
+# Date 1554975872 0
+# Node ID 040df193736f2274ca87a23d0fb405b4a0f2e1f2
+# Parent  43b78a85f3266f65c0ed4045e28c16dec90b480c
+Bug 1543244 - Refactor mach addtest support, r=ahal,bgrins
+
+Add addtest support for per-suite arguments and multiple files. Also
+support opening the created test in an editor. This allowed supporting
+the wpt suite and replaces `mach wpt-create`.
+
+ # Create a wpt test
+ ./mach addtest testing/web-platform/tests/accelerometer/test.html
+
+ # Create a wpt reftest
+ ./mach addtest --suite wpt-reftesttesting/web-platform/tests/css/example.html --ref example-ref.html
+
+The files created will be opened in the default editor if --editor is
+supplied or a specified editor if the argument is given a value.
+
+Differential Revision: https://phabricator.services.mozilla.com/D26339
+
+diff --git a/testing/addtest.py b/testing/addtest.py
+--- a/testing/addtest.py
++++ b/testing/addtest.py
+@@ -1,89 +1,280 @@
+ 
+ from __future__ import absolute_import, unicode_literals, print_function
+ 
+ import os
+ import manifestparser
+ 
+ 
+-class XpcshellCreator():
++class Creator(object):
++    def __init__(self, topsrcdir, test, suite, doc, **kwargs):
++        self.topsrcdir = topsrcdir
++        self.test = test
++        self.suite = suite
++        self.doc = doc
++        self.kwargs = kwargs
++
++    def check_args(self):
++        """Perform any validation required for suite-specific arguments"""
++        return True
++
++    def __iter__(self):
++        """Iterate over a list of (path, data) tuples coresponding to the files
++        to be created"""
++        yield (self.test, self._get_template_contents())
++
++    def _get_template_contents(self, **kwargs):
++        raise NotImplementedError
++
++    def update_manifest(self):
++        """Perform any manifest updates required to register the added tests"""
++        raise NotImplementedError
++
++
++class XpcshellCreator(Creator):
+     template_body = """/* Any copyright is dedicated to the Public Domain.
+ http://creativecommons.org/publicdomain/zero/1.0/ */
+ 
+ "use strict";
+ 
+ add_task(async function test_TODO() {
+   ok(true, "TODO: implement the test");
+ });
+ """
+ 
+-    def get_template_contents(self, suite, doc):
++    def _get_template_contents(self):
+         return self.template_body
+ 
+-    def add_test(self, test, suite, doc):
+-        content = self.get_template_contents(suite, doc)
+-        with open(test, "w") as f:
+-            f.write(content)
+-
+-        manifest_file = os.path.join(os.path.dirname(test), "xpcshell.ini")
+-        filename = os.path.basename(test)
++    def update_manifest(self):
++        manifest_file = os.path.join(os.path.dirname(self.test), "xpcshell.ini")
++        filename = os.path.basename(self.test)
+ 
+         if not os.path.isfile(manifest_file):
+             print('Could not open manifest file {}'.format(manifest_file))
+             return
+         write_to_ini_file(manifest_file, filename)
+ 
+ 
+-class MochitestCreator():
+-    def get_template_contents(self, suite, doc):
++class MochitestCreator(Creator):
++    templates = {
++        "mochitest-browser": "browser.template.txt",
++        "mochitest-plain": "plain%(doc)s.template.txt",
++        "mochitest-chrome": "chrome%(doc)s.template.txt",
++    }
++
++    def _get_template_contents(self):
+         mochitest_templates = os.path.abspath(
+             os.path.join(os.path.dirname(__file__), 'mochitest', 'static')
+         )
+         template_file_name = None
+-        if suite == "mochitest-browser":
+-            template_file_name = 'browser.template.txt'
+ 
+-        if suite == "mochitest-plain":
+-            template_file_name = 'plain{}.template.txt'.format(doc)
+-
+-        if suite == "mochitest-chrome":
+-            template_file_name = 'chrome{}.template.txt'.format(doc)
++        template_file_name = self.templates.get(self.suite)
+ 
+         if template_file_name is None:
+             return None
+ 
++        template_file_name = template_file_name % {"doc": self.doc}
++
+         template_file = os.path.join(mochitest_templates, template_file_name)
+         if not os.path.isfile(template_file):
+             return None
+ 
+         with open(template_file) as f:
+             return f.read()
+ 
+-    def add_test(self, test, suite, doc):
+-        content = self.get_template_contents(suite, doc)
+-        with open(test, "w") as f:
+-            f.write(content)
+-
++    def update_manifest(self):
+         # attempt to insert into the appropriate manifest
+         guessed_ini = {
+             "mochitest-plain": "mochitest.ini",
+             "mochitest-chrome": "chrome.ini",
+             "mochitest-browser": "browser.ini"
+-        }[suite]
+-        manifest_file = os.path.join(os.path.dirname(test), guessed_ini)
+-        filename = os.path.basename(test)
++        }[self.suite]
++        manifest_file = os.path.join(os.path.dirname(self.test), guessed_ini)
++        filename = os.path.basename(self.test)
+ 
+         if not os.path.isfile(manifest_file):
+             print('Could not open manifest file {}'.format(manifest_file))
+             return
+ 
+         write_to_ini_file(manifest_file, filename)
+ 
+ 
++class WebPlatformTestsCreator(Creator):
++    template_prefix = """<!doctype html>
++%(documentElement)s<meta charset=utf-8>
++"""
++    template_long_timeout = "<meta name=timeout content=long>\n"
++
++    template_body_th = """<title></title>
++<script src=/resources/testharness.js></script>
++<script src=/resources/testharnessreport.js></script>
++<script>
++
++</script>
++"""
++
++    template_body_reftest = """<title></title>
++<link rel=%(match)s href=%(ref)s>
++"""
++
++    template_body_reftest_wait = """<script src="/common/reftest-wait.js"></script>
++"""
++
++    upstream_path = os.path.join("testing", "web-platform", "tests")
++    local_path = os.path.join("testing", "web-platform", "mozilla", "tests")
++
++    def __init__(self, *args, **kwargs):
++        super(WebPlatformTestsCreator, self).__init__(*args, **kwargs)
++        self.reftest = self.suite == "web-platform-tests-reftest"
++
++    @classmethod
++    def get_parser(cls, parser):
++        parser.add_argument("--long-timeout", action="store_true",
++                            help="Test should be given a long timeout "
++                            "(typically 60s rather than 10s, but varies depending on environment)")
++        parser.add_argument("-m", "--reference", dest="ref", help="Path to the reference file")
++        parser.add_argument("--mismatch", action="store_true",
++                            help="Create a mismatch reftest")
++        parser.add_argument("--wait", action="store_true",
++                            help="Create a reftest that waits until takeScreenshot() is called")
++
++    def check_args(self):
++        if self.wpt_type(self.test) is None:
++            print("""Test path %s is not in wpt directories:
++testing/web-platform/tests for tests that may be shared
++testing/web-platform/mozilla/tests for Gecko-only tests""" % self.test)
++            return False
++
++        if not self.reftest:
++            if self.kwargs["ref"]:
++                print("--ref only makes sense for a reftest")
++                return False
++
++            if self.kwargs["mismatch"]:
++                print("--mismatch only makes sense for a reftest")
++                return False
++
++            if self.kwargs["wait"]:
++                print("--wait only makes sense for a reftest")
++                return False
++        else:
++            # Set the ref to a url relative to the test
++            if self.kwargs["ref"]:
++                if self.ref_path(self.kwargs["ref"]) is None:
++                    print("--ref doesn't refer to a path inside web-platform-tests")
++                    return False
++
++    def __iter__(self):
++        yield (self.test, self._get_template_contents())
++
++        if self.reftest and self.kwargs["ref"]:
++            ref_path = self.ref_path(self.kwargs["ref"])
++            yield (ref_path, self._get_template_contents(reference=True))
++
++    def _get_template_contents(self, reference=False):
++        args = {"documentElement": "<html class=reftest-wait>\n"
++                if self.kwargs["wait"] else ""}
++
++        template = self.template_prefix % args
++        if self.kwargs["long_timeout"]:
++            template += self.template_long_timeout
++
++        if self.reftest:
++            if not reference:
++                args = {"match": "match" if not self.kwargs["mismatch"] else "mismatch",
++                        "ref": self.ref_url(self.kwargs["ref"]) if self.kwargs["ref"] else '""'}
++                template += self.template_body_reftest % args
++                if self.kwargs["wait"]:
++                    template += self.template_body_reftest_wait
++            else:
++                template += "<title></title>"
++        else:
++            template += self.template_body_th
++
++        return template
++
++    def update_manifest(self):
++        pass
++
++    def src_rel_path(self, path):
++        if path is None:
++            return
++
++        abs_path = os.path.normpath(os.path.abspath(path))
++        return os.path.relpath(abs_path, self.topsrcdir)
++
++    def wpt_type(self, path):
++        path = self.src_rel_path(path)
++        if path.startswith(self.upstream_path):
++            return "upstream"
++        elif path.startswith(self.local_path):
++            return "local"
++        return None
++
++    def ref_path(self, path):
++        # The ref parameter can be one of several things
++        # 1. An absolute path to a reference file
++        # 2. A path to a file relative to the topsrcdir
++        # 3. A path relative to the test file
++        # These are not unambiguous, so it's somewhat best effort
++
++        if os.path.isabs(path):
++            path = os.path.normpath(path)
++            if not path.startswith(self.topsrcdir):
++                # Path is an absolute URL relative to the tests root
++                if path.startswith("/_mozilla/"):
++                    base = self.local_path
++                    path = path[len("/_mozilla/"):]
++                else:
++                    base = self.upstream_path
++                    path = path[1:]
++                path = path.replace("/", os.sep)
++                return os.path.join(base, path)
++            else:
++                return self.src_rel_path(path)
++        else:
++            if self.wpt_type(path) is not None:
++                return path
++            else:
++                test_rel_path = self.src_rel_path(
++                    os.path.join(os.path.dirname(self.test), path))
++                if self.wpt_type(test_rel_path) is not None:
++                    return test_rel_path
++        # Returning None indicates that the path wasn't valid
++
++    def ref_url(self, path):
++        ref_path = self.ref_path(path)
++        if not ref_path:
++            return
++
++        if path[0] == "/" and len(path) < len(ref_path):
++            # This is an absolute url
++            return path
++
++        # Othewise it's a file path
++        wpt_type_ref = self.wpt_type(ref_path)
++        wpt_type_test = self.wpt_type(self.test)
++        if wpt_type_ref == wpt_type_test:
++            return os.path.relpath(ref_path, os.path.dirname(self.test))
++
++        # If we have a local test referencing an upstream ref,
++        # or vice-versa use absolute paths
++        if wpt_type_ref == "upstream":
++            rel_path = os.path.relpath(ref_path, self.upstream_path)
++            url_base = "/"
++        elif wpt_type_ref == "local":
++            rel_path = os.path.relpath(ref_path, self.local_path)
++            url_base = "/_mozilla/"
++        else:
++            return None
++        return url_base + rel_path.replace(os.path.sep, "/")
++
++
++# Insert a new test in the right place within a given manifest file
+ def write_to_ini_file(manifest_file, filename):
+     # Insert a new test in the right place within a given manifest file
+     manifest = manifestparser.TestManifest(manifests=[manifest_file])
+     insert_before = None
+ 
+     if any(t['name'] == filename for t in manifest.tests):
+         print("{} is already in the manifest.".format(filename))
+         return
+@@ -104,8 +295,18 @@ def write_to_ini_file(manifest_file, fil
+         insert_before = '[{}]'.format(insert_before)
+         for i in range(len(contents)):
+             if contents[i].startswith(insert_before):
+                 contents.insert(i, filename)
+                 break
+ 
+     with open(manifest_file, "w") as f:
+         f.write("".join(contents))
++
++
++TEST_CREATORS = {"mochitest": MochitestCreator,
++                 "web-platform-tests": WebPlatformTestsCreator,
++                 "xpcshell": XpcshellCreator}
++
++
++def creator_for_suite(suite):
++    base_suite = suite.rsplit("-", 1)[0]
++    return TEST_CREATORS.get(base_suite)
+diff --git a/testing/mach_commands.py b/testing/mach_commands.py
+--- a/testing/mach_commands.py
++++ b/testing/mach_commands.py
+@@ -79,41 +79,77 @@ def get_test_parser():
+                         help="Extra arguments to pass to the underlying test command(s). "
+                              "If an underlying command doesn't recognize the argument, it "
+                              "will fail.")
+     add_logging_group(parser)
+     return parser
+ 
+ 
+ ADD_TEST_SUPPORTED_SUITES = ['mochitest-chrome', 'mochitest-plain', 'mochitest-browser',
++                             'web-platform-tests-testharness', 'web-platform-tests-reftest',
+                              'xpcshell']
+ ADD_TEST_SUPPORTED_DOCS = ['js', 'html', 'xhtml', 'xul']
+ 
++SUITE_SYNONYMS = {
++    "wpt": "web-platform-tests-testharness",
++    "wpt-testharness": "web-platform-tests-testharness",
++    "wpt-reftest": "web-platform-tests-reftest"
++}
++
++MISSING_ARG = object()
++
++
++def create_parser_addtest():
++    import addtest
++    parser = argparse.ArgumentParser()
++    parser.add_argument('--suite',
++                        choices=sorted(ADD_TEST_SUPPORTED_SUITES + SUITE_SYNONYMS.keys()),
++                        help='suite for the test. '
++                        'If you pass a `test` argument this will be determined '
++                        'based on the filename and the folder it is in')
++    parser.add_argument('-o', '--overwrite',
++                        action='store_true',
++                        help='Overwrite an existing file if it exists.')
++    parser.add_argument('--doc',
++                        choices=ADD_TEST_SUPPORTED_DOCS,
++                        help='Document type for the test (if applicable).'
++                        'If you pass a `test` argument this will be determined '
++                        'based on the filename.')
++    parser.add_argument("-e", "--editor", action="store", nargs="?",
++                        default=MISSING_ARG, help="Open the created file(s) in an editor; if a "
++                        "binary is supplied it will be used otherwise the default editor for "
++                        "your environment will be opened")
++
++    for base_suite in addtest.TEST_CREATORS:
++        cls = addtest.TEST_CREATORS[base_suite]
++        if hasattr(cls, "get_parser"):
++            group = parser.add_argument_group(base_suite)
++            cls.get_parser(group)
++
++    parser.add_argument('test',
++                        nargs='?',
++                        help=('Test to create.'))
++    return parser
++
+ 
+ @CommandProvider
+ class AddTest(MachCommandBase):
+     @Command('addtest', category='testing',
+-             description='Generate tests based on templates')
+-    @CommandArgument('--suite',
+-                     choices=ADD_TEST_SUPPORTED_SUITES,
+-                     help='suite for the test (currently only mochitests and xpcshell '
+-                          'are supported). If you pass a `test` argument this will be determined'
+-                          'based on the filename and the folder it is in')
+-    @CommandArgument('-o', '--overwrite',
+-                     action='store_true',
+-                     help='Overwrite an existing file if it exists.')
+-    @CommandArgument('--doc',
+-                     choices=ADD_TEST_SUPPORTED_DOCS,
+-                     help='Document type for the test (if applicable).'
+-                          'If you pass a `test` argument this will be determined'
+-                          'based on the filename.')
+-    @CommandArgument('test',
+-                     nargs='?',
+-                     help=('Test to create.'))
+-    def addtest(self, suite=None, doc=None, overwrite=False, test=None):
++             description='Generate tests based on templates',
++             parser=create_parser_addtest)
++    def addtest(self, suite=None, test=None, doc=None, overwrite=False,
++                editor=MISSING_ARG, **kwargs):
++        import addtest
++
++        if not suite and not test:
++            return create_parser_addtest().parse_args(["--help"])
++
++        if suite in SUITE_SYNONYMS:
++            suite = SUITE_SYNONYMS[suite]
++
+         if test:
+             if not overwrite and os.path.isfile(os.path.abspath(test)):
+                 print("Error: can't generate a test that already exists:", test)
+                 return 1
+ 
+             abs_test = os.path.abspath(test)
+             if doc is None:
+                 doc = self.guess_doc(abs_test)
+@@ -137,44 +173,73 @@ class AddTest(MachCommandBase):
+                   .format(ADD_TEST_SUPPORTED_SUITES))
+             return 1
+ 
+         if doc not in ADD_TEST_SUPPORTED_DOCS:
+             print("Error: invalid `doc`. Either pass in a test with a valid extension"
+                   "({}) or pass in the `doc` argument".format(ADD_TEST_SUPPORTED_DOCS))
+             return 1
+ 
+-        from addtest import (
+-            MochitestCreator,
+-            XpcshellCreator,
+-        )
+-        creator = None
+-        if suite == "xpcshell":
+-            creator = XpcshellCreator()
+-        elif suite in ("mochitest-browser", "mochitest-chrome", "mochitest-plain"):
+-            creator = MochitestCreator()
+-        else:
++        creator_cls = addtest.creator_for_suite(suite)
++
++        if creator_cls is None:
+             print("Sorry, `addtest` doesn't currently know how to add {}".format(suite))
+             return 1
+ 
+-        if (test):
+-            print("Adding a test at {} (suite `{}`)".format(test, suite))
++        creator = creator_cls(self.topsrcdir, test, suite, doc, **kwargs)
++
++        creator.check_args()
++
++        paths = []
++        for path, template in creator:
++            if (path):
++                paths.append(path)
++                print("Adding a test file at {} (suite `{}`)".format(path, suite))
+ 
+-            adding_error = creator.add_test(test, suite, doc)
++                try:
++                    os.makedirs(os.path.dirname(path))
++                except OSError:
++                    pass
+ 
+-            if adding_error:
+-                print("Error adding test: {}".format(adding_error))
+-                return 1
++                with open(path, "w") as f:
++                    f.write(template)
++            else:
++                # write to stdout if you passed only suite and doc and not a file path
++                print(template)
++
++        if test:
++            creator.update_manifest()
++
++            # Small hack, should really do this better
++            if suite.startswith("wpt-"):
++                suite = "web-platform-tests"
+ 
+             mach_command = TEST_SUITES[suite]["mach_command"]
+             print('Please make sure to add the new test to your commit. '
+                   'You can now run the test with:\n    ./mach {} {}'.format(mach_command, test))
+-        else:
+-            # write to stdout if you passed only suite and doc and not a file path
+-            print(creator.get_template_contents(suite, doc))
++
++        if editor is not MISSING_ARG:
++            if editor is not None:
++                editor = editor
++            elif "VISUAL" in os.environ:
++                editor = os.environ["VISUAL"]
++            elif "EDITOR" in os.environ:
++                editor = os.environ["EDITOR"]
++            else:
++                print('Unable to determine editor; please specify a binary')
++                editor = None
++
++            proc = None
++            if editor:
++                import subprocess
++                proc = subprocess.Popen("%s %s" % (editor, " ".join(paths)), shell=True)
++
++            if proc:
++                proc.wait()
++
+         return 0
+ 
+     def guess_doc(self, abs_test):
+         filename = os.path.basename(abs_test)
+         return os.path.splitext(filename)[1].strip(".")
+ 
+     def guess_suite(self, abs_test):
+         # If you pass a abs_test, try to detect the type based on the name
+@@ -184,17 +249,26 @@ class AddTest(MachCommandBase):
+         parent = os.path.dirname(abs_test)
+         filename = os.path.basename(abs_test)
+ 
+         has_browser_ini = os.path.isfile(os.path.join(parent, "browser.ini"))
+         has_chrome_ini = os.path.isfile(os.path.join(parent, "chrome.ini"))
+         has_plain_ini = os.path.isfile(os.path.join(parent, "mochitest.ini"))
+         has_xpcshell_ini = os.path.isfile(os.path.join(parent, "xpcshell.ini"))
+ 
+-        if filename.startswith("test_") and has_xpcshell_ini and self.guess_doc(abs_test) == "js":
++        in_wpt_folder = abs_test.startswith(
++            os.path.abspath(os.path.join("testing", "web-platform")))
++
++        if in_wpt_folder:
++            guessed_suite = "web-platform-tests-testharness"
++            if "/css/" in abs_test:
++                guessed_suite = "web-platform-tests-reftest"
++        elif (filename.startswith("test_") and
++              has_xpcshell_ini and
++              self.guess_doc(abs_test) == "js"):
+             guessed_suite = "xpcshell"
+         else:
+             if filename.startswith("browser_") and has_browser_ini:
+                 guessed_suite = "mochitest-browser"
+             elif filename.startswith("test_"):
+                 if has_chrome_ini and has_plain_ini:
+                     err = ("Error: directory contains both a chrome.ini and mochitest.ini. "
+                            "Please set --suite=mochitest-chrome or --suite=mochitest-plain.")
+diff --git a/testing/web-platform/mach_commands.py b/testing/web-platform/mach_commands.py
+--- a/testing/web-platform/mach_commands.py
++++ b/testing/web-platform/mach_commands.py
+@@ -191,133 +191,16 @@ class WebPlatformTestsUpdater(MozbuildOb
+             update.run_update(logger, **kwargs)
+         except Exception:
+             import pdb
+             import traceback
+             traceback.print_exc()
+ #            pdb.post_mortem()
+ 
+ 
+-class WebPlatformTestsCreator(MozbuildObject):
+-    template_prefix = """<!doctype html>
+-%(documentElement)s<meta charset=utf-8>
+-"""
+-    template_long_timeout = "<meta name=timeout content=long>\n"
+-
+-    template_body_th = """<title></title>
+-<script src=/resources/testharness.js></script>
+-<script src=/resources/testharnessreport.js></script>
+-<script>
+-
+-</script>
+-"""
+-
+-    template_body_reftest = """<title></title>
+-<link rel=%(match)s href=%(ref)s>
+-"""
+-
+-    template_body_reftest_wait = """<script src="/common/reftest-wait.js"></script>
+-"""
+-
+-    def rel_path(self, path):
+-        if path is None:
+-            return
+-
+-        abs_path = os.path.normpath(os.path.abspath(path))
+-        return os.path.relpath(abs_path, self.topsrcdir)
+-
+-    def rel_url(self, rel_path):
+-        upstream_path = os.path.join("testing", "web-platform", "tests")
+-        local_path = os.path.join("testing", "web-platform", "mozilla", "tests")
+-
+-        if rel_path.startswith(upstream_path):
+-            return rel_path[len(upstream_path):].replace(os.path.sep, "/")
+-        elif rel_path.startswith(local_path):
+-            return "/_mozilla" + rel_path[len(local_path):].replace(os.path.sep, "/")
+-        else:
+-            return None
+-
+-    def run_create(self, context, **kwargs):
+-        import subprocess
+-
+-        path = self.rel_path(kwargs["path"])
+-        ref_path = self.rel_path(kwargs["ref"])
+-
+-        if kwargs["ref"]:
+-            kwargs["reftest"] = True
+-
+-        if self.rel_url(path) is None:
+-            print("""Test path %s is not in wpt directories:
+-testing/web-platform/tests for tests that may be shared
+-testing/web-platform/mozilla/tests for Gecko-only tests""" % path)
+-            return 1
+-
+-        if ref_path and self.rel_url(ref_path) is None:
+-            print("""Reference path %s is not in wpt directories:
+-testing/web-platform/tests for tests that may be shared
+-            testing/web-platform/mozilla/tests for Gecko-only tests""" % ref_path)
+-            return 1
+-
+-        if os.path.exists(path) and not kwargs["overwrite"]:
+-            print("Test path already exists, pass --overwrite to replace")
+-            return 1
+-
+-        if kwargs["mismatch"] and not kwargs["reftest"]:
+-            print("--mismatch only makes sense for a reftest")
+-            return 1
+-
+-        if kwargs["wait"] and not kwargs["reftest"]:
+-            print("--wait only makes sense for a reftest")
+-            return 1
+-
+-        args = {"documentElement": "<html class=reftest-wait>\n" if kwargs["wait"] else ""}
+-        template = self.template_prefix % args
+-        if kwargs["long_timeout"]:
+-            template += self.template_long_timeout
+-
+-        if kwargs["reftest"]:
+-            args = {"match": "match" if not kwargs["mismatch"] else "mismatch",
+-                    "ref": self.rel_url(ref_path) if kwargs["ref"] else '""'}
+-            template += self.template_body_reftest % args
+-            if kwargs["wait"]:
+-                template += self.template_body_reftest_wait
+-        else:
+-            template += self.template_body_th
+-        try:
+-            os.makedirs(os.path.dirname(path))
+-        except OSError:
+-            pass
+-        with open(path, "w") as f:
+-            f.write(template)
+-
+-        ref_path = kwargs["ref"]
+-        if ref_path and not os.path.exists(ref_path):
+-            with open(ref_path, "w") as f:
+-                f.write(self.template_prefix % {"documentElement": ""})
+-
+-        if kwargs["no_editor"]:
+-            editor = None
+-        elif kwargs["editor"]:
+-            editor = kwargs["editor"]
+-        elif "VISUAL" in os.environ:
+-            editor = os.environ["VISUAL"]
+-        elif "EDITOR" in os.environ:
+-            editor = os.environ["EDITOR"]
+-        else:
+-            editor = None
+-
+-        proc = None
+-        if editor:
+-            if ref_path:
+-                path = "%s %s" % (path, ref_path)
+-            proc = subprocess.Popen("%s %s" % (editor, path), shell=True)
+-
+-        if proc:
+-            proc.wait()
+-
+ 
+ def create_parser_update():
+     from update import updatecommandline
+     return updatecommandline.create_parser()
+ 
+ 
+ def create_parser_create():
+     import argparse
+@@ -401,32 +284,16 @@ class MachCommands(MachCommandBase):
+ 
+     @Command("wpt-update",
+              category="testing",
+              description="Update web-platform-test metadata.",
+              parser=create_parser_update)
+     def update_wpt(self, **params):
+         return self.update_web_platform_tests(**params)
+ 
+-    @Command("web-platform-tests-create",
+-             category="testing",
+-             description="Create a new web-platform test.",
+-             parser=create_parser_create)
+-    def create_web_platform_test(self, **params):
+-        self.setup()
+-        wpt_creator = self._spawn(WebPlatformTestsCreator)
+-        wpt_creator.run_create(self._mach_context, **params)
+-
+-    @Command("wpt-create",
+-             category="testing",
+-             description="Create a new web-platform test.",
+-             parser=create_parser_create)
+-    def create_wpt(self, **params):
+-        return self.create_web_platform_test(**params)
+-
+     @Command("wpt-manifest-update",
+              category="testing",
+              description="Update web-platform-test manifests.",
+              parser=create_parser_manifest_update)
+     def wpt_manifest_update(self, **params):
+         self.setup()
+         wpt_setup = self._spawn(WebPlatformTestsRunnerSetup)
+         wpt_runner = WebPlatformTestsRunner(wpt_setup)
+
