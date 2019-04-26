@@ -1,0 +1,1917 @@
+# HG changeset patch
+# Parent  ff3ec9547e4f15209af87010ed39a0590c253efe
+
+diff --git a/accessible/generic/Accessible.cpp b/accessible/generic/Accessible.cpp
+--- a/accessible/generic/Accessible.cpp
++++ b/accessible/generic/Accessible.cpp
+@@ -412,16 +412,17 @@ uint64_t Accessible::NativeState() const
+   state |= VisibilityState();
+ 
+   nsIFrame* frame = GetFrame();
+   if (frame) {
+     if (frame->GetStateBits() & NS_FRAME_OUT_OF_FLOW) state |= states::FLOATING;
+ 
+     // XXX we should look at layout for non XUL box frames, but need to decide
+     // how that interacts with ARIA.
++    // XXXndeakin emulated-flexbox do something here?
+     if (HasOwnContent() && mContent->IsXULElement() && frame->IsXULBoxFrame()) {
+       const nsStyleXUL* xulStyle = frame->StyleXUL();
+       if (xulStyle && frame->IsXULBoxFrame()) {
+         // In XUL all boxes are either vertical or horizontal
+         if (xulStyle->mBoxOrient == StyleBoxOrient::Vertical)
+           state |= states::VERTICAL;
+         else
+           state |= states::HORIZONTAL;
+diff --git a/dom/xul/XULPopupElement.cpp b/dom/xul/XULPopupElement.cpp
+--- a/dom/xul/XULPopupElement.cpp
++++ b/dom/xul/XULPopupElement.cpp
+@@ -109,30 +109,18 @@ void XULPopupElement::MoveToAnchor(Eleme
+   nsMenuPopupFrame* menuPopupFrame = do_QueryFrame(GetPrimaryFrame());
+   if (menuPopupFrame && menuPopupFrame->IsVisible()) {
+     menuPopupFrame->MoveToAnchor(aAnchorElement, aPosition, aXPos, aYPos,
+                                  aAttributesOverride);
+   }
+ }
+ 
+ void XULPopupElement::SizeTo(int32_t aWidth, int32_t aHeight) {
+-  nsAutoString width, height;
+-  width.AppendInt(aWidth);
+-  height.AppendInt(aHeight);
+-
+   nsCOMPtr<nsIContent> kungFuDeathGrip = this;  // keep a reference
+-
+-  // We only want to pass aNotify=true to SetAttr once, but must make sure
+-  // we pass it when a value is being changed.  Thus, we check if the height
+-  // is the same and if so, pass true when setting the width.
+-  bool heightSame =
+-      AttrValueIs(kNameSpaceID_None, nsGkAtoms::height, height, eCaseMatters);
+-
+-  SetAttr(kNameSpaceID_None, nsGkAtoms::width, width, heightSame);
+-  SetAttr(kNameSpaceID_None, nsGkAtoms::height, height, true);
++  nsXULElement::SetWidthAndHeight(this, aWidth, aHeight);
+ 
+   // If the popup is open, force a reposition of the popup after resizing it
+   // with notifications set to true so that the popuppositioned event is fired.
+   nsMenuPopupFrame* menuPopupFrame = do_QueryFrame(GetPrimaryFrame());
+   if (menuPopupFrame && menuPopupFrame->PopupState() == ePopupShown) {
+     menuPopupFrame->SetPopupPosition(nullptr, false, false, true);
+   }
+ }
+diff --git a/dom/xul/nsXULElement.cpp b/dom/xul/nsXULElement.cpp
+--- a/dom/xul/nsXULElement.cpp
++++ b/dom/xul/nsXULElement.cpp
+@@ -1455,16 +1455,50 @@ JSObject* nsXULElement::WrapNode(JSConte
+   return dom::XULElement_Binding::Wrap(aCx, this, aGivenProto);
+ }
+ 
+ bool nsXULElement::IsInteractiveHTMLContent(bool aIgnoreTabindex) const {
+   return IsXULElement(nsGkAtoms::menupopup) ||
+          Element::IsInteractiveHTMLContent(aIgnoreTabindex);
+ }
+ 
++void nsXULElement::SetWidthAndHeight(Element* aElement, int32_t aWidth, int32_t aHeight)
++{
++  nsAutoString width, height;
++  width.AppendInt(aWidth);
++  height.AppendInt(aHeight);
++
++  if (aElement->IsXULElement()) {
++    // On XUL elements, the attributes are always set so that they can be persisted.
++    bool heightUnchanged =
++        aElement->AttrValueIs(kNameSpaceID_None, nsGkAtoms::height, height, eCaseMatters);
++    aElement->SetAttr(kNameSpaceID_None, nsGkAtoms::width, width, heightUnchanged);
++    if (!heightUnchanged) {
++      aElement->SetAttr(kNameSpaceID_None, nsGkAtoms::height, height, true);
++    }
++  }
++
++  if (mozilla::StaticPrefs::layout_css_emulate_moz_box_with_flex()) {
++    nsCOMPtr<nsStyledElement> inlineStyleContent = do_QueryInterface(aElement);
++    if (inlineStyleContent) {
++      nsICSSDeclaration* decl = inlineStyleContent->Style();
++
++      if (aWidth > 0) {
++        width.AppendLiteral("px");
++        decl->SetProperty(NS_LITERAL_STRING("width"), width, EmptyString());
++      }
++
++      if (aHeight > 0) {
++        height.AppendLiteral("px");
++        decl->SetProperty(NS_LITERAL_STRING("height"), height, EmptyString());
++      }
++    }
++  }
++}
++
+ NS_IMPL_CYCLE_COLLECTION_CLASS(nsXULPrototypeNode)
+ 
+ NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(nsXULPrototypeNode)
+   if (tmp->mType == nsXULPrototypeNode::eType_Element) {
+     static_cast<nsXULPrototypeElement*>(tmp)->Unlink();
+   } else if (tmp->mType == nsXULPrototypeNode::eType_Script) {
+     static_cast<nsXULPrototypeScript*>(tmp)->UnlinkJSObjects();
+   }
+diff --git a/dom/xul/nsXULElement.h b/dom/xul/nsXULElement.h
+--- a/dom/xul/nsXULElement.h
++++ b/dom/xul/nsXULElement.h
+@@ -521,16 +521,23 @@ class nsXULElement : public nsStyledElem
+   nsINode* GetScopeChainParent() const override {
+     // For XUL, the parent is the parent element, if any
+     Element* parent = GetParentElement();
+     return parent ? parent : nsStyledElement::GetScopeChainParent();
+   }
+ 
+   bool IsInteractiveHTMLContent(bool aIgnoreTabindex) const override;
+ 
++  /**
++   * Set both the width and height attributes on the element. In emulated
++   * flexbox mode, the style width and height properties are set as well.
++   */
++  static void SetWidthAndHeight(mozilla::dom::Element* aElement,
++                                int32_t aWidth, int32_t aHeight);
++
+  protected:
+   ~nsXULElement();
+ 
+   // This can be removed if EnsureContentsGenerated dies.
+   friend class nsNSElementTearoff;
+ 
+   // Implementation methods
+   nsresult EnsureContentsGenerated(void) const;
+diff --git a/layout/generic/CSSOrderAwareFrameIterator.cpp b/layout/generic/CSSOrderAwareFrameIterator.cpp
+--- a/layout/generic/CSSOrderAwareFrameIterator.cpp
++++ b/layout/generic/CSSOrderAwareFrameIterator.cpp
+@@ -14,17 +14,17 @@ template <>
+ bool CSSOrderAwareFrameIterator::CSSOrderComparator(nsIFrame* const& a,
+                                                     nsIFrame* const& b) {
+   return a->StylePosition()->mOrder < b->StylePosition()->mOrder;
+ }
+ 
+ template <>
+ bool CSSOrderAwareFrameIterator::CSSBoxOrdinalGroupComparator(
+     nsIFrame* const& a, nsIFrame* const& b) {
+-  return a->StyleXUL()->mBoxOrdinal < b->StyleXUL()->mBoxOrdinal;
++  return a->GetXULOrdinal() < b->GetXULOrdinal();
+ }
+ 
+ template <>
+ bool CSSOrderAwareFrameIterator::IsForward() const {
+   return true;
+ }
+ 
+ template <>
+diff --git a/layout/generic/CSSOrderAwareFrameIterator.h b/layout/generic/CSSOrderAwareFrameIterator.h
+--- a/layout/generic/CSSOrderAwareFrameIterator.h
++++ b/layout/generic/CSSOrderAwareFrameIterator.h
+@@ -92,17 +92,17 @@ class CSSOrderAwareFrameIteratorT {
+         if (aOrderProp == eUseBoxOrdinalGroup) {
+           // We'll be using mBoxOrdinal, which has type uint32_t. However, the
+           // modern 'order' property (whose functionality we're co-opting) has
+           // type int32_t.  So: if we happen to have a uint32_t value that's
+           // greater than INT32_MAX, we clamp it rather than letting it
+           // overflow. Chances are, this is just an author using BIG_VALUE
+           // anyway, so the clamped value should be fine.
+           uint32_t clampedBoxOrdinal = std::min(
+-              child->StyleXUL()->mBoxOrdinal, static_cast<uint32_t>(INT32_MAX));
++              child->GetXULOrdinal(), static_cast<uint32_t>(INT32_MAX));
+           order = static_cast<int32_t>(clampedBoxOrdinal);
+         } else {
+           order = child->StylePosition()->mOrder;
+         }
+ 
+         if (order < maxOrder) {
+           isOrdered = false;
+           break;
+diff --git a/layout/generic/ReflowInput.cpp b/layout/generic/ReflowInput.cpp
+--- a/layout/generic/ReflowInput.cpp
++++ b/layout/generic/ReflowInput.cpp
+@@ -1110,17 +1110,17 @@ void ReflowInput::ApplyRelativePositioni
+       *aPosition = ssc->ComputePosition(aFrame);
+     }
+   }
+ }
+ 
+ // Returns true if aFrame is non-null, a XUL frame, and "XUL-collapsed" (which
+ // only becomes a valid question to ask if we know it's a XUL frame).
+ static bool IsXULCollapsedXULFrame(nsIFrame* aFrame) {
+-  return aFrame && aFrame->IsXULBoxFrame() && aFrame->IsXULCollapsed();
++  return aFrame && aFrame->IsXULBoxOrEmulatedFrame() && aFrame->IsXULCollapsed();
+ }
+ 
+ nsIFrame* ReflowInput::GetHypotheticalBoxContainer(nsIFrame* aFrame,
+                                                    nscoord& aCBIStartEdge,
+                                                    LogicalSize& aCBSize) const {
+   aFrame = aFrame->GetContainingBlock();
+   NS_ASSERTION(aFrame != mFrame, "How did that happen?");
+ 
+diff --git a/layout/generic/nsFlexContainerFrame.cpp b/layout/generic/nsFlexContainerFrame.cpp
+--- a/layout/generic/nsFlexContainerFrame.cpp
++++ b/layout/generic/nsFlexContainerFrame.cpp
+@@ -109,19 +109,43 @@ static CSSOrderAwareFrameIterator::Order
+     const nsFlexContainerFrame* aFlexContainer) {
+   return IsLegacyBox(aFlexContainer)
+              ? CSSOrderAwareFrameIterator::OrderingProperty::eUseBoxOrdinalGroup
+              : CSSOrderAwareFrameIterator::OrderingProperty::eUseOrder;
+ }
+ 
+ // Returns the "align-items" value that's equivalent to the legacy "box-align"
+ // value in the given style struct.
+-static uint8_t ConvertLegacyStyleToAlignItems(const nsStyleXUL* aStyleXUL) {
++static uint8_t ConvertLegacyStyleToAlignItems(const nsIFrame* aFrame) {
++  nsIContent* content = aFrame->GetContent();
++  if (content && content->IsXULElement()) {
++    if (content->AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::align,
++                                          nsGkAtoms::stretch, eCaseMatters)) {
++      return NS_STYLE_ALIGN_STRETCH;
++    }
++    if (content->AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::align,
++                                          nsGkAtoms::start, eCaseMatters)) {
++      return NS_STYLE_ALIGN_FLEX_START;
++    }
++    if (content->AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::align,
++                                          nsGkAtoms::center, eCaseMatters)) {
++      return NS_STYLE_ALIGN_CENTER;
++    }
++    if (content->AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::align,
++                                          nsGkAtoms::baseline, eCaseMatters)) {
++      return NS_STYLE_ALIGN_BASELINE;
++    }
++    if (content->AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::align,
++                                          nsGkAtoms::end, eCaseMatters)) {
++      return NS_STYLE_ALIGN_FLEX_END;
++    }
++  }
++
+   // -[moz|webkit]-box-align corresponds to modern "align-items"
+-  switch (aStyleXUL->mBoxAlign) {
++  switch (aFrame->StyleXUL()->mBoxAlign) {
+     case StyleBoxAlign::Stretch:
+       return NS_STYLE_ALIGN_STRETCH;
+     case StyleBoxAlign::Start:
+       return NS_STYLE_ALIGN_FLEX_START;
+     case StyleBoxAlign::Center:
+       return NS_STYLE_ALIGN_CENTER;
+     case StyleBoxAlign::Baseline:
+       return NS_STYLE_ALIGN_BASELINE;
+@@ -131,19 +155,35 @@ static uint8_t ConvertLegacyStyleToAlign
+ 
+   MOZ_ASSERT_UNREACHABLE("Unrecognized mBoxAlign enum value");
+   // Fall back to default value of "align-items" property:
+   return NS_STYLE_ALIGN_STRETCH;
+ }
+ 
+ // Returns the "justify-content" value that's equivalent to the legacy
+ // "box-pack" value in the given style struct.
+-static uint8_t ConvertLegacyStyleToJustifyContent(const nsStyleXUL* aStyleXUL) {
++static uint8_t ConvertLegacyStyleToJustifyContent(const nsIFrame* aFrame) {
++  nsIContent* content = aFrame->GetContent();
++  if (content && content->IsXULElement()) {
++    if (content->AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::pack,
++                                          nsGkAtoms::start, eCaseMatters)) {
++      return NS_STYLE_ALIGN_FLEX_START;
++    }
++    if (content->AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::pack,
++                                          nsGkAtoms::center, eCaseMatters)) {
++      return NS_STYLE_ALIGN_CENTER;
++    }
++    if (content->AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::pack,
++                                          nsGkAtoms::end, eCaseMatters)) {
++      return NS_STYLE_ALIGN_FLEX_END;
++    }
++  }
++
+   // -[moz|webkit]-box-pack corresponds to modern "justify-content"
+-  switch (aStyleXUL->mBoxPack) {
++  switch (aFrame->StyleXUL()->mBoxPack) {
+     case StyleBoxPack::Start:
+       return NS_STYLE_ALIGN_FLEX_START;
+     case StyleBoxPack::Center:
+       return NS_STYLE_ALIGN_CENTER;
+     case StyleBoxPack::End:
+       return NS_STYLE_ALIGN_FLEX_END;
+     case StyleBoxPack::Justify:
+       return NS_STYLE_ALIGN_SPACE_BETWEEN;
+@@ -1273,17 +1313,21 @@ UniquePtr<FlexItem> nsFlexContainerFrame
+   ReflowInput childRI(
+       aPresContext, aParentReflowInput, aChildFrame,
+       aParentReflowInput.ComputedSize(aChildFrame->GetWritingMode()));
+ 
+   // FLEX GROW & SHRINK WEIGHTS
+   // --------------------------
+   float flexGrow, flexShrink;
+   if (IsLegacyBox(this)) {
+-    flexGrow = flexShrink = aChildFrame->StyleXUL()->mBoxFlex;
++    nscoord flex = 0;
++    if (aChildFrame->Style()->GetPseudoType() != PseudoStyleType::anonymousFlexItem) {
++      nsFrame::AddXULFlex(aChildFrame, flex);
++    }
++    flexGrow = flexShrink = flex;
+   } else {
+     const nsStylePosition* stylePos = aChildFrame->StylePosition();
+     flexGrow = stylePos->mFlexGrow;
+     flexShrink = stylePos->mFlexShrink;
+   }
+ 
+   WritingMode childWM = childRI.GetWritingMode();
+ 
+@@ -1912,18 +1956,17 @@ FlexItem::FlexItem(ReflowInput& aFlexIte
+   if (IsLegacyBox(containerRS->mFrame)) {
+     // For -webkit-{inline-}box and -moz-{inline-}box, we need to:
+     // (1) Use prefixed "box-align" instead of "align-items" to determine the
+     //     container's cross-axis alignment behavior.
+     // (2) Suppress the ability for flex items to override that with their own
+     //     cross-axis alignment. (The legacy box model doesn't support this.)
+     // So, each FlexItem simply copies the container's converted "align-items"
+     // value and disregards their own "align-self" property.
+-    const nsStyleXUL* containerStyleXUL = containerRS->mFrame->StyleXUL();
+-    mAlignSelf = ConvertLegacyStyleToAlignItems(containerStyleXUL);
++    mAlignSelf = ConvertLegacyStyleToAlignItems(containerRS->mFrame);
+     mAlignSelfFlags = 0;
+   } else {
+     mAlignSelf = aFlexItemReflowInput.mStylePosition->UsedAlignSelf(
+         containerRS->mFrame->Style());
+     if (MOZ_LIKELY(mAlignSelf == NS_STYLE_ALIGN_NORMAL)) {
+       mAlignSelf = NS_STYLE_ALIGN_STRETCH;
+     }
+ 
+@@ -3576,22 +3619,74 @@ FlexboxAxisTracker::FlexboxAxisTracker(
+       mCrossAxis = GetReverseAxis(mCrossAxis);
+       mAreAxesInternallyReversed = true;
+       mIsMainAxisReversed = !mIsMainAxisReversed;
+       mIsCrossAxisReversed = !mIsCrossAxisReversed;
+     }
+   }
+ }
+ 
++bool GetXULFlexOrientIsHorizontal(const nsIFrame* aFrame)
++{
++  bool horizontal = (aFrame->StyleXUL()->mBoxOrient == StyleBoxOrient::Horizontal);
++
++  nsIContent* content = aFrame->GetContent();
++  if (content && content->IsXULElement()) {
++    // Now see if we have an attribute.  The attribute overrides the style system value.
++    static const Element::AttrValuesArray strings[] =
++      {nsGkAtoms::vertical, nsGkAtoms::horizontal, nullptr};
++    int32_t index = content->AsElement()->FindAttrValueIn(kNameSpaceID_None, nsGkAtoms::orient,
++                                                          strings, eCaseMatters);
++    if (index >= 0) {
++      horizontal = index == 1;
++    }
++  }
++
++  return horizontal;
++}
++
++mozilla::StyleBoxDirection GetXULFlexDirection(const nsIFrame* aFrame)
++{
++  const nsStyleXUL* boxInfo = aFrame->StyleXUL();
++
++  nsIContent* content = aFrame->GetContent();
++  if (content && content->IsXULElement()) {
++    bool horizontal = GetXULFlexOrientIsHorizontal(aFrame);
++
++    bool normalDir = true;
++    if (horizontal) {
++      normalDir = (aFrame->StyleVisibility()->mDirection == NS_STYLE_DIRECTION_LTR);
++    }
++    if (boxInfo->mBoxDirection == StyleBoxDirection::Reverse) {
++      normalDir = !normalDir;
++    }
++
++    if (horizontal) {
++      static const Element::AttrValuesArray strings[] =
++        {nsGkAtoms::reverse, nsGkAtoms::ltr, nsGkAtoms::rtl, nullptr};
++      int32_t index = content->AsElement()->FindAttrValueIn(kNameSpaceID_None, nsGkAtoms::dir,
++                                                            strings, eCaseMatters);
++      if (index >= 0) {
++        bool values[] = {!normalDir, true, false};
++        normalDir = values[index];
++      }
++    } else if (content->AsElement()->AttrValueIs(kNameSpaceID_None, nsGkAtoms::dir,
++                                                 nsGkAtoms::reverse, eCaseMatters)) {
++      normalDir = !normalDir;
++    }
++
++    return normalDir ? StyleBoxDirection::Normal : StyleBoxDirection::Reverse;
++  }
++
++  return boxInfo->mBoxDirection;
++}
++
+ void FlexboxAxisTracker::InitAxesFromLegacyProps(
+     const nsFlexContainerFrame* aFlexContainer) {
+-  const nsStyleXUL* styleXUL = aFlexContainer->StyleXUL();
+-
+-  const bool boxOrientIsVertical =
+-      (styleXUL->mBoxOrient == StyleBoxOrient::Vertical);
++  const bool boxOrientIsVertical = !GetXULFlexOrientIsHorizontal(aFlexContainer);
+   const bool wmIsVertical = mWM.IsVertical();
+ 
+   // If box-orient agrees with our writing-mode, then we're "row-oriented"
+   // (i.e. the flexbox main axis is the same as our writing mode's inline
+   // direction).  Otherwise, we're column-oriented (i.e. the flexbox's main
+   // axis is perpendicular to the writing-mode's inline direction).
+   mIsRowOriented = (boxOrientIsVertical == wmIsVertical);
+ 
+@@ -3610,17 +3705,17 @@ void FlexboxAxisTracker::InitAxesFromLeg
+   if (!mWM.IsBidiLTR()) {
+     AxisOrientationType& axisToFlip = mIsRowOriented ? mMainAxis : mCrossAxis;
+     axisToFlip = GetReverseAxis(axisToFlip);
+   }
+   // XXXdholbert END CODE TO SET DEPRECATED MEMBER-VARS
+ 
+   // Legacy flexbox can use "-webkit-box-direction: reverse" to reverse the
+   // main axis (so it runs in the reverse direction of the inline axis):
+-  if (styleXUL->mBoxDirection == StyleBoxDirection::Reverse) {
++  if (GetXULFlexDirection(aFlexContainer) == StyleBoxDirection::Reverse) {
+     mMainAxis = GetReverseAxis(mMainAxis);
+     mIsMainAxisReversed = true;
+   } else {
+     mIsMainAxisReversed = false;
+   }
+ 
+   // Legacy flexbox does not support reversing the cross axis -- it has no
+   // equivalent of modern flexbox's "flex-wrap: wrap-reverse".
+@@ -4449,19 +4544,17 @@ bool nsFlexContainerFrame::IsItemInlineA
+   MOZ_ASSERT(aFrame && aFrame->IsFlexItem(), "expecting arg to be a flex item");
+   const WritingMode flexItemWM = aFrame->GetWritingMode();
+   const nsIFrame* flexContainer = aFrame->GetParent();
+ 
+   if (IsLegacyBox(flexContainer)) {
+     // For legacy boxes, the main axis is determined by "box-orient", and we can
+     // just directly check if that's vertical, and compare that to whether the
+     // item's WM is also vertical:
+-    bool boxOrientIsVertical =
+-        (flexContainer->StyleXUL()->mBoxOrient == StyleBoxOrient::Vertical);
+-    return flexItemWM.IsVertical() == boxOrientIsVertical;
++    return flexItemWM.IsVertical() == !GetXULFlexOrientIsHorizontal(flexContainer);
+   }
+ 
+   // For modern CSS flexbox, we get our return value by asking two questions
+   // and comparing their answers.
+   // Question 1: does aFrame have the same inline axis as its flex container?
+   bool itemInlineAxisIsParallelToParent =
+       !flexItemWM.IsOrthogonalTo(flexContainer->GetWritingMode());
+ 
+@@ -4726,17 +4819,17 @@ void nsFlexContainerFrame::DoFlexLayout(
+       flexContainerAscent = ComputePhysicalAscentFromFlexRelativeAscent(
+           crossAxisPosnTracker.GetPosition() + firstLineBaselineOffset,
+           contentBoxCrossSize, aReflowInput, aAxisTracker);
+     }
+   }
+ 
+   const auto justifyContent =
+       IsLegacyBox(aReflowInput.mFrame)
+-          ? ConvertLegacyStyleToJustifyContent(StyleXUL())
++          ? ConvertLegacyStyleToJustifyContent(aReflowInput.mFrame)
+           : aReflowInput.mStylePosition->mJustifyContent;
+ 
+   // Recalculate the gap sizes if necessary now that the container size has
+   // been determined.
+   if (aReflowInput.ComputedBSize() == NS_INTRINSICSIZE &&
+       aReflowInput.mStylePosition->mRowGap.IsLengthPercentage() &&
+       aReflowInput.mStylePosition->mRowGap.AsLengthPercentage().HasPercent()) {
+     bool rowIsCross = aAxisTracker.IsRowOriented();
+@@ -5239,8 +5332,38 @@ nscoord nsFlexContainerFrame::GetPrefISi
+     mCachedPrefISize =
+         StyleDisplay()->IsContainSize()
+             ? 0
+             : IntrinsicISize(aRenderingContext, nsLayoutUtils::PREF_ISIZE);
+   }
+ 
+   return mCachedPrefISize;
+ }
++
++nsresult
++nsFlexContainerFrame::AttributeChanged(int32_t aNameSpaceID,
++                                       nsAtom* aAttribute,
++                                       int32_t aModType)
++{
++  nsresult rv = nsContainerFrame::AttributeChanged(aNameSpaceID, aAttribute,
++                                                   aModType);
++
++  nsIContent* content = GetContent();
++  if (!content || !content->IsXULElement()) {
++    return NS_OK;
++  }
++
++  if (aAttribute == nsGkAtoms::flex ||
++      aAttribute == nsGkAtoms::orient ||
++      aAttribute == nsGkAtoms::align ||
++      aAttribute == nsGkAtoms::pack ||
++      aAttribute == nsGkAtoms::dir) {
++    PresContext()->PresShell()->
++      FrameNeedsReflow(this, nsIPresShell::eStyleChange, NS_FRAME_IS_DIRTY);
++  }
++  else if (aAttribute == nsGkAtoms::ordinal) {
++    PresContext()->PresShell()->
++      FrameNeedsReflow(GetParent(), nsIPresShell::eStyleChange,
++                       NS_FRAME_IS_DIRTY);
++  }
++
++  return rv;
++}
+diff --git a/layout/generic/nsFlexContainerFrame.h b/layout/generic/nsFlexContainerFrame.h
+--- a/layout/generic/nsFlexContainerFrame.h
++++ b/layout/generic/nsFlexContainerFrame.h
+@@ -88,17 +88,17 @@ struct ComputedFlexContainerInfo {
+  * "legacy" properties for alignment/flexibility/etc. *instead of* honoring the
+  * modern flexbox & alignment properties.  For brevity, many comments in
+  * nsFlexContainerFrame.cpp simply refer to these properties using their
+  * "-webkit" versions, since we're mostly expecting to encounter them in that
+  * form. (Technically, the "-moz" versions of these properties *can* influence
+  * layout here as well (since that's what the -webkit versions are aliased to)
+  * -- but only inside of a "display:-webkit-{inline-}box" container.)
+  */
+-class nsFlexContainerFrame final : public nsContainerFrame {
++class nsFlexContainerFrame : public nsContainerFrame {
+  public:
+   NS_DECL_FRAMEARENA_HELPERS(nsFlexContainerFrame)
+   NS_DECL_QUERYFRAME
+ 
+   // Factory method:
+   friend nsContainerFrame* NS_NewFlexContainerFrame(
+       mozilla::PresShell* aPresShell, ComputedStyle* aStyle);
+ 
+@@ -146,16 +146,28 @@ class nsFlexContainerFrame final : publi
+       return false;
+     }
+     *aBaseline = aBaselineGroup == BaselineSharingGroup::First
+                      ? mBaselineFromLastReflow
+                      : mLastBaselineFromLastReflow;
+     return true;
+   }
+ 
++  nsresult AttributeChanged(int32_t aNameSpaceID,
++                            nsAtom* aAttribute,
++                            int32_t aModType) override;
++
++  virtual bool IsFrameOfType(uint32_t aFlags) const override {
++    if (mozilla::StaticPrefs::layout_css_emulate_moz_box_with_flex()) {
++      aFlags &= ~eEmulatedFlexBox;
++    }
++
++    return nsContainerFrame::IsFrameOfType(aFlags);
++  }
++
+   // nsContainerFrame overrides
+   uint16_t CSSAlignmentForAbsPosChild(
+       const ReflowInput& aChildRI,
+       mozilla::LogicalAxis aLogicalAxis) const override;
+ 
+   /**
+    * Helper function to calculate packing space and initial offset of alignment
+    * subjects in MainAxisPositionTracker() and CrossAxisPositionTracker() for
+@@ -230,18 +242,19 @@ class nsFlexContainerFrame final : publi
+   /**
+    * Callback for nsFrame::MarkIntrinsicISizesDirty() on a flex item.
+    */
+   static void MarkCachedFlexMeasurementsDirty(nsIFrame* aItemFrame);
+ 
+  protected:
+   // Protected constructor & destructor
+   explicit nsFlexContainerFrame(ComputedStyle* aStyle,
+-                                nsPresContext* aPresContext)
+-      : nsContainerFrame(aStyle, aPresContext, kClassID),
++                                nsPresContext* aPresContext,
++                                ClassID aID = kClassID)
++      : nsContainerFrame(aStyle, aPresContext, aID),
+         mCachedMinISize(NS_INTRINSIC_WIDTH_UNKNOWN),
+         mCachedPrefISize(NS_INTRINSIC_WIDTH_UNKNOWN),
+         mBaselineFromLastReflow(NS_INTRINSIC_WIDTH_UNKNOWN),
+         mLastBaselineFromLastReflow(NS_INTRINSIC_WIDTH_UNKNOWN) {}
+ 
+   virtual ~nsFlexContainerFrame();
+ 
+   /*
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -230,16 +230,21 @@ static void SetOrUpdateRectValuedPropert
+   }
+ }
+ 
+ static bool IsXULBoxWrapped(const nsIFrame* aFrame) {
+   return aFrame->GetParent() && aFrame->GetParent()->IsXULBoxFrame() &&
+          !aFrame->IsXULBoxFrame();
+ }
+ 
++static bool IsXULBoxOrEmulatedWrapped(const nsIFrame* aFrame) {
++  return aFrame->GetParent() && aFrame->GetParent()->IsXULBoxOrEmulatedFrame() &&
++         !aFrame->IsXULBoxFrame();
++}
++
+ void nsReflowStatus::UpdateTruncated(const ReflowInput& aReflowInput,
+                                      const ReflowOutput& aMetrics) {
+   const WritingMode containerWM = aMetrics.GetWritingMode();
+   if (aReflowInput.GetWritingMode().IsOrthogonalTo(containerWM)) {
+     // Orthogonal flows are always reflowed with an unconstrained dimension,
+     // so should never end up truncated (see ReflowInput::Init()).
+     mTruncated = false;
+   } else if (aReflowInput.AvailableBSize() != NS_UNCONSTRAINEDSIZE &&
+@@ -724,17 +729,17 @@ void nsFrame::Init(nsIContent* aContent,
+   }
+ 
+   if (PresShell()->AssumeAllFramesVisible() && TrackingVisibility()) {
+     IncApproximateVisibleCount();
+   }
+ 
+   DidSetComputedStyle(nullptr);
+ 
+-  if (::IsXULBoxWrapped(this)) ::InitBoxMetrics(this, false);
++  if (::IsXULBoxOrEmulatedWrapped(this)) ::InitBoxMetrics(this, false);
+ 
+   // For a newly created frame, we need to update this frame's visibility state.
+   // Usually we update the state when the frame is restyled and has a
+   // VisibilityChange change hint but we don't generate any change hints for
+   // newly created frames.
+   // Note: We don't need to do this for placeholders since placeholders have
+   // different styles so that the styles don't have visibility:hidden even if
+   // the parent has visibility:hidden style.
+@@ -10507,17 +10512,17 @@ void nsIFrame::SetParent(nsContainerFram
+   // _can_ change parent if our parent is a wrapper anon box, because some
+   // wrapper anon boxes can have continuations.
+   MOZ_ASSERT_IF(ParentIsWrapperAnonBox(),
+                 aParent->Style()->IsInheritingAnonBox());
+ 
+   // Note that the current mParent may already be destroyed at this point.
+   mParent = aParent;
+   MOZ_DIAGNOSTIC_ASSERT(!mParent || PresShell() == mParent->PresShell());
+-  if (::IsXULBoxWrapped(this)) {
++  if (::IsXULBoxOrEmulatedWrapped(this)) {
+     ::InitBoxMetrics(this, true);
+   } else {
+     // We could call Properties().Delete(BoxMetricsProperty()); here but
+     // that's kind of slow and re-parenting in such a way that we were
+     // IsXULBoxWrapped() before but not now should be very rare, so we'll just
+     // keep this unused frame property until this frame dies instead.
+   }
+ 
+diff --git a/layout/generic/nsFrameList.h b/layout/generic/nsFrameList.h
+--- a/layout/generic/nsFrameList.h
++++ b/layout/generic/nsFrameList.h
+@@ -14,16 +14,17 @@
+ #include "mozilla/RefPtr.h"
+ #include "mozilla/ReverseIterator.h"
+ 
+ #if defined(DEBUG) || defined(MOZ_DUMP_PAINTING)
+ // DEBUG_FRAME_DUMP enables nsIFrame::List and related methods.
+ // You can also define this in a non-DEBUG build if you need frame dumps.
+ #  define DEBUG_FRAME_DUMP 1
+ #endif
++#  define DEBUG_FRAME_DUMP 1
+ 
+ class nsContainerFrame;
+ class nsIContent;
+ class nsIFrame;
+ class nsPresContext;
+ 
+ namespace mozilla {
+ class PresShell;
+diff --git a/layout/generic/nsGfxScrollFrame.cpp b/layout/generic/nsGfxScrollFrame.cpp
+--- a/layout/generic/nsGfxScrollFrame.cpp
++++ b/layout/generic/nsGfxScrollFrame.cpp
+@@ -6029,17 +6029,17 @@ void ScrollFrameHelper::LayoutScrollbars
+   double res = 1.0;
+   if (overlayScrollBarsWithZoom) {
+     scrollPortClampingSize = presShell->GetVisualViewportSize();
+     res = presShell->GetCumulativeResolution();
+   }
+ 
+   // place the scrollcorner
+   if (mScrollCornerBox || mResizerBox) {
+-    MOZ_ASSERT(!mScrollCornerBox || mScrollCornerBox->IsXULBoxFrame(),
++    MOZ_ASSERT(!mScrollCornerBox || mScrollCornerBox->IsXULBoxOrEmulatedFrame(),
+                "Must be a box frame!");
+ 
+     nsRect r(0, 0, 0, 0);
+     if (aContentArea.x != mScrollPort.x || scrollbarOnLeft) {
+       // scrollbar (if any) on left
+       r.x = aContentArea.x;
+       r.width = mScrollPort.x - aContentArea.x;
+       NS_ASSERTION(r.width >= 0, "Scroll area should be inside client rect");
+@@ -6091,17 +6091,17 @@ void ScrollFrameHelper::LayoutScrollbars
+       // otherwise lay out the resizer with an empty rectangle
+       nsBoxFrame::LayoutChildAt(aState, mResizerBox, nsRect());
+     }
+   }
+ 
+   nsPresContext* presContext = mScrolledFrame->PresContext();
+   nsRect vRect;
+   if (mVScrollbarBox) {
+-    MOZ_ASSERT(mVScrollbarBox->IsXULBoxFrame(), "Must be a box frame!");
++    MOZ_ASSERT(mVScrollbarBox->IsXULBoxOrEmulatedFrame(), "Must be a box frame!");
+     vRect = mScrollPort;
+     if (overlayScrollBarsWithZoom) {
+       vRect.height = NSToCoordRound(res * scrollPortClampingSize.height);
+     }
+     vRect.width = aContentArea.width - mScrollPort.width;
+     vRect.x = scrollbarOnLeft
+                   ? aContentArea.x
+                   : mScrollPort.x +
+@@ -6112,17 +6112,17 @@ void ScrollFrameHelper::LayoutScrollbars
+       vRect.Deflate(margin);
+     }
+     AdjustScrollbarRectForResizer(mOuter, presContext, vRect, hasResizer,
+                                   ScrollDirection::eVertical);
+   }
+ 
+   nsRect hRect;
+   if (mHScrollbarBox) {
+-    MOZ_ASSERT(mHScrollbarBox->IsXULBoxFrame(), "Must be a box frame!");
++    MOZ_ASSERT(mHScrollbarBox->IsXULBoxOrEmulatedFrame(), "Must be a box frame!");
+     hRect = mScrollPort;
+     if (overlayScrollBarsWithZoom) {
+       hRect.width = NSToCoordRound(res * scrollPortClampingSize.width);
+     }
+     hRect.height = aContentArea.height - mScrollPort.height;
+     hRect.y =
+         mScrollPort.y + NSToCoordRound(res * scrollPortClampingSize.height);
+     if (mHasHorizontalScrollbar) {
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -2860,16 +2860,19 @@ class nsIFrame : public nsQueryFrame {
+     // inline-block sizing characteristics (like form controls).
+     eReplacedSizing = 1 << 15,
+ 
+     // Does this frame class support 'contain: layout' and
+     // 'contain:paint' (supporting one is equivalent to supporting the
+     // other).
+     eSupportsContainLayoutAndPaint = 1 << 16,
+ 
++     // This is a flex container that is emulating a XUL box.
++     eEmulatedFlexBox = 1 << 17,
++
+     // These are to allow nsFrame::Init to assert that IsFrameOfType
+     // implementations all call the base class method.  They are only
+     // meaningful in DEBUG builds.
+     eDEBUGAllFrames = 1 << 30,
+     eDEBUGNoFrames = 1 << 31
+   };
+ 
+   /**
+@@ -3660,16 +3663,18 @@ class nsIFrame : public nsQueryFrame {
+    */
+   virtual bool IsFocusable(int32_t* aTabIndex = nullptr,
+                            bool aWithMouse = false);
+ 
+   // BOX LAYOUT METHODS
+   // These methods have been migrated from nsIBox and are in the process of
+   // being refactored. DO NOT USE OUTSIDE OF XUL.
+   bool IsXULBoxFrame() const { return IsFrameOfType(nsIFrame::eXULBox); }
++  bool IsXULBoxOrEmulatedFrame() const { return IsFrameOfType(nsIFrame::eXULBox) ||
++                                                IsFrameOfType(nsIFrame::eEmulatedFlexBox); }
+ 
+   enum Halignment { hAlign_Left, hAlign_Right, hAlign_Center };
+ 
+   enum Valignment { vAlign_Top, vAlign_Middle, vAlign_BaseLine, vAlign_Bottom };
+ 
+   /**
+    * This calculates the minimum size required for a box based on its state
+    * @param[in] aBoxLayoutState The desired state to calculate for
+diff --git a/layout/xul/nsBox.cpp b/layout/xul/nsBox.cpp
+--- a/layout/xul/nsBox.cpp
++++ b/layout/xul/nsBox.cpp
+@@ -681,25 +681,25 @@ nsSize nsBox::BoundsCheck(const nsSize& 
+       BoundsCheck(aMinSize.width, aPrefSize.width, aMaxSize.width),
+       BoundsCheck(aMinSize.height, aPrefSize.height, aMaxSize.height));
+ }
+ 
+ /*static*/
+ nsIFrame* nsBox::GetChildXULBox(const nsIFrame* aFrame) {
+   // box layout ends at box-wrapped frames, so don't allow these frames
+   // to report child boxes.
+-  return aFrame->IsXULBoxFrame() ? aFrame->PrincipalChildList().FirstChild()
++  return aFrame->IsXULBoxOrEmulatedFrame() ? aFrame->PrincipalChildList().FirstChild()
+                                  : nullptr;
+ }
+ 
+ /*static*/
+ nsIFrame* nsBox::GetNextXULBox(const nsIFrame* aFrame) {
+-  return aFrame->GetParent() && aFrame->GetParent()->IsXULBoxFrame()
++  return aFrame->GetParent() && aFrame->GetParent()->IsXULBoxOrEmulatedFrame()
+              ? aFrame->GetNextSibling()
+              : nullptr;
+ }
+ 
+ /*static*/
+ nsIFrame* nsBox::GetParentXULBox(const nsIFrame* aFrame) {
+-  return aFrame->GetParent() && aFrame->GetParent()->IsXULBoxFrame()
++  return aFrame->GetParent() && aFrame->GetParent()->IsXULBoxOrEmulatedFrame()
+              ? aFrame->GetParent()
+              : nullptr;
+ }
+diff --git a/layout/xul/nsMenuFrame.cpp b/layout/xul/nsMenuFrame.cpp
+--- a/layout/xul/nsMenuFrame.cpp
++++ b/layout/xul/nsMenuFrame.cpp
+@@ -688,18 +688,17 @@ nsSize nsMenuFrame::GetXULMinSize(nsBoxL
+ NS_IMETHODIMP
+ nsMenuFrame::DoXULLayout(nsBoxLayoutState& aState) {
+   // lay us out
+   nsresult rv = nsBoxFrame::DoXULLayout(aState);
+ 
+   nsMenuPopupFrame* popupFrame = GetPopup();
+   if (popupFrame) {
+     bool sizeToPopup = IsSizedToPopup(mContent, false);
+-    popupFrame->LayoutPopup(aState, this, GetAnchor()->GetPrimaryFrame(),
+-                            sizeToPopup);
++    popupFrame->ReflowPopup(aState.GetRenderingContext(), this, GetAnchor()->GetPrimaryFrame(), sizeToPopup);
+   }
+ 
+   return rv;
+ }
+ 
+ //
+ // Enter
+ //
+diff --git a/layout/xul/nsMenuPopupFrame.cpp b/layout/xul/nsMenuPopupFrame.cpp
+--- a/layout/xul/nsMenuPopupFrame.cpp
++++ b/layout/xul/nsMenuPopupFrame.cpp
+@@ -83,24 +83,24 @@ nsIFrame* NS_NewMenuPopupFrame(PresShell
+   return new (aPresShell)
+       nsMenuPopupFrame(aStyle, aPresShell->GetPresContext());
+ }
+ 
+ NS_IMPL_FRAMEARENA_HELPERS(nsMenuPopupFrame)
+ 
+ NS_QUERYFRAME_HEAD(nsMenuPopupFrame)
+   NS_QUERYFRAME_ENTRY(nsMenuPopupFrame)
+-NS_QUERYFRAME_TAIL_INHERITING(nsBoxFrame)
++NS_QUERYFRAME_TAIL_INHERITING(nsFlexContainerFrame)
+ 
+ //
+ // nsMenuPopupFrame ctor
+ //
+ nsMenuPopupFrame::nsMenuPopupFrame(ComputedStyle* aStyle,
+                                    nsPresContext* aPresContext)
+-    : nsBoxFrame(aStyle, aPresContext, kClassID),
++    : nsFlexContainerFrame(aStyle, aPresContext, kClassID),
+       mCurrentMenu(nullptr),
+       mView(nullptr),
+       mPrefSize(-1, -1),
+       mXPos(0),
+       mYPos(0),
+       mAlignmentOffset(0),
+       mLastClientOffset(0, 0),
+       mPopupType(ePopupTypePanel),
+@@ -129,17 +129,17 @@ nsMenuPopupFrame::nsMenuPopupFrame(Compu
+   sDefaultLevelIsTop =
+       Preferences::GetBool("ui.panel.default_level_parent", false);
+   Preferences::AddUintVarCache(&sTimeoutOfIncrementalSearch,
+                                kPrefIncrementalSearchTimeout, 1000);
+ }  // ctor
+ 
+ void nsMenuPopupFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                             nsIFrame* aPrevInFlow) {
+-  nsBoxFrame::Init(aContent, aParent, aPrevInFlow);
++  nsFlexContainerFrame::Init(aContent, aParent, aPrevInFlow);
+ 
+   // lookup if we're allowed to overlap the OS bar (menubar/taskbar) from the
+   // look&feel object
+   mMenuCanOverlapOSBar =
+       LookAndFeel::GetInt(LookAndFeel::eIntID_MenusCanOverlapOSBar) != 0;
+ 
+   CreatePopupView();
+ 
+@@ -187,17 +187,17 @@ void nsMenuPopupFrame::Init(nsIContent* 
+                                          nsGkAtoms::_true, eIgnoreCase)) {
+     nsIPopupContainer* popupContainer =
+         nsIPopupContainer::GetPopupContainer(PresContext()->GetPresShell());
+     if (popupContainer) {
+       popupContainer->SetDefaultTooltip(aContent->AsElement());
+     }
+   }
+ 
+-  AddStateBits(NS_FRAME_IN_POPUP);
++  AddStateBits(NS_FRAME_IN_POPUP | NS_STATE_FLEX_IS_EMULATING_LEGACY_BOX);
+ }
+ 
+ bool nsMenuPopupFrame::HasRemoteContent() const {
+   return (!mInContentShell && mPopupType == ePopupTypePanel &&
+           mContent->AsElement()->AttrValueIs(kNameSpaceID_None,
+                                              nsGkAtoms::remote,
+                                              nsGkAtoms::_true, eIgnoreCase));
+ }
+@@ -450,16 +450,17 @@ bool nsMenuPopupFrame::IsLeafDynamic() c
+ 
+ void nsMenuPopupFrame::UpdateWidgetProperties() {
+   if (nsIWidget* widget = GetWidget()) {
+     widget->SetWindowOpacity(StyleUIReset()->mWindowOpacity);
+     widget->SetWindowTransform(ComputeWidgetTransform());
+   }
+ }
+ 
++// XXXndeakin this is the old version. It is still called by nsPopupSetFrame.
+ void nsMenuPopupFrame::LayoutPopup(nsBoxLayoutState& aState,
+                                    nsIFrame* aParentMenu, nsIFrame* aAnchor,
+                                    bool aSizedToPopup) {
+   if (IsLeaf()) {
+     return;
+   }
+ 
+   SchedulePaint();
+@@ -598,16 +599,145 @@ void nsMenuPopupFrame::LayoutPopup(nsBox
+   }
+ 
+   if (needCallback && !mReflowCallbackData.mPosted) {
+     pc->PresShell()->PostReflowCallback(this);
+     mReflowCallbackData.MarkPosted(aAnchor, aSizedToPopup, openChanged);
+   }
+ }
+ 
++void nsMenuPopupFrame::ReflowPopup(gfxContext* aRenderingContext, nsIFrame* aParent,
++                                   nsIFrame* aAnchor, bool aSizedToPopup)
++{
++  WritingMode wm = GetWritingMode();
++  nsPresContext* presContext = PresContext();
++
++  ReflowInput parentReflowInput(presContext, aParent, aRenderingContext,
++                                LogicalSize(wm, ISize(), NS_UNCONSTRAINEDSIZE),
++                                ReflowInput::DUMMY_PARENT_REFLOW_INPUT);
++
++  // XXXndeakin can this be fixed to not need two different ReflowInputs?
++  ReflowInput* reflowInput;
++  if (aSizedToPopup) {
++    LogicalSize availableSize = LogicalSize(wm, ISize(), NS_UNCONSTRAINEDSIZE);
++    reflowInput = new ReflowInput(presContext, parentReflowInput, aParent, availableSize, nullptr,
++                                  ReflowInput::DUMMY_PARENT_REFLOW_INPUT);
++  }
++  else {
++    LogicalSize availableSize = LogicalSize(wm, NS_UNCONSTRAINEDSIZE, NS_UNCONSTRAINEDSIZE);
++    reflowInput = new ReflowInput(presContext, parentReflowInput, this, availableSize);
++  }
++
++  const nsSize containerSize;
++  ReflowOutput desiredSize(parentReflowInput);
++  nsReflowStatus ignoredStatus;
++  uint32_t layoutFlags = GetXULLayoutFlags();
++  ReflowChild(this, presContext, desiredSize, *reflowInput,
++              wm, LogicalPoint(wm), containerSize, layoutFlags, 
++              ignoredStatus);
++  FinishReflowChild(this, presContext, desiredSize, reflowInput,
++                    wm, LogicalPoint(wm), containerSize, layoutFlags);
++
++  delete reflowInput;
++
++  if (IsLeaf()) {
++    return;
++  }
++
++  SchedulePaint();
++
++  bool shouldPosition = true;
++  bool isOpen = IsOpen();
++  if (!isOpen) {
++    // if the popup is not open, only do layout while showing or if the menu
++    // is sized to the popup
++    shouldPosition =
++        (mPopupState == ePopupShowing || mPopupState == ePopupPositioning);
++    if (!shouldPosition && !aSizedToPopup) {
++      RemoveStateBits(NS_FRAME_FIRST_REFLOW);
++      return;
++    }
++  }
++
++  // if the popup has just been opened, make sure the scrolled window is at 0,0
++  // Don't scroll menulists as they will scroll to their selected item on their
++  // own.
++  if (mIsOpenChanged && !IsMenuList()) {
++    nsIScrollableFrame* scrollframe =
++        do_QueryFrame(nsBox::GetChildXULBox(this));
++    if (scrollframe) {
++      AutoWeakFrame weakFrame(this);
++      scrollframe->ScrollTo(nsPoint(0, 0), ScrollMode::eInstant);
++      if (!weakFrame.IsAlive()) {
++        return;
++      }
++    }
++  }
++
++  mPrefSize = mRect.Size();
++
++  bool needCallback = false;
++  if (shouldPosition) {
++    SetPopupPosition(aAnchor, false, aSizedToPopup,
++                     mPopupState == ePopupPositioning);
++    needCallback = true;
++  }
++
++  nsPresContext* pc = PresContext();
++  nsView* view = GetView();
++
++  if (isOpen) {
++    nsViewManager* viewManager = view->GetViewManager();
++    nsRect rect = GetRect();
++    rect.x = rect.y = 0;
++    viewManager->ResizeView(view, rect);
++
++    if (mPopupState == ePopupOpening) {
++      mPopupState = ePopupVisible;
++    }
++
++    viewManager->SetViewVisibility(view, nsViewVisibility_kShow);
++  }
++
++  // finally, if the popup just opened, send a popupshown event
++  bool openChanged = mIsOpenChanged;
++  if (openChanged) {
++    mIsOpenChanged = false;
++
++    // Make sure the current selection in a menulist is visible.
++    if (IsMenuList() && mCurrentMenu) {
++      EnsureMenuItemIsVisible(mCurrentMenu);
++    }
++
++#ifndef MOZ_WIDGET_GTK
++    // If the animate attribute is set to open, check for a transition and wait
++    // for it to finish before firing the popupshown event.
++    if (mContent->AsElement()->AttrValueIs(kNameSpaceID_None,
++                                           nsGkAtoms::animate, nsGkAtoms::open,
++                                           eCaseMatters) &&
++        AnimationUtils::HasCurrentTransitions(mContent->AsElement(),
++                                              PseudoStyleType::NotPseudo)) {
++      mPopupShownDispatcher = new nsXULPopupShownEvent(mContent, pc);
++      mContent->AddSystemEventListener(NS_LITERAL_STRING("transitionend"),
++                                       mPopupShownDispatcher, false, false);
++      return;
++    }
++#endif
++
++    // If there are no transitions, fire the popupshown event right away.
++    nsCOMPtr<nsIRunnable> event = new nsXULPopupShownEvent(GetContent(), pc);
++    mContent->OwnerDoc()->Dispatch(TaskCategory::Other, event.forget());
++  }
++
++  if (needCallback && !mReflowCallbackData.mPosted) {
++    pc->PresShell()->PostReflowCallback(this);
++    mReflowCallbackData.MarkPosted(aAnchor, aSizedToPopup, openChanged);
++  }
++}
++
+ bool nsMenuPopupFrame::ReflowFinished() {
+   SetPopupPosition(mReflowCallbackData.mAnchor, false,
+                    mReflowCallbackData.mSizedToPopup, true);
+ 
+   mReflowCallbackData.Clear();
+ 
+   return false;
+ }
+@@ -984,16 +1114,17 @@ nsView* nsMenuPopupFrame::GetRootViewFor
+     }
+     view = temp;
+   }
+ 
+   return nullptr;
+ }
+ 
+ nsPoint nsMenuPopupFrame::AdjustPositionForAnchorAlign(nsRect& anchorRect,
++                                                       nsSize& prefSize,
+                                                        FlipStyle& aHFlip,
+                                                        FlipStyle& aVFlip) {
+   // flip the anchor and alignment for right-to-left
+   int8_t popupAnchor(mPopupAnchor);
+   int8_t popupAlign(mPopupAlignment);
+   if (IsDirectionRTL()) {
+     // no need to flip the centered anchor types vertically
+     if (popupAnchor <= POPUPALIGNMENT_LEFTCENTER) {
+@@ -1045,23 +1176,23 @@ nsPoint nsMenuPopupFrame::AdjustPosition
+   // If the alignment is on the right edge of the popup, move the popup left
+   // by the width. Similarly, if the alignment is on the bottom edge of the
+   // popup, move the popup up by the height. In addition, account for the
+   // margins of the popup on the edge on which it is aligned.
+   nsMargin margin(0, 0, 0, 0);
+   StyleMargin()->GetMargin(margin);
+   switch (popupAlign) {
+     case POPUPALIGNMENT_TOPRIGHT:
+-      pnt.MoveBy(-mRect.width - margin.right, margin.top);
++      pnt.MoveBy(-prefSize.width - margin.right, margin.top);
+       break;
+     case POPUPALIGNMENT_BOTTOMLEFT:
+-      pnt.MoveBy(margin.left, -mRect.height - margin.bottom);
++      pnt.MoveBy(margin.left, -prefSize.height - margin.bottom);
+       break;
+     case POPUPALIGNMENT_BOTTOMRIGHT:
+-      pnt.MoveBy(-mRect.width - margin.right, -mRect.height - margin.bottom);
++      pnt.MoveBy(-prefSize.width - margin.right, -prefSize.height - margin.bottom);
+       break;
+     case POPUPALIGNMENT_TOPLEFT:
+     default:
+       pnt.MoveBy(margin.left, margin.top);
+       break;
+   }
+ 
+   // If we aligning to the selected item in the popup, adjust the vertical
+@@ -1358,24 +1489,23 @@ nsresult nsMenuPopupFrame::SetPopupPosit
+   }
+ 
+   // Set the popup's size to the preferred size. Below, this size will be
+   // adjusted to fit on the screen or within the content area. If the anchor
+   // is sized to the popup, use the anchor's width instead of the preferred
+   // width. The preferred size should already be set by the parent frame.
+   NS_ASSERTION(mPrefSize.width >= 0 || mPrefSize.height >= 0,
+                "preferred size of popup not set");
+-  mRect.width = aSizedToPopup ? parentWidth : mPrefSize.width;
+-  mRect.height = mPrefSize.height;
++  nsSize prefSize(aSizedToPopup ? parentWidth : mPrefSize.width, mPrefSize.height);
+ 
+   // If we're anchoring to a rect, and the rect is smaller than the preferred
+   // size of the popup, change its width accordingly.
+   if (mAnchorType == MenuPopupAnchorType_Rect &&
+       parentWidth < mPrefSize.width) {
+-    mRect.width = mPrefSize.width;
++    prefSize.width = mPrefSize.width;
+   }
+ 
+   // the screen position in app units where the popup should appear
+   nsPoint screenPoint;
+ 
+   // indicators of whether the popup should be flipped or resized.
+   FlipStyle hFlip = FlipStyle_None, vFlip = FlipStyle_None;
+ 
+@@ -1398,17 +1528,17 @@ nsresult nsMenuPopupFrame::SetPopupPosit
+     // When doing this reposition, we want to move the popup to the side with
+     // the most room. The combination of anchor and alignment dictate if we
+     // readjust above/below or to the left/right.
+     if (mAnchorContent || mAnchorType == MenuPopupAnchorType_Rect) {
+       // move the popup according to the anchor and alignment. This will also
+       // tell us which axis the popup is flush against in case we have to move
+       // it around later. The AdjustPositionForAnchorAlign method accounts for
+       // the popup's margin.
+-      screenPoint = AdjustPositionForAnchorAlign(anchorRect, hFlip, vFlip);
++      screenPoint = AdjustPositionForAnchorAlign(anchorRect, prefSize, hFlip, vFlip);
+     } else {
+       // with no anchor, the popup is positioned relative to the root frame
+       anchorRect = rootScreenRect;
+       screenPoint = anchorRect.TopLeft() + nsPoint(margin.left, margin.top);
+     }
+ 
+     // mXPos and mYPos specify an additonal offset passed to OpenPopup that
+     // should be added to the position.  We also add the offset to the anchor
+@@ -1511,18 +1641,18 @@ nsresult nsMenuPopupFrame::SetPopupPosit
+         GetConstraintRect(anchorRectDevPix, rootScreenRectDevPix, popupLevel);
+     nsRect screenRect =
+         LayoutDeviceIntRect::ToAppUnits(screenRectDevPix, appPerDev);
+ 
+     // Ensure that anchorRect is on screen.
+     anchorRect = anchorRect.Intersect(screenRect);
+ 
+     // shrink the the popup down if it is larger than the screen size
+-    if (mRect.width > screenRect.width) mRect.width = screenRect.width;
+-    if (mRect.height > screenRect.height) mRect.height = screenRect.height;
++    if (prefSize.width > screenRect.width) prefSize.width = screenRect.width;
++    if (prefSize.height > screenRect.height) prefSize.height = screenRect.height;
+ 
+     // at this point the anchor (anchorRect) is within the available screen
+     // area (screenRect) and the popup is known to be no larger than the screen.
+ 
+     // We might want to "slide" an arrow if the panel is of the correct type -
+     // but we can only slide on one axis - the other axis must be "flipped or
+     // resized" as normal.
+     bool slideHorizontal = false, slideVertical = false;
+@@ -1539,44 +1669,44 @@ nsresult nsMenuPopupFrame::SetPopupPosit
+     // of their anchor point, or resize them as necessary.
+     bool endAligned = IsDirectionRTL()
+                           ? mPopupAlignment == POPUPALIGNMENT_TOPLEFT ||
+                                 mPopupAlignment == POPUPALIGNMENT_BOTTOMLEFT
+                           : mPopupAlignment == POPUPALIGNMENT_TOPRIGHT ||
+                                 mPopupAlignment == POPUPALIGNMENT_BOTTOMRIGHT;
+     nscoord preOffsetScreenPoint = screenPoint.x;
+     if (slideHorizontal) {
+-      mRect.width = SlideOrResize(screenPoint.x, mRect.width, screenRect.x,
++      prefSize.width = SlideOrResize(screenPoint.x, prefSize.width, screenRect.x,
+                                   screenRect.XMost(), &mAlignmentOffset);
+     } else {
+-      mRect.width = FlipOrResize(
+-          screenPoint.x, mRect.width, screenRect.x, screenRect.XMost(),
++      prefSize.width = FlipOrResize(
++          screenPoint.x, prefSize.width, screenRect.x, screenRect.XMost(),
+           anchorRect.x, anchorRect.XMost(), margin.left, margin.right,
+           offsetForContextMenu.x, hFlip, endAligned, &mHFlip);
+     }
+     mIsOffset = preOffsetScreenPoint != screenPoint.x;
+ 
+     endAligned = mPopupAlignment == POPUPALIGNMENT_BOTTOMLEFT ||
+                  mPopupAlignment == POPUPALIGNMENT_BOTTOMRIGHT;
+     preOffsetScreenPoint = screenPoint.y;
+     if (slideVertical) {
+-      mRect.height = SlideOrResize(screenPoint.y, mRect.height, screenRect.y,
++      prefSize.height = SlideOrResize(screenPoint.y, prefSize.height, screenRect.y,
+                                    screenRect.YMost(), &mAlignmentOffset);
+     } else {
+-      mRect.height = FlipOrResize(
+-          screenPoint.y, mRect.height, screenRect.y, screenRect.YMost(),
++      prefSize.height = FlipOrResize(
++          screenPoint.y, prefSize.height, screenRect.y, screenRect.YMost(),
+           anchorRect.y, anchorRect.YMost(), margin.top, margin.bottom,
+           offsetForContextMenu.y, vFlip, endAligned, &mVFlip);
+     }
+     mIsOffset = mIsOffset || (preOffsetScreenPoint != screenPoint.y);
+ 
+     NS_ASSERTION(screenPoint.x >= screenRect.x &&
+                      screenPoint.y >= screenRect.y &&
+-                     screenPoint.x + mRect.width <= screenRect.XMost() &&
+-                     screenPoint.y + mRect.height <= screenRect.YMost(),
++                     screenPoint.x + prefSize.width <= screenRect.XMost() &&
++                     screenPoint.y + prefSize.height <= screenRect.YMost(),
+                  "Popup is offscreen");
+   }
+ 
+   // snap the popup's position in screen coordinates to device pixels,
+   // see bug 622507, bug 961431
+   screenPoint.x = presContext->RoundAppUnitsToNearestDevPixels(screenPoint.x);
+   screenPoint.y = presContext->RoundAppUnitsToNearestDevPixels(screenPoint.y);
+ 
+@@ -1597,27 +1727,28 @@ nsresult nsMenuPopupFrame::SetPopupPosit
+     viewPoint.x += presContext->DevPixelsToAppUnits(mLastClientOffset.x);
+     viewPoint.y += presContext->DevPixelsToAppUnits(mLastClientOffset.y);
+   }
+ 
+   presContext->GetPresShell()->GetViewManager()->MoveViewTo(view, viewPoint.x,
+                                                             viewPoint.y);
+ 
+   // Now that we've positioned the view, sync up the frame's origin.
+-  nsBoxFrame::SetPosition(viewPoint - GetParent()->GetOffsetTo(rootFrame));
++  SetPosition(viewPoint - GetParent()->GetOffsetTo(rootFrame));
+ 
+   if (aSizedToPopup) {
+-    nsBoxLayoutState state(PresContext());
++    // XXXndeakin fix this?
++//    nsBoxLayoutState state(PresContext());
+     // XXXndeakin can parentSize.width still extend outside?
+-    SetXULBounds(state, mRect);
++//    SetXULBounds(state, mRect);
+   }
+ 
+   // If the popup is in the positioned state or if it is shown and the position
+   // or size changed, dispatch a popuppositioned event if the popup wants it.
+-  nsIntRect newRect(screenPoint.x, screenPoint.y, mRect.width, mRect.height);
++  nsIntRect newRect(screenPoint.x, screenPoint.y, prefSize.width, prefSize.height);
+   if (mPopupState == ePopupPositioning ||
+       (mPopupState == ePopupShown && !newRect.IsEqualEdges(mUsedScreenRect)) ||
+       (mPopupState == ePopupShown && oldAlignmentOffset != mAlignmentOffset)) {
+     mUsedScreenRect = newRect;
+     if (aNotify) {
+       nsXULPopupPositionedEvent::DispatchIfNeeded(mContent, false, false);
+     }
+   }
+@@ -2151,17 +2282,17 @@ nsIWidget* nsMenuPopupFrame::GetWidget()
+ // helpers /////////////////////////////////////////////////////////////
+ 
+ nsresult nsMenuPopupFrame::AttributeChanged(int32_t aNameSpaceID,
+                                             nsAtom* aAttribute,
+                                             int32_t aModType)
+ 
+ {
+   nsresult rv =
+-      nsBoxFrame::AttributeChanged(aNameSpaceID, aAttribute, aModType);
++      nsFlexContainerFrame::AttributeChanged(aNameSpaceID, aAttribute, aModType);
+ 
+   if (aAttribute == nsGkAtoms::left || aAttribute == nsGkAtoms::top)
+     MoveToAttributePosition();
+ 
+   if (aAttribute == nsGkAtoms::remote) {
+     // When the remote attribute changes, we need to create a new widget to
+     // ensure that it has the correct compositor and transparency settings to
+     // match the new value.
+@@ -2236,17 +2367,17 @@ void nsMenuPopupFrame::DestroyFrom(nsIFr
+   if (pm) pm->PopupDestroyed(this);
+ 
+   nsIPopupContainer* popupContainer =
+       nsIPopupContainer::GetPopupContainer(PresContext()->GetPresShell());
+   if (popupContainer && popupContainer->GetDefaultTooltip() == mContent) {
+     popupContainer->SetDefaultTooltip(nullptr);
+   }
+ 
+-  nsBoxFrame::DestroyFrom(aDestructRoot, aPostDestroyData);
++  nsFlexContainerFrame::DestroyFrom(aDestructRoot, aPostDestroyData);
+ }
+ 
+ void nsMenuPopupFrame::MoveTo(const CSSIntPoint& aPos, bool aUpdateAttrs) {
+   nsIWidget* widget = GetWidget();
+   if ((mScreenRect.x == aPos.x && mScreenRect.y == aPos.y) &&
+       (!widget || widget->GetClientOffset() == mLastClientOffset)) {
+     return;
+   }
+diff --git a/layout/xul/nsMenuPopupFrame.h b/layout/xul/nsMenuPopupFrame.h
+--- a/layout/xul/nsMenuPopupFrame.h
++++ b/layout/xul/nsMenuPopupFrame.h
+@@ -13,16 +13,17 @@
+ 
+ #include "mozilla/Attributes.h"
+ #include "mozilla/gfx/Types.h"
+ #include "nsAtom.h"
+ #include "nsIDOMXULSelectCntrlEl.h"
+ #include "nsGkAtoms.h"
+ #include "nsCOMPtr.h"
+ #include "nsMenuFrame.h"
++#include "nsFlexContainerFrame.h"
+ 
+ #include "nsBoxFrame.h"
+ #include "nsMenuParent.h"
+ 
+ #include "nsITimer.h"
+ 
+ #include "Units.h"
+ 
+@@ -162,17 +163,17 @@ class nsXULPopupShownEvent final : publi
+  protected:
+   virtual ~nsXULPopupShownEvent() {}
+ 
+  private:
+   nsCOMPtr<nsIContent> mPopup;
+   RefPtr<nsPresContext> mPresContext;
+ };
+ 
+-class nsMenuPopupFrame final : public nsBoxFrame,
++class nsMenuPopupFrame final : public nsFlexContainerFrame,
+                                public nsMenuParent,
+                                public nsIReflowCallback {
+  public:
+   NS_DECL_QUERYFRAME
+   NS_DECL_FRAMEARENA_HELPERS(nsMenuPopupFrame)
+ 
+   explicit nsMenuPopupFrame(ComputedStyle* aStyle, nsPresContext* aPresContext);
+ 
+@@ -251,16 +252,19 @@ class nsMenuPopupFrame final : public ns
+   virtual bool IsLeafDynamic() const override;
+ 
+   virtual void UpdateWidgetProperties() override;
+ 
+   // layout, position and display the popup as needed
+   void LayoutPopup(nsBoxLayoutState& aState, nsIFrame* aParentMenu,
+                    nsIFrame* aAnchor, bool aSizedToPopup);
+ 
++  void ReflowPopup(gfxContext* aRenderingContext, nsIFrame* aParent,
++                   nsIFrame* aAnchor, bool aSizedToPopup);
++
+   nsView* GetRootViewForPopup(nsIFrame* aStartFrame);
+ 
+   // Set the position of the popup either relative to the anchor aAnchorFrame
+   // (or the frame for mAnchorContent if aAnchorFrame is null), anchored at a
+   // rectangle, or at a specific point if a screen position is set. The popup
+   // will be adjusted so that it is on screen. If aIsMove is true, then the
+   // popup is being moved, and should not be flipped. If aNotify is true, then
+   // a popuppositioned event is sent.
+@@ -438,30 +442,31 @@ class nsMenuPopupFrame final : public ns
+   // CheckForAnchorChange. If the popup needs to be moved, aRect will be updated
+   // with the new rectangle.
+   void CheckForAnchorChange(nsRect& aRect);
+ 
+   // nsIReflowCallback
+   virtual bool ReflowFinished() override;
+   virtual void ReflowCallbackCanceled() override;
+ 
++  // redefine to tell the box system not to move the views.
++  virtual uint32_t GetXULLayoutFlags() override;
++
+  protected:
+   // returns the popup's level.
+   nsPopupLevel PopupLevel(bool aIsNoAutoHide) const;
+ 
+-  // redefine to tell the box system not to move the views.
+-  virtual uint32_t GetXULLayoutFlags() override;
+-
+   void InitPositionFromAnchorAlign(const nsAString& aAnchor,
+                                    const nsAString& aAlign);
+ 
+   // return the position where the popup should be, when it should be
+   // anchored at anchorRect. aHFlip and aVFlip will be set if the popup may be
+   // flipped in that direction if there is not enough space available.
+-  nsPoint AdjustPositionForAnchorAlign(nsRect& anchorRect, FlipStyle& aHFlip,
++  nsPoint AdjustPositionForAnchorAlign(nsRect& anchorRect, nsSize& prefSize,
++                                       FlipStyle& aHFlip,
+                                        FlipStyle& aVFlip);
+ 
+   // For popups that are going to align to their selected item, get the frame of
+   // the selected item.
+   nsIFrame* GetSelectedItemForAlignment();
+ 
+   // check if the popup will fit into the available space and resize it. This
+   // method handles only one axis at a time so is called twice, once for
+diff --git a/layout/xul/nsPopupSetFrame.cpp b/layout/xul/nsPopupSetFrame.cpp
+--- a/layout/xul/nsPopupSetFrame.cpp
++++ b/layout/xul/nsPopupSetFrame.cpp
+@@ -104,17 +104,17 @@ void nsPopupSetFrame::DestroyFrom(nsIFra
+ NS_IMETHODIMP
+ nsPopupSetFrame::DoXULLayout(nsBoxLayoutState& aState) {
+   // lay us out
+   nsresult rv = nsBoxFrame::DoXULLayout(aState);
+ 
+   // lay out all of our currently open popups.
+   for (nsFrameList::Enumerator e(mPopupList); !e.AtEnd(); e.Next()) {
+     nsMenuPopupFrame* popupChild = static_cast<nsMenuPopupFrame*>(e.get());
+-    popupChild->LayoutPopup(aState, nullptr, nullptr, false);
++    popupChild->ReflowPopup(aState.GetRenderingContext(), this, nullptr, false);
+   }
+ 
+   return rv;
+ }
+ 
+ void nsPopupSetFrame::RemovePopupFrame(nsIFrame* aPopup) {
+   MOZ_ASSERT((aPopup->GetStateBits() & NS_FRAME_OUT_OF_FLOW) &&
+                  aPopup->IsMenuPopupFrame(),
+diff --git a/layout/xul/nsResizerFrame.cpp b/layout/xul/nsResizerFrame.cpp
+--- a/layout/xul/nsResizerFrame.cpp
++++ b/layout/xul/nsResizerFrame.cpp
+@@ -21,16 +21,17 @@
+ #include "nsIBaseWindow.h"
+ #include "nsPIDOMWindow.h"
+ #include "mozilla/MouseEvents.h"
+ #include "nsContentUtils.h"
+ #include "nsMenuPopupFrame.h"
+ #include "nsIScreenManager.h"
+ #include "mozilla/dom/Element.h"
+ #include "mozilla/dom/MouseEventBinding.h"
++#include "nsXULElement.h"
+ #include "nsError.h"
+ #include "nsICSSDeclaration.h"
+ #include "nsStyledElement.h"
+ #include <algorithm>
+ 
+ using namespace mozilla;
+ 
+ //
+@@ -250,22 +251,19 @@ nsresult nsResizerFrame::HandleEvent(nsP
+             if (widget) oldRect = widget->GetScreenBounds();
+ 
+             // convert the new rectangle into outer window coordinates
+             LayoutDeviceIntPoint clientOffset = widget->GetClientOffset();
+             rect.x -= clientOffset.x;
+             rect.y -= clientOffset.y;
+           }
+ 
+-          SizeInfo sizeInfo, originalSizeInfo;
+-          sizeInfo.width.AppendInt(cssRect.width);
+-          sizeInfo.height.AppendInt(cssRect.height);
+-          ResizeContent(contentToResize, direction, sizeInfo,
+-                        &originalSizeInfo);
+-          MaybePersistOriginalSize(contentToResize, originalSizeInfo);
++          nsIntSize originalSize = GetCurrentSize(contentToResize);
++          ResizeContent(contentToResize, direction, cssRect.Size());
++          MaybePersistOriginalSize(contentToResize, originalSize);
+ 
+           // Move the popup to the new location unless it is anchored, since
+           // the position shouldn't change. nsMenuPopupFrame::SetPopupPosition
+           // will instead ensure that the popup's position is anchored at the
+           // right place.
+           if (weakFrame.IsAlive() &&
+               (oldRect.x != rect.x || oldRect.y != rect.y) &&
+               (!menuPopupFrame->IsAnchored() ||
+@@ -391,97 +389,81 @@ void nsResizerFrame::AdjustDimensions(in
+   // Constrain the size within the minimum and maximum size.
+   *aSize = std::max(aMinSize, std::min(aMaxSize, *aSize));
+ 
+   // For left and top resizers, the window must be moved left by the same
+   // amount that the window was resized.
+   if (aResizerDirection == -1) *aPos += oldSize - *aSize;
+ }
+ 
+-/* static */
+-void nsResizerFrame::ResizeContent(nsIContent* aContent,
+-                                   const Direction& aDirection,
+-                                   const SizeInfo& aSizeInfo,
+-                                   SizeInfo* aOriginalSizeInfo) {
+-  // for XUL elements, just set the width and height attributes. For
+-  // other elements, set style.width and style.height
++/* static */ nsIntSize nsResizerFrame::GetCurrentSize(nsIContent* aContent) {
++  nsAutoString widthStr, heightStr;
+   if (aContent->IsXULElement()) {
+-    if (aOriginalSizeInfo) {
+-      aContent->AsElement()->GetAttr(kNameSpaceID_None, nsGkAtoms::width,
+-                                     aOriginalSizeInfo->width);
+-      aContent->AsElement()->GetAttr(kNameSpaceID_None, nsGkAtoms::height,
+-                                     aOriginalSizeInfo->height);
+-    }
+-    // only set the property if the element could have changed in that direction
+-    if (aDirection.mHorizontal) {
+-      aContent->AsElement()->SetAttr(kNameSpaceID_None, nsGkAtoms::width,
+-                                     aSizeInfo.width, true);
+-    }
+-    if (aDirection.mVertical) {
+-      aContent->AsElement()->SetAttr(kNameSpaceID_None, nsGkAtoms::height,
+-                                     aSizeInfo.height, true);
+-    }
++    // for XUL elements, just set the width and height attributes. For
++    // other elements, set style.width and style.height
++    aContent->AsElement()->GetAttr(kNameSpaceID_None, nsGkAtoms::width,
++                                   widthStr);
++    aContent->AsElement()->GetAttr(kNameSpaceID_None, nsGkAtoms::height,
++                                   heightStr);
+   } else {
+     nsCOMPtr<nsStyledElement> inlineStyleContent = do_QueryInterface(aContent);
+     if (inlineStyleContent) {
+       nsICSSDeclaration* decl = inlineStyleContent->Style();
+-
+-      if (aOriginalSizeInfo) {
+-        decl->GetPropertyValue(NS_LITERAL_STRING("width"),
+-                               aOriginalSizeInfo->width);
+-        decl->GetPropertyValue(NS_LITERAL_STRING("height"),
+-                               aOriginalSizeInfo->height);
+-      }
+-
+-      // only set the property if the element could have changed in that
+-      // direction
+-      if (aDirection.mHorizontal) {
+-        nsAutoString widthstr(aSizeInfo.width);
+-        if (!widthstr.IsEmpty() &&
+-            !Substring(widthstr, widthstr.Length() - 2, 2).EqualsLiteral("px"))
+-          widthstr.AppendLiteral("px");
+-        decl->SetProperty(NS_LITERAL_STRING("width"), widthstr, EmptyString());
+-      }
+-      if (aDirection.mVertical) {
+-        nsAutoString heightstr(aSizeInfo.height);
+-        if (!heightstr.IsEmpty() &&
+-            !Substring(heightstr, heightstr.Length() - 2, 2)
+-                 .EqualsLiteral("px"))
+-          heightstr.AppendLiteral("px");
+-        decl->SetProperty(NS_LITERAL_STRING("height"), heightstr,
+-                          EmptyString());
+-      }
++      decl->GetPropertyValue(NS_LITERAL_STRING("width"), widthStr);
++      decl->GetPropertyValue(NS_LITERAL_STRING("height"), heightStr);
+     }
+   }
++
++  nsresult rv;
++  nsIntSize size;
++  int32_t widthInt = widthStr.ToInteger(&rv);
++  if (NS_SUCCEEDED(rv)) {
++    size.width = widthInt;
++  }
++  int32_t heightInt = heightStr.ToInteger(&rv);
++  if (NS_SUCCEEDED(rv)) {
++    size.height = heightInt;
++  }
++
++  return size;
++}
++
++/* static */ void nsResizerFrame::ResizeContent(nsIContent* aContent,
++                                                const Direction& aDirection,
++                                                const nsIntSize& aSize) {
++  // only set the property if the element could have changed in that direction
++  int32_t width = aDirection.mHorizontal ? aSize.width : -1;
++  int32_t height = aDirection.mVertical ? aSize.height : -1;
++  nsXULElement::SetWidthAndHeight(aContent->AsElement(), width, height);
+ }
+ 
+ /* static */
+ void nsResizerFrame::MaybePersistOriginalSize(nsIContent* aContent,
+-                                              const SizeInfo& aSizeInfo) {
++                                              const nsIntSize& aSize) {
+   nsresult rv;
+ 
+   aContent->GetProperty(nsGkAtoms::_moz_original_size, &rv);
+   if (rv != NS_PROPTABLE_PROP_NOT_THERE) return;
+ 
+-  nsAutoPtr<SizeInfo> sizeInfo(new SizeInfo(aSizeInfo));
+-  rv = aContent->SetProperty(nsGkAtoms::_moz_original_size, sizeInfo.get(),
+-                             nsINode::DeleteProperty<nsResizerFrame::SizeInfo>);
+-  if (NS_SUCCEEDED(rv)) sizeInfo.forget();
++  nsAutoPtr<nsIntSize> size(new nsIntSize(aSize));
++  rv = aContent->SetProperty(nsGkAtoms::_moz_original_size, size.get(),
++                             nsINode::DeleteProperty<nsIntSize>);
++  if (NS_SUCCEEDED(rv)) size.forget();
+ }
+ 
+ /* static */
+ void nsResizerFrame::RestoreOriginalSize(nsIContent* aContent) {
+   nsresult rv;
+-  SizeInfo* sizeInfo = static_cast<SizeInfo*>(
++  nsIntSize* size = static_cast<nsIntSize*>(
+       aContent->GetProperty(nsGkAtoms::_moz_original_size, &rv));
+   if (NS_FAILED(rv)) return;
+ 
+-  NS_ASSERTION(sizeInfo, "We set a null sizeInfo!?");
++  NS_ASSERTION(size, "We set a null size!?");
+   Direction direction = {1, 1};
+-  ResizeContent(aContent, direction, *sizeInfo, nullptr);
++  ResizeContent(aContent, direction, *size);
+   aContent->DeleteProperty(nsGkAtoms::_moz_original_size);
+ }
+ 
+ /* returns a Direction struct containing the horizontal and vertical direction
+  */
+ nsResizerFrame::Direction nsResizerFrame::GetDirection() {
+   static const Element::AttrValuesArray strings[] = {
+       // clang-format off
+diff --git a/layout/xul/nsResizerFrame.h b/layout/xul/nsResizerFrame.h
+--- a/layout/xul/nsResizerFrame.h
++++ b/layout/xul/nsResizerFrame.h
+@@ -57,26 +57,21 @@ class nsResizerFrame final : public nsTi
+    * @param aMacSize maximum width or height
+    * @param aMovement the amount the mouse was moved
+    * @param aResizerDirection resizer direction returned by GetDirection
+    */
+   static void AdjustDimensions(int32_t* aPos, int32_t* aSize, int32_t aMinSize,
+                                int32_t aMaxSize, int32_t aMovement,
+                                int8_t aResizerDirection);
+ 
+-  struct SizeInfo {
+-    nsString width, height;
+-  };
+-  static void SizeInfoDtorFunc(void* aObject, nsAtom* aPropertyName,
+-                               void* aPropertyValue, void* aData);
++  static nsIntSize GetCurrentSize(nsIContent* aContent);
+   static void ResizeContent(nsIContent* aContent, const Direction& aDirection,
+-                            const SizeInfo& aSizeInfo,
+-                            SizeInfo* aOriginalSizeInfo);
++                            const nsIntSize& aSize);
+   static void MaybePersistOriginalSize(nsIContent* aContent,
+-                                       const SizeInfo& aSizeInfo);
++                                       const nsIntSize& aSize);
+   static void RestoreOriginalSize(nsIContent* aContent);
+ 
+  protected:
+   LayoutDeviceIntRect mMouseDownRect;
+   LayoutDeviceIntPoint mMouseDownPoint;
+ };  // class nsResizerFrame
+ 
+ #endif /* nsResizerFrame_h___ */
+diff --git a/layout/xul/nsSliderFrame.cpp b/layout/xul/nsSliderFrame.cpp
+--- a/layout/xul/nsSliderFrame.cpp
++++ b/layout/xul/nsSliderFrame.cpp
+@@ -672,17 +672,17 @@ nsIFrame* nsSliderFrame::GetScrollbar() 
+   // if we are in a scrollbar then return the scrollbar's content node
+   // if we are not then return ours.
+   nsIFrame* scrollbar;
+   nsScrollbarButtonFrame::GetParentWithTag(nsGkAtoms::scrollbar, this,
+                                            scrollbar);
+ 
+   if (scrollbar == nullptr) return this;
+ 
+-  return scrollbar->IsXULBoxFrame() ? scrollbar : this;
++  return scrollbar->IsXULBoxOrEmulatedFrame() ? scrollbar : this;
+ }
+ 
+ void nsSliderFrame::PageUpDown(nscoord change) {
+   // on a page up or down get our page increment. We get this by getting the
+   // scrollbar we are in and asking it for the current position and the page
+   // increment. If we are not in a scrollbar we will get the values from our own
+   // node.
+   nsIFrame* scrollbarBox = GetScrollbar();
+diff --git a/layout/xul/nsSplitterFrame.cpp b/layout/xul/nsSplitterFrame.cpp
+--- a/layout/xul/nsSplitterFrame.cpp
++++ b/layout/xul/nsSplitterFrame.cpp
+@@ -238,17 +238,17 @@ void nsSplitterFrame::Init(nsIContent* a
+   mInner = new nsSplitterFrameInner(this);
+ 
+   mInner->AddRef();
+ 
+   // determine orientation of parent, and if vertical, set orient to vertical
+   // on splitter content, then re-resolve style
+   // XXXbz this is pretty messed up, since this can change whether we should
+   // have a frame at all.  This really needs a better solution.
+-  if (aParent && aParent->IsXULBoxFrame()) {
++  if (aParent && aParent->IsXULBoxOrEmulatedFrame()) {
+     if (!aParent->IsXULHorizontal()) {
+       if (!nsContentUtils::HasNonEmptyAttr(aContent, kNameSpaceID_None,
+                                            nsGkAtoms::orient)) {
+         aContent->AsElement()->SetAttr(kNameSpaceID_None, nsGkAtoms::orient,
+                                        NS_LITERAL_STRING("vertical"), false);
+       }
+     }
+   }
+@@ -743,17 +743,17 @@ void nsSplitterFrameInner::UpdateState()
+   State newState = GetState();
+ 
+   if (newState == mState) {
+     // No change.
+     return;
+   }
+ 
+   if ((SupportsCollapseDirection(Before) || SupportsCollapseDirection(After)) &&
+-      mOuter->GetParent()->IsXULBoxFrame()) {
++      mOuter->GetParent()->IsXULBoxOrEmulatedFrame()) {
+     // Find the splitter's immediate sibling.
+     nsIFrame* splitterSibling;
+     if (newState == CollapsedBefore || mState == CollapsedBefore) {
+       splitterSibling = mOuter->GetPrevSibling();
+     } else {
+       splitterSibling = mOuter->GetNextSibling();
+     }
+ 
+@@ -856,44 +856,27 @@ void nsSplitterFrameInner::SetPreferredS
+       pref = rect.height;
+   } else {
+     pref = *aSize;
+   }
+ 
+   nsMargin margin(0, 0, 0, 0);
+   aChildBox->GetXULMargin(margin);
+ 
+-  RefPtr<nsAtom> attribute;
+-
+   if (aIsHorizontal) {
+     pref -= (margin.left + margin.right);
+-    attribute = nsGkAtoms::width;
+   } else {
+     pref -= (margin.top + margin.bottom);
+-    attribute = nsGkAtoms::height;
+   }
+ 
+   nsIContent* content = aChildBox->GetContent();
+-  if (!content->IsElement()) {
+-    return;
++  if (content->IsElement()) {
++    AutoWeakFrame weakBox(aChildBox);
++    nsXULElement::SetWidthAndHeight(content->AsElement(), pref / aOnePixel, -1);
+   }
+-
+-  // set its preferred size.
+-  nsAutoString prefValue;
+-  prefValue.AppendInt(pref / aOnePixel);
+-  if (content->AsElement()->AttrValueIs(kNameSpaceID_None, attribute, prefValue,
+-                                        eCaseMatters)) {
+-    return;
+-  }
+-
+-  AutoWeakFrame weakBox(aChildBox);
+-  content->AsElement()->SetAttr(kNameSpaceID_None, attribute, prefValue, true);
+-  NS_ENSURE_TRUE_VOID(weakBox.IsAlive());
+-  aState.PresShell()->FrameNeedsReflow(aChildBox, IntrinsicDirty::StyleChange,
+-                                       NS_FRAME_IS_DIRTY);
+ }
+ 
+ void nsSplitterFrameInner::AddRemoveSpace(nscoord aDiff,
+                                           nsSplitterInfo* aChildInfos,
+                                           int32_t aCount, int32_t& aSpaceLeft) {
+   aSpaceLeft = 0;
+ 
+   for (int i = 0; i < aCount; i++) {
+diff --git a/layout/xul/nsStackLayout.cpp b/layout/xul/nsStackLayout.cpp
+--- a/layout/xul/nsStackLayout.cpp
++++ b/layout/xul/nsStackLayout.cpp
+@@ -173,17 +173,17 @@ nscoord nsStackLayout::GetAscent(nsIFram
+ 
+ uint8_t nsStackLayout::GetOffset(nsIFrame* aChild, nsMargin& aOffset) {
+   aOffset = nsMargin(0, 0, 0, 0);
+ 
+   // get the left, right, top and bottom offsets
+ 
+   // As an optimization, we cache the fact that we are not positioned to avoid
+   // wasting time fetching attributes.
+-  if (aChild->IsXULBoxFrame() &&
++  if (aChild->IsXULBoxOrEmulatedFrame() &&
+       (aChild->GetStateBits() & NS_STATE_STACK_NOT_POSITIONED))
+     return 0;
+ 
+   uint8_t offsetSpecified = 0;
+   nsIContent* content = aChild->GetContent();
+   if (content && content->IsElement()) {
+     bool ltr = aChild->StyleVisibility()->mDirection == NS_STYLE_DIRECTION_LTR;
+     nsAutoString value;
+@@ -244,17 +244,17 @@ uint8_t nsStackLayout::GetOffset(nsIFram
+     if (!value.IsEmpty()) {
+       value.Trim("%");
+       aOffset.bottom =
+           nsPresContext::CSSPixelsToAppUnits(value.ToInteger(&error));
+       offsetSpecified |= SPECIFIED_BOTTOM;
+     }
+   }
+ 
+-  if (!offsetSpecified && aChild->IsXULBoxFrame()) {
++  if (!offsetSpecified && aChild->IsXULBoxOrEmulatedFrame()) {
+     // If no offset was specified at all, then we cache this fact to avoid
+     // requerying CSS or the content model.
+     aChild->AddStateBits(NS_STATE_STACK_NOT_POSITIONED);
+   }
+ 
+   return offsetSpecified;
+ }
+ 
+diff --git a/layout/xul/nsXULPopupManager.cpp b/layout/xul/nsXULPopupManager.cpp
+--- a/layout/xul/nsXULPopupManager.cpp
++++ b/layout/xul/nsXULPopupManager.cpp
+@@ -518,25 +518,18 @@ void nsXULPopupManager::PopupResized(nsI
+   if (!popup->HasAttr(kNameSpaceID_None, nsGkAtoms::width) ||
+       !popup->HasAttr(kNameSpaceID_None, nsGkAtoms::height)) {
+     return;
+   }
+ 
+   // The size is different. Convert the actual size to css pixels and store it
+   // as 'width' and 'height' attributes on the popup.
+   nsPresContext* presContext = menuPopupFrame->PresContext();
+-
+-  CSSIntSize newCSS(presContext->DevPixelsToIntCSSPixels(aSize.width),
+-                    presContext->DevPixelsToIntCSSPixels(aSize.height));
+-
+-  nsAutoString width, height;
+-  width.AppendInt(newCSS.width);
+-  height.AppendInt(newCSS.height);
+-  popup->SetAttr(kNameSpaceID_None, nsGkAtoms::width, width, false);
+-  popup->SetAttr(kNameSpaceID_None, nsGkAtoms::height, height, true);
++  nsXULElement::SetWidthAndHeight(popup, presContext->DevPixelsToIntCSSPixels(aSize.width),
++                                         presContext->DevPixelsToIntCSSPixels(aSize.height));
+ }
+ 
+ nsMenuPopupFrame* nsXULPopupManager::GetPopupFrameForContent(
+     nsIContent* aContent, bool aShouldFlush) {
+   if (aShouldFlush) {
+     Document* document = aContent->GetUncomposedDoc();
+     if (document) {
+       if (RefPtr<PresShell> presShell = document->GetPresShell()) {
+diff --git a/modules/libpref/init/StaticPrefList.h b/modules/libpref/init/StaticPrefList.h
+--- a/modules/libpref/init/StaticPrefList.h
++++ b/modules/libpref/init/StaticPrefList.h
+@@ -1049,17 +1049,17 @@ VARCACHE_PREF(
+    layout_css_font_variations_enabled,
+   RelaxedAtomicBool, true
+ )
+ 
+ // Are we emulating -moz-{inline}-box layout using CSS flexbox?
+ VARCACHE_PREF(
+   "layout.css.emulate-moz-box-with-flex",
+    layout_css_emulate_moz_box_with_flex,
+-  bool, false
++  bool, true
+ )
+ 
+ // Does arbitrary ::-webkit-* pseudo-element parsed?
+ VARCACHE_PREF(
+   "layout.css.unknown-webkit-pseudo-element",
+    layout_css_unknown_webkit_pseudo_element,
+   bool, true
+ )
+diff --git a/toolkit/content/xul.css b/toolkit/content/xul.css
+--- a/toolkit/content/xul.css
++++ b/toolkit/content/xul.css
+@@ -382,18 +382,18 @@ treechildren {
+   display: -moz-box;
+   -moz-user-select: none;
+   -moz-box-flex: 1;
+ }
+ 
+ tree {
+   -moz-binding: none;
+   -moz-box-orient: vertical;
+-  width: 10px;
+-  height: 10px;
++  min-width: 10px;
++  min-height: 10px;
+ }
+ 
+ tree[hidecolumnpicker="true"] treecolpicker {
+   display: none;
+ }
+ 
+ treecol {
+   min-width: 16px;
+@@ -655,56 +655,8 @@ tabmodalprompt {
+ }
+ 
+ .menulist-highlightable-label:not([highlightable="true"]),
+ .menulist-label[highlightable="true"],
+ .menu-iconic-highlightable-text:not([highlightable="true"]),
+ .menu-iconic-text[highlightable="true"] {
+   display: none;
+ }
+-
+-@supports -moz-bool-pref("layout.css.emulate-moz-box-with-flex") {
+-  /* Support common XUL attributes in the emulated flex mode so we can
+-     test the browser in this configuration without mass-changing existing
+-     markup and CSS. */
+-  [orient="vertical"] { -moz-box-orient: vertical; }
+-  [orient="horizontal"] { -moz-box-orient: horizontal; }
+-
+-  [dir="reverse"] { -moz-box-direction: reverse; }
+-
+-  [align="start"] { -moz-box-align: start; }
+-  [align="center"] { -moz-box-align: center; }
+-  [align="end"] { -moz-box-align: end; }
+-  [align="baseline"] { -moz-box-align: baseline; }
+-  [align="stretch"] { -moz-box-align: stretch; }
+-
+-  [pack="start"] { -moz-box-pack: start; }
+-  [pack="center"] { -moz-box-pack: center; }
+-  [pack="end"] { -moz-box-pack: end; }
+-
+-  /* This isn't a real solution for [flex] and [ordinal], but it covers enough
+-     cases to render the browser chrome. If we get attr() in Bug 435426 this could
+-     work for all cases. */
+-  [flex="1"] { -moz-box-flex: 1; }
+-  [flex="2"] { -moz-box-flex: 2; }
+-  [flex="3"] { -moz-box-flex: 3; }
+-  [flex="4"] { -moz-box-flex: 4; }
+-  [flex="5"] { -moz-box-flex: 5; }
+-  [flex="6"] { -moz-box-flex: 6; }
+-  [flex="7"] { -moz-box-flex: 7; }
+-  [flex="8"] { -moz-box-flex: 8; }
+-  [flex="9"] { -moz-box-flex: 9; }
+-  [flex="100"] { -moz-box-flex: 100; }
+-  [flex="400"] { -moz-box-flex: 400; }
+-  [flex="1000"] { -moz-box-flex: 1000; }
+-  [flex="10000"] { -moz-box-flex: 10000; }
+-
+-  [ordinal="1"] { -moz-box-ordinal-group: 1; }
+-  [ordinal="2"] { -moz-box-ordinal-group: 2; }
+-  [ordinal="3"] { -moz-box-ordinal-group: 3; }
+-  [ordinal="4"] { -moz-box-ordinal-group: 4; }
+-  [ordinal="5"] { -moz-box-ordinal-group: 5; }
+-  [ordinal="6"] { -moz-box-ordinal-group: 6; }
+-  [ordinal="7"] { -moz-box-ordinal-group: 7; }
+-  [ordinal="8"] { -moz-box-ordinal-group: 8; }
+-  [ordinal="9"] { -moz-box-ordinal-group: 9; }
+-  [ordinal="1000"] { -moz-box-ordinal-group: 1000; }
+-}
