@@ -1,0 +1,1462 @@
+
+# HG changeset patch
+# User Andrew Swan <aswan@mozilla.com>
+# Date 1560289786 25200
+# Node ID ffb971149fbbd52fdec1dca0c0c73ee73cb5cf44
+# Parent  2941e3467a8de9a2d9d987b2bfc630bf207c763c
+Bug 1555060 Stop using dom structure for <tabs>/<tab> relationships
+
+A bunch of existing code assumes that <tab> elements are the immediate
+and only children of a <tabs> element, and uses dom apis to traverse
+relationships between these elements.  To simplify conversion of <tabs>
+to a custom element (and hopefully improve readability a bit at the same
+time!), introduce new apis:
+
+On <tab>
+this.parentNode -> this.container
+this.nextElementSibling -> this.container.findNextTab(...)
+this.previousElementSibiling -> this.container.findNextTab(...)
+
+On <tabs>
+this.firstElementChild -> this.firstTab
+this.lastElementChild -> this.lastTab
+this.children.length -> this.tabCount
+this.children[i] -> this.getItemAtIndex(i)
+this.children -> this.allTabs
+
+One subtle difference is that the allTabs property on a <tabs> element
+which used to return a live HTMLCollection now returns an Array.  Accessing
+allTabs is also more expensive than the old .children property, so various
+callers have been updated to use .tabCount, .getItemAtIndex, etc as
+appropriate.
+
+Differential Revision: https://phabricator.services.mozilla.com/D34648
+
+diff --git a/accessible/tests/mochitest/relations/test_tabbrowser.xul b/accessible/tests/mochitest/relations/test_tabbrowser.xul
+--- a/accessible/tests/mochitest/relations/test_tabbrowser.xul
++++ b/accessible/tests/mochitest/relations/test_tabbrowser.xul
+@@ -41,17 +41,17 @@
+         });
+       }
+ 
+       this.finalCheck = function testTabRelations_finalCheck(aEvent)
+       {
+         ////////////////////////////////////////////////////////////////////////
+         // 'labelled by'/'label for' relations for xul:tab and xul:tabpanel
+ 
+-        var tabs = Array.from(tabBrowser().tabContainer.children);
++        var tabs = tabBrowser().tabContainer.allTabs;
+         // For preloaded tabs, there might be items in this array where this relation
+         // doesn't hold, so just deal with that:
+         var panels = tabs.map(t => t.linkedBrowser.closest("tabpanels > *"));
+ 
+         testRelation(panels[0], RELATION_LABELLED_BY, tabs[0]);
+         testRelation(tabs[0], RELATION_LABEL_FOR, panels[0]);
+         testRelation(panels[1], RELATION_LABELLED_BY, tabs[1]);
+         testRelation(tabs[1], RELATION_LABEL_FOR, panels[1]);
+diff --git a/browser/base/content/tabbrowser-tab.js b/browser/base/content/tabbrowser-tab.js
+--- a/browser/base/content/tabbrowser-tab.js
++++ b/browser/base/content/tabbrowser-tab.js
+@@ -103,16 +103,20 @@ class MozTabbrowserTab extends MozElemen
+     this.setAttribute("context", "tabContextMenu");
+     this._initialized = true;
+ 
+     if (!("_lastAccessed" in this)) {
+       this.updateLastAccessed();
+     }
+   }
+ 
++  get container() {
++    return this.closest("tabs");
++  }
++
+   set _visuallySelected(val) {
+     if (val == (this.getAttribute("visuallyselected") == "true")) {
+       return val;
+     }
+ 
+     if (val) {
+       this.setAttribute("visuallyselected", "true");
+     } else {
+@@ -269,17 +273,17 @@ class MozTabbrowserTab extends MozElemen
+       this.style.MozUserFocus = "";
+     } else if (this.mOverCloseButton) {
+       event.stopPropagation();
+     }
+   }
+ 
+   on_mousedown(event) {
+     let eventMaySelectTab = true;
+-    let tabContainer = this.parentNode;
++    let tabContainer = this.container;
+ 
+     if (tabContainer._closeTabByDblclick &&
+         event.button == 0 &&
+         event.detail == 1) {
+       this._selectedOnFirstMouseDown = this.selected;
+     }
+ 
+     if (this.selected) {
+@@ -390,17 +394,17 @@ class MozTabbrowserTab extends MozElemen
+       return;
+     }
+ 
+     // for the one-close-button case
+     if (event.target.classList.contains("tab-close-button")) {
+       event.stopPropagation();
+     }
+ 
+-    let tabContainer = this.parentNode;
++    let tabContainer = this.container;
+     if (tabContainer._closeTabByDblclick &&
+         this._selectedOnFirstMouseDown &&
+         this.selected &&
+         !(event.target.classList.contains("tab-icon-sound") ||
+           event.target.classList.contains("tab-icon-overlay"))) {
+       gBrowser.removeTab(this, {
+         animate: true,
+         byMouse: event.mozInputSource == MouseEvent.MOZ_SOURCE_MOUSE,
+@@ -414,17 +418,17 @@ class MozTabbrowserTab extends MozElemen
+     }
+   }
+ 
+   _mouseenter() {
+     if (this.hidden || this.closing) {
+       return;
+     }
+ 
+-    let tabContainer = this.parentNode;
++    let tabContainer = this.container;
+     let visibleTabs = tabContainer._getVisibleTabs();
+     let tabIndex = visibleTabs.indexOf(this);
+ 
+     if (this.selected) {
+       tabContainer._handleTabSelect();
+     }
+ 
+     if (tabIndex == 0) {
+@@ -462,17 +466,17 @@ class MozTabbrowserTab extends MozElemen
+     let tabToWarm = this;
+     if (this.mOverCloseButton) {
+       tabToWarm = gBrowser._findTabToBlurTo(this);
+     }
+     gBrowser.warmupTab(tabToWarm);
+   }
+ 
+   _mouseleave() {
+-    let tabContainer = this.parentNode;
++    let tabContainer = this.container;
+     if (tabContainer._beforeHoveredTab) {
+       tabContainer._beforeHoveredTab.removeAttribute("beforehovered");
+       tabContainer._beforeHoveredTab = null;
+     }
+     if (tabContainer._afterHoveredTab) {
+       tabContainer._afterHoveredTab.removeAttribute("afterhovered");
+       tabContainer._afterHoveredTab = null;
+     }
+diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowser.js
+--- a/browser/base/content/tabbrowser.js
++++ b/browser/base/content/tabbrowser.js
+@@ -200,18 +200,21 @@ window._gBrowser = {
+   _hoverTabTimer: null,
+ 
+   get tabContainer() {
+     delete this.tabContainer;
+     return this.tabContainer = document.getElementById("tabbrowser-tabs");
+   },
+ 
+   get tabs() {
+-    delete this.tabs;
+-    return this.tabs = this.tabContainer.children;
++    return this.tabContainer.allTabs;
++  },
++
++  get tabCount() {
++    return this.tabContainer.tabCount;
+   },
+ 
+   get tabbox() {
+     delete this.tabbox;
+     return this.tabbox = document.getElementById("tabbrowser-tabbox");
+   },
+ 
+   get tabpanels() {
+@@ -238,18 +241,18 @@ window._gBrowser = {
+     if (!this._visibleTabs) {
+       this._visibleTabs =
+         Array.prototype.filter.call(this.tabs, tab => !tab.hidden && !tab.closing);
+     }
+     return this._visibleTabs;
+   },
+ 
+   get _numPinnedTabs() {
+-    for (var i = 0; i < this.tabs.length; i++) {
+-      if (!this.tabs[i].pinned)
++    for (var i = 0; i < this.tabCount; i++) {
++      if (!this.tabContainer.getItemAtIndex(i).pinned)
+         break;
+     }
+     return i;
+   },
+ 
+   get popupAnchor() {
+     if (this.selectedTab._popupAnchor) {
+       return this.selectedTab._popupAnchor;
+@@ -342,17 +345,17 @@ window._gBrowser = {
+     browser.droppedLinkHandler = handleDroppedLink;
+     browser.loadURI = _loadURI.bind(null, browser);
+ 
+     let uniqueId = this._generateUniquePanelID();
+     let panel = this.getPanel(browser);
+     panel.id = uniqueId;
+     this.tabpanels.appendChild(panel);
+ 
+-    let tab = this.tabs[0];
++    let tab = this.tabContainer.firstTab;
+     tab.linkedPanel = uniqueId;
+     this._selectedTab = tab;
+     this._selectedBrowser = browser;
+     tab.permanentKey = browser.permanentKey;
+     tab._tPos = 0;
+     tab._fullyOpen = true;
+     tab.linkedBrowser = browser;
+ 
+@@ -642,22 +645,22 @@ window._gBrowser = {
+     } finally {
+       this.selectedTab = currentTab;
+       this._previewMode = false;
+     }
+   },
+ 
+   syncThrobberAnimations(aTab) {
+     aTab.ownerGlobal.promiseDocumentFlushed(() => {
+-      if (!aTab.parentNode) {
++      if (!aTab.container) {
+         return;
+       }
+ 
+       const animations =
+-        Array.from(aTab.parentNode.getElementsByTagName("tab"))
++        Array.from(aTab.container.getElementsByTagName("tab"))
+         .map(tab => {
+           const throbber = tab.throbber;
+           return throbber ? throbber.getAnimations({ subtree: true }) : [];
+         })
+         .reduce((a, b) => a.concat(b))
+         .filter(anim =>
+           anim instanceof CSSAnimation &&
+           (anim.animationName === "tab-throbber-animation" ||
+@@ -1788,17 +1791,17 @@ window._gBrowser = {
+     if (wasActive)
+       aBrowser.focus();
+ 
+     // If the findbar has been initialised, reset its browser reference.
+     if (this.isFindBarInitialized(tab)) {
+       this.getCachedFindBar(tab).browser = aBrowser;
+     }
+ 
+-    tab.linkedBrowser.sendMessageToActor("Browser:HasSiblings", this.tabs.length > 1, "BrowserTab");
++    tab.linkedBrowser.sendMessageToActor("Browser:HasSiblings", this.tabCount > 1, "BrowserTab");
+ 
+     evt = document.createEvent("Events");
+     evt.initEvent("TabRemotenessChange", true, false);
+     tab.dispatchEvent(evt);
+ 
+     return true;
+   },
+ 
+@@ -2133,21 +2136,21 @@ window._gBrowser = {
+     // into the DOM. We thus have to register the new outerWindowID
+     // for non-remote browsers after we have called browser.loadURI().
+     if (remoteType == E10SUtils.NOT_REMOTE) {
+       this._outerWindowIDBrowserMap.set(browser.outerWindowID, browser);
+     }
+ 
+     // If we transitioned from one browser to two browsers, we need to set
+     // hasSiblings=false on both the existing browser and the new browser.
+-    if (this.tabs.length == 2) {
++    if (this.tabCount == 2) {
+       this.tabs[0].linkedBrowser.sendMessageToActor("Browser:HasSiblings", true, "BrowserTab");
+       this.tabs[1].linkedBrowser.sendMessageToActor("Browser:HasSiblings", true, "BrowserTab");
+     } else {
+-      aTab.linkedBrowser.sendMessageToActor("Browser:HasSiblings", this.tabs.length > 1, "BrowserTab");
++      aTab.linkedBrowser.sendMessageToActor("Browser:HasSiblings", this.tabCount > 1, "BrowserTab");
+     }
+ 
+     var evt = new CustomEvent("TabBrowserInserted", { bubbles: true, detail: { insertedOnTabCreation: aInsertedOnTabCreation } });
+     aTab.dispatchEvent(evt);
+   },
+ 
+   _mayDiscardBrowser(aTab, aForceDiscard) {
+     let browser = aTab.linkedBrowser;
+@@ -2419,22 +2422,20 @@ window._gBrowser = {
+         }
+       }
+       // Ensure index is within bounds.
+       if (pinned) {
+         index = Math.max(index, 0);
+         index = Math.min(index, this._numPinnedTabs);
+       } else {
+         index = Math.max(index, this._numPinnedTabs);
+-        index = Math.min(index, this.tabs.length);
++        index = Math.min(index, this.tabCount);
+       }
+ 
+-      // Use .item() instead of [] because we need .item() to return null in
+-      // order to append the tab at the end in case index == tabs.length.
+-      let tabAfter = this.tabs.item(index);
++      let tabAfter = this.tabContainer.getItemAtIndex(index);
+       this.tabContainer.insertBefore(t, tabAfter);
+       if (tabAfter) {
+         this._updateTabsAfterInsert();
+       } else {
+         t._tPos = index;
+       }
+ 
+       if (pinned) {
+@@ -2629,18 +2630,18 @@ window._gBrowser = {
+     }
+   },
+ 
+   moveTabsToEnd(contextTab) {
+     let tabs = contextTab.multiselected ?
+       this.selectedTabs :
+       [contextTab];
+     for (let tab of tabs) {
+-      if (tab._tPos < this.tabs.length - 1) {
+-        this.moveTabTo(tab, this.tabs.length - 1);
++      if (tab._tPos < this.tabCount - 1) {
++        this.moveTabTo(tab, this.tabCount - 1);
+       }
+     }
+   },
+ 
+   warnAboutClosingTabs(tabsToClose, aCloseTabs) {
+     if (tabsToClose <= 1)
+       return true;
+ 
+@@ -2804,17 +2805,17 @@ window._gBrowser = {
+     // Handle requests for synchronously removing an already
+     // asynchronously closing tab.
+     if (!animate &&
+         aTab.closing) {
+       this._endRemoveTab(aTab);
+       return;
+     }
+ 
+-    var isLastTab = (this.tabs.length - this._removingTabs.length == 1);
++    var isLastTab = (this.tabCount - this._removingTabs.length == 1);
+     let windowUtils = window.windowUtils;
+     // We have to sample the tab width now, since _beginRemoveTab might
+     // end up modifying the DOM in such a way that aTab gets a new
+     // frame created for it (for example, by updating the visually selected
+     // state).
+     let tabWidth = windowUtils.getBoundsWithoutFlushing(aTab).width;
+ 
+     if (!this._beginRemoveTab(aTab, {
+@@ -2848,17 +2849,17 @@ window._gBrowser = {
+     // We're animating, so we can cancel the non-animation stopwatch.
+     TelemetryStopwatch.cancel("FX_TAB_CLOSE_TIME_NO_ANIM_MS", aTab);
+ 
+     aTab.style.maxWidth = ""; // ensure that fade-out transition happens
+     aTab.removeAttribute("fadein");
+     aTab.removeAttribute("bursting");
+ 
+     setTimeout(function(tab, tabbrowser) {
+-      if (tab.parentNode &&
++      if (tab.container &&
+           window.getComputedStyle(tab).maxWidth == "0.1px") {
+         console.assert(false, "Giving up waiting for the tab closing animation to finish (bug 608589)");
+         tabbrowser._endRemoveTab(tab);
+       }
+     }, 3000, aTab, this);
+   },
+ 
+   _hasBeforeUnload(aTab) {
+@@ -2909,17 +2910,17 @@ window._gBrowser = {
+     if (tabCacheIndex != -1) {
+       this._tabLayerCache.splice(tabCacheIndex, 1);
+     }
+ 
+     this._blurTab(aTab);
+ 
+     var closeWindow = false;
+     var newTab = false;
+-    if (this.tabs.length - this._removingTabs.length == 1) {
++    if (this.tabCount - this._removingTabs.length == 1) {
+       closeWindow = closeWindowWithLastTab != null ? closeWindowWithLastTab :
+         !window.toolbar.visible ||
+         Services.prefs.getBoolPref("browser.tabs.closeWindowWithLastTab");
+ 
+       if (closeWindow) {
+         // We've already called beforeunload on all the relevant tabs if we get here,
+         // so avoid calling it again:
+         window.skipNextCanClose = true;
+@@ -2993,17 +2994,17 @@ window._gBrowser = {
+ 
+     // We're committed to closing the tab now.
+     // Dispatch a notification.
+     // We dispatch it before any teardown so that event listeners can
+     // inspect the tab that's about to close.
+     let evt = new CustomEvent("TabClose", { bubbles: true, detail: { adoptedBy: adoptedByTab } });
+     aTab.dispatchEvent(evt);
+ 
+-    if (this.tabs.length == 2) {
++    if (this.tabCount == 2) {
+       // We're closing one of our two open tabs, inform the other tab that its
+       // sibling is going away.
+       this.tabs[0].linkedBrowser.sendMessageToActor("Browser:HasSiblings", false, "BrowserTab");
+       this.tabs[1].linkedBrowser.sendMessageToActor("Browser:HasSiblings", false, "BrowserTab");
+     }
+ 
+     if (aTab.linkedPanel) {
+       if (!adoptedByTab && !gMultiProcessBrowser) {
+@@ -3100,18 +3101,18 @@ window._gBrowser = {
+     // Remove the tab ...
+     aTab.remove();
+ 
+     // Update hashiddentabs if this tab was hidden.
+     if (aTab.hidden)
+       this.tabContainer._updateHiddenTabsStatus();
+ 
+     // ... and fix up the _tPos properties immediately.
+-    for (let i = aTab._tPos; i < this.tabs.length; i++)
+-      this.tabs[i]._tPos = i;
++    for (let i = aTab._tPos; i < this.tabCount; i++)
++      this.tabContainer.getItemAtIndex(i)._tPos = i;
+ 
+     if (!this._windowIsClosing) {
+       if (wasPinned)
+         this.tabContainer._positionPinnedTabs();
+ 
+       // update tab close buttons state
+       this.tabContainer._updateCloseButtons();
+ 
+@@ -3614,17 +3615,17 @@ window._gBrowser = {
+     }
+   },
+ 
+   /**
+    * Moves a tab to a new browser window, unless it's already the only tab
+    * in the current window, in which case this will do nothing.
+    */
+   replaceTabWithWindow(aTab, aOptions) {
+-    if (this.tabs.length == 1)
++    if (this.tabCount == 1)
+       return null;
+ 
+     var options = "chrome,dialog=no,all";
+     for (var name in aOptions)
+       options += "," + name + "=" + aOptions[name];
+ 
+     // Play the tab closing animation to give immediate feedback while
+     // waiting for the new window to appear.
+@@ -3646,17 +3647,17 @@ window._gBrowser = {
+   replaceTabsWithWindow(contextTab, aOptions) {
+     let tabs;
+     if (contextTab.multiselected) {
+       tabs = this.selectedTabs;
+     } else {
+       tabs = [contextTab];
+     }
+ 
+-    if (this.tabs.length == tabs.length) {
++    if (this.tabCount == tabs.length) {
+       return null;
+     }
+ 
+     if (tabs.length == 1) {
+       return this.replaceTabWithWindow(tabs[0], aOptions);
+     }
+ 
+     // Play the closing animation for all selected tabs to give
+@@ -3689,19 +3690,20 @@ window._gBrowser = {
+       win.gBrowser.addRangeToMultiSelectedTabs(winVisibleTabs[0],
+                                                winVisibleTabs[winTabLength - 1]);
+       win.gBrowser.lockClearMultiSelectionOnce();
+     }, {once: true});
+     return win;
+   },
+ 
+   _updateTabsAfterInsert() {
+-    for (let i = 0; i < this.tabs.length; i++) {
+-      this.tabs[i]._tPos = i;
+-      this.tabs[i]._selected = false;
++    for (let i = 0; i < this.tabCount; i++) {
++      let tab = this.tabContainer.getItemAtIndex(i);
++      tab._tPos = i;
++      tab._selected = false;
+     }
+ 
+     // If we're in the midst of an async tab switch while calling
+     // moveTabTo, we can get into a case where _visuallySelected
+     // is set to true on two different tabs.
+     //
+     // What we want to do in moveTabTo is to remove logical selection
+     // from all tabs, and then re-add logical selection to selectedTab
+@@ -3736,19 +3738,17 @@ window._gBrowser = {
+ 
+     let wasFocused = (document.activeElement == this.selectedTab);
+ 
+     aIndex = aIndex < aTab._tPos ? aIndex : aIndex + 1;
+ 
+     // invalidate cache
+     this._visibleTabs = null;
+ 
+-    // use .item() instead of [] because dragging to the end of the strip goes out of
+-    // bounds: .item() returns null (so it acts like appendChild), but [] throws
+-    this.tabContainer.insertBefore(aTab, this.tabs.item(aIndex));
++    this.tabContainer.insertBefore(aTab, this.tabContainer.getItemAtIndex(aIndex));
+     this._updateTabsAfterInsert();
+ 
+     if (wasFocused)
+       this.selectedTab.focus();
+ 
+     this.tabContainer._handleTabSelect(true);
+ 
+     if (aTab.pinned)
+@@ -3803,17 +3803,17 @@ window._gBrowser = {
+ 
+     if (aTab.hasAttribute("usercontextid")) {
+       // new tab must have the same usercontextid as the old one
+       params.userContextId = aTab.getAttribute("usercontextid");
+     }
+     let newTab = this.addWebTab("about:blank", params);
+     let newBrowser = this.getBrowserForTab(newTab);
+ 
+-    aTab.parentNode._finishAnimateTabMove();
++    aTab.container._finishAnimateTabMove();
+ 
+     if (!createLazyBrowser) {
+       // Stop the about:blank load.
+       newBrowser.stop();
+       // Make sure it has a docshell.
+       newBrowser.docShell;
+     }
+ 
+@@ -4518,17 +4518,17 @@ window._gBrowser = {
+         }
+         // In the parent-process browser case, it's possible that the browser
+         // that fired DOMWindowClose is actually a child of another browser. We
+         // want to find the top-most browser to determine whether or not this is
+         // for a tab or not. The chromeEventHandler will be the top-most browser.
+         browser = event.target.docShell.chromeEventHandler;
+       }
+ 
+-      if (this.tabs.length == 1) {
++      if (this.tabCount == 1) {
+         // We already did PermitUnload in the content process
+         // for this tab (the only one in the window). So we don't
+         // need to do it again for any tabs.
+         window.skipNextCanClose = true;
+         // In the parent-process browser case, the nsCloseEvent will actually take
+         // care of tearing down the window, but we need to do this ourselves in the
+         // content-process browser case. Doing so in both cases doesn't appear to
+         // hurt.
+@@ -5357,17 +5357,17 @@ var StatusPanel = {
+ 
+ var TabBarVisibility = {
+   _initialUpdateDone: false,
+ 
+   update() {
+     let toolbar = document.getElementById("TabsToolbar");
+     let collapse = false;
+     if (!gBrowser /* gBrowser isn't initialized yet */ ||
+-        gBrowser.tabs.length - gBrowser._removingTabs.length == 1) {
++        gBrowser.tabCount - gBrowser._removingTabs.length == 1) {
+       collapse = !window.toolbar.visible;
+     }
+ 
+     if (collapse == toolbar.collapsed && this._initialUpdateDone) {
+       return;
+     }
+     this._initialUpdateDone = true;
+ 
+@@ -5397,17 +5397,17 @@ var TabContextMenu = {
+         }
+       }
+     });
+   },
+   updateContextMenu(aPopupMenu) {
+     let tab = aPopupMenu.triggerNode && aPopupMenu.triggerNode.closest("tab");
+     this.contextTab = tab || gBrowser.selectedTab;
+ 
+-    let disabled = gBrowser.tabs.length == 1;
++    let disabled = gBrowser.tabCount == 1;
+     let multiselectionContext = this.contextTab.multiselected;
+ 
+     var menuItems = aPopupMenu.getElementsByAttribute("tbattr", "tabbrowser-multiple");
+     for (let menuItem of menuItems) {
+       menuItem.disabled = disabled;
+     }
+ 
+     if (this.contextTab.hasAttribute("customizemode")) {
+diff --git a/browser/base/content/test/general/browser_bug462673.js b/browser/base/content/test/general/browser_bug462673.js
+--- a/browser/base/content/test/general/browser_bug462673.js
++++ b/browser/base/content/test/general/browser_bug462673.js
+@@ -1,36 +1,36 @@
+ add_task(async function() {
+   var win = openDialog(AppConstants.BROWSER_CHROME_URL, "_blank", "chrome,all,dialog=no");
+   await SimpleTest.promiseFocus(win);
+ 
+-  let tab = win.gBrowser.tabContainer.firstElementChild;
++  let tab = win.gBrowser.tabContainer.firstTab;
+   await promiseTabLoadEvent(tab, getRootDirectory(gTestPath) + "test_bug462673.html");
+ 
+   is(win.gBrowser.browsers.length, 2, "test_bug462673.html has opened a second tab");
+   is(win.gBrowser.selectedTab, tab.nextElementSibling, "dependent tab is selected");
+   win.gBrowser.removeTab(tab);
+ 
+   // Closing a tab will also close its parent chrome window, but async
+   await BrowserTestUtils.domWindowClosed(win);
+ });
+ 
+ add_task(async function() {
+   var win = openDialog(AppConstants.BROWSER_CHROME_URL, "_blank", "chrome,all,dialog=no");
+   await SimpleTest.promiseFocus(win);
+ 
+-  let tab = win.gBrowser.tabContainer.firstElementChild;
++  let tab = win.gBrowser.tabContainer.firstTab;
+   await promiseTabLoadEvent(tab, getRootDirectory(gTestPath) + "test_bug462673.html");
+ 
+   var newTab = BrowserTestUtils.addTab(win.gBrowser);
+   var newBrowser = newTab.linkedBrowser;
+   win.gBrowser.removeTab(tab);
+   ok(!win.closed, "Window stays open");
+   if (!win.closed) {
+-    is(win.gBrowser.tabContainer.childElementCount, 1, "Window has one tab");
++    is(win.gBrowser.tabCount, 1, "Window has one tab");
+     is(win.gBrowser.browsers.length, 1, "Window has one browser");
+     is(win.gBrowser.selectedTab, newTab, "Remaining tab is selected");
+     is(win.gBrowser.selectedBrowser, newBrowser, "Browser for remaining tab is selected");
+     is(win.gBrowser.tabbox.selectedPanel, newBrowser.parentNode.parentNode.parentNode, "Panel for remaining tab is selected");
+   }
+ 
+   await promiseWindowClosed(win);
+ });
+diff --git a/browser/base/content/test/general/browser_ctrlTab.js b/browser/base/content/test/general/browser_ctrlTab.js
+--- a/browser/base/content/test/general/browser_ctrlTab.js
++++ b/browser/base/content/test/general/browser_ctrlTab.js
+@@ -86,22 +86,22 @@ add_task(async function() {
+        "Ctrl+Tab*2 -> Ctrl+W removes the second most recently selected tab");
+ 
+     await pressCtrlTab(true);
+     await pressCtrlTab(true);
+     await releaseCtrl();
+     ok(selectedTab.selected,
+        "Ctrl+Tab*2 -> Ctrl+W -> Ctrl+Shift+Tab*2 keeps the selected tab");
+   }
+-  gBrowser.removeTab(gBrowser.tabContainer.lastElementChild);
++  gBrowser.removeTab(gBrowser.tabContainer.lastTab);
+   checkTabs(2);
+ 
+   await ctrlTabTest([1], 1, 0);
+ 
+-  gBrowser.removeTab(gBrowser.tabContainer.lastElementChild);
++  gBrowser.removeTab(gBrowser.tabContainer.lastTab);
+   checkTabs(1);
+ 
+   { // test for bug 445768
+     let focusedWindow = document.commandDispatcher.focusedWindow;
+     let eventConsumed = true;
+     let detectKeyEvent = function(event) {
+       eventConsumed = event.defaultPrevented;
+     };
+diff --git a/browser/base/content/test/general/browser_tabs_owner.js b/browser/base/content/test/general/browser_tabs_owner.js
+--- a/browser/base/content/test/general/browser_tabs_owner.js
++++ b/browser/base/content/test/general/browser_tabs_owner.js
+@@ -1,32 +1,31 @@
+ function test() {
+   BrowserTestUtils.addTab(gBrowser);
+   BrowserTestUtils.addTab(gBrowser);
+   BrowserTestUtils.addTab(gBrowser);
+ 
+-  var tabs = gBrowser.tabs;
+   var owner;
+ 
+-  is(tabs.length, 4, "4 tabs are open");
++  is(gBrowser.tabCount, 4, "4 tabs are open");
+ 
+-  owner = gBrowser.selectedTab = tabs[2];
++  owner = gBrowser.selectedTab = gBrowser.tabs[2];
+   BrowserOpenTab();
+-  is(gBrowser.selectedTab, tabs[4], "newly opened tab is selected");
++  is(gBrowser.selectedTab, gBrowser.tabs[4], "newly opened tab is selected");
+   gBrowser.removeCurrentTab();
+   is(gBrowser.selectedTab, owner, "owner is selected");
+ 
+   owner = gBrowser.selectedTab;
+   BrowserOpenTab();
+-  gBrowser.selectedTab = tabs[1];
+-  gBrowser.selectedTab = tabs[4];
++  gBrowser.selectedTab = gBrowser.tabs[1];
++  gBrowser.selectedTab = gBrowser.tabs[4];
+   gBrowser.removeCurrentTab();
+   isnot(gBrowser.selectedTab, owner, "selecting a different tab clears the owner relation");
+ 
+   owner = gBrowser.selectedTab;
+   BrowserOpenTab();
+   gBrowser.moveTabTo(gBrowser.selectedTab, 0);
+   gBrowser.removeCurrentTab();
+-  is(gBrowser.selectedTab, owner, "owner relatitionship persists when tab is moved");
++  is(gBrowser.selectedTab, owner, "owner relationship persists when tab is moved");
+ 
+-  while (tabs.length > 1)
++  while (gBrowser.tabs.length > 1)
+     gBrowser.removeCurrentTab();
+ }
+diff --git a/browser/base/content/test/performance/browser_tabstrip_overflow_underflow.js b/browser/base/content/test/performance/browser_tabstrip_overflow_underflow.js
+--- a/browser/base/content/test/performance/browser_tabstrip_overflow_underflow.js
++++ b/browser/base/content/test/performance/browser_tabstrip_overflow_underflow.js
+@@ -109,17 +109,17 @@ add_task(async function() {
+ 
+   // First, we'll check that the first tab is actually scrolled
+   // at least partially out of view.
+   Assert.ok(arrowScrollbox.scrollPosition > 0,
+             "First tab should be partially scrolled out of view.");
+ 
+   // Now switch to the first tab. We shouldn't flush layout at all.
+   await withPerfObserver(async function() {
+-    let firstTab = gBrowser.tabContainer.firstElementChild;
++    let firstTab = gBrowser.tabContainer.firstTab;
+     await BrowserTestUtils.switchTab(gBrowser, firstTab);
+     await BrowserTestUtils.waitForCondition(() => {
+       return gBrowser.tabContainer.arrowScrollbox.hasAttribute("scrolledtostart");
+     });
+   }, {expectedReflows: [], frames: ignoreTabstripRects});
+ 
+   // Okay, now close the last tab. The tabstrip should stay overflowed, but removing
+   // one more after that should underflow it.
+@@ -127,17 +127,17 @@ add_task(async function() {
+ 
+   Assert.ok(gBrowser.tabContainer.hasAttribute("overflow"),
+             "Tabs should still be overflowed.");
+ 
+   // Depending on the size of the window, it might take one or more tab
+   // removals to put the tab strip out of the overflow state, so we'll just
+   // keep testing removals until that occurs.
+   while (gBrowser.tabContainer.hasAttribute("overflow")) {
+-    lastTab = gBrowser.tabContainer.lastElementChild;
++    lastTab = gBrowser.tabContainer.lastTab;
+     if (gBrowser.selectedTab !== lastTab) {
+       await BrowserTestUtils.switchTab(gBrowser, lastTab);
+     }
+ 
+     // ... and make sure we don't flush layout when closing it, and exiting
+     // the overflowed state.
+     await withPerfObserver(async function() {
+       let switchDone = BrowserTestUtils.waitForEvent(window, "TabSwitchDone");
+diff --git a/browser/base/content/test/tabs/browser_audioTabIcon.js b/browser/base/content/test/tabs/browser_audioTabIcon.js
+--- a/browser/base/content/test/tabs/browser_audioTabIcon.js
++++ b/browser/base/content/test/tabs/browser_audioTabIcon.js
+@@ -159,17 +159,17 @@ async function test_playing_icon_on_tab(
+ }
+ 
+ async function test_playing_icon_on_hidden_tab(tab) {
+   let oldSelectedTab = gBrowser.selectedTab;
+   let otherTabs = [
+     await BrowserTestUtils.openNewForegroundTab(gBrowser, PAGE, true, true),
+     await BrowserTestUtils.openNewForegroundTab(gBrowser, PAGE, true, true),
+   ];
+-  let tabContainer = tab.parentNode;
++  let tabContainer = tab.container;
+   let alltabsButton = document.getElementById("alltabs-button");
+   let alltabsBadge = alltabsButton.badgeLabel;
+ 
+   function assertIconShowing() {
+     is(getComputedStyle(alltabsBadge).backgroundImage,
+       'url("chrome://browser/skin/tabbrowser/badge-audio-playing.svg")',
+       "The audio playing icon is shown");
+     is(tabContainer.getAttribute("hiddensoundplaying"), "true", "There are hidden audio tabs");
+diff --git a/browser/base/content/test/tabs/browser_multiselect_tabs_open_related.js b/browser/base/content/test/tabs/browser_multiselect_tabs_open_related.js
+--- a/browser/base/content/test/tabs/browser_multiselect_tabs_open_related.js
++++ b/browser/base/content/test/tabs/browser_multiselect_tabs_open_related.js
+@@ -54,49 +54,55 @@ add_task(async function test() {
+   ok(tab1.multiselected, "Tab1 is multi-selected");
+   ok(!tab2.multiselected, "Tab2 is not multi-selected");
+   ok(tab3.multiselected, "Tab3 is multi-selected");
+ 
+   promiseTabOpened = BrowserTestUtils.waitForEvent(gBrowser.tabContainer, "TabOpen");
+   EventUtils.synthesizeMouseAtCenter(newTabButton, metaKeyEvent);
+   openEvent = await promiseTabOpened;
+   newTab = openEvent.target;
+-  is(newTab.previousElementSibling, tab3,
+-    "New tab should be opened after tab3 when tab1 and tab3 are selected");
+-  is(newTab.nextElementSibling, null,
++  let previous = gBrowser.tabContainer.findNextTab(newTab, -1, false, true);
++  is(previous, tab3,
++     "New tab should be opened after tab3 when tab1 and tab3 are selected");
++  let next = gBrowser.tabContainer.findNextTab(newTab, 1, false, true);
++  is(next, null,
+     "New tab should be opened at the end of the tabstrip when tab1 and tab3 are selected");
+   BrowserTestUtils.removeTab(newTab);
+ 
+   await BrowserTestUtils.switchTab(gBrowser, tab1);
+   ok(!tab1.multiselected, "Tab1 is not multi-selected");
+   ok(!tab2.multiselected, "Tab2 is not multi-selected");
+   ok(!tab3.multiselected, "Tab3 is not multi-selected");
+ 
+   promiseTabOpened = BrowserTestUtils.waitForEvent(gBrowser.tabContainer, "TabOpen");
+   EventUtils.synthesizeMouseAtCenter(newTabButton, {});
+   openEvent = await promiseTabOpened;
+   newTab = openEvent.target;
+-  is(newTab.previousElementSibling, tab3,
++  previous = gBrowser.tabContainer.findNextTab(newTab, -1, false, true);
++  is(previous, tab3,
+     "New tab should be opened after tab3 when ctrlKey is not used without multiselection");
+-  is(newTab.nextElementSibling, null,
++  next = gBrowser.tabContainer.findNextTab(newTab, 1, false, true);
++  is(next, null,
+     "New tab should be opened at the end of the tabstrip when ctrlKey is not used without multiselection");
+   BrowserTestUtils.removeTab(newTab);
+ 
+   await BrowserTestUtils.switchTab(gBrowser, tab1);
+   await triggerClickOn(tab2, { ctrlKey: true });
+   ok(tab1.multiselected, "Tab1 is multi-selected");
+   ok(tab2.multiselected, "Tab2 is multi-selected");
+   ok(!tab3.multiselected, "Tab3 is not multi-selected");
+ 
+   promiseTabOpened = BrowserTestUtils.waitForEvent(gBrowser.tabContainer, "TabOpen");
+   EventUtils.synthesizeMouseAtCenter(newTabButton, {});
+   openEvent = await promiseTabOpened;
+   newTab = openEvent.target;
+-  is(newTab.previousElementSibling, tab3,
++  previous = gBrowser.tabContainer.findNextTab(newTab, -1, false, true);
++  is(previous, tab3,
+     "New tab should be opened after tab3 when ctrlKey is not used with multiselection");
+-  is(newTab.nextElementSibling, null,
++  next = gBrowser.tabContainer.findNextTab(newTab, 1, false, true);
++  is(next, null,
+     "New tab should be opened at the end of the tabstrip when ctrlKey is not used with multiselection");
+   BrowserTestUtils.removeTab(newTab);
+ 
+   BrowserTestUtils.removeTab(tab1);
+   BrowserTestUtils.removeTab(tab2);
+   BrowserTestUtils.removeTab(tab3);
+ });
+diff --git a/browser/base/content/test/tabs/browser_overflowScroll.js b/browser/base/content/test/tabs/browser_overflowScroll.js
+--- a/browser/base/content/test/tabs/browser_overflowScroll.js
++++ b/browser/base/content/test/tabs/browser_overflowScroll.js
+@@ -5,50 +5,49 @@ requestLongerTimeout(2);
+ /**
+  * Tests that scrolling the tab strip via the scroll buttons scrolls the right
+  * amount in non-smoothscroll mode.
+  */
+ add_task(async function() {
+   let arrowScrollbox = gBrowser.tabContainer.arrowScrollbox;
+   let scrollbox = arrowScrollbox.scrollbox;
+   let originalSmoothScroll = arrowScrollbox.smoothScroll;
+-  let tabs = gBrowser.tabs;
+   let tabMinWidth = parseInt(getComputedStyle(gBrowser.selectedTab, null).minWidth);
+ 
+   let rect = ele => ele.getBoundingClientRect();
+   let width = ele => rect(ele).width;
+ 
+   let tabCountForOverflow = Math.ceil(width(arrowScrollbox) / tabMinWidth * 3);
+ 
+   let left = ele => rect(ele).left;
+   let right = ele => rect(ele).right;
+   let isLeft = (ele, msg) => is(left(ele), left(scrollbox), msg);
+   let isRight = (ele, msg) => is(right(ele), right(scrollbox), msg);
+   let elementFromPoint = x => arrowScrollbox._elementFromPoint(x);
+   let nextLeftElement = () => elementFromPoint(left(scrollbox) - 1);
+   let nextRightElement = () => elementFromPoint(right(scrollbox) + 1);
+-  let firstScrollable = () => tabs[gBrowser._numPinnedTabs];
++  let firstScrollable = () => gBrowser.tabs[gBrowser._numPinnedTabs];
+   let waitForNextFrame = async function() {
+     await window.promiseDocumentFlushed(() => {});
+     await new Promise(resolve => Services.tm.dispatchToMainThread(resolve));
+   };
+ 
+   arrowScrollbox.smoothScroll = false;
+   registerCleanupFunction(() => {
+     arrowScrollbox.smoothScroll = originalSmoothScroll;
+   });
+ 
+-  while (tabs.length < tabCountForOverflow) {
++  while (gBrowser.tabCount < tabCountForOverflow) {
+     BrowserTestUtils.addTab(gBrowser, "about:blank", { skipAnimation: true });
+   }
+ 
+-  gBrowser.pinTab(tabs[0]);
++  gBrowser.pinTab(gBrowser.tabContainer.firstTab);
+ 
+   await BrowserTestUtils.waitForCondition(() => {
+-    return Array.from(gBrowser.tabs).every(tab => tab._fullyOpen);
++    return gBrowser.tabs.every(tab => tab._fullyOpen);
+   });
+ 
+   ok(!scrollbox.hasAttribute("notoverflowing"),
+      "Tab strip should be overflowing");
+ 
+   let upButton = arrowScrollbox._scrollButtonUp;
+   let downButton = arrowScrollbox._scrollButtonDown;
+   let element;
+@@ -57,17 +56,17 @@ add_task(async function() {
+   ok(left(scrollbox) <= left(firstScrollable()), "Selecting the first tab scrolls it into view " +
+      "(" + left(scrollbox) + " <= " + left(firstScrollable()) + ")");
+ 
+   element = nextRightElement();
+   EventUtils.synthesizeMouseAtCenter(downButton, {});
+   await waitForNextFrame();
+   isRight(element, "Scrolled one tab to the right with a single click");
+ 
+-  gBrowser.selectedTab = tabs[tabs.length - 1];
++  gBrowser.selectedTab = gBrowser.tabContainer.lastTab;
+   await waitForNextFrame();
+   ok(right(gBrowser.selectedTab) <= right(scrollbox), "Selecting the last tab scrolls it into view " +
+      "(" + right(gBrowser.selectedTab) + " <= " + right(scrollbox) + ")");
+ 
+   element = nextLeftElement();
+   EventUtils.synthesizeMouseAtCenter(upButton, {});
+   await waitForNextFrame();
+   isLeft(element, "Scrolled one tab to the left with a single click");
+@@ -83,12 +82,12 @@ add_task(async function() {
+   isLeft(element, "Scrolled one page of tabs with a double click");
+ 
+   EventUtils.synthesizeMouseAtCenter(upButton, {clickCount: 3});
+   await waitForNextFrame();
+   var firstScrollableLeft = left(firstScrollable());
+   ok(left(scrollbox) <= firstScrollableLeft, "Scrolled to the start with a triple click " +
+      "(" + left(scrollbox) + " <= " + firstScrollableLeft + ")");
+ 
+-  while (tabs.length > 1) {
+-    BrowserTestUtils.removeTab(gBrowser.tabs[0]);
++  while (gBrowser.tabCount > 1) {
++    BrowserTestUtils.removeTab(gBrowser.tabContainer.firstTab);
+   }
+ });
+diff --git a/browser/base/content/test/tabs/browser_tabReorder_overflow.js b/browser/base/content/test/tabs/browser_tabReorder_overflow.js
+--- a/browser/base/content/test/tabs/browser_tabReorder_overflow.js
++++ b/browser/base/content/test/tabs/browser_tabReorder_overflow.js
+@@ -4,40 +4,41 @@
+ "use strict";
+ 
+ requestLongerTimeout(2);
+ 
+ add_task(async function() {
+   let initialTabsLength = gBrowser.tabs.length;
+ 
+   let arrowScrollbox = gBrowser.tabContainer.arrowScrollbox;
+-  let tabs = gBrowser.tabs;
+   let tabMinWidth = parseInt(getComputedStyle(gBrowser.selectedTab, null).minWidth);
+ 
+   let width = ele => ele.getBoundingClientRect().width;
+ 
+   let tabCountForOverflow = Math.ceil(width(arrowScrollbox) / tabMinWidth);
+ 
+   let newTab1 = gBrowser.selectedTab = BrowserTestUtils.addTab(gBrowser, "about:robots", {skipAnimation: true});
+   let newTab2 = gBrowser.selectedTab = BrowserTestUtils.addTab(gBrowser, "about:about", {skipAnimation: true});
+   let newTab3 = gBrowser.selectedTab = BrowserTestUtils.addTab(gBrowser, "about:config", {skipAnimation: true});
+ 
+-  while (tabs.length < tabCountForOverflow) {
++  while (gBrowser.tabCount < tabCountForOverflow) {
+     BrowserTestUtils.addTab(gBrowser, "about:blank", { skipAnimation: true });
+   }
+ 
+   registerCleanupFunction(function() {
+-    while (tabs.length > initialTabsLength) {
+-      gBrowser.removeTab(gBrowser.tabs[initialTabsLength]);
++    while (gBrowser.tabCount > initialTabsLength) {
++      gBrowser.removeTab(gBrowser.tabContainer.getItemAtIndex(initialTabsLength));
+     }
+   });
+ 
+-  is(gBrowser.tabs.length, tabCountForOverflow, "new tabs are opened");
+-  is(gBrowser.tabs[initialTabsLength], newTab1, "newTab1 position is correct");
+-  is(gBrowser.tabs[initialTabsLength + 1], newTab2, "newTab2 position is correct");
+-  is(gBrowser.tabs[initialTabsLength + 2], newTab3, "newTab3 position is correct");
++  let tabs = gBrowser.tabs;
++  is(tabs.length, tabCountForOverflow, "new tabs are opened");
++  is(tabs[initialTabsLength], newTab1, "newTab1 position is correct");
++  is(tabs[initialTabsLength + 1], newTab2, "newTab2 position is correct");
++  is(tabs[initialTabsLength + 2], newTab3, "newTab3 position is correct");
+ 
+   await dragAndDrop(newTab1, newTab2, false);
+-  is(gBrowser.tabs.length, tabCountForOverflow, "tabs are still there");
+-  is(gBrowser.tabs[initialTabsLength], newTab2, "newTab2 and newTab1 are swapped");
+-  is(gBrowser.tabs[initialTabsLength + 1], newTab1, "newTab1 and newTab2 are swapped");
+-  is(gBrowser.tabs[initialTabsLength + 2], newTab3, "newTab3 stays same place");
++  tabs = gBrowser.tabs;
++  is(tabs.length, tabCountForOverflow, "tabs are still there");
++  is(tabs[initialTabsLength], newTab2, "newTab2 and newTab1 are swapped");
++  is(tabs[initialTabsLength + 1], newTab1, "newTab1 and newTab2 are swapped");
++  is(tabs[initialTabsLength + 2], newTab3, "newTab3 stays same place");
+ });
+diff --git a/browser/components/contextualidentity/test/browser/browser_windowName.js b/browser/components/contextualidentity/test/browser/browser_windowName.js
+--- a/browser/components/contextualidentity/test/browser/browser_windowName.js
++++ b/browser/components/contextualidentity/test/browser/browser_windowName.js
+@@ -47,18 +47,18 @@ add_task(async function test() {
+ 
+   is(browser1.contentTitle, "?old", "Tab1 title must be 'old'");
+   is(browser1.contentPrincipal.userContextId, 1, "Tab1 UCI must be 1");
+ 
+   is(browser2.contentTitle, "?old", "Tab2 title must be 'old'");
+   is(browser2.contentPrincipal.userContextId, 2, "Tab2 UCI must be 2");
+ 
+   let found = false;
+-  for (let i = 0; i < gBrowser.tabContainer.children.length; ++i) {
+-    let tab = gBrowser.tabContainer.children[i];
++  for (let i = 0; i < gBrowser.tabCount; ++i) {
++    let tab = gBrowser.tabContainer.getItemAtIndex(i);
+     let browser = gBrowser.getBrowserForTab(tab);
+     if (browser.contentTitle == "?new") {
+       is(browser.contentPrincipal.userContextId, 1, "Tab3 UCI must be 1");
+       isnot(browser, browser1, "Tab3 is not browser 1");
+       isnot(browser, browser2, "Tab3 is not browser 2");
+       gBrowser.removeTab(tab);
+       found = true;
+       break;
+diff --git a/browser/components/places/tests/browser/browser_sidebarpanels_click.js b/browser/components/places/tests/browser/browser_sidebarpanels_click.js
+--- a/browser/components/places/tests/browser/browser_sidebarpanels_click.js
++++ b/browser/components/places/tests/browser/browser_sidebarpanels_click.js
+@@ -84,18 +84,18 @@ add_task(async function test_sidebarpane
+     });
+ 
+     await testPlacesPanel(test, () => {
+       changeSidebarDirection("rtl");
+       info("Running " + test.desc + " in RTL mode");
+     });
+ 
+     // Remove tabs created by sub-tests.
+-    while (gBrowser.tabs.length > 1) {
+-      gBrowser.removeTab(gBrowser.tabContainer.lastElementChild);
++    while (gBrowser.tabCount > 1) {
++      gBrowser.removeTab(gBrowser.tabContainer.lastTab);
+     }
+   }
+ });
+ 
+ async function testPlacesPanel(testInfo, preFunc) {
+   await testInfo.init();
+ 
+   let promise = new Promise(resolve => {
+diff --git a/browser/components/urlbar/tests/browser/browser_tabMatchesInAwesomebar.js b/browser/components/urlbar/tests/browser/browser_tabMatchesInAwesomebar.js
+--- a/browser/components/urlbar/tests/browser/browser_tabMatchesInAwesomebar.js
++++ b/browser/components/urlbar/tests/browser/browser_tabMatchesInAwesomebar.js
+@@ -145,17 +145,18 @@ function loadTab(tab, url) {
+ function ensure_opentabs_match_db() {
+   let tabs = {};
+ 
+   for (let browserWin of Services.wm.getEnumerator("navigator:browser")) {
+     // skip closed-but-not-destroyed windows
+     if (browserWin.closed)
+       continue;
+ 
+-    for (let i = 0; i < browserWin.gBrowser.tabContainer.childElementCount; i++) {
++    let {tabCount} = browserWin.gBrowser;
++    for (let i = 0; i < tabCount; i++) {
+       let browser = browserWin.gBrowser.getBrowserAtIndex(i);
+       let url = browser.currentURI.spec;
+       if (browserWin.isBlankPageURL(url))
+         continue;
+       if (!(url in tabs))
+         tabs[url] = 1;
+       else
+         tabs[url]++;
+diff --git a/browser/modules/test/browser/browser_taskbar_preview.js b/browser/modules/test/browser/browser_taskbar_preview.js
+--- a/browser/modules/test/browser/browser_taskbar_preview.js
++++ b/browser/modules/test/browser/browser_taskbar_preview.js
+@@ -53,21 +53,21 @@ function test() {
+   ok(gBrowser.tabs.length == 3, "Successfully closed a tab");
+ 
+   // Select #1
+   ok(getPreviewForTab(gBrowser.tabs[0]).controller.onActivate(), "Activation was accepted");
+   ok(gBrowser.tabs[0].selected, "Correct tab was selected");
+   checkSelectedTab();
+ 
+   // Remove #3 (non active)
+-  gBrowser.removeTab(gBrowser.tabContainer.lastElementChild);
++  gBrowser.removeTab(gBrowser.tabContainer.lastTab);
+   checkPreviews(2, "Expected number of previews after closing unselected via browser");
+ 
+   // Remove #1 (active)
+-  gBrowser.removeTab(gBrowser.tabContainer.firstElementChild);
++  gBrowser.removeTab(gBrowser.tabContainer.firstTab);
+   checkPreviews(1, "Expected number of previews after closing selected tab via browser");
+ 
+   // Add a new tab
+   BrowserTestUtils.addTab(gBrowser);
+   checkPreviews(2);
+   // Check default selection
+   checkSelectedTab();
+ 
+diff --git a/dom/push/PushRecord.jsm b/dom/push/PushRecord.jsm
+--- a/dom/push/PushRecord.jsm
++++ b/dom/push/PushRecord.jsm
+@@ -181,17 +181,17 @@ PushRecord.prototype = {
+   },
+ 
+   isTabOpen() {
+     for (let window of Services.wm.getEnumerator("navigator:browser")) {
+       if (window.closed || PrivateBrowsingUtils.isWindowPrivate(window)) {
+         continue;
+       }
+       // `gBrowser` on Desktop; `BrowserApp` on Fennec.
+-      let tabs = window.gBrowser ? window.gBrowser.tabContainer.children :
++      let tabs = window.gBrowser ? window.gBrowser.tabs :
+                  window.BrowserApp.tabs;
+       for (let tab of tabs) {
+         // `linkedBrowser` on Desktop; `browser` on Fennec.
+         let tabURI = (tab.linkedBrowser || tab.browser).currentURI;
+         if (tabURI.prePath == this.uri.prePath) {
+           return true;
+         }
+       }
+diff --git a/testing/mochitest/browser-test.js b/testing/mochitest/browser-test.js
+--- a/testing/mochitest/browser-test.js
++++ b/testing/mochitest/browser-test.js
+@@ -559,17 +559,17 @@ Tester.prototype = {
+     // eslint-disable-next-line no-nested-ternary
+     let baseMsg = timedOut ? "Found a {elt} after previous test timed out"
+                            : this.currentTest ? "Found an unexpected {elt} at the end of test run"
+                                               : "Found an unexpected {elt}";
+ 
+     // Remove stale tabs
+     if (this.currentTest && window.gBrowser && gBrowser.tabs.length > 1) {
+       while (gBrowser.tabs.length > 1) {
+-        let lastTab = gBrowser.tabContainer.lastElementChild;
++        let {lastTab} = gBrowser.tabContainer;
+         if (!lastTab.closing) {
+           // Report the stale tab as an error only when they're not closing.
+           // Tests can finish without waiting for the closing tabs.
+           this.currentTest.addResult(new testResult({
+             name: baseMsg.replace("{elt}", "tab") + ": " +
+               lastTab.linkedBrowser.currentURI.spec,
+             allowFailure: this.currentTest.allowFailure,
+           }));
+diff --git a/toolkit/components/contextualidentity/ContextualIdentityService.jsm b/toolkit/components/contextualidentity/ContextualIdentityService.jsm
+--- a/toolkit/components/contextualidentity/ContextualIdentityService.jsm
++++ b/toolkit/components/contextualidentity/ContextualIdentityService.jsm
+@@ -482,18 +482,18 @@ function _ContextualIdentityService(path
+ 
+   _forEachContainerTab(callback, userContextId = 0) {
+     for (let win of Services.wm.getEnumerator("navigator:browser")) {
+       if (win.closed || !win.gBrowser) {
+         continue;
+       }
+ 
+       let tabbrowser = win.gBrowser;
+-      for (let i = tabbrowser.tabContainer.children.length - 1; i >= 0; --i) {
+-        let tab = tabbrowser.tabContainer.children[i];
++      for (let i = tabbrowser.tabCount - 1; i >= 0; --i) {
++        let tab = tabbrowser.tabContainer.getItemAtIndex(i);
+         if (tab.hasAttribute("usercontextid") &&
+                   (!userContextId ||
+                    parseInt(tab.getAttribute("usercontextid"), 10) == userContextId)) {
+           callback(tab, tabbrowser);
+         }
+       }
+     }
+   },
+diff --git a/toolkit/content/tests/chrome/test_tabbox.xul b/toolkit/content/tests/chrome/test_tabbox.xul
+--- a/toolkit/content/tests/chrome/test_tabbox.xul
++++ b/toolkit/content/tests/chrome/test_tabbox.xul
+@@ -77,44 +77,44 @@
+ SimpleTest.waitForExplicitFinish();
+ 
+ function test_tabbox()
+ {
+   var tabbox = document.getElementById("tabbox");
+   var tabs = document.getElementById("tabs");
+   var tabpanels = document.getElementById("tabpanels");
+ 
+-  test_tabbox_State(tabbox, "tabbox initial", 0, tabs.firstChild, tabpanels.firstChild);
++  test_tabbox_State(tabbox, "tabbox initial", 0, tabs.firstTab, tabpanels.firstChild);
+ 
+   // check the selectedIndex property
+   tabbox.selectedIndex = 1;
+-  test_tabbox_State(tabbox, "tabbox selectedIndex 1", 1, tabs.lastChild, tabpanels.lastChild);
++  test_tabbox_State(tabbox, "tabbox selectedIndex 1", 1, tabs.lastTab, tabpanels.lastChild);
+ 
+   tabbox.selectedIndex = 2;
+-  test_tabbox_State(tabbox, "tabbox selectedIndex 2", 1, tabs.lastChild, tabpanels.lastChild);
++  test_tabbox_State(tabbox, "tabbox selectedIndex 2", 1, tabs.lastTab, tabpanels.lastChild);
+ 
+   // tabbox must have a selection, so setting to -1 should do nothing
+   tabbox.selectedIndex = -1;
+-  test_tabbox_State(tabbox, "tabbox selectedIndex -1", 1, tabs.lastChild, tabpanels.lastChild);
++  test_tabbox_State(tabbox, "tabbox selectedIndex -1", 1, tabs.lastTab, tabpanels.lastChild);
+ 
+   // check the selectedTab property
+-  tabbox.selectedTab = tabs.firstChild;
+-  test_tabbox_State(tabbox, "tabbox selected", 0, tabs.firstChild, tabpanels.firstChild);
++  tabbox.selectedTab = tabs.firstTab;
++  test_tabbox_State(tabbox, "tabbox selected", 0, tabs.firstTab, tabpanels.firstChild);
+ 
+   // setting selectedTab to null should not do anything
+   tabbox.selectedTab = null;
+-  test_tabbox_State(tabbox, "tabbox selectedTab null", 0, tabs.firstChild, tabpanels.firstChild);
++  test_tabbox_State(tabbox, "tabbox selectedTab null", 0, tabs.firstTab, tabpanels.firstChild);
+ 
+   // check the selectedPanel property
+   tabbox.selectedPanel = tabpanels.lastChild;
+-  test_tabbox_State(tabbox, "tabbox selectedPanel", 0, tabs.firstChild, tabpanels.lastChild);
++  test_tabbox_State(tabbox, "tabbox selectedPanel", 0, tabs.firstTab, tabpanels.lastChild);
+ 
+   // setting selectedPanel to null should not do anything
+   tabbox.selectedPanel = null;
+-  test_tabbox_State(tabbox, "tabbox selectedPanel null", 0, tabs.firstChild, tabpanels.lastChild);
++  test_tabbox_State(tabbox, "tabbox selectedPanel null", 0, tabs.firstTab, tabpanels.lastChild);
+ 
+   tabbox.selectedIndex = 0;
+   test_tabpanels(tabpanels, tabbox);
+ 
+   tabs.firstChild.remove();
+   tabs.firstChild.remove();
+ 
+   test_tabs(tabs);
+diff --git a/toolkit/content/widgets/tabbox.js b/toolkit/content/widgets/tabbox.js
+--- a/toolkit/content/widgets/tabbox.js
++++ b/toolkit/content/widgets/tabbox.js
+@@ -228,17 +228,17 @@ class MozTabpanels extends MozXULElement
+       return null;
+ 
+     // Return tab element having 'linkedpanel' attribute equal to the id
+     // of the tab panel or the same index as the tab panel element.
+     let tabpanelIdx = Array.prototype.indexOf.call(this.children, aTabPanelElm);
+     if (tabpanelIdx == -1)
+       return null;
+ 
+-    let tabElms = tabsElm.children;
++    let tabElms = tabsElm.allTabs;
+     let tabElmFromIndex = tabElms[tabpanelIdx];
+ 
+     let tabpanelId = aTabPanelElm.id;
+     if (tabpanelId) {
+       for (let idx = 0; idx < tabElms.length; idx++) {
+         let tabElm = tabElms[idx];
+         if (tabElm.linkedPanel == tabpanelId)
+           return tabElm;
+@@ -319,17 +319,17 @@ MozElements.MozTab = class MozTab extend
+ 
+     let stopwatchid = this.parentNode.getAttribute("stopwatchid");
+     if (stopwatchid) {
+       TelemetryStopwatch.start(stopwatchid);
+     }
+ 
+     // Call this before setting the 'ignorefocus' attribute because this
+     // will pass on focus if the formerly selected tab was focused as well.
+-    this.parentNode._selectNewTab(this);
++    this.closest("tabs")._selectNewTab(this);
+ 
+     var isTabFocused = false;
+     try {
+       isTabFocused = (document.commandDispatcher.focusedElement == this);
+     } catch (e) {}
+ 
+     // Set '-moz-user-focus' to 'ignore' so that PostHandleEvent() can't
+     // focus the tab; we only want tabs to be focusable by the mouse if
+@@ -347,48 +347,47 @@ MozElements.MozTab = class MozTab extend
+ 
+   on_keydown(event) {
+     if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) {
+       return;
+     }
+     switch (event.keyCode) {
+       case KeyEvent.DOM_VK_LEFT: {
+         let direction = window.getComputedStyle(this.parentNode).direction;
+-        this.parentNode.advanceSelectedTab(direction == "ltr" ? -1 : 1,
++        this.container.advanceSelectedTab(direction == "ltr" ? -1 : 1,
+                                            this.arrowKeysShouldWrap);
+         event.preventDefault();
+         break;
+       }
+ 
+       case KeyEvent.DOM_VK_RIGHT: {
+         let direction = window.getComputedStyle(this.parentNode).direction;
+-        this.parentNode.advanceSelectedTab(direction == "ltr" ? 1 : -1,
++        this.container.advanceSelectedTab(direction == "ltr" ? 1 : -1,
+                                            this.arrowKeysShouldWrap);
+         event.preventDefault();
+         break;
+       }
+ 
+       case KeyEvent.DOM_VK_UP:
+-        this.parentNode.advanceSelectedTab(-1, this.arrowKeysShouldWrap);
++        this.container.advanceSelectedTab(-1, this.arrowKeysShouldWrap);
+         event.preventDefault();
+         break;
+ 
+       case KeyEvent.DOM_VK_DOWN:
+-        this.parentNode.advanceSelectedTab(1, this.arrowKeysShouldWrap);
++        this.container.advanceSelectedTab(1, this.arrowKeysShouldWrap);
+         event.preventDefault();
+         break;
+ 
+       case KeyEvent.DOM_VK_HOME:
+-        this.parentNode._selectNewTab(this.parentNode.children[0]);
++        this.container._selectNewTab(this.container.firstTab);
+         event.preventDefault();
+         break;
+ 
+       case KeyEvent.DOM_VK_END: {
+-        let tabs = this.parentNode.children;
+-        this.parentNode._selectNewTab(tabs[tabs.length - 1], -1);
++        this.container._selectNewTab(this.container.lastTab, -1);
+         event.preventDefault();
+         break;
+       }
+     }
+   }
+ 
+   set value(val) {
+     this.setAttribute("value", val);
+diff --git a/toolkit/content/widgets/tabbox.xml b/toolkit/content/widgets/tabbox.xml
+--- a/toolkit/content/widgets/tabbox.xml
++++ b/toolkit/content/widgets/tabbox.xml
+@@ -41,16 +41,40 @@
+         var value = this.value;
+         if (value)
+           this.value = value;
+         else
+           this.selectedIndex = 0;
+       ]]>
+       </constructor>
+ 
++      <property name="firstTab">
++        <getter>
++          return this.firstElementChild;
++        </getter>
++      </property>
++
++      <property name="lastTab">
++        <getter>
++          return this.lastElementChild;
++        </getter>
++      </property>
++
++      <property name="tabCount">
++        <getter>
++          return this.childElementCount;
++        </getter>
++      </property>
++
++      <property name="allTabs">
++        <getter>
++          return Array.from(this.children);
++        </getter>
++      </property>
++
+       <!-- nsIDOMXULRelatedElement -->
+       <method name="getRelatedElement">
+         <parameter name="aTabElm"/>
+         <body>
+         <![CDATA[
+           if (!aTabElm)
+             return null;
+ 
+@@ -264,33 +288,76 @@
+         <parameter name="index"/>
+         <body>
+         <![CDATA[
+           return this.children.item(index);
+         ]]>
+         </body>
+       </method>
+ 
++      <method name="findNextTab">
++        <parameter name="startTab"/>
++        <parameter name="direction"/>
++        <parameter name="wrap"/>
++        <parameter name="advance"/>
++        <parameter name="filter"/>
++        <body>
++        <![CDATA[
++          if (advance === undefined) {
++            advance = false;
++          }
++          if (filter === undefined) {
++            filter = tab => true;
++          }
++
++          let tab = startTab;
++          if (!advance && filter(tab)) {
++            return tab;
++          }
++
++          let tabs = this.allTabs;
++          let i = tabs.indexOf(tab);
++          if (i < 0) {
++            return null;
++          }
++
++          while (true) {
++            i += direction;
++            if (wrap) {
++              if (i < 0) {
++                i = tabs.length - 1;
++              } else if (i >= tabs.length) {
++                i = 0;
++              }
++            } else if (i < 0 || i >= tabs.length) {
++              return null;
++            }
++
++            tab = tabs[i];
++            if (tab == startTab) {
++              return null;
++            }
++            if (filter(tab)) {
++              return tab;
++            }
++          }
++        ]]>
++        </body>
++      </method>
++
+       <method name="_selectNewTab">
+         <parameter name="aNewTab"/>
+         <parameter name="aFallbackDir"/>
+         <parameter name="aWrap"/>
+         <body>
+         <![CDATA[
+           this.ariaFocusedItem = null;
+ 
+-          var requestedTab = aNewTab;
+-          while (aNewTab.hidden || aNewTab.disabled || !this._canAdvanceToTab(aNewTab)) {
+-            aNewTab = aFallbackDir == -1 ? aNewTab.previousElementSibling : aNewTab.nextElementSibling;
+-            if (!aNewTab && aWrap)
+-              aNewTab = aFallbackDir == -1 ? this.children[this.children.length - 1] :
+-                                             this.children[0];
+-            if (!aNewTab || aNewTab == requestedTab)
+-              return;
+-          }
++          aNewTab = this.findNextTab(aNewTab, aFallbackDir, aWrap, false,
++                                     tab => !tab.hidden && !tab.disabled && this._canAdvanceToTab(tab));
+ 
+           var isTabFocused = false;
+           try {
+             isTabFocused =
+               (document.commandDispatcher.focusedElement == this.selectedItem);
+           } catch (e) {}
+           this.selectedItem = aNewTab;
+           if (isTabFocused) {
+@@ -327,24 +394,18 @@
+       </method>
+ 
+       <method name="advanceSelectedTab">
+         <parameter name="aDir"/>
+         <parameter name="aWrap"/>
+         <body>
+         <![CDATA[
+           var startTab = this.ariaFocusedItem || this.selectedItem;
+-          var next = startTab[(aDir == -1 ? "previous" : "next") + "ElementSibling"];
+-          if (!next && aWrap) {
+-            next = aDir == -1 ? this.children[this.children.length - 1] :
+-                                this.children[0];
+-          }
+-          if (next && next != startTab) {
+-            this._selectNewTab(next, aDir, aWrap);
+-          }
++          let newTab = this.findNextTab(startTab, aDir, aWrap, true);
++          this._selectNewTab(newTab, aDir, aWrap);
+         ]]>
+         </body>
+       </method>
+ 
+       <method name="appendItem">
+         <parameter name="label"/>
+         <parameter name="value"/>
+         <body>
+
