@@ -1,0 +1,407 @@
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -2314,6 +2314,8 @@
+ pref("devtools.responsive.metaViewport.enabled", false);
+ // The user agent of the viewport.
+ pref("devtools.responsive.userAgent", "");
++// Whether or not the RDM UI is embedded in the browser.
++pref("devtools.responsive.browserUI.enabled", false);
+ 
+ // Show the custom user agent input in Nightly builds.
+ #if defined(NIGHTLY_BUILD)
+diff --git a/browser/base/content/browser.xhtml b/browser/base/content/browser.xhtml
+--- a/browser/base/content/browser.xhtml
++++ b/browser/base/content/browser.xhtml
+@@ -1393,6 +1393,7 @@
+ 
+     <splitter id="sidebar-splitter" class="chromeclass-extrachrome sidebar-splitter" hidden="true"/>
+     <vbox id="appcontent" flex="1">
++      <!-- Responsive Design Mode frame will be added here lazily -->
+       <!-- gHighPriorityNotificationBox will be added here lazily. -->
+       <tabbox id="tabbrowser-tabbox"
+               flex="1" tabcontainer="tabbrowser-tabs">
+diff --git a/devtools/client/framework/devtools-browser.js b/devtools/client/framework/devtools-browser.js
+--- a/devtools/client/framework/devtools-browser.js
++++ b/devtools/client/framework/devtools-browser.js
+@@ -816,6 +816,12 @@
+   handleEvent(event) {
+     switch (event.type) {
+       case "TabSelect":
++        if (
++          Services.prefs.getBoolPref("devtools.responsive.browserUI.enabled")
++        ) {
++          ResponsiveUIManager.toggleRDMVisibility(event.target);
++        }
++
+         gDevToolsBrowser._updateMenu();
+         break;
+       case "unload":
+diff --git a/devtools/client/jar.mn b/devtools/client/jar.mn
+--- a/devtools/client/jar.mn
++++ b/devtools/client/jar.mn
+@@ -51,6 +51,7 @@
+     content/aboutdebugging/index.html (aboutdebugging/index.html)
+     content/aboutdebugging/aboutdebugging.css (aboutdebugging/aboutdebugging.css)
+     content/responsive/index.xhtml (responsive/index.xhtml)
++    content/responsive/toolbar.xhtml (responsive/toolbar.xhtml)
+     content/dom/index.html (dom/index.html)
+     content/dom/main.js (dom/main.js)
+     content/accessibility/index.html (accessibility/index.html)
+diff --git a/devtools/client/responsive/components/App.js b/devtools/client/responsive/components/App.js
+--- a/devtools/client/responsive/components/App.js
++++ b/devtools/client/responsive/components/App.js
+@@ -422,16 +422,18 @@
+         onToggleUserAgentInput,
+         onUpdateDeviceModal,
+       }),
+-      Viewports({
+-        screenshot,
+-        viewports,
+-        onBrowserMounted,
+-        onChangeViewportOrientation,
+-        onContentResize,
+-        onRemoveDeviceAssociation,
+-        doResizeViewport,
+-        onResizeViewport,
+-      }),
++      !Services.prefs.getBoolPref("devtools.responsive.browserUI.enabled")
++        ? Viewports({
++            screenshot,
++            viewports,
++            onBrowserMounted,
++            onChangeViewportOrientation,
++            onContentResize,
++            onRemoveDeviceAssociation,
++            doResizeViewport,
++            onResizeViewport,
++          })
++        : null,
+       devices.isModalOpen
+         ? DeviceModal({
+             deviceAdderViewportTemplate,
+diff --git a/devtools/client/responsive/index.js b/devtools/client/responsive/index.js
+--- a/devtools/client/responsive/index.js
++++ b/devtools/client/responsive/index.js
+@@ -13,6 +13,7 @@
+   baseURI: "resource://devtools/client/responsive/",
+   window,
+ });
++const Services = require("Services");
+ const Telemetry = require("devtools/client/shared/telemetry");
+ 
+ const {
+@@ -36,6 +37,11 @@
+ // Exposed for use by tests
+ window.require = require;
+ 
++if (Services.prefs.getBoolPref("devtools.responsive.browserUI.enabled")) {
++  // Tell the ResponsiveUIManager that the frame script has begun initializing.
++  message.post(window, "script-init");
++}
++
+ const bootstrap = {
+   telemetry: new Telemetry(),
+ 
+@@ -127,7 +133,7 @@
+ /**
+  * Called by manager.js to add the initial viewport based on the original page.
+  */
+-window.addInitialViewport = ({ uri, userContextId }) => {
++window.addInitialViewport = ({ userContextId }) => {
+   try {
+     onDevicePixelRatioChange();
+     bootstrap.dispatch(changeDisplayPixelRatio(window.devicePixelRatio));
+diff --git a/devtools/client/responsive/manager.js b/devtools/client/responsive/manager.js
+--- a/devtools/client/responsive/manager.js
++++ b/devtools/client/responsive/manager.js
+@@ -78,6 +78,10 @@
+ const RELOAD_NOTIFICATION_PREF =
+   "devtools.responsive.reloadNotification.enabled";
+ 
++const BROWSER_UI_ENABLED = Services.prefs.getBoolPref(
++  "devtools.responsive.browserUI.enabled"
++);
++
+ function debug(msg) {
+   // console.log(`RDM manager: ${msg}`);
+ }
+@@ -109,11 +113,31 @@
+    *         it is resolved to the ResponsiveUI instance for this tab.  If the
+    *         the UI has closed, there is no resolution value.
+    */
+-  toggle(window, tab, options = {}) {
+-    const action = this.isActiveForTab(tab) ? "close" : "open";
+-    const completed = this[action + "IfNeeded"](window, tab, options);
+-    completed.catch(console.error);
+-    return completed;
++  async toggle(window, tab, options = {}) {
++    if (this.isActiveForTab(tab)) {
++      await this.closeIfNeeded(window, tab, options);
++    } else {
++      await this.openIfNeeded(window, tab, options);
++    }
++
++    if (BROWSER_UI_ENABLED) {
++      this.toggleRDMVisibility(window.gBrowser.selectedTab);
++    }
++  },
++
++  /**
++   * Toggle the RDM frame visibility for a tab.
++   *
++   * @param tab
++   *        The browser tab.
++   */
++  toggleRDMVisibility(tab) {
++    const rdmFrame = tab.ownerDocument.getElementById("rdm-frame");
++    if (!rdmFrame) {
++      return;
++    }
++
++    rdmFrame.hidden = !this.isActiveForTab(tab);
+   },
+ 
+   /**
+@@ -352,6 +376,11 @@
+   destroyed: false,
+ 
+   /**
++   * The iframe containing the RDM UI.
++   */
++  rdmFrame: null,
++
++  /**
+    * A window reference for the chrome:// document that displays the responsive
+    * design tool.  It is safe to reference this window directly even with e10s,
+    * as the tool UI is always loaded in the parent process.  The web content
+@@ -360,6 +389,12 @@
+    */
+   toolWindow: null,
+ 
++  get docShell() {
++    return BROWSER_UI_ENABLED
++      ? this.rdmFrame.contentWindow.docShell
++      : this.toolWindow.docShell;
++  },
++
+   /**
+    * Open RDM while preserving the state of the page.  We use `swapFrameLoaders`
+    * to ensure all in-page state is preserved, just like when you move a tab to
+@@ -372,31 +407,38 @@
+ 
+     const ui = this;
+ 
++    if (BROWSER_UI_ENABLED) {
++      this.initRDMFrame();
++    }
++
+     // Watch for tab close and window close so we can clean up RDM synchronously
+     this.tab.addEventListener("TabClose", this);
+     this.browserWindow.addEventListener("unload", this);
+ 
+-    // Swap page content from the current tab into a viewport within RDM
+-    debug("Create browser swapper");
+-    this.swap = swapToInnerBrowser({
+-      tab: this.tab,
+-      containerURL: TOOL_URL,
+-      async getInnerBrowser(containerBrowser) {
+-        const toolWindow = (ui.toolWindow = containerBrowser.contentWindow);
+-        toolWindow.addEventListener("message", ui);
+-        debug("Wait until init from inner");
+-        await message.request(toolWindow, "init");
+-        toolWindow.addInitialViewport({
+-          uri: "about:blank",
+-          userContextId: ui.tab.userContextId,
+-        });
+-        debug("Wait until browser mounted");
+-        await message.wait(toolWindow, "browser-mounted");
+-        return ui.getViewportBrowser();
+-      },
+-    });
+-    debug("Wait until swap start");
+-    await this.swap.start();
++    if (!BROWSER_UI_ENABLED) {
++      // Swap page content from the current tab into a viewport within RDM
++      debug("Create browser swapper");
++      this.swap = swapToInnerBrowser({
++        tab: this.tab,
++        containerURL: TOOL_URL,
++        async getInnerBrowser(containerBrowser) {
++          const toolWindow = (ui.toolWindow = containerBrowser.contentWindow);
++          toolWindow.addEventListener("message", ui);
++          debug("Wait until init from inner");
++          await message.request(toolWindow, "init");
++          toolWindow.addInitialViewport({
++            userContextId: ui.tab.userContextId,
++          });
++          debug("Wait until browser mounted");
++          await message.wait(toolWindow, "browser-mounted");
++          return ui.getViewportBrowser();
++        },
++      });
++      debug("Wait until swap start");
++      await this.swap.start();
++    } else {
++      this.rdmFrame.contentWindow.addEventListener("message", this);
++    }
+ 
+     // Set the ui toolWindow to fullZoom and textZoom of 100%. Directly change
+     // the zoom levels of the toolwindow docshell. That doesn't affect the zoom
+@@ -412,13 +454,13 @@
+     // changes to zoom levels will send Zoom UI update events in an order that
+     // keeps the Zoom UI synchronized with the RDM content zoom levels.
+     const rdmContent = this.tab.linkedBrowser;
+-    const rdmViewport = ui.toolWindow;
+-
+     const fullZoom = rdmContent.fullZoom;
+     const textZoom = rdmContent.textZoom;
+ 
+-    rdmViewport.docShell.contentViewer.fullZoom = 1;
+-    rdmViewport.docShell.contentViewer.textZoom = 1;
++    if (!BROWSER_UI_ENABLED) {
++      this.docShell.contentViewer.fullZoom = 1;
++      this.docShell.contentViewer.textZoom = 1;
++    }
+ 
+     // Listen to FullZoomChange events coming from the linkedBrowser,
+     // so that we can zoom the size of the viewport by the same amount.
+@@ -426,9 +468,11 @@
+ 
+     this.tab.addEventListener("BeforeTabRemotenessChange", this);
+ 
+-    // Notify the inner browser to start the frame script
+-    debug("Wait until start frame script");
+-    await message.request(this.toolWindow, "start-frame-script");
++    if (!BROWSER_UI_ENABLED) {
++      // Notify the inner browser to start the frame script
++      debug("Wait until start frame script");
++      await message.request(this.toolWindow, "start-frame-script");
++    }
+ 
+     // Get the protocol ready to speak with emulation actor
+     debug("Wait until RDP server connect");
+@@ -437,10 +481,12 @@
+     // Restore the previous state of RDM.
+     await this.restoreState();
+ 
+-    // Re-apply our cached zoom levels. Other Zoom UI update events have finished
+-    // by now.
+-    rdmContent.fullZoom = fullZoom;
+-    rdmContent.textZoom = textZoom;
++    if (!BROWSER_UI_ENABLED) {
++      // Re-apply our cached zoom levels. Other Zoom UI update events have finished
++      // by now.
++      rdmContent.fullZoom = fullZoom;
++      rdmContent.textZoom = textZoom;
++    }
+ 
+     // Non-blocking message to tool UI to start any delayed init activities
+     message.post(this.toolWindow, "post-init");
+@@ -449,6 +495,40 @@
+   },
+ 
+   /**
++   * Initialize the RDM iframe inside of the browser document.
++   */
++  initRDMFrame() {
++    const doc = this.browserWindow.document;
++    let rdmFrame = doc.getElementById("rdm-frame");
++
++    if (!rdmFrame) {
++      rdmFrame = doc.createElement("iframe");
++      rdmFrame.id = "rdm-frame";
++      rdmFrame.src = "chrome://devtools/content/responsive/toolbar.xhtml";
++      rdmFrame.style.height = rdmFrame.style.minHeight = "30px";
++      rdmFrame.style.borderStyle = "none";
++      doc.getElementById("appcontent").prepend(rdmFrame);
++
++      // Wait for the frame script to be loaded.
++      message.wait(rdmFrame.contentWindow, "script-init").then(async () => {
++        // Notify the frame window that the Resposnive UI manager has begun initializing.
++        // At this point, we can render our React content inside the frame.
++        message.post(rdmFrame.contentWindow, "init");
++        // Wait for the tools to be rendered above the content. The frame script will
++        // then dispatch the necessary actions to the Redux store to give the toolbar the
++        // state it needs.
++        message.wait(rdmFrame.contentWindow, "init:done").then(() => {
++          rdmFrame.contentWindow.addInitialViewport({
++            userContextId: this.tab.userContextId,
++          });
++        });
++      });
++    }
++
++    this.rdmFrame = rdmFrame;
++  },
++
++  /**
+    * Close RDM and restore page content back into a regular tab.
+    *
+    * @param object
+@@ -484,9 +564,14 @@
+     this.tab.removeEventListener("TabClose", this);
+     this.tab.removeEventListener("BeforeTabRemotenessChange", this);
+     this.browserWindow.removeEventListener("unload", this);
+-    this.toolWindow.removeEventListener("message", this);
+ 
+-    if (!isTabContentDestroying) {
++    if (!BROWSER_UI_ENABLED) {
++      this.toolWindow.removeEventListener("message", this);
++    } else {
++      this.rdmFrame.removeEventListener("message", this);
++    }
++
++    if (!BROWSER_UI_ENABLED && !isTabContentDestroying) {
+       // Notify the inner browser to stop the frame script
+       await message.request(this.toolWindow, "stop-frame-script");
+     }
+@@ -512,6 +597,7 @@
+     this.browserWindow = null;
+     this.tab = null;
+     this.inited = null;
++    this.rdmFrame = null;
+     this.toolWindow = null;
+     this.swap = null;
+ 
+@@ -524,7 +610,7 @@
+     }
+     this.client = this.emulationFront = null;
+ 
+-    if (!isWindowClosing) {
++    if (!BROWSER_UI_ENABLED && !isWindowClosing) {
+       // Undo the swap and return the content back to a normal tab
+       swap.stop();
+     }
+@@ -691,7 +777,7 @@
+ 
+   onExit() {
+     const { browserWindow, tab } = this;
+-    ResponsiveUIManager.closeIfNeeded(browserWindow, tab);
++    ResponsiveUIManager.toggle(browserWindow, tab);
+   },
+ 
+   async onRemoveDeviceAssociation() {
+diff --git a/devtools/client/responsive/toolbar.xhtml b/devtools/client/responsive/toolbar.xhtml
+new file mode 100644
+--- /dev/null
++++ b/devtools/client/responsive/toolbar.xhtml
+@@ -0,0 +1,17 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<!DOCTYPE html>
++<html xmlns="http://www.w3.org/1999/xhtml">
++  <head>
++    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
++    <link rel="stylesheet" type="text/css"
++          href="resource://devtools/client/responsive/index.css"/>
++    <script src="chrome://devtools/content/shared/theme-switching.js"></script>
++    <script src="resource://devtools/client/responsive/index.js"></script>
++  </head>
++  <body role="application">
++    <div id="root"></div>
++  </body>
++</html>
+
