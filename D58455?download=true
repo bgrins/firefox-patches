@@ -1,0 +1,541 @@
+diff --git a/dom/base/nsGlobalWindowInner.h b/dom/base/nsGlobalWindowInner.h
+--- a/dom/base/nsGlobalWindowInner.h
++++ b/dom/base/nsGlobalWindowInner.h
+@@ -95,6 +95,7 @@
+ 
+ namespace mozilla {
+ class AbstractThread;
++class JSGlobalKeyListener;
+ namespace dom {
+ class BarProp;
+ class BrowsingContext;
+@@ -113,6 +114,8 @@
+ class IncrementalRunnable;
+ class InstallTriggerImpl;
+ class IntlUtils;
++class WindowKeyboardShortcutCallback;
++struct WindowKeyboardShortcutInfo;
+ class Location;
+ class MediaQueryList;
+ class OwningExternalOrWindowProxy;
+@@ -1235,6 +1238,12 @@
+ 
+   void SetActiveLoadingState(bool aIsLoading) override;
+ 
++  already_AddRefed<mozilla::dom::Promise> RegisterKeyboardShortcut(
++      JSContext* aCx, const nsAString& aId,
++      const mozilla::dom::WindowKeyboardShortcutInfo& aInfo,
++      mozilla::dom::WindowKeyboardShortcutCallback& aCallback,
++      mozilla::ErrorResult& aError);
++
+  protected:
+   // Window offline status. Checked to see if we need to fire offline event
+   bool mWasOffline : 1;
+@@ -1421,6 +1430,8 @@
+   nsTArray<mozilla::UniquePtr<PromiseDocumentFlushedResolver>>
+       mDocumentFlushedResolvers;
+ 
++  RefPtr<mozilla::JSGlobalKeyListener> mJSKeyListeners;
++
+   static InnerWindowByIdTable* sInnerWindowsById;
+ 
+   // Members in the mChromeFields member should only be used in chrome windows.
+diff --git a/dom/base/nsGlobalWindowInner.cpp b/dom/base/nsGlobalWindowInner.cpp
+--- a/dom/base/nsGlobalWindowInner.cpp
++++ b/dom/base/nsGlobalWindowInner.cpp
+@@ -26,6 +26,7 @@
+ #include "mozilla/dom/DocumentInlines.h"
+ #include "mozilla/dom/DOMJSProxyHandler.h"
+ #include "mozilla/dom/EventTarget.h"
++#include "mozilla/dom/WindowKeyboardShortcutBinding.h"
+ #include "mozilla/dom/LocalStorage.h"
+ #include "mozilla/dom/LocalStorageCommon.h"
+ #include "mozilla/dom/LSObject.h"
+@@ -251,6 +252,9 @@
+ #include "AccessCheck.h"
+ #include "SessionStorageCache.h"
+ 
++#include "mozilla/GlobalKeyListener.h"
++#include "mozilla/WindowKeyboardShortcut.h"
++
+ #ifdef ANDROID
+ #  include <android/log.h>
+ #endif
+@@ -7107,6 +7111,40 @@
+   }
+ }
+ 
++already_AddRefed<Promise> nsGlobalWindowInner::RegisterKeyboardShortcut(
++    JSContext* aCx, const nsAString& aId,
++    const mozilla::dom::WindowKeyboardShortcutInfo& aInfo,
++    mozilla::dom::WindowKeyboardShortcutCallback& aCallback, ErrorResult& aError) {
++  RefPtr<Promise> promise = Promise::Create(this, aError);
++
++  if (NS_WARN_IF(aError.Failed())) {
++    return nullptr;
++  }
++
++  if ((!aInfo.mKey.WasPassed() || aInfo.mKey.Value().IsEmpty()) &&
++      (!aInfo.mKeyCode.WasPassed() || aInfo.mKeyCode.Value().IsEmpty())) {
++    promise->MaybeRejectWithUndefined();
++    return promise.forget();
++  }
++
++  if (!mJSKeyListeners) {
++    mJSKeyListeners = new JSGlobalKeyListener(this);
++  }
++
++  JSKeyEventHandler* handler = mJSKeyListeners->Register(aInfo, aCallback);
++  RefPtr<WindowKeyboardShortcut> shortcut = new WindowKeyboardShortcut(this, mJSKeyListeners, handler);
++
++  JS::Rooted<JS::Value> shortcutValue(aCx);
++  if (!ToJSValue(aCx, shortcut, &shortcutValue)) {
++    promise->MaybeRejectWithUndefined();
++    return promise.forget();
++  }
++
++  promise->MaybeResolveWithClone(aCx, shortcutValue);
++
++  return promise.forget();
++}
++
+ mozilla::dom::TabGroup* nsPIDOMWindowInner::TabGroup() {
+   return nsGlobalWindowInner::Cast(this)->TabGroupInner();
+ }
+diff --git a/dom/bindings/Bindings.conf b/dom/bindings/Bindings.conf
+--- a/dom/bindings/Bindings.conf
++++ b/dom/bindings/Bindings.conf
+@@ -1455,10 +1455,16 @@
+     'headerFile': 'nsGlobalWindow.h',
+     'implicitJSContext': [
+         'createImageBitmap',
+-        'requestIdleCallback'
++        'requestIdleCallback',
++        'registerKeyboardShortcut',
+     ],
+ },
+ 
++'WindowKeyboardShortcut': {
++    'nativeType': 'mozilla::WindowKeyboardShortcut',
++    'headerFile': 'mozilla/WindowKeyboardShortcut.h',
++},
++
+ 'WindowProxy': {
+     'nativeType': 'mozilla::dom::WindowProxyHolder',
+     'headerFile': 'mozilla/dom/WindowProxyHolder.h',
+diff --git a/dom/chrome-webidl/WindowKeyboardShortcut.webidl b/dom/chrome-webidl/WindowKeyboardShortcut.webidl
+new file mode 100644
+--- /dev/null
++++ b/dom/chrome-webidl/WindowKeyboardShortcut.webidl
+@@ -0,0 +1,23 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++callback WindowKeyboardShortcutCallback = void ();
++
++enum WindowKeyboardShortcutModifier {
++  "shift", "alt", "meta", "control", "os", "accel", "access"
++};
++
++dictionary WindowKeyboardShortcutInfo {
++  DOMString key;
++  DOMString keyCode;
++  sequence<WindowKeyboardShortcutModifier> modifiers;
++};
++
++[NoInterfaceObject, Exposed=Window]
++interface WindowKeyboardShortcut {
++  attribute boolean disabled;
++
++  void unregister();
++};
+diff --git a/dom/chrome-webidl/moz.build b/dom/chrome-webidl/moz.build
+--- a/dom/chrome-webidl/moz.build
++++ b/dom/chrome-webidl/moz.build
+@@ -66,6 +66,7 @@
+     'WebExtensionContentScript.webidl',
+     'WebExtensionPolicy.webidl',
+     'WindowGlobalActors.webidl',
++    'WindowKeyboardShortcut.webidl',
+     'XULFrameElement.webidl',
+     'XULMenuElement.webidl',
+     'XULTextElement.webidl',
+diff --git a/dom/events/GlobalKeyListener.h b/dom/events/GlobalKeyListener.h
+--- a/dom/events/GlobalKeyListener.h
++++ b/dom/events/GlobalKeyListener.h
+@@ -9,6 +9,7 @@
+ 
+ #include "mozilla/EventForwards.h"
+ #include "mozilla/layers/KeyboardMap.h"
++#include "mozilla/dom/WindowKeyboardShortcutBinding.h"
+ #include "nsIDOMEventListener.h"
+ #include "nsIWeakReferenceUtils.h"
+ 
+@@ -33,6 +34,7 @@
+ 
+ class KeyEventHandler;
+ class XULKeyEventHandler;
++class JSKeyEventHandler;
+ 
+ /**
+  * A generic listener for key events.
+@@ -101,6 +103,23 @@
+   KeyEventHandler* mHandler;  // Linked list of event handlers.
+ };
+ 
++class JSGlobalKeyListener final : public GlobalKeyListener {
++ public:
++  explicit JSGlobalKeyListener(EventTarget* aTarget);
++
++  JSKeyEventHandler* Register(const mozilla::dom::WindowKeyboardShortcutInfo& aInfo,
++    mozilla::dom::WindowKeyboardShortcutCallback& aCallback);
++  void Unregister(JSKeyEventHandler* aHandler);
++
++  virtual bool CanHandle(KeyEventHandler* aHandler,
++                         bool aWillExecute) const override;
++
++ protected:
++  virtual ~JSGlobalKeyListener();
++
++  virtual void EnsureHandlers() override {}
++};
++
+ /**
+  * A listener for shortcut keys defined in XUL keyset elements.
+  *
+diff --git a/dom/events/GlobalKeyListener.cpp b/dom/events/GlobalKeyListener.cpp
+--- a/dom/events/GlobalKeyListener.cpp
++++ b/dom/events/GlobalKeyListener.cpp
+@@ -469,6 +469,66 @@
+   return WalkHandlersInternal(aEvent, false, aOutReservedForChrome);
+ }
+ 
++JSGlobalKeyListener::JSGlobalKeyListener(EventTarget* aTarget)
++    : GlobalKeyListener(aTarget) {
++  EventListenerManager* manager = aTarget->GetOrCreateListenerManager();
++  if (!manager) {
++    return;
++  }
++
++  InstallKeyboardEventListenersTo(manager);
++}
++
++JSGlobalKeyListener::~JSGlobalKeyListener() {
++  if (mHandler) {
++    delete mHandler;
++  }
++}
++
++JSKeyEventHandler*
++JSGlobalKeyListener::Register(const mozilla::dom::WindowKeyboardShortcutInfo& aInfo,
++    mozilla::dom::WindowKeyboardShortcutCallback& aCallback) {
++  JSKeyEventHandler* handler = new JSKeyEventHandler(aInfo, aCallback);
++  if (!mHandler) {
++    mHandler = handler;
++  } else {
++    KeyEventHandler* previous = mHandler;
++    while (previous->GetNextHandler()) {
++      previous = previous->GetNextHandler();
++    }
++    previous->SetNextHandler(handler);
++  }
++
++  return handler;
++}
++
++void
++JSGlobalKeyListener::Unregister(JSKeyEventHandler* aHandler) {
++  if (mHandler == aHandler) {
++    mHandler = aHandler->GetNextHandler();
++  } else {
++    KeyEventHandler* previous = mHandler;
++    while (previous && previous->GetNextHandler() != aHandler) {
++      previous = previous->GetNextHandler();
++    }
++
++    // Already unregistered? Probably shouldn't ever happen.
++    if (!previous) {
++      return;
++    }
++
++    previous->SetNextHandler(aHandler->GetNextHandler());
++  }
++
++  aHandler->SetNextHandler(nullptr);
++  delete aHandler;
++}
++
++bool JSGlobalKeyListener::CanHandle(KeyEventHandler* aHandler,
++                                    bool aWillExecute) const {
++  JSKeyEventHandler* handler = static_cast<JSKeyEventHandler*>(aHandler);
++  return !handler->Disabled();
++}
+ //
+ // AttachGlobalKeyHandler
+ //
+diff --git a/dom/events/KeyEventHandler.h b/dom/events/KeyEventHandler.h
+--- a/dom/events/KeyEventHandler.h
++++ b/dom/events/KeyEventHandler.h
+@@ -118,6 +118,23 @@
+   RefPtr<nsAtom> mEventName;  // The type of the event, e.g., "keypress"
+ };
+ 
++class JSKeyEventHandler final : public KeyEventHandler {
++ public:
++  explicit JSKeyEventHandler(
++    const mozilla::dom::WindowKeyboardShortcutInfo& aInfo,
++    mozilla::dom::WindowKeyboardShortcutCallback& aCallback);
++
++  bool Disabled();
++  void SetDisabled(bool aDisabled);
++
++  MOZ_CAN_RUN_SCRIPT
++  virtual nsresult ExecuteHandler(EventTarget* aTarget, Event* aEvent) override;
++
++ protected:
++  bool mDisabled;
++  RefPtr<mozilla::dom::WindowKeyboardShortcutCallback> mCallback;
++};
++
+ class XULKeyEventHandler final : public KeyEventHandler {
+  public:
+   explicit XULKeyEventHandler(Element* aKeyElement);
+diff --git a/dom/events/KeyEventHandler.cpp b/dom/events/KeyEventHandler.cpp
+--- a/dom/events/KeyEventHandler.cpp
++++ b/dom/events/KeyEventHandler.cpp
+@@ -319,12 +319,70 @@
+   return n;
+ }
+ 
++JSKeyEventHandler::JSKeyEventHandler(
++    const mozilla::dom::WindowKeyboardShortcutInfo& aInfo,
++    mozilla::dom::WindowKeyboardShortcutCallback& aCallback)
++    : KeyEventHandler(),
++      mDisabled(false),
++      mCallback(&aCallback) {
++  mDetail = -1;
++  mMisc = 0;
++  mKeyMask = cAllModifiers;
++  mEventName = nsGkAtoms::keypress;
++
++  if (aInfo.mModifiers.WasPassed()) {
++    for (auto modifier : aInfo.mModifiers.Value()) {
++      if (modifier == WindowKeyboardShortcutModifier::Shift) {
++        mKeyMask |= cShift | cShiftMask;
++      } else if (modifier == WindowKeyboardShortcutModifier::Alt) {
++        mKeyMask |= cAlt | cAltMask;
++      } else if (modifier == WindowKeyboardShortcutModifier::Meta) {
++        mKeyMask |= cMeta | cMetaMask;
++      } else if (modifier == WindowKeyboardShortcutModifier::Os) {
++        mKeyMask |= cOS | cOSMask;
++      } else if (modifier == WindowKeyboardShortcutModifier::Control) {
++        mKeyMask |= cControl | cControlMask;
++      } else if (modifier == WindowKeyboardShortcutModifier::Accel) {
++        mKeyMask |= AccelKeyMask();
++      } else if (modifier == WindowKeyboardShortcutModifier::Access) {
++        mKeyMask |= KeyToMask(kMenuAccessKey);
++      }
++    }
++  }
++
++  if (aInfo.mKey.WasPassed() && !aInfo.mKey.Value().IsEmpty()) {
++    nsString key(aInfo.mKey.Value());
++    ToLowerCase(key);
++
++    // We have a charcode.
++    mMisc = 1;
++    mDetail = key[0];
++
++    // TODO report key conflict.
++  } else if (aInfo.mKeyCode.WasPassed() && !aInfo.mKeyCode.Value().IsEmpty()) {
++    mDetail = GetMatchingKeyCode(aInfo.mKeyCode.Value());
++  }
++}
++
++bool JSKeyEventHandler::Disabled() {
++  return mDisabled;
++}
++
++void JSKeyEventHandler::SetDisabled(bool aDisabled) {
++  mDisabled = aDisabled;
++}
++
++nsresult JSKeyEventHandler::ExecuteHandler(EventTarget* aTarget, Event* aEvent) {
++  mCallback->Call();
++  return NS_OK;
++}
++
+ XULKeyEventHandler::XULKeyEventHandler(Element* aKeyElement)
+     : KeyEventHandler(),
+       mHandlerElement(nullptr) {
+   mDetail = -1;
+   mMisc = 0;
+-  mKeyMask = 0;
++  mKeyMask = cAllModifiers;
+   nsAutoString modifiers;
+ 
+   nsWeakPtr weak = do_GetWeakReference(aKeyElement);
+@@ -351,9 +409,6 @@
+   }
+ 
+   if (!key.IsEmpty()) {
+-    if (mKeyMask == 0) {
+-      mKeyMask = cAllModifiers;
+-    }
+     ToLowerCase(key);
+ 
+     // We have a charcode.
+@@ -378,9 +433,6 @@
+     aKeyElement->GetAttr(kNameSpaceID_None, nsGkAtoms::keycode, key);
+ 
+     if (!key.IsEmpty()) {
+-      if (mKeyMask == 0) {
+-        mKeyMask = cAllModifiers;
+-      }
+       mDetail = GetMatchingKeyCode(key);
+     }
+   }
+diff --git a/dom/events/WindowKeyboardShortcut.h b/dom/events/WindowKeyboardShortcut.h
+new file mode 100644
+--- /dev/null
++++ b/dom/events/WindowKeyboardShortcut.h
+@@ -0,0 +1,44 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_WindowKeyboardShortcut_h_
++#define mozilla_WindowKeyboardShortcut_h_
++
++#include "nsWrapperCache.h"
++#include "nsPIDOMWindow.h"
++#include "mozilla/GlobalKeyListener.h"
++#include "mozilla/KeyEventHandler.h"
++
++namespace mozilla {
++
++class WindowKeyboardShortcut final : public nsWrapperCache {
++ public:
++  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(WindowKeyboardShortcut)
++  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(WindowKeyboardShortcut)
++
++  WindowKeyboardShortcut(nsPIDOMWindowInner* aWindow,
++      JSGlobalKeyListener* aListener, JSKeyEventHandler* aEventHandler);
++  nsISupports* GetParentObject() const;
++  virtual JSObject* WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto) override;
++
++  bool Disabled();
++  void SetDisabled(bool aDisabled);
++
++  void Unregister();
++
++ private:
++  ~WindowKeyboardShortcut() = default;
++
++  nsCOMPtr<nsPIDOMWindowInner> mWindow;
++  RefPtr<JSGlobalKeyListener> mListener;
++
++  // This object is owned by the global listener.
++  JSKeyEventHandler* mEventHandler;
++};
++
++}  // namespace mozilla
++
++#endif
+diff --git a/dom/events/WindowKeyboardShortcut.cpp b/dom/events/WindowKeyboardShortcut.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/events/WindowKeyboardShortcut.cpp
+@@ -0,0 +1,56 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "WindowKeyboardShortcut.h"
++#include "mozilla/dom/WindowKeyboardShortcutBinding.h"
++
++namespace mozilla {
++
++NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE_0(WindowKeyboardShortcut)
++
++NS_IMPL_CYCLE_COLLECTION_ROOT_NATIVE(WindowKeyboardShortcut, AddRef)
++NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(WindowKeyboardShortcut, Release)
++
++WindowKeyboardShortcut::WindowKeyboardShortcut(nsPIDOMWindowInner* aWindow,
++    JSGlobalKeyListener* aListener, JSKeyEventHandler* aEventHandler)
++  : mWindow(aWindow),
++    mListener(aListener),
++    mEventHandler(aEventHandler) {
++}
++
++nsISupports*
++WindowKeyboardShortcut::GetParentObject() const {
++  return mWindow.get();
++}
++
++JSObject*
++WindowKeyboardShortcut::WrapObject(JSContext* aCx, JS::Handle<JSObject*> aGivenProto) {
++  return WindowKeyboardShortcut_Binding::Wrap(aCx, this, aGivenProto);
++}
++
++bool
++WindowKeyboardShortcut::Disabled() {
++  return mEventHandler ? mEventHandler->Disabled() : true;
++}
++
++void
++WindowKeyboardShortcut::SetDisabled(bool aDisabled) {
++  if (mEventHandler) {
++    mEventHandler->SetDisabled(aDisabled);
++  }
++}
++
++void
++WindowKeyboardShortcut::Unregister() {
++  if (mListener && mEventHandler) {
++    mListener->Unregister(mEventHandler);
++  }
++
++  mListener = nullptr;
++  mEventHandler = nullptr;
++}
++
++} // namespace mozilla
+diff --git a/dom/events/moz.build b/dom/events/moz.build
+--- a/dom/events/moz.build
++++ b/dom/events/moz.build
+@@ -61,6 +61,7 @@
+     'TextComposition.h',
+     'VirtualKeyCodeList.h',
+     'WheelHandlingHelper.h',
++    'WindowKeyboardShortcut.h',
+ ]
+ 
+ EXPORTS.mozilla.dom += [
+@@ -159,6 +160,7 @@
+     'UIEvent.cpp',
+     'WheelEvent.cpp',
+     'WheelHandlingHelper.cpp',
++    'WindowKeyboardShortcut.cpp',
+     'XULCommandEvent.cpp',
+ ]
+ 
+diff --git a/dom/webidl/Window.webidl b/dom/webidl/Window.webidl
+--- a/dom/webidl/Window.webidl
++++ b/dom/webidl/Window.webidl
+@@ -788,3 +788,8 @@
+ dictionary WindowPostMessageOptions : PostMessageOptions {
+   USVString targetOrigin = "/";
+ };
++
++partial interface Window {
++  [Throws, Func="nsGlobalWindowInner::IsPrivilegedChromeWindow"]
++  Promise<WindowKeyboardShortcut> registerKeyboardShortcut(DOMString id, WindowKeyboardShortcutInfo info, WindowKeyboardShortcutCallback callback);
++};
+

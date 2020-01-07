@@ -1,0 +1,201 @@
+diff --git a/js/src/jsfriendapi.h b/js/src/jsfriendapi.h
+--- a/js/src/jsfriendapi.h
++++ b/js/src/jsfriendapi.h
+@@ -2696,6 +2696,11 @@
+     JSContext* cx, CompartmentTransplantCallback* callback,
+     JS::MutableHandleObject newTarget);
+ 
++// Given a linked/instantiated ES module object, return the namespace object
++// representing it's exported bindings.
++extern JS_FRIEND_API JSObject* GetModuleNamespaceObjectForModule(
++    JSContext* cx, JS::HandleObject obj);
++
+ } /* namespace js */
+ 
+ #endif /* jsfriendapi_h */
+diff --git a/js/src/jsfriendapi.cpp b/js/src/jsfriendapi.cpp
+--- a/js/src/jsfriendapi.cpp
++++ b/js/src/jsfriendapi.cpp
+@@ -1420,3 +1420,9 @@
+   return runtime->isBeingDestroyed();
+ }
+ #endif
++
++JS_FRIEND_API JSObject* js::GetModuleNamespaceObjectForModule(
++    JSContext* cx, JS::HandleObject obj) {
++  RootedModuleObject module(cx, &obj->as<ModuleObject>());
++  return ModuleObject::GetOrCreateModuleNamespace(cx, module);
++}
+diff --git a/js/xpconnect/loader/mozJSComponentLoader.h b/js/xpconnect/loader/mozJSComponentLoader.h
+--- a/js/xpconnect/loader/mozJSComponentLoader.h
++++ b/js/xpconnect/loader/mozJSComponentLoader.h
+@@ -117,6 +117,13 @@
+                              char** location, bool aCatchException,
+                              JS::MutableHandleValue aException);
+ 
++  nsresult ObjectForLocationES6(ComponentLoaderInfo& aInfo,
++                                nsIFile* aComponentFile,
++                                JS::MutableHandleObject aObject,
++                                JS::MutableHandleScript aTableScript,
++                                char** location, bool aCatchException,
++                                JS::MutableHandleValue aException);
++
+   nsresult ImportInto(const nsACString& aLocation, JS::HandleObject targetObj,
+                       JSContext* callercx, JS::MutableHandleObject vp);
+ 
+@@ -187,6 +194,10 @@
+   nsresult ExtractExports(JSContext* aCx, ComponentLoaderInfo& aInfo,
+                           ModuleEntry* aMod, JS::MutableHandleObject aExports);
+ 
++  nsresult ExtractExportsES6(JSContext* aCx, ComponentLoaderInfo& aInfo,
++                             ModuleEntry* aMod,
++                             JS::MutableHandleObject aExports);
++
+   static size_t DataEntrySizeOfExcludingThis(
+       const nsACString& aKey, ModuleEntry* const& aData,
+       mozilla::MallocSizeOf aMallocSizeOf, void* arg);
+diff --git a/js/xpconnect/loader/mozJSComponentLoader.cpp b/js/xpconnect/loader/mozJSComponentLoader.cpp
+--- a/js/xpconnect/loader/mozJSComponentLoader.cpp
++++ b/js/xpconnect/loader/mozJSComponentLoader.cpp
+@@ -773,6 +773,74 @@
+   return std::move(str);
+ }
+ 
++nsresult mozJSComponentLoader::ObjectForLocationES6(
++    ComponentLoaderInfo& aInfo, nsIFile* aComponentFile,
++    MutableHandleObject aObject, MutableHandleScript aTableScript,
++    char** aLocation, bool aPropagateExceptions,
++    MutableHandleValue aException) {
++  MOZ_ASSERT(NS_IsMainThread(), "Must be on main thread.");
++
++  dom::AutoJSAPI jsapi;
++  jsapi.Init();
++  JSContext* cx = jsapi.cx();
++
++  nsresult rv = aInfo.EnsureURI();
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  RootedObject gobj(cx, GetSharedGlobal(cx));
++  NS_ENSURE_TRUE(gobj, NS_ERROR_FAILURE);
++  MOZ_ASSERT(JS_IsGlobalObject(gobj));
++
++  JSAutoRealm ar(cx, gobj);
++
++  nsAutoCString nativePath;
++  rv = aInfo.URI()->GetSpec(nativePath);
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  LOG(("ES6 loading %s\n", nativePath.get()));
++
++  // If we are debugging a replaying process and have diverged from the
++  // recording, trying to load and compile new code will cause the
++  // debugger operation to fail, so just abort now.
++  if (recordreplay::HasDivergedFromRecording()) {
++    return NS_ERROR_FAILURE;
++  }
++
++  CompileOptions options(cx);
++  options.setNoScriptRval(true)
++      .setForceStrictMode()
++      .setFileAndLine(nativePath.get(), 1)
++      .setSourceIsLazy(false);
++
++  // Get Source Text
++  nsCString str;
++  MOZ_TRY_VAR(str, ReadScript(aInfo));
++  JS::SourceText<mozilla::Utf8Unit> srcBuf;
++  if (!srcBuf.init(cx, str.get(), str.Length(),
++                   JS::SourceOwnership::Borrowed)) {
++    return NS_ERROR_FAILURE;
++  }
++
++  nsAutoMicroTask mt;
++
++  // Compile the Module
++  JS::Rooted<JSObject*> module(cx);
++  rv = nsJSUtils::CompileModule(cx, srcBuf, gobj, options, &module);
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  // Link / Instantiate module
++  rv = nsJSUtils::ModuleInstantiate(cx, module);
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  // Execute the script
++  rv = nsJSUtils::ModuleEvaluate(cx, module);
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  aObject.set(module);
++
++  return NS_OK;
++}
++
+ nsresult mozJSComponentLoader::ObjectForLocation(
+     ComponentLoaderInfo& aInfo, nsIFile* aComponentFile,
+     MutableHandleObject aObject, MutableHandleScript aTableScript,
+@@ -1155,6 +1223,22 @@
+   return NS_OK;
+ }
+ 
++nsresult mozJSComponentLoader::ExtractExportsES6(
++    JSContext* aCx, ComponentLoaderInfo& aInfo, ModuleEntry* aMod,
++    JS::MutableHandleObject aExports) {
++  JSAutoRealm ar(aCx, aMod->obj);
++
++  // Get the `Module Namespace Exotic Object` and return that. This is the
++  // object that a dynamic import of this same ES module would resolve to.
++  aExports.set(js::GetModuleNamespaceObjectForModule(aCx, aMod->obj));
++  if (!aExports) {
++    return NS_ERROR_FAILURE;
++  }
++
++  aMod->exports = aExports;
++  return NS_OK;
++}
++
+ nsresult mozJSComponentLoader::ExtractExports(
+     JSContext* aCx, ComponentLoaderInfo& aInfo, ModuleEntry* aMod,
+     JS::MutableHandleObject aExports) {
+@@ -1287,6 +1371,10 @@
+   rv = info.EnsureKey();
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
++  // Use resource suffix to decide if we should use ES6 loader.
++  bool isEcmaScriptModule =
++      StringEndsWith(aLocation, NS_LITERAL_CSTRING(".mjs"));
++
+   ModuleEntry* mod;
+   nsAutoPtr<ModuleEntry> newEntry;
+   if (!mImports.Get(info.Key(), &mod) &&
+@@ -1337,9 +1425,15 @@
+       auto cleanup =
+           MakeScopeExit([&]() { mInProgressImports.Remove(info.Key()); });
+ 
+-      rv = ObjectForLocation(info, sourceFile, &newEntry->obj,
+-                             &newEntry->thisObjectKey, &newEntry->location,
+-                             true, &exception);
++      if (isEcmaScriptModule) {
++        rv = ObjectForLocationES6(info, sourceFile, &newEntry->obj,
++                                  &newEntry->thisObjectKey, &newEntry->location,
++                                  true, &exception);
++      } else {
++        rv = ObjectForLocation(info, sourceFile, &newEntry->obj,
++                               &newEntry->thisObjectKey, &newEntry->location,
++                               true, &exception);
++      }
+     }
+ 
+     if (NS_FAILED(rv)) {
+@@ -1371,7 +1465,11 @@
+ 
+   JS::RootedObject exports(aCx, mod->exports);
+   if (!exports && !aIgnoreExports) {
+-    MOZ_TRY(ExtractExports(aCx, info, mod, &exports));
++    if (isEcmaScriptModule) {
++      MOZ_TRY(ExtractExportsES6(aCx, info, mod, &exports));
++    } else {
++      MOZ_TRY(ExtractExports(aCx, info, mod, &exports));
++    }
+   }
+ 
+   if (exports && !JS_WrapObject(aCx, &exports)) {
+
