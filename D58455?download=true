@@ -127,7 +127,7 @@ diff --git a/dom/chrome-webidl/WindowKeyboardShortcut.webidl b/dom/chrome-webidl
 new file mode 100644
 --- /dev/null
 +++ b/dom/chrome-webidl/WindowKeyboardShortcut.webidl
-@@ -0,0 +1,23 @@
+@@ -0,0 +1,24 @@
 +/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -142,6 +142,7 @@ new file mode 100644
 +dictionary WindowKeyboardShortcutInfo {
 +  DOMString key;
 +  DOMString keyCode;
++  boolean reserved;
 +  sequence<WindowKeyboardShortcutModifier> modifiers;
 +};
 +
@@ -181,7 +182,7 @@ diff --git a/dom/events/GlobalKeyListener.h b/dom/events/GlobalKeyListener.h
  
  /**
   * A generic listener for key events.
-@@ -101,6 +103,23 @@
+@@ -107,6 +109,25 @@
    KeyEventHandler* mHandler;  // Linked list of event handlers.
  };
  
@@ -200,6 +201,8 @@ diff --git a/dom/events/GlobalKeyListener.h b/dom/events/GlobalKeyListener.h
 +  virtual ~JSGlobalKeyListener();
 +
 +  virtual void EnsureHandlers() override {}
++
++  virtual bool IsReservedKey(WidgetKeyboardEvent* aKeyEvent, KeyEventHandler* aHandler) override;
 +};
 +
  /**
@@ -208,7 +211,7 @@ diff --git a/dom/events/GlobalKeyListener.h b/dom/events/GlobalKeyListener.h
 diff --git a/dom/events/GlobalKeyListener.cpp b/dom/events/GlobalKeyListener.cpp
 --- a/dom/events/GlobalKeyListener.cpp
 +++ b/dom/events/GlobalKeyListener.cpp
-@@ -469,6 +469,66 @@
+@@ -469,6 +469,86 @@
    return WalkHandlersInternal(aEvent, false, aOutReservedForChrome);
  }
  
@@ -272,13 +275,33 @@ diff --git a/dom/events/GlobalKeyListener.cpp b/dom/events/GlobalKeyListener.cpp
 +  JSKeyEventHandler* handler = static_cast<JSKeyEventHandler*>(aHandler);
 +  return !handler->Disabled();
 +}
++
++bool JSGlobalKeyListener::IsReservedKey(WidgetKeyboardEvent* aKeyEvent,
++    KeyEventHandler* aHandler) {
++  JSKeyEventHandler* handler = static_cast<JSKeyEventHandler*>(aHandler);
++
++  ReservedKey reserved = handler->GetIsReserved();
++  // reserved="true" means that the key is always reserved. reserved="false"
++  // means that the key is never reserved. Otherwise, we check site-specific
++  // permissions.
++  if (reserved == ReservedKey_False) {
++    return false;
++  }
++
++  if (reserved == ReservedKey_True) {
++    return true;
++  }
++
++  return nsContentUtils::ShouldBlockReservedKeys(aKeyEvent);
++}
++
  //
  // AttachGlobalKeyHandler
  //
 diff --git a/dom/events/KeyEventHandler.h b/dom/events/KeyEventHandler.h
 --- a/dom/events/KeyEventHandler.h
 +++ b/dom/events/KeyEventHandler.h
-@@ -118,6 +118,23 @@
+@@ -126,6 +126,26 @@
    RefPtr<nsAtom> mEventName;  // The type of the event, e.g., "keypress"
  };
  
@@ -294,9 +317,12 @@ diff --git a/dom/events/KeyEventHandler.h b/dom/events/KeyEventHandler.h
 +  MOZ_CAN_RUN_SCRIPT
 +  virtual nsresult ExecuteHandler(EventTarget* aTarget, Event* aEvent) override;
 +
++  ReservedKey GetIsReserved() { return mReserved; }
++
 + protected:
 +  bool mDisabled;
 +  RefPtr<mozilla::dom::WindowKeyboardShortcutCallback> mCallback;
++  ReservedKey mReserved;
 +};
 +
  class XULKeyEventHandler final : public KeyEventHandler {
@@ -305,7 +331,7 @@ diff --git a/dom/events/KeyEventHandler.h b/dom/events/KeyEventHandler.h
 diff --git a/dom/events/KeyEventHandler.cpp b/dom/events/KeyEventHandler.cpp
 --- a/dom/events/KeyEventHandler.cpp
 +++ b/dom/events/KeyEventHandler.cpp
-@@ -319,12 +319,70 @@
+@@ -319,13 +319,76 @@
    return n;
  }
  
@@ -314,7 +340,8 @@ diff --git a/dom/events/KeyEventHandler.cpp b/dom/events/KeyEventHandler.cpp
 +    mozilla::dom::WindowKeyboardShortcutCallback& aCallback)
 +    : KeyEventHandler(),
 +      mDisabled(false),
-+      mCallback(&aCallback) {
++      mCallback(&aCallback),
++      mReserved(ReservedKey_Unset) {
 +  mDetail = -1;
 +  mMisc = 0;
 +  mKeyMask = cAllModifiers;
@@ -338,6 +365,10 @@ diff --git a/dom/events/KeyEventHandler.cpp b/dom/events/KeyEventHandler.cpp
 +        mKeyMask |= KeyToMask(kMenuAccessKey);
 +      }
 +    }
++  }
++
++  if (aInfo.mReserved.WasPassed()) {
++    mReserved = aInfo.mReserved.Value() ? ReservedKey_True : ReservedKey_False;
 +  }
 +
 +  if (aInfo.mKey.WasPassed() && !aInfo.mKey.Value().IsEmpty()) {
@@ -369,7 +400,8 @@ diff --git a/dom/events/KeyEventHandler.cpp b/dom/events/KeyEventHandler.cpp
 +
  XULKeyEventHandler::XULKeyEventHandler(Element* aKeyElement)
      : KeyEventHandler(),
-       mHandlerElement(nullptr) {
+       mHandlerElement(nullptr),
+       mReserved(ReservedKey_Unset) {
    mDetail = -1;
    mMisc = 0;
 -  mKeyMask = 0;
@@ -377,7 +409,7 @@ diff --git a/dom/events/KeyEventHandler.cpp b/dom/events/KeyEventHandler.cpp
    nsAutoString modifiers;
  
    nsWeakPtr weak = do_GetWeakReference(aKeyElement);
-@@ -351,9 +409,6 @@
+@@ -360,9 +423,6 @@
    }
  
    if (!key.IsEmpty()) {
@@ -387,7 +419,7 @@ diff --git a/dom/events/KeyEventHandler.cpp b/dom/events/KeyEventHandler.cpp
      ToLowerCase(key);
  
      // We have a charcode.
-@@ -378,9 +433,6 @@
+@@ -387,9 +447,6 @@
      aKeyElement->GetAttr(kNameSpaceID_None, nsGkAtoms::keycode, key);
  
      if (!key.IsEmpty()) {

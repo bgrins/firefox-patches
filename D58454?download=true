@@ -9,18 +9,18 @@ diff --git a/dom/events/GlobalKeyListener.h b/dom/events/GlobalKeyListener.h
  
  /**
   * A generic listener for key events.
-@@ -85,10 +86,6 @@
-   bool HasHandlerForEvent(KeyboardEvent* aEvent,
-                           bool* aOutReservedForChrome = nullptr);
+@@ -87,7 +88,9 @@
  
--  // Returns true if the key would be reserved for the given handler. A reserved
--  // key is not sent to a content process or single-process equivalent.
+   // Returns true if the key would be reserved for the given handler. A reserved
+   // key is not sent to a content process or single-process equivalent.
 -  bool IsReservedKey(WidgetKeyboardEvent* aKeyEvent, KeyEventHandler* aHandler);
--
++  virtual bool IsReservedKey(WidgetKeyboardEvent* aKeyEvent, KeyEventHandler* aHandler) {
++    return false;
++  }
+ 
    // lazily load the handlers. Overridden to handle being attached
    // to a particular element rather than the document
-   virtual void EnsureHandlers() = 0;
-@@ -99,11 +96,6 @@
+@@ -99,11 +102,6 @@
  
    virtual bool IsDisabled() const { return false; }
  
@@ -32,7 +32,7 @@ diff --git a/dom/events/GlobalKeyListener.h b/dom/events/GlobalKeyListener.h
    EventTarget* mTarget;  // weak ref;
  
    KeyEventHandler* mHandler;  // Linked list of event handlers.
-@@ -136,8 +128,6 @@
+@@ -136,8 +134,6 @@
    virtual bool CanHandle(KeyEventHandler* aHandler,
                           bool aWillExecute) const override;
    virtual bool IsDisabled() const override;
@@ -41,7 +41,7 @@ diff --git a/dom/events/GlobalKeyListener.h b/dom/events/GlobalKeyListener.h
  
    /**
     * GetElementForHandler() retrieves an element for the handler.  The element
-@@ -148,7 +138,7 @@
+@@ -148,7 +144,7 @@
     *                           this.
     * @return                   true if the handler is valid.  Otherwise, false.
     */
@@ -50,6 +50,15 @@ diff --git a/dom/events/GlobalKeyListener.h b/dom/events/GlobalKeyListener.h
                              Element** aElementForHandler) const;
  
    /**
+@@ -157,6 +153,8 @@
+    */
+   bool IsExecutableElement(Element* aElement) const;
+ 
++  virtual bool IsReservedKey(WidgetKeyboardEvent* aKeyEvent, KeyEventHandler* aHandler) override;
++
+   // Using weak pointer to the DOM Element.
+   nsWeakPtr mWeakPtrForElement;
+ };
 diff --git a/dom/events/GlobalKeyListener.cpp b/dom/events/GlobalKeyListener.cpp
 --- a/dom/events/GlobalKeyListener.cpp
 +++ b/dom/events/GlobalKeyListener.cpp
@@ -72,30 +81,7 @@ diff --git a/dom/events/GlobalKeyListener.cpp b/dom/events/GlobalKeyListener.cpp
  
      handler->SetNextHandler(*aResult);
      *aResult = handler;
-@@ -399,7 +389,7 @@
-     if (!aExecute) {
-       if (handler->EventTypeEquals(eventType)) {
-         if (aOutReservedForChrome) {
--          *aOutReservedForChrome = IsReservedKey(widgetKeyboardEvent, handler);
-+          *aOutReservedForChrome = nsContentUtils::ShouldBlockReservedKeys(widgetKeyboardEvent);
-         }
- 
-         return true;
-@@ -410,7 +400,7 @@
-       // reserved, we shouldn't dispatch the event into web contents.
-       if (eventType == nsGkAtoms::keydown &&
-           handler->EventTypeEquals(nsGkAtoms::keypress)) {
--        if (IsReservedKey(widgetKeyboardEvent, handler)) {
-+        if (nsContentUtils::ShouldBlockReservedKeys(widgetKeyboardEvent)) {
-           if (aOutReservedForChrome) {
-             *aOutReservedForChrome = true;
-           }
-@@ -428,15 +418,19 @@
-     // If it's not reserved and the event is a key event on a plugin,
-     // the handler shouldn't be executed.
-     if (widgetKeyboardEvent->IsKeyEventOnPlugin() &&
--        !IsReservedKey(widgetKeyboardEvent, handler)) {
-+        !nsContentUtils::ShouldBlockReservedKeys(widgetKeyboardEvent)) {
+@@ -432,11 +422,15 @@
        return false;
      }
  
@@ -146,20 +132,34 @@ diff --git a/dom/events/GlobalKeyListener.cpp b/dom/events/GlobalKeyListener.cpp
    MOZ_ASSERT(aElementForHandler);
    *aElementForHandler = nullptr;
  
-@@ -658,20 +635,11 @@
+@@ -658,20 +635,30 @@
    return !value.IsEmpty();
  }
  
 -already_AddRefed<EventTarget> XULKeySetGlobalKeyListener::GetHandlerTarget(
--    KeyEventHandler* aHandler) {
++bool XULKeySetGlobalKeyListener::IsReservedKey(WidgetKeyboardEvent* aKeyEvent,
+     KeyEventHandler* aHandler) {
 -  nsCOMPtr<Element> commandElement;
 -  if (!GetElementForHandler(aHandler, getter_AddRefs(commandElement))) {
 -    return nullptr;
--  }
--
++  XULKeyEventHandler* handler = static_cast<XULKeyEventHandler*>(aHandler);
++
++  ReservedKey reserved = handler->GetIsReserved();
++  // reserved="true" means that the key is always reserved. reserved="false"
++  // means that the key is never reserved. Otherwise, we check site-specific
++  // permissions.
++  if (reserved == ReservedKey_False) {
++    return false;
+   }
+ 
 -  return commandElement.forget();
--}
--
++  if (reserved == ReservedKey_True) {
++    return true;
++  }
++
++  return nsContentUtils::ShouldBlockReservedKeys(aKeyEvent);
+ }
+ 
  bool XULKeySetGlobalKeyListener::CanHandle(KeyEventHandler* aHandler,
                                             bool aWillExecute) const {
 +  XULKeyEventHandler* handler = static_cast<XULKeyEventHandler*>(aHandler);
@@ -169,7 +169,7 @@ diff --git a/dom/events/GlobalKeyListener.cpp b/dom/events/GlobalKeyListener.cpp
      return false;
    }
  
-@@ -700,8 +668,9 @@
+@@ -700,8 +687,9 @@
  
    for (KeyEventHandler* handler = handlers; handler;
         handler = handler->GetNextHandler()) {
@@ -183,18 +183,10 @@ diff --git a/dom/events/GlobalKeyListener.cpp b/dom/events/GlobalKeyListener.cpp
 diff --git a/dom/events/KeyEventHandler.h b/dom/events/KeyEventHandler.h
 --- a/dom/events/KeyEventHandler.h
 +++ b/dom/events/KeyEventHandler.h
-@@ -38,34 +38,9 @@
+@@ -46,26 +46,9 @@
+   ReservedKey_Unset = 2,
+ };
  
- using namespace dom;
- 
--// Values of the reserved attribute. When unset, the default value depends on
--// the permissions.default.shortcuts preference.
--enum ReservedKey : uint8_t {
--  ReservedKey_False = 0,
--  ReservedKey_True = 1,
--  ReservedKey_Unset = 2,
--};
--
 -class KeyEventHandler final {
 +class KeyEventHandler {
   public:
@@ -220,7 +212,7 @@ diff --git a/dom/events/KeyEventHandler.h b/dom/events/KeyEventHandler.h
  
    bool EventTypeEquals(nsAtom* aEventType) const {
      return mEventName == aEventType;
-@@ -76,23 +51,20 @@
+@@ -76,23 +59,20 @@
    bool KeyEventMatched(KeyboardEvent* aDomKeyboardEvent, uint32_t aCharCode,
                         const IgnoreModifierState& aIgnoreModifierState);
  
@@ -248,7 +240,7 @@ diff --git a/dom/events/KeyEventHandler.h b/dom/events/KeyEventHandler.h
      ++gRefCnt;
      if (gRefCnt == 1) {
        // Get the primary accelerator key.
-@@ -100,26 +72,11 @@
+@@ -100,26 +80,11 @@
      }
    }
  
@@ -275,7 +267,7 @@ diff --git a/dom/events/KeyEventHandler.h b/dom/events/KeyEventHandler.h
  
    Modifiers GetModifiers() const;
    Modifiers GetModifiersMask() const;
-@@ -145,21 +102,10 @@
+@@ -145,21 +110,10 @@
    static const int32_t cAllModifiers;
  
   protected:
@@ -297,7 +289,7 @@ diff --git a/dom/events/KeyEventHandler.h b/dom/events/KeyEventHandler.h
    int32_t mKeyMask;  // Which modifier keys this event handler expects to have
                       // down in order to be matched.
  
-@@ -172,6 +118,48 @@
+@@ -172,6 +126,51 @@
    RefPtr<nsAtom> mEventName;  // The type of the event, e.g., "keypress"
  };
  
@@ -314,8 +306,11 @@ diff --git a/dom/events/KeyEventHandler.h b/dom/events/KeyEventHandler.h
 +  void ReportKeyConflict(const char16_t* aKey, const char16_t* aModifiers,
 +                         Element* aKeyElement, const char* aMessageName);
 +
++  ReservedKey GetIsReserved() { return mReserved; }
++
 + protected:
 +  nsIWeakReference* mHandlerElement;
++  ReservedKey mReserved;
 +};
 +
 +class ShortcutKeyEventHandler final : public KeyEventHandler {
@@ -451,7 +446,7 @@ diff --git a/dom/events/KeyEventHandler.cpp b/dom/events/KeyEventHandler.cpp
  /////////////////////////////////////////////////////////////////////////////
  // Get the menu access key from prefs.
  // XXX Eventually pick up using CSS3 key-equivalent property or somesuch
-@@ -185,27 +97,464 @@
+@@ -185,27 +97,473 @@
    kMenuAccessKey = Preferences::GetInt("ui.key.menuAccessKey", kMenuAccessKey);
  }
  
@@ -681,7 +676,8 @@ diff --git a/dom/events/KeyEventHandler.cpp b/dom/events/KeyEventHandler.cpp
 +
 +XULKeyEventHandler::XULKeyEventHandler(Element* aKeyElement)
 +    : KeyEventHandler(),
-+      mHandlerElement(nullptr) {
++      mHandlerElement(nullptr),
++      mReserved(ReservedKey_Unset) {
 +  mDetail = -1;
 +  mMisc = 0;
 +  mKeyMask = 0;
@@ -708,6 +704,14 @@ diff --git a/dom/events/KeyEventHandler.cpp b/dom/events/KeyEventHandler.cpp
 +  aKeyElement->GetAttr(kNameSpaceID_None, nsGkAtoms::key, key);
 +  if (key.IsEmpty()) {
 +    aKeyElement->GetAttr(kNameSpaceID_None, nsGkAtoms::charcode, key);
++  }
++
++  if (aKeyElement->AttrValueIs(kNameSpaceID_None, nsGkAtoms::reserved,
++                               nsGkAtoms::_true, eCaseMatters)) {
++    mReserved = ReservedKey_True;
++  } else if (aKeyElement->AttrValueIs(kNameSpaceID_None, nsGkAtoms::reserved,
++                                      nsGkAtoms::_false, eCaseMatters)) {
++    mReserved = ReservedKey_False;
 +  }
 +
 +  if (!key.IsEmpty()) {
@@ -926,7 +930,7 @@ diff --git a/dom/events/KeyEventHandler.cpp b/dom/events/KeyEventHandler.cpp
    // This is a special-case optimization to make command handling fast.
    // It isn't really a part of XBL, but it helps speed things up.
  
-@@ -314,420 +663,63 @@
+@@ -314,420 +672,63 @@
    return NS_OK;
  }
  
