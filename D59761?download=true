@@ -1,0 +1,189 @@
+diff --git a/dom/webidl/TreeColumns.webidl b/dom/webidl/TreeColumns.webidl
+--- a/dom/webidl/TreeColumns.webidl
++++ b/dom/webidl/TreeColumns.webidl
+@@ -50,6 +50,4 @@
+    * the column cache needs to be rebuilt.
+    */
+   void invalidateColumns();
+-
+-  void restoreNaturalOrder();
+ };
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -3768,9 +3768,6 @@
+   virtual nsSize GetXULMinSizeForScrollArea(
+       nsBoxLayoutState& aBoxLayoutState) = 0;
+ 
+-  // Implemented in nsBox, used in nsBoxFrame
+-  int32_t GetXULOrdinal();
+-
+   virtual nscoord GetXULFlex() = 0;
+   virtual nscoord GetXULBoxAscent(nsBoxLayoutState& aBoxLayoutState) = 0;
+   virtual bool IsXULCollapsed() = 0;
+diff --git a/layout/xul/nsBox.cpp b/layout/xul/nsBox.cpp
+--- a/layout/xul/nsBox.cpp
++++ b/layout/xul/nsBox.cpp
+@@ -259,24 +259,6 @@
+   return flex;
+ }
+ 
+-int32_t nsIFrame::GetXULOrdinal() {
+-  int32_t ordinal = StyleXUL()->mBoxOrdinal;
+-
+-  // When present, attribute value overrides CSS.
+-  nsIContent* content = GetContent();
+-  if (content && content->IsXULElement()) {
+-    nsresult error;
+-    nsAutoString value;
+-
+-    content->AsElement()->GetAttr(kNameSpaceID_None, nsGkAtoms::ordinal, value);
+-    if (!value.IsEmpty()) {
+-      ordinal = value.ToInteger(&error);
+-    }
+-  }
+-
+-  return ordinal;
+-}
+-
+ nscoord nsBox::GetXULBoxAscent(nsBoxLayoutState& aState) {
+   if (IsXULCollapsed()) return 0;
+ 
+diff --git a/layout/xul/nsBoxFrame.cpp b/layout/xul/nsBoxFrame.cpp
+--- a/layout/xul/nsBoxFrame.cpp
++++ b/layout/xul/nsBoxFrame.cpp
+@@ -886,20 +886,6 @@
+ 
+     PresShell()->FrameNeedsReflow(this, IntrinsicDirty::StyleChange,
+                                   NS_FRAME_IS_DIRTY);
+-  } else if (aAttribute == nsGkAtoms::ordinal) {
+-    nsIFrame* parent = GetParentXULBox(this);
+-    // If our parent is not a box, there's not much we can do... but in that
+-    // case our ordinal doesn't matter anyway, so that's ok.
+-    // Also don't bother with popup frames since they are kept on the
+-    // kPopupList and XULRelayoutChildAtOrdinal() only handles
+-    // principal children.
+-    if (parent && !(GetStateBits() & NS_FRAME_OUT_OF_FLOW) &&
+-        StyleDisplay()->mDisplay != mozilla::StyleDisplay::MozPopup) {
+-      parent->XULRelayoutChildAtOrdinal(this);
+-      // XXXldb Should this instead be a tree change on the child or parent?
+-      PresShell()->FrameNeedsReflow(parent, IntrinsicDirty::StyleChange,
+-                                    NS_FRAME_IS_DIRTY);
+-    }
+   }
+   // If the accesskey changed, register for the new value
+   // The old value has been unregistered in nsXULElement::SetAttr
+@@ -1049,7 +1035,8 @@
+   // If we've got a placeholder frame, use its out-of-flow frame's ordinal val.
+   nsIFrame* aRealFrame1 = nsPlaceholderFrame::GetRealFrameFor(aFrame1);
+   nsIFrame* aRealFrame2 = nsPlaceholderFrame::GetRealFrameFor(aFrame2);
+-  return aRealFrame1->GetXULOrdinal() <= aRealFrame2->GetXULOrdinal();
++  return aRealFrame1->StyleXUL()->mBoxOrdinal <=
++         aRealFrame2->StyleXUL()->mBoxOrdinal;
+ }
+ 
+ void nsBoxFrame::CheckBoxOrder() {
+@@ -1075,13 +1062,13 @@
+ }
+ 
+ nsresult nsBoxFrame::XULRelayoutChildAtOrdinal(nsIFrame* aChild) {
+-  int32_t ord = aChild->GetXULOrdinal();
++  int32_t ord = aChild->StyleXUL()->mBoxOrdinal;
+ 
+   nsIFrame* child = mFrames.FirstChild();
+   nsIFrame* newPrevSib = nullptr;
+ 
+   while (child) {
+-    if (ord < child->GetXULOrdinal()) {
++    if (ord < child->StyleXUL()->mBoxOrdinal) {
+       break;
+     }
+ 
+diff --git a/layout/xul/tree/nsTreeColFrame.cpp b/layout/xul/tree/nsTreeColFrame.cpp
+--- a/layout/xul/tree/nsTreeColFrame.cpp
++++ b/layout/xul/tree/nsTreeColFrame.cpp
+@@ -127,7 +127,7 @@
+   nsresult rv =
+       nsBoxFrame::AttributeChanged(aNameSpaceID, aAttribute, aModType);
+ 
+-  if (aAttribute == nsGkAtoms::ordinal || aAttribute == nsGkAtoms::primary) {
++  if (aAttribute == nsGkAtoms::primary) {
+     InvalidateColumns();
+   }
+ 
+diff --git a/layout/xul/tree/nsTreeColumns.h b/layout/xul/tree/nsTreeColumns.h
+--- a/layout/xul/tree/nsTreeColumns.h
++++ b/layout/xul/tree/nsTreeColumns.h
+@@ -186,7 +186,6 @@
+   void GetSupportedNames(nsTArray<nsString>& aNames);
+ 
+   void InvalidateColumns();
+-  void RestoreNaturalOrder();
+ 
+   friend class nsTreeBodyFrame;
+ 
+diff --git a/layout/xul/tree/nsTreeColumns.cpp b/layout/xul/tree/nsTreeColumns.cpp
+--- a/layout/xul/tree/nsTreeColumns.cpp
++++ b/layout/xul/tree/nsTreeColumns.cpp
+@@ -413,38 +413,6 @@
+   mFirstColumn = nullptr;
+ }
+ 
+-void nsTreeColumns::RestoreNaturalOrder() {
+-  if (!mTree) {
+-    return;
+-  }
+-
+-  nsIContent* content = mTree->GetBaseElement();
+-
+-  // Strong ref, since we'll be setting attributes
+-  nsCOMPtr<nsIContent> colsContent =
+-      nsTreeUtils::GetImmediateChild(content, nsGkAtoms::treecols);
+-  if (!colsContent) {
+-    return;
+-  }
+-
+-  int32_t i = 0;
+-  for (nsINode* child = colsContent->GetFirstChild(); child;
+-       child = child->GetNextSibling()) {
+-    nsAutoString ordinal;
+-    ordinal.AppendInt(i++);
+-    if (child->IsElement()) {
+-      child->AsElement()->SetAttr(kNameSpaceID_None, nsGkAtoms::ordinal,
+-                                  ordinal, true);
+-    }
+-  }
+-
+-  nsTreeColumns::InvalidateColumns();
+-
+-  if (mTree) {
+-    mTree->Invalidate();
+-  }
+-}
+-
+ nsTreeColumn* nsTreeColumns::GetPrimaryColumn() {
+   EnsureColumns();
+   for (nsTreeColumn* currCol = mFirstColumn; currCol;
+diff --git a/toolkit/content/widgets/tree.js b/toolkit/content/widgets/tree.js
+--- a/toolkit/content/widgets/tree.js
++++ b/toolkit/content/widgets/tree.js
+@@ -211,7 +211,6 @@
+           tree.stopEditing(true);
+           var menuitem = this.querySelector('[anonid="menuitem"]');
+           if (event.originalTarget == menuitem) {
+-            tree.columns.restoreNaturalOrder();
+             this.style.MozBoxOrdinalGroup = "";
+             tree._ensureColumnOrder();
+           } else {
+diff --git a/xpcom/ds/StaticAtoms.py b/xpcom/ds/StaticAtoms.py
+--- a/xpcom/ds/StaticAtoms.py
++++ b/xpcom/ds/StaticAtoms.py
+@@ -926,7 +926,6 @@
+     Atom("option", "option"),
+     Atom("_or", "or"),
+     Atom("order", "order"),
+-    Atom("ordinal", "ordinal"),
+     Atom("orient", "orient"),
+     Atom("orientation", "orientation"),
+     Atom("otherwise", "otherwise"),
+
