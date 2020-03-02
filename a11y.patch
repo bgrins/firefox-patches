@@ -345,7 +345,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
  
        panel.remove();
  
-@@ -4172,16 +4267,23 @@
+@@ -4172,16 +4267,26 @@
  
      announceWindowCreated(browser, userContextId) {
        let tab = this.getTabForBrowser(browser);
@@ -355,11 +355,14 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
        }
  
 +      // Automatically create the a11ymodeBrowser:
-+      // if (tab) {
-+      //   if (!browser.a11ymodeBrowser) {
-+      //     browser.after(browser.createA11YModeBrowser());
-+      //   }
-+      // }
++      // XXX: this should only happen if the tab previously had it or if
++      // there's some global state
++      if (tab) {
++        if (!browser.a11ymodeBrowser) {
++          // XXX: Make a module to control the sidebar here instead of random clicking
++          browser.parentNode.querySelector(".a11ymode-split").click();
++        }
++      }
 +
        // We don't want to update the container icon and identifier if
        // this is not the selected browser.
@@ -369,7 +372,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
      },
  
      reloadMultiSelectedTabs() {
-@@ -5160,17 +5262,16 @@
+@@ -5160,17 +5265,16 @@
            openContextMenu(aMessage);
            break;
          }
@@ -387,7 +390,7 @@ diff --git a/browser/base/content/tabbrowser.js b/browser/base/content/tabbrowse
            );
            break;
          }
-@@ -5500,16 +5601,21 @@
+@@ -5500,16 +5604,21 @@
  
        this.addEventListener("oop-browser-crashed", event => {
          if (!event.isTrusted) {
@@ -447,7 +450,7 @@ diff --git a/browser/components/a11ymode/A11YModeChild.jsm b/browser/components/
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/a11ymode/A11YModeChild.jsm
-@@ -0,0 +1,432 @@
+@@ -0,0 +1,552 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -456,8 +459,11 @@ new file mode 100644
 +
 +const EXPORTED_SYMBOLS = ["A11YModeChild"];
 +
-+let a11yModes = new Map();
-+let hostWindows = new Map();
++const { XPCOMUtils } = ChromeUtils.import(
++  "resource://gre/modules/XPCOMUtils.jsm"
++);
++const { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm");
++const { setTimeout } = ChromeUtils.import("resource://gre/modules/Timer.jsm");
 +
 +const {
 +  EVENT_TEXT_CHANGED,
@@ -478,8 +484,6 @@ new file mode 100644
 +  EVENT_VALUE_CHANGE,
 +} = Ci.nsIAccessibleEvent;
 +
-+const { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm");
-+
 +const RELATIONS_TO_IGNORE = new Set([
 +  Ci.nsIAccessibleRelation.RELATION_CONTAINING_APPLICATION,
 +  Ci.nsIAccessibleRelation.RELATION_CONTAINING_TAB_PANE,
@@ -495,6 +499,19 @@ new file mode 100644
 +]);
 +
 +const STATE_DEFUNCT = Ci.nsIAccessibleStates.EXT_STATE_DEFUNCT;
++
++function throttle(that, callback, limit) {
++  var wait = false;
++  return function() {
++    if (!wait) {
++      callback.apply(that, arguments);
++      wait = true;
++      setTimeout(function() {
++        wait = false;
++      }, limit);
++    }
++  };
++}
 +
 +/**
 + * Helper function that determines if nsIAccessible object is in defunct state.
@@ -547,13 +564,91 @@ new file mode 100644
 +const hostToOverlayMap = new WeakMap();
 +const overlayToAccIdMap = new Map();
 +
++// Simple event emitter abstraction for storage objects to use.
++function EventEmitter() {}
++
++EventEmitter.prototype = {};
++
++class SingletonObserver {
++  constructor() {
++    this._listeners = new Set();
++  }
++  get a11yService() {
++    if (!this._a11yService) {
++      // This turns on accessibility automatically (see Services.appinfo.accessibilityEnabled)
++      // See https://searchfox.org/mozilla-central/source/devtools/server/actors/accessibility/accessibility-parent.js#135 for more lifecycle
++      this._a11yService = Cc["@mozilla.org/accessibilityService;1"].getService(
++        Ci.nsIAccessibilityService
++      );
++    }
++    return this._a11yService;
++  }
++
++  on(listener) {
++    if (!this._listeners.size) {
++      this.a11yService;
++      console.log("Adding listener");
++      Services.obs.addObserver(this, "accessible-event");
++    }
++    this._listeners.add(listener);
++    console.log(this._listeners.size, "listenesr");
++  }
++
++  off(listener) {
++    if (this._listeners.has(listener) && this._listeners.size == 1) {
++      console.log("Removing observer");
++      Services.obs.removeObserver(this, "accessible-event");
++    }
++    this._listeners.delete(listener);
++  }
++
++  observe(subject) {
++    const event = subject.QueryInterface(Ci.nsIAccessibleEvent);
++    for (let listener of this._listeners.values()) {
++      try {
++        if (
++          event.accessibleDocument &&
++          listener.hostBrowsingContext.window.document ==
++            event.accessibleDocument.DOMDocument
++        ) {
++          listener.changeObserved(event);
++        }
++      } catch (e) {
++        Cu.reportError(e);
++      }
++    }
++  }
++}
++
++SingletonObserver.prototype.QueryInterface = ChromeUtils.generateQI([
++  Ci.nsIObserver,
++  Ci.nsISupportsWeakReference,
++]);
++const gSingletonObserver = new SingletonObserver();
++
 +class A11YWalker {
++  get a11yService() {
++    if (!this._a11yService) {
++      // This turns on accessibility automatically (see Services.appinfo.accessibilityEnabled)
++      // See https://searchfox.org/mozilla-central/source/devtools/server/actors/accessibility/accessibility-parent.js#135 for more lifecycle
++      this._a11yService = Cc["@mozilla.org/accessibilityService;1"].getService(
++        Ci.nsIAccessibilityService
++      );
++    }
++    return this._a11yService;
++  }
++
 +  constructor(hostBrowsingContext, overlayBrowsingContext) {
 +    this.overlayBrowsingContext = overlayBrowsingContext;
 +    this.hostBrowsingContext = hostBrowsingContext;
-+    this.a11yService; // <-- XXX start observing
 +    this.accIdUnique = 0;
-+    this.sendSnapshot();
++    this.changeObserved = throttle(this, this.changeObserved, 100);
++    gSingletonObserver.on(this);
++  }
++
++  destruct() {
++    gSingletonObserver.off(this);
++    this.overlayBrowsingContext = this.hostBrowsingContext = null;
 +  }
 +
 +  sendToContent(messageType, detail) {
@@ -563,19 +658,6 @@ new file mode 100644
 +      detail: Cu.cloneInto(message, win),
 +    });
 +    win.dispatchEvent(event);
-+  }
-+
-+  get a11yService() {
-+    if (!this._a11yService) {
-+      // This turns on accessibility automatically (see Services.appinfo.accessibilityEnabled)
-+      // See https://searchfox.org/mozilla-central/source/devtools/server/actors/accessibility/accessibility-parent.js#135 for more lifecycle
-+      this._a11yService = Cc["@mozilla.org/accessibilityService;1"].getService(
-+        Ci.nsIAccessibilityService
-+      );
-+
-+      Services.obs.addObserver(this, "accessible-event");
-+    }
-+    return this._a11yService;
 +  }
 +
 +  /**
@@ -596,10 +678,8 @@ new file mode 100644
 +      };
 +    }
 +
-+    this.accIdUnique++;
-+    overlayToAccIdMap
-+      .get(this.overlayBrowsingContext)
-+      .set(this.accIdUnique, acc);
++    let accIdUnique = ++this.accIdUnique;
++    overlayToAccIdMap.get(this.overlayBrowsingContext).set(accIdUnique, acc);
 +
 +    const actions = [];
 +    for (let i = 0; i < acc.actionCount; i++) {
@@ -634,11 +714,11 @@ new file mode 100644
 +      description: acc.description,
 +      keyboardShortcut: acc.accessKey || acc.keyboardShortcut,
 +      childCount: acc.childCount,
-+      indexInParent: acc.indexInParent,
++      indexInParent: acc.indexInParent, // XXX: Crash on cdc page when navigating to french
 +      states,
 +      children,
 +      attributes,
-+      id: this.accIdUnique,
++      id: accIdUnique,
 +    };
 +  }
 +
@@ -658,21 +738,32 @@ new file mode 100644
 +    return this.a11yService.getAccessibleFor(rawNode);
 +  }
 +
++  doAction(accId) {
++    const acc = overlayToAccIdMap
++      .get(this.overlayBrowsingContext)
++      .get(parseInt(accId));
++    if (!acc) {
++      throw new Error(
++        `No accId ${accId}. We should be sending down actual ids from platform so this doesn't happen.`
++      );
++    }
++
++    for (let i = 0; i < acc.actionCount; i++) {
++      console.log(i, acc.getActionName(i));
++    }
++
++    acc.doAction(0);
++  }
++
 +  getSnapshot(acc) {
 +    overlayToAccIdMap.set(this.overlayBrowsingContext, new Map());
 +    return this.doSnapshot(acc, this.a11yService);
 +  }
 +
 +  sendSnapshot() {
-+    // If it's a top level document notify listeners about the document
-+    // being ready.
-+
 +    let start = this.overlayBrowsingContext.window.performance.now();
-+    // XXX: Get accessible foor doc
 +    let snapshot = this.getSnapshot(
-+      this.getRawAccessibleFor(
-+        this.hostBrowsingContext.window.document.documentElement
-+      )
++      this.getRawAccessibleFor(this.hostBrowsingContext.window.document)
 +    );
 +
 +    console.log(
@@ -692,10 +783,11 @@ new file mode 100644
 +   *                                      accessible event object.
 +   */
 +  // eslint-disable-next-line complexity
-+  observe(subject) {
-+    const event = subject.QueryInterface(Ci.nsIAccessibleEvent);
++  changeObserved(event) {
++    // XXX: Always sending the whole snapshot for everything
++    this.sendSnapshot();
++    return;
 +    const rawAccessible = event.accessible;
-+
 +    if (
 +      event.eventType == EVENT_DOCUMENT_LOAD_COMPLETE &&
 +      event.accessibleDocument &&
@@ -838,11 +930,6 @@ new file mode 100644
 +  }
 +}
 +
-+A11YWalker.prototype.QueryInterface = ChromeUtils.generateQI([
-+  Ci.nsIObserver,
-+  Ci.nsISupportsWeakReference,
-+]);
-+
 +// See stuff like https://searchfox.org/mozilla-central/source/devtools/server/actors/accessibility/walker.js#499
 +
 +// Basic idea here is to use this actor to receive the accessibility tree and
@@ -850,19 +937,45 @@ new file mode 100644
 +// 'a11ymode' browser (which are running in the same content process)
 +// Maybe this should be two different actors?
 +class A11YModeChild extends JSWindowActorChild {
++  willDestroy() {
++    if (this.walker) {
++      console.trace(
++        "BYE",
++        this.browsingContext.window.location.toString(),
++        Services.appinfo.processID
++      );
++      // let overlayBrowsingContext = hostToOverlayMap.get(this.browsingContext);
++      // overlayToHostMap.delete(overlayBrowsingContext);
++      // hostToOverlayMap.delete(this.browsingContext);
++      // this.walker.destruct();
++      // this.walker = null;
++    }
++  }
++  actorCreated() {
++    // if (this.browsingContext.window.location.toString() == "about:a11ymode") {
++    //   this.sendAsyncMessage("A11YMode:WindowCreated");
++    // }
++    // console.log(
++    //   "actorCreated",
++    //   this.browsingContext.window.location.toString(),
++    //   Services.appinfo.processID,
++    //   overlayToHostMap.has(this.browsingContext)
++    // );
++  }
++
 +  receiveMessage(message) {
 +    console.log("A11YModeChild::receiveMessage", message.name);
 +    switch (message.name) {
 +      case "A11YMode:UpdateBrowsingContext":
-+        // console.log("Received ", message.data);
 +        const { browsingContext } = message.data;
-+
-+        // A11YModeContentLoaded happened first
-+
-+        hostToOverlayMap.set(this.browsingContext, browsingContext);
-+        overlayToHostMap.set(browsingContext, this.browsingContext);
-+
 +        this.walker = new A11YWalker(this.browsingContext, browsingContext);
++
++        // console.log("Received ", browsingContext, browsingContext.window.location.toString());
++        hostToOverlayMap.set(this.browsingContext, browsingContext);
++        overlayToHostMap.set(browsingContext, this.walker);
++
++        // a11ymode loaded first:
++        this.walker.sendSnapshot();
 +        break;
 +    }
 +  }
@@ -873,10 +986,20 @@ new file mode 100644
 +        console.log("A11YModeContentLoaded, PID:", Services.appinfo.processID);
 +        let title = this.document.querySelector("#title");
 +        title.textContent = `a11ymode from PID: ${Services.appinfo.processID}`;
++
++        // if (overlayToHostMap.has(this.browsingContext)) {
++        //   overlayToHostMap.get(this.browsingContext).sendSnapshot();
++        // }
++        this.sendAsyncMessage("A11YMode:WindowCreated");
 +        break;
-+      // case "A11YModeContentClicked":
-+      //   this.sendToContent("TreeChanged");
-+      //   break;
++      case "A11YModeContentClicked":
++        // console.log("Received command for ", event.detail.accId);
++        if (overlayToHostMap.has(this.browsingContext)) {
++          overlayToHostMap
++            .get(this.browsingContext)
++            .doAction(event.detail.accId);
++        }
++        break;
 +    }
 +  }
 +}
@@ -906,7 +1029,7 @@ new file mode 100644
 +
 +class A11YModeParent extends JSWindowActorParent {
 +  receiveMessage(message) {
-+    console.log("A11YModeParent::receiveMessage", message);
++    // console.log("A11YModeParent::receiveMessage", message);
 +    let browser = this.manager.browsingContext.embedderElement;
 +    if (!browser) {
 +      return; // Can happen sometimes if browser is being destroyed
@@ -1004,19 +1127,32 @@ diff --git a/browser/components/a11ymode/content/a11ymode.js b/browser/component
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/a11ymode/content/a11ymode.js
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,151 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 +
 +"use strict";
 +
-+document.addEventListener(
++document.querySelector("#content").addEventListener(
 +  "click",
 +  e => {
-+    // e.preventDefault();
++    if (isDebug()) {
++      return;
++    }
 +    // XXX: Send this up with accessible id to do command
 +    // (see [id] field passed into the snapshot)
++    console.log(e, e.target.dataset.accId);
++    const { accId } = e.target.dataset;
++    if (accId) {
++      document.dispatchEvent(
++        new CustomEvent("A11YModeContentClicked", {
++          bubbles: true,
++          detail: { accId },
++        })
++      );
++    }
++    e.preventDefault();
 +  },
 +  { capture: true }
 +);
@@ -1075,7 +1211,15 @@ new file mode 100644
 +    return renderDebugContainer(currentNode, children);
 +  }
 +
-+  return role.render(currentNode, children);
++  let els = role.render(currentNode, children);
++  // XXX: find a better way to map id to element
++  // if (els.length == 1 && els[0] && els[0].nodeType == 1) {
++  //   if (els[0].tagName == "A") {
++  //     console.log("Setting", els[0], currentNode.id);
++  //   }
++  //   els[0].dataset.accId = currentNode.id;
++  // }
++  return els;
 +}
 +
 +function throttle(callback, limit) {
@@ -1126,12 +1270,6 @@ new file mode 100644
 +  );
 +});
 +
-+document.addEventListener("click", function() {
-+  document.dispatchEvent(
-+    new CustomEvent("A11YModeContentClicked", { bubbles: true })
-+  );
-+});
-+
 +window.addEventListener("A11YModeChromeToContent", event => {
 +  switch (event.detail.messageType) {
 +    case "TreeChanged": {
@@ -1159,7 +1297,7 @@ diff --git a/browser/components/a11ymode/content/roles.js b/browser/components/a
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/a11ymode/content/roles.js
-@@ -0,0 +1,1536 @@
+@@ -0,0 +1,1541 @@
 +// Built from https://searchfox.org/mozilla-central/source/accessible/base/RoleMap.h
 +// Copy in the contents of that file and then
 +// VSCode: Find with regex ".*" and then alt+enter to select all
@@ -1420,6 +1558,8 @@ new file mode 100644
 +      let container = document.createElement("a");
 +      container.href = treeItem.value;
 +      container.append(...children);
++
++      container.dataset.accId = treeItem.id;
 +      return [container, " "];
 +    },
 +  },
@@ -1520,7 +1660,7 @@ new file mode 100644
 +  },
 +  statictext: {
 +    render(treeItem, children) {
-+      if (treeItem.name == "") {
++      if (!treeItem.name) {
 +        return [];
 +      }
 +      return [treeItem.name];
@@ -1536,6 +1676,7 @@ new file mode 100644
 +  pushbutton: {
 +    render(treeItem, children) {
 +      let container = document.createElement("button");
++      container.dataset.accId = treeItem.id;
 +      container.append(...children);
 +      return [container];
 +    },
@@ -2536,7 +2677,10 @@ new file mode 100644
 +  },
 +  text: {
 +    render(treeItem, children) {
-+      return [...children];
++      if (!treeItem.name) {
++        return [];
++      }
++      return [treeItem.name];
 +    },
 +  },
 +  details: {
@@ -2657,8 +2801,7 @@ new file mode 100644
 +  },
 +  blockquote: {
 +    render(treeItem, children) {
-+      let container = document.createElement("div");
-+      container.textContent = `${treeItem.role}: ${treeItem.name}`;
++      let container = document.createElement("blockquote");
 +      container.append(...children);
 +      return [container];
 +    },
@@ -2884,7 +3027,7 @@ diff --git a/toolkit/content/widgets/browser-custom-element.js b/toolkit/content
        );
      }
  
-@@ -1321,25 +1372,71 @@
+@@ -1321,25 +1372,53 @@
        }
  
        if (this.messageManager) {
@@ -2894,38 +3037,20 @@ diff --git a/toolkit/content/widgets/browser-custom-element.js b/toolkit/content
          );
        }
 +
-+      if (this.hostBrowser) {
-+        this.hostBrowser.browsingContext.currentWindowGlobal
-+          .getActor("A11YMode")
-+          .sendAsyncMessage("A11YMode:UpdateBrowsingContext", {
-+            browsingContext: this.browsingContext,
-+          });
-+      }
-+      // if (this.hostBrowser) {
-+      //   console.log("Created a11ymode");
-+
-+      //   let load = () => {
-+      //     this.loadURI(`about:a11ymode`, {
-+      //       triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
-+      //     });
-+      //   };
-+
-+      //   load();
-+      //   this.hostBrowser.addEventListener("XULFrameLoaderCreated", () => {
-+      //     // load();
-+      //     console.log(
-+      //       "XULFrameLoaderCreated",
-+      //       this.webNavigation,
-+      //       this.isConnected
-+      //     );
-+      //   });
-+      // }
++      // this.connectToHost();
 +    }
 +
 +    connectToHost() {
 +      if (!this.hostBrowser) {
 +        return;
 +      }
++      console.trace();
++
++      this.hostBrowser.browsingContext.currentWindowGlobal
++        .getActor("A11YMode")
++        .sendAsyncMessage("A11YMode:UpdateBrowsingContext", {
++          browsingContext: this.browsingContext,
++        });
 +
 +      // let hostBC = this.hostBrowser.browsingContext;
 +      // console.log(hostBC, this.browsingContext, this.documentURI);
