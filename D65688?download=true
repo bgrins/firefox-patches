@@ -1,0 +1,265 @@
+# HG changeset patch
+# Parent  4c982daa151954c59f20a9b9ac805c1768a350c2
+
+diff --git a/devtools/client/responsive/components/DeviceSelector.js b/devtools/client/responsive/components/DeviceSelector.js
+--- a/devtools/client/responsive/components/DeviceSelector.js
++++ b/devtools/client/responsive/components/DeviceSelector.js
+@@ -145,36 +145,38 @@ class DeviceSelector extends PureCompone
+ 
+     if (!selectedDevice) {
+       label = getStr("responsive.responsiveMode");
+     }
+ 
+     // MenuButton is expected to be used in the toolbox document usually,
+     // but since RDM's frame also loads theme-switching.js, we can create
+     // MenuButtons (& HTMLTooltips) in the RDM frame document.
+-    let toolboxDoc = null;
++    let popupContainer = null;
+     if (Services.prefs.getBoolPref("devtools.responsive.browserUI.enabled")) {
+-      toolboxDoc = window.document;
++      popupContainer = window._responsivePopupContainer;
+     } else if (window.parent) {
+-      toolboxDoc = window.parent.document;
++      popupContainer = window.parent._responsivePopupContainer;
+     } else {
+       // Main process content in old RDM.
+       // However, actually, this case is a possibility to run through only
+       // from browser_tab_remoteness_change.js test.
+       console.error(
+         "Unable to find a proper document to create the device-selector MenuButton for RDM"
+       );
+       return null;
+     }
++    const toolboxDoc = popupContainer.ownerDocument;
+ 
+     return MenuButton(
+       {
+         id: "device-selector",
+         menuId: "device-selector-menu",
+         toolboxDoc,
++        popupContainer,
+         className: "devtools-button devtools-dropdown-button",
+         label,
+         icon,
+         title: tooltip,
+         disabled: devices.listState !== Types.loadableState.LOADED,
+         onClick: () => onUpdateDeviceSelectorMenu(true),
+         onCloseButton: () => onUpdateDeviceSelectorMenu(false),
+       },
+diff --git a/devtools/client/responsive/ui.js b/devtools/client/responsive/ui.js
+--- a/devtools/client/responsive/ui.js
++++ b/devtools/client/responsive/ui.js
+@@ -171,16 +171,17 @@ class ResponsiveUI {
+       // Swap page content from the current tab into a viewport within RDM
+       debug("Create browser swapper");
+       this.swap = swapToInnerBrowser({
+         tab: this.tab,
+         containerURL: TOOL_URL,
+         async getInnerBrowser(containerBrowser) {
+           const toolWindow = (ui._toolWindow = containerBrowser.contentWindow);
+           toolWindow.addEventListener("message", ui);
++          ui.initPopupPanel();
+           debug("Wait until init from inner");
+           await message.request(toolWindow, "init");
+           toolWindow.addInitialViewport({
+             uri: "about:blank",
+             userContextId: ui.tab.userContextId,
+           });
+           debug("Wait until browser mounted");
+           await message.wait(toolWindow, "browser-mounted");
+@@ -251,16 +252,25 @@ class ResponsiveUI {
+     }
+ 
+     // Non-blocking message to tool UI to start any delayed init activities
+     message.post(this.toolWindow, "post-init");
+ 
+     debug("Init done");
+   }
+ 
++  initPopupPanel() {
++    // Prepare a place to show HTML menu.
++    const { gBrowser } = this.browserWindow;
++    const browserContainerEl = gBrowser.getBrowserContainer(
++      gBrowser.getBrowserForTab(this.tab)
++    );
++    this.toolWindow._responsivePopupContainer = browserContainerEl;
++  }
++
+   /**
+    * Initialize the RDM iframe inside of the browser document.
+    */
+   initRDMFrame() {
+     const { document: doc, gBrowser } = this.browserWindow;
+     const rdmFrame = doc.createElement("iframe");
+     rdmFrame.src = "chrome://devtools/content/responsive/toolbar.xhtml";
+     rdmFrame.classList.add("rdm-toolbar");
+@@ -285,16 +295,17 @@ class ResponsiveUI {
+     // Prepend the RDM iframe inside of the current tab's browser stack.
+     this.browserStackEl.prepend(rdmFrame);
+     this.browserStackEl.append(resizeHandle);
+     this.browserStackEl.append(resizeHandleX);
+     this.browserStackEl.append(resizeHandleY);
+ 
+     // Wait for the frame script to be loaded.
+     message.wait(rdmFrame.contentWindow, "script-init").then(async () => {
++      this.initPopupPanel();
+       // Notify the frame window that the Resposnive UI manager has begun initializing.
+       // At this point, we can render our React content inside the frame.
+       message.post(rdmFrame.contentWindow, "init");
+       // Wait for the tools to be rendered above the content. The frame script will
+       // then dispatch the necessary actions to the Redux store to give the toolbar the
+       // state it needs.
+       message.wait(rdmFrame.contentWindow, "init:done").then(() => {
+         rdmFrame.contentWindow.addInitialViewport({
+@@ -376,21 +387,21 @@ class ResponsiveUI {
+           options.reason === "BeforeTabRemotenessChange"));
+ 
+     // Ensure init has finished before starting destroy
+     if (!isTabContentDestroying) {
+       await this.inited;
+ 
+       // Restore screen orientation of physical device.
+       await this.updateScreenOrientation("landscape-primary", 0);
++    }
+ 
+-      if (this.isBrowserUIEnabled) {
+-        await this.responsiveFront.setDocumentInRDMPane(false);
+-        await this.responsiveFront.setFloatingScrollbars(false);
+-      }
++    if (this.isBrowserUIEnabled) {
++      await this.responsiveFront.setDocumentInRDMPane(false);
++      await this.responsiveFront.setFloatingScrollbars(false);
+ 
+       this.targetList.unwatchTargets(
+         [this.targetList.TYPES.FRAME],
+         this.onTargetAvailable
+       );
+     }
+ 
+     this.tab.removeEventListener("TabClose", this);
+diff --git a/devtools/client/shared/components/menu/MenuButton.js b/devtools/client/shared/components/menu/MenuButton.js
+--- a/devtools/client/shared/components/menu/MenuButton.js
++++ b/devtools/client/shared/components/menu/MenuButton.js
+@@ -50,16 +50,19 @@ const omit = (obj, fields) => {
+ };
+ 
+ class MenuButton extends PureComponent {
+   static get propTypes() {
+     return {
+       // The toolbox document that will be used for rendering the menu popup.
+       toolboxDoc: PropTypes.object.isRequired,
+ 
++      // A place used to show the menu popup.
++      popupPanel: PropTypes.object,
++
+       // A text content for the button.
+       label: PropTypes.string,
+ 
+       // URL of the icon to associate with the MenuButton. (Optional)
+       // e.g. chrome://devtools/skin/image/foo.svg
+       icon: PropTypes.string,
+ 
+       // An optional ID to assign to the menu's container tooltip object.
+@@ -167,16 +170,20 @@ class MenuButton extends PureComponent {
+       useXulWrapper: true,
+       isMenuTooltip: true,
+     };
+ 
+     if (this.props.menuId) {
+       tooltipProps.id = this.props.menuId;
+     }
+ 
++    if (this.props.popupContainer) {
++      tooltipProps.popupContainer = this.props.popupContainer;
++    }
++
+     this.tooltip = new HTMLTooltip(this.props.toolboxDoc, tooltipProps);
+     this.tooltip.on("hidden", this.onHidden);
+   }
+ 
+   async resetTooltip() {
+     if (!this.tooltip) {
+       return;
+     }
+diff --git a/devtools/client/shared/widgets/tooltip/HTMLTooltip.js b/devtools/client/shared/widgets/tooltip/HTMLTooltip.js
+--- a/devtools/client/shared/widgets/tooltip/HTMLTooltip.js
++++ b/devtools/client/shared/widgets/tooltip/HTMLTooltip.js
+@@ -350,29 +350,30 @@ function HTMLTooltip(
+   {
+     className = "",
+     consumeOutsideClicks = true,
+     id = "",
+     isMenuTooltip = false,
+     type = "normal",
+     useXulWrapper = false,
+     noAutoHide = false,
++    popupContainer = null,
+   } = {}
+ ) {
+   EventEmitter.decorate(this);
+ 
+   this.doc = toolboxDoc;
+   this.id = id;
+   this.className = className;
+   this.type = type;
+   this.noAutoHide = noAutoHide;
+   // consumeOutsideClicks cannot be used if the tooltip is not closed on click
+   this.consumeOutsideClicks = this.noAutoHide ? false : consumeOutsideClicks;
+   this.isMenuTooltip = isMenuTooltip;
+-  this.useXulWrapper = this._isXUL() && useXulWrapper;
++  this.useXulWrapper = useXulWrapper;
+   this.preferredWidth = "auto";
+   this.preferredHeight = "auto";
+ 
+   // The top window is used to attach click event listeners to close the tooltip if the
+   // user clicks on the content page.
+   this.topWindow = this._getTopWindow();
+ 
+   this._position = null;
+@@ -385,21 +386,23 @@ function HTMLTooltip(
+   this.container.classList.toggle("tooltip-container-xul", this.useXulWrapper);
+ 
+   if (this.useXulWrapper) {
+     // When using a XUL panel as the wrapper, the actual markup for the tooltip is as
+     // follows :
+     // <panel> <!-- XUL panel used to position the tooltip anywhere on screen -->
+     //   <div> <!-- div wrapper used to isolate the tooltip container -->
+     //     <div> <! the actual tooltip.container element -->
++    popupContainer = popupContainer || this.doc.documentElement;
++
+     this.xulPanelWrapper = this._createXulPanelWrapper();
+     const inner = this.doc.createElementNS(XHTML_NS, "div");
+     inner.classList.add("tooltip-xul-wrapper-inner");
+ 
+-    this.doc.documentElement.appendChild(this.xulPanelWrapper);
++    popupContainer.appendChild(this.xulPanelWrapper);
+     this.xulPanelWrapper.appendChild(inner);
+     inner.appendChild(this.container);
+   } else if (this._isXUL()) {
+     this.doc.documentElement.appendChild(this.container);
+   } else {
+     // In non-XUL context the container is ready to use as is.
+     this.doc.body.appendChild(this.container);
+   }
+@@ -839,19 +842,21 @@ HTMLTooltip.prototype = {
+   /**
+    * Destroy the tooltip instance. Hide the tooltip if displayed, remove the
+    * tooltip container from the document.
+    */
+   destroy: function() {
+     this.hide();
+     this.removeEventListeners();
+     this.container.remove();
++
+     if (this.xulPanelWrapper) {
+       this.xulPanelWrapper.remove();
+     }
++
+     if (this._toggle) {
+       this._toggle.destroy();
+       this._toggle = null;
+     }
+   },
+ 
+   _createContainer: function() {
+     const container = this.doc.createElementNS(XHTML_NS, "div");
