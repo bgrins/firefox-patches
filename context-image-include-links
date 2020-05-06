@@ -1,0 +1,218 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  591f7dad3455bd87d1c920081d292acf7feff992
+Support context menu options for images that are covered by other elements
+
+diff --git a/browser/actors/BrowserTabChild.jsm b/browser/actors/BrowserTabChild.jsm
+--- a/browser/actors/BrowserTabChild.jsm
++++ b/browser/actors/BrowserTabChild.jsm
+@@ -25,17 +25,17 @@ class BrowserTabChild extends JSWindowAc
+         if (this.handledWindowCreated) {
+           return;
+         }
+         this.handledWindowCreated = true;
+ 
+         let context = this.manager.browsingContext;
+         let loadContext = context.docShell.QueryInterface(Ci.nsILoadContext);
+         let userContextId = loadContext.originAttributes.userContextId;
+-
++        console.log(context);
+         this.sendAsyncMessage("Browser:WindowCreated", { userContextId });
+         break;
+       }
+ 
+       case "MozAfterPaint":
+         if (this.handledFirstPaint) {
+           return;
+         }
+diff --git a/browser/actors/ContextMenuChild.jsm b/browser/actors/ContextMenuChild.jsm
+--- a/browser/actors/ContextMenuChild.jsm
++++ b/browser/actors/ContextMenuChild.jsm
+@@ -782,16 +782,18 @@ class ContextMenuChild extends JSWindowA
+     delete context.linkURI;
+   }
+ 
+   _setContext(aEvent) {
+     this.context = Object.create(null);
+     const context = this.context;
+ 
+     context.timeStamp = aEvent.timeStamp;
++    context.clientX = aEvent.clientX;
++    context.clientY = aEvent.clientY;
+     context.screenX = aEvent.screenX;
+     context.screenY = aEvent.screenY;
+     context.mozInputSource = aEvent.mozInputSource;
+ 
+     let node = aEvent.composedTarget;
+ 
+     // Set the node to containing <video>/<audio>/<embed>/<object> if the node
+     // is in the videocontrols/pluginProblem UA Widget.
+@@ -950,83 +952,110 @@ class ContextMenuChild extends JSWindowA
+     }
+ 
+     // We only deal with TEXT_NODE and ELEMENT_NODE in this function, so return
+     // early if we don't have one.
+     if (context.target.nodeType != context.target.ELEMENT_NODE) {
+       return;
+     }
+ 
+-    // See if the user clicked on an image. This check mirrors
+-    // nsDocumentViewer::GetInImage. Make sure to update both if this is
+-    // changed.
+-    if (
+-      context.target instanceof Ci.nsIImageLoadingContent &&
+-      (context.target.currentRequestFinalURI || context.target.currentURI)
+-    ) {
+-      context.onImage = true;
++    // We use winUtils.nodesFromRect instead of document.elementsFromPoint,
++    // since document.elementsFromPoint always flushes layout. The 1's in that
++    // function call are for the size of the rect that we want, which is 1x1.
++    //
++    // We pass the aOnlyVisible boolean argument to check that the video isn't
++    // occluded by anything visible at the point of mousedown. If it is, we'll
++    // ignore the mousedown.
++    let winUtils = context.target.ownerGlobal.windowUtils;
++    let targets = winUtils.nodesFromRect(
++      context.clientX,
++      context.clientY,
++      1,
++      1,
++      1,
++      1,
++      true,
++      false,
++      false /* aOnlyVisible */
++    );
+ 
+-      context.imageInfo = {
+-        currentSrc: context.target.currentSrc,
+-        width: context.target.width,
+-        height: context.target.height,
+-        imageText: context.target.title || context.target.alt,
+-      };
+-      const { SVGAnimatedLength } = context.target.ownerGlobal;
+-      if (context.imageInfo.height instanceof SVGAnimatedLength) {
+-        context.imageInfo.height = context.imageInfo.height.animVal.value;
+-      }
+-      if (context.imageInfo.width instanceof SVGAnimatedLength) {
+-        context.imageInfo.width = context.imageInfo.width.animVal.value;
+-      }
++    console.log(targets, context.target);
+ 
+-      const request = context.target.getRequest(
+-        Ci.nsIImageLoadingContent.CURRENT_REQUEST
+-      );
+-
+-      if (request && request.imageStatus & request.STATUS_SIZE_AVAILABLE) {
+-        context.onLoadedImage = true;
+-      }
+-
++    for (let target of targets) {
++      // See if the user clicked on an image. This check mirrors
++      // nsDocumentViewer::GetInImage. Make sure to update both if this is
++      // changed.
+       if (
+-        request &&
+-        request.imageStatus & request.STATUS_LOAD_COMPLETE &&
+-        !(request.imageStatus & request.STATUS_ERROR)
++        target instanceof Ci.nsIImageLoadingContent &&
++        (target.currentRequestFinalURI || target.currentURI)
+       ) {
+-        context.onCompletedImage = true;
+-      }
++        console.log("ON IMAGE");
++        context.onImage = true;
++
++        context.imageInfo = {
++          currentSrc: target.currentSrc,
++          width: target.width,
++          height: target.height,
++          imageText: target.title || target.alt,
++        };
++        const { SVGAnimatedLength } = target.ownerGlobal;
++        if (context.imageInfo.height instanceof SVGAnimatedLength) {
++          context.imageInfo.height = context.imageInfo.height.animVal.value;
++        }
++        if (context.imageInfo.width instanceof SVGAnimatedLength) {
++          context.imageInfo.width = context.imageInfo.width.animVal.value;
++        }
++
++        const request = target.getRequest(
++          Ci.nsIImageLoadingContent.CURRENT_REQUEST
++        );
++
++        if (request && request.imageStatus & request.STATUS_SIZE_AVAILABLE) {
++          context.onLoadedImage = true;
++        }
+ 
+-      // The actual URL the image was loaded from (after redirects) is the
+-      // currentRequestFinalURI.  We should use that as the URL for purposes of
+-      // deciding on the filename, if it is present. It might not be present
+-      // if images are blocked.
+-      //
+-      // It is important to check both the final and the current URI, as they
+-      // could be different blob URIs, see bug 1625786.
+-      context.mediaURL = (() => {
+-        let finalURI = context.target.currentRequestFinalURI?.spec;
+-        if (finalURI && this._isMediaURLReusable(finalURI)) {
+-          return finalURI;
++        if (
++          request &&
++          request.imageStatus & request.STATUS_LOAD_COMPLETE &&
++          !(request.imageStatus & request.STATUS_ERROR)
++        ) {
++          context.onCompletedImage = true;
+         }
+-        let currentURI = context.target.currentURI?.spec;
+-        if (currentURI && this._isMediaURLReusable(currentURI)) {
+-          return currentURI;
+-        }
+-        return "";
+-      })();
+ 
+-      const descURL = context.target.getAttribute("longdesc");
++        // The actual URL the image was loaded from (after redirects) is the
++        // currentRequestFinalURI.  We should use that as the URL for purposes of
++        // deciding on the filename, if it is present. It might not be present
++        // if images are blocked.
++        //
++        // It is important to check both the final and the current URI, as they
++        // could be different blob URIs, see bug 1625786.
++        context.mediaURL = (() => {
++          let finalURI = target.currentRequestFinalURI?.spec;
++          if (finalURI && this._isMediaURLReusable(finalURI)) {
++            return finalURI;
++          }
++          let currentURI = target.currentURI?.spec;
++          if (currentURI && this._isMediaURLReusable(currentURI)) {
++            return currentURI;
++          }
++          return "";
++        })();
+ 
+-      if (descURL) {
+-        context.imageDescURL = this._makeURLAbsolute(
+-          context.target.ownerDocument.body.baseURI,
+-          descURL
+-        );
++        const descURL = target.getAttribute("longdesc");
++
++        if (descURL) {
++          context.imageDescURL = this._makeURLAbsolute(
++            target.ownerDocument.body.baseURI,
++            descURL
++          );
++        }
+       }
+-    } else if (context.target instanceof this.contentWindow.HTMLCanvasElement) {
++    }
++
++    if (context.target instanceof this.contentWindow.HTMLCanvasElement) {
+       context.onCanvas = true;
+     } else if (context.target instanceof this.contentWindow.HTMLVideoElement) {
+       const mediaURL = context.target.currentSrc || context.target.src;
+ 
+       if (this._isMediaURLReusable(mediaURL)) {
+         context.mediaURL = mediaURL;
+       }
+ 
