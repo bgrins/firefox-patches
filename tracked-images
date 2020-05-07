@@ -1,0 +1,239 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  8e5fa8d40396c4fbd976d4328c80a107597145b8
+
+diff --git a/browser/actors/ClickHandlerChild.jsm b/browser/actors/ClickHandlerChild.jsm
+--- a/browser/actors/ClickHandlerChild.jsm
++++ b/browser/actors/ClickHandlerChild.jsm
+@@ -33,16 +33,29 @@ class ClickHandlerChild extends JSWindow
+     if (
+       !event.isTrusted ||
+       event.defaultPrevented ||
+       event.button == 2 ||
+       (event.type == "click" && event.button == 1)
+     ) {
+       return;
+     }
++
++    console.log(
++      event.target.ownerDocument.URI,
++      event.target.ownerGlobal.windowUtils.getTrackedImages(),
++      [...event.target.ownerGlobal.windowUtils.getTrackedImages()].map(img => {
++        return img.image.width;
++      }),
++      [...event.target.ownerGlobal.windowUtils.getTrackedImages()]
++        .map(img => {
++          return img.URI.spec;
++        })
++        .join("\n")
++    );
+     // Don't do anything on editable things, we shouldn't open links in
+     // contenteditables, and editor needs to possibly handle middlemouse paste
+     let composedTarget = event.composedTarget;
+     if (
+       composedTarget.isContentEditable ||
+       (composedTarget.ownerDocument &&
+         composedTarget.ownerDocument.designMode == "on") ||
+       ChromeUtils.getClassName(composedTarget) == "HTMLInputElement" ||
+diff --git a/dom/base/ImageTracker.cpp b/dom/base/ImageTracker.cpp
+--- a/dom/base/ImageTracker.cpp
++++ b/dom/base/ImageTracker.cpp
+@@ -136,16 +136,30 @@ void ImageTracker::SetAnimatingState(boo
+ }
+ 
+ void ImageTracker::RequestDiscardAll() {
+   for (auto iter = mImages.Iter(); !iter.Done(); iter.Next()) {
+     iter.Key()->RequestDiscard();
+   }
+ }
+ 
++void ImageTracker::GetTrackedImages(nsTArray<RefPtr<imgIRequest> >& images) {
++  // nsTArray<nsCOMPtr<imgIContainer>> images;
++  for (auto iter = mImages.Iter(); !iter.Done(); iter.Next()) {
++    imgIRequest* req = iter.Key();
++    images.AppendElement(req);
++    // // nsCOMPtr<imgIContainer> image;
++    // req->GetImage(getter_AddRefs(image));
++    // if (!image) {
++    //   continue;
++    // }
++    // images.AppendElement(image->Unwrap());
++  }
++}
++
+ void ImageTracker::MediaFeatureValuesChangedAllDocuments(
+     const MediaFeatureChange& aChange) {
+   // Inform every content image used in the document that media feature values
+   // have changed.  If the same image is used in multiple places, then we can
+   // end up informing them multiple times.  Theme changes are rare though and we
+   // don't bother trying to ensure we only do this once per image.
+   //
+   // Pull the images out into an array and iterate over them, in case the
+diff --git a/dom/base/ImageTracker.h b/dom/base/ImageTracker.h
+--- a/dom/base/ImageTracker.h
++++ b/dom/base/ImageTracker.h
+@@ -53,16 +53,18 @@ class ImageTracker {
+   // Makes the images on this document capable of having their animation
+   // active or suspended. An Image will animate as long as at least one of its
+   // owning Documents needs it to animate; otherwise it can suspend.
+   void SetAnimatingState(bool aAnimating);
+ 
+   void RequestDiscardAll();
+   void MediaFeatureValuesChangedAllDocuments(const MediaFeatureChange&);
+ 
++  void GetTrackedImages(nsTArray<RefPtr<imgIRequest> >& images);
++
+  private:
+   ~ImageTracker();
+ 
+   nsDataHashtable<nsPtrHashKey<imgIRequest>, uint32_t> mImages;
+   bool mLocking;
+   bool mAnimating;
+ };
+ 
+diff --git a/dom/base/nsDOMWindowUtils.cpp b/dom/base/nsDOMWindowUtils.cpp
+--- a/dom/base/nsDOMWindowUtils.cpp
++++ b/dom/base/nsDOMWindowUtils.cpp
+@@ -33,16 +33,18 @@
+ #include "ClientLayerManager.h"
+ #include "nsQueryObject.h"
+ #include "CubebDeviceEnumerator.h"
+ 
+ #include "nsIScrollableFrame.h"
+ 
+ #include "nsContentUtils.h"
+ 
++#include "imgIRequest.h"
++
+ #include "nsIFrame.h"
+ #include "nsIWidget.h"
+ #include "nsCharsetSource.h"
+ #include "nsJSEnvironment.h"
+ #include "nsJSUtils.h"
+ 
+ #include "mozilla/ChaosMode.h"
+ #include "mozilla/CheckedInt.h"
+@@ -70,16 +72,17 @@
+ 
+ #if defined(MOZ_X11) && defined(MOZ_WIDGET_GTK)
+ #  include <gdk/gdk.h>
+ #  include <gdk/gdkx.h>
+ #endif
+ 
+ #include "Layers.h"
+ 
++#include "mozilla/dom/ImageTracker.h"
+ #include "mozilla/dom/AudioDeviceInfo.h"
+ #include "mozilla/dom/Element.h"
+ #include "mozilla/dom/BrowserChild.h"
+ #include "mozilla/dom/IDBFactoryBinding.h"
+ #include "mozilla/dom/IDBMutableFileBinding.h"
+ #include "mozilla/dom/IDBMutableFile.h"
+ #include "mozilla/dom/IndexedDatabaseManager.h"
+ #include "mozilla/dom/PermissionMessageUtils.h"
+@@ -401,16 +404,47 @@ nsDOMWindowUtils::GetViewportInfo(uint32
+   CSSIntSize size = gfx::RoundedToInt(info.GetSize());
+   *aWidth = size.width;
+   *aHeight = size.height;
+   *aAutoSize = info.IsAutoSizeEnabled();
+   return NS_OK;
+ }
+ 
+ NS_IMETHODIMP
++nsDOMWindowUtils::GetTrackedImages(nsTArray<RefPtr<imgIRequest> >& images) {
++  nsCOMPtr<Document> doc = GetDocument();
++  if (doc) {
++    doc->ImageTracker()->GetTrackedImages(images);
++  }
++
++
++  // // nsTArray<nsCOMPtr<imgIContainer>> images;
++  // for (auto iter = doc->ImageTracker()->Images().Iter(); !iter.Done(); iter.Next()) {
++  //   imgIRequest* req = iter.Key();
++  //   images.AppendElement(req);
++  //   // // nsCOMPtr<imgIContainer> image;
++  //   // req->GetImage(getter_AddRefs(image));
++  //   // if (!image) {
++  //   //   continue;
++  //   // }
++  //   // images.AppendElement(image->Unwrap());
++  // }
++
++    // doc->ImageTracker()
++
++    // PendingAnimationTracker* tracker = doc->GetPendingAnimationTracker();
++    // if (tracker) {
++    //   tracker->TriggerPendingAnimationsNow();
++    // }
++  // }
++
++  return NS_OK;
++}
++
++NS_IMETHODIMP
+ nsDOMWindowUtils::GetViewportFitInfo(nsAString& aViewportFit) {
+   Document* doc = GetDocument();
+   NS_ENSURE_STATE(doc);
+ 
+   ViewportMetaData metaData = doc->GetViewportMetaData();
+   if (metaData.mViewportFit.EqualsLiteral("contain")) {
+     aViewportFit.AssignLiteral("contain");
+   } else if (metaData.mViewportFit.EqualsLiteral("cover")) {
+@@ -2262,16 +2296,17 @@ nsDOMWindowUtils::StartFrameTimeRecordin
+       Preferences::GetUint("toolkit.framesRecording.bufferSize", uint32_t(0));
+   bufferSize = std::min(bufferSize, kRecordingMaxSize);
+   bufferSize = std::max(bufferSize, kRecordingMinSize);
+   *startIndex = mgr->StartFrameTimeRecording(bufferSize);
+ 
+   return NS_OK;
+ }
+ 
++
+ NS_IMETHODIMP
+ nsDOMWindowUtils::StopFrameTimeRecording(uint32_t startIndex,
+                                          nsTArray<float>& frameIntervals) {
+   nsCOMPtr<nsIWidget> widget = GetWidget();
+   if (!widget) return NS_ERROR_FAILURE;
+ 
+   LayerManager* mgr = widget->GetLayerManager();
+   if (!mgr) return NS_ERROR_FAILURE;
+diff --git a/dom/interfaces/base/nsIDOMWindowUtils.idl b/dom/interfaces/base/nsIDOMWindowUtils.idl
+--- a/dom/interfaces/base/nsIDOMWindowUtils.idl
++++ b/dom/interfaces/base/nsIDOMWindowUtils.idl
+@@ -37,16 +37,17 @@ interface nsIQueryContentEventResult;
+ interface nsIDOMWindow;
+ interface nsIFile;
+ interface nsIURI;
+ interface nsIRunnable;
+ interface nsITranslationNodeList;
+ interface nsIJSRAIIHelper;
+ interface nsIContentPermissionRequest;
+ interface nsIObserver;
++interface imgIRequest;
+ 
+ webidl Animation;
+ webidl DOMRect;
+ webidl Element;
+ webidl EventTarget;
+ webidl Event;
+ webidl Node;
+ webidl NodeList;
+@@ -116,16 +117,18 @@ interface nsIDOMWindowUtils : nsISupport
+                        out uint32_t aWidth, out uint32_t aHeight,
+                        out boolean aAutoSize);
+   /*
+    * Information retrieved from the viewport-fit value of <meta name="viewport">
+    * element.
+    */
+   AString getViewportFitInfo();
+ 
++  Array<imgIRequest> getTrackedImages();
++
+   /**
+    * Information about the window size in device pixels.
+    */
+   void getContentViewerSize(out uint32_t aDisplayWidth, out uint32_t aDisplayHeight);
+ 
+   /**
+    * For any scrollable element, this allows you to override the
+    * visible region and draw more than what is visible, which is
