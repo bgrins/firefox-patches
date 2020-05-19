@@ -583,7 +583,7 @@ diff --git a/browser/components/secondarybrowser/SecondaryBrowserChild.jsm b/bro
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/secondarybrowser/SecondaryBrowserChild.jsm
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,353 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -678,10 +678,108 @@ new file mode 100644
 +        hostToSecondaryBrowserMap.set(this.browsingContext, browsingContext);
 +        secondaryToHostBrowserMap.set(browsingContext, this.browsingContext);
 +        this.sendImages();
++        this.cloneAndWalk();
 +
 +        break;
 +      }
 +    }
++  }
++
++  cloneAndWalk() {
++    let nodeFilterConstants = {
++      FILTER_ACCEPT: 1,
++      FILTER_REJECT: 2,
++      FILTER_SKIP: 3,
++
++      SHOW_ALL: 0xffffffff,
++      SHOW_ELEMENT: 0x00000001,
++      SHOW_ATTRIBUTE: 0x00000002,
++      SHOW_TEXT: 0x00000004,
++      SHOW_CDATA_SECTION: 0x00000008,
++      SHOW_ENTITY_REFERENCE: 0x00000010,
++      SHOW_ENTITY: 0x00000020,
++      SHOW_PROCESSING_INSTRUCTION: 0x00000040,
++      SHOW_COMMENT: 0x00000080,
++      SHOW_DOCUMENT: 0x00000100,
++      SHOW_DOCUMENT_TYPE: 0x00000200,
++      SHOW_DOCUMENT_FRAGMENT: 0x00000400,
++      SHOW_NOTATION: 0x00000800,
++    };
++
++    let win = this.browsingContext.window;
++    let doc = win.document;
++
++    function standardTreeWalkerFilter(node) {
++      // Ignore empty whitespace text nodes that do not impact the layout.
++      // if (isWhitespaceTextNode(node)) {
++      //   return nodeHasSize(node)
++      //     ? nodeFilterConstants.FILTER_ACCEPT
++      //     : nodeFilterConstants.FILTER_SKIP;
++      // }
++
++      if (node.isNativeAnonymous) {
++        return nodeFilterConstants.FILTER_SKIP;
++      }
++
++      return nodeFilterConstants.FILTER_ACCEPT;
++    }
++
++    let walker = Cc["@mozilla.org/inspector/deep-tree-walker;1"].createInstance(
++      Ci.inIDeepTreeWalker
++    );
++    walker.showAnonymousContent = true;
++    walker.showSubDocuments = true;
++    walker.showDocumentsAsNodes = true;
++    walker.init(
++      doc.documentElement,
++      nodeFilterConstants.SHOW_TEXT | nodeFilterConstants.SHOW_ELEMENT
++    );
++
++    let domToSerialized = new Map();
++    let currentNode = walker.currentNode;
++    let clonedTree = {
++      children: [],
++      tag: currentNode.tagName,
++      attributes: {},
++    };
++
++    domToSerialized.set(currentNode, clonedTree);
++    while ((currentNode = walker.nextNode())) {
++      if (currentNode.isNativeAnonymous) {
++        continue;
++      }
++      if (
++        currentNode.tagName == "SCRIPT" ||
++        currentNode.tagName == "LINK" ||
++        currentNode.tagName == "STYLE"
++      ) {
++        continue;
++      }
++      if (currentNode.tagName == "HEAD") {
++        // XXX: Should any of this come across?
++        continue;
++      }
++
++      if (!domToSerialized.has(currentNode.parentNode)) {
++        continue;
++      }
++
++      let parentTree = domToSerialized.get(currentNode.parentNode);
++      if (currentNode.nodeType == 3) {
++        parentTree.children.push(currentNode.data);
++      } else {
++        let thisTree = {
++          children: [],
++          tag: currentNode.tagName,
++          attributes: {},
++        };
++        domToSerialized.get(currentNode.parentNode).children.push(thisTree);
++        domToSerialized.set(currentNode, thisTree);
++      }
++    }
++    console.log(clonedTree);
++    let browsingContext = hostToSecondaryBrowserMap.get(this.browsingContext);
++    sendToContent(browsingContext, "DOMTree", clonedTree);
 +  }
 +
 +  handleEvent(event) {
@@ -1095,7 +1193,7 @@ diff --git a/browser/components/secondarybrowser/content/secondaryui.html b/brow
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/secondarybrowser/content/secondaryui.html
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,67 @@
 +<!-- This Source Code Form is subject to the terms of the Mozilla Public
 +   - License, v. 2.0. If a copy of the MPL was not distributed with this
 +   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
@@ -1125,7 +1223,7 @@ new file mode 100644
 +      <button is="named-deck-button" deck="details-deck" name="outline" class="tab-button">Outline</button>
 +      <!-- <button is="named-deck-button" deck="details-deck" name="dev" class="tab-button">Firefox Developer</button> -->
 +    </button-group>
-+    <named-deck id="details-deck" selected-view="images">
++    <named-deck id="details-deck" selected-view="outline">
 +      <section name="info">
 +        <h2>Page Information</h2>
 +        <div id="title"></div>
@@ -1147,6 +1245,9 @@ new file mode 100644
 +      </section>
 +      <section name="outline">
 +        <h2>Page Outline</h2>
++        <iframe id="outline-output">
++
++        </iframe>
 +      </section>
 +      <!-- <section name="dev">
 +        <h2>Firefox Developer</h2>
@@ -1164,7 +1265,7 @@ diff --git a/browser/components/secondarybrowser/content/secondaryui.js b/browse
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/secondarybrowser/content/secondaryui.js
-@@ -0,0 +1,458 @@
+@@ -0,0 +1,473 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -1610,14 +1711,29 @@ new file mode 100644
 +    columns: ".image-grid-col",
 +    items: ".image-grid-item",
 +  });
-+
-+
 +}
 +window.addEventListener("SecondaryBrowserChromeToContent", event => {
 +  console.log("SecondaryBrowserChromeToContent", event.detail);
 +  switch (event.detail.messageType) {
 +    case "TrackedImages": {
 +      buildImages(event.detail.value);
++
++      break;
++    }
++    case "DOMTree": {
++      let frameDoc = document.querySelector("#outline-output").contentDocument;
++      function createElement(node) {
++        if (typeof node === "string") {
++          return document.createTextNode(node);
++        }
++        return document.createElement(node.type);
++      }
++      // frameDoc.body.append(createElement({type: "div"}));
++      frameDoc.body.append(`${event.detail.value.children.length} children`);
++
++      // document.querySelector("#outline-output").textContent = JSON.stringify(
++      //   event.detail.value
++      // );
 +
 +      break;
 +    }
