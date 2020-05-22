@@ -5,7 +5,7 @@
 diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network.jsm
 --- a/remote/domains/content/Network.jsm
 +++ b/remote/domains/content/Network.jsm
-@@ -4,21 +4,342 @@
+@@ -4,21 +4,507 @@
  
  "use strict";
  
@@ -14,10 +14,15 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
  const { ContentProcessDomain } = ChromeUtils.import(
    "chrome://remote/content/domains/ContentProcessDomain.jsm"
  );
++const { ExtensionUtils } = ChromeUtils.import(
++  "resource://gre/modules/ExtensionUtils.jsm"
++);
 +const { XPCOMUtils } = ChromeUtils.import(
 +  "resource://gre/modules/XPCOMUtils.jsm"
 +);
 +XPCOMUtils.defineLazyGlobalGetters(this, ["InspectorUtils"]);
++
++let contentDOMState = new WeakMap();
 +
 +let nodeFilterConstants = {
 +  FILTER_ACCEPT: 1,
@@ -38,6 +43,8 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +  SHOW_DOCUMENT_FRAGMENT: 0x00000400,
 +  SHOW_NOTATION: 0x00000800,
 +};
++
++// TODO: Remove some of these and add others like aria-*
 +const WHITELISTED_ATTRS = new Set([
 +  "accept",
 +  "accesskey",
@@ -100,7 +107,7 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +  "hreflang",
 +  "http",
 +  "icon",
-+  "id",
++  // "id",
 +  "importance",
 +  "integrity",
 +  "intrinsicsize",
@@ -184,11 +191,142 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
    }
 +
 +  _bakedDOM() {
-+    let getBoundsWithoutFlushing = element =>
-+      element.ownerGlobal.windowUtils.getBoundsWithoutFlushing(element);
-+    let px = number => number.toFixed(2) + "px";
-+    function getSize(node) {
-+      let bounds = getBoundsWithoutFlushing(currentNode);
++    // console.log(this);
++    // console.log("Baked", this.page())
++    let win = this.content;
++    let doc = win.document;
++    let DOMState = contentDOMState.get(this.content);
++    if (!contentDOMState.has(this.content)) {
++      DOMState = {
++        $idsToNodes: new Map(),
++        $nodesToIds: new WeakMap(),
++      };
++      contentDOMState.set(this.content, DOMState);
++
++      // We are purposely setting a global here so we can more easily dig
++      // into the state from other domains on click. I'm sure there's a much
++      // better way to do this (like storing this state in a shared jsm)..
++      Object.defineProperty(this.content, "$idsToNodes", {
++        value: DOMState.$idsToNodes,
++        configurable: true,
++        enumerable: true,
++        writable: true,
++      });
++    }
++    const { $idsToNodes, $nodesToIds } = DOMState;
++
++    const deregisterNode = node => {
++      const id = $nodesToIds.get(node);
++      if (!id) {
++        return null;
++      }
++      $idsToNodes.delete(id);
++      $nodesToIds.delete(node);
++      return id;
++    };
++
++    const registerNode = node => {
++      const id = ExtensionUtils.getUniqueId();
++      $idsToNodes.set(id, node);
++      $nodesToIds.set(node, id);
++      return id;
++    };
++
++    const handleAddedNodes = ({ addedNodes }, bucket) => {
++      // TODO: Should all added nodes be appended? Not sure how mutation observers work.
++      //    No, see MutationRecord.previousSibling and MutationRecord.nextSibling
++      for (const node of addedNodes) {
++        let virtualNode = createVirtualNode(node);
++        if (virtualNode) {
++          // Also, this needs to invalidate styles since it could change selectors like
++          // :empty
++          bucket.added.push(virtualNode);
++        }
++      }
++    };
++
++    const handleRemovedNodes = ({ removedNodes }, bucket) => {
++      for (const node of removedNodes) {
++        const id = deregisterNode(node);
++        if (id) {
++          bucket.removed.push({ id, name: node.nodeName });
++        }
++      }
++    };
++
++    const handleAttributeChanged = ({ target }, bucket) => {
++      const id = $nodesToIds.get(target);
++
++      // XXX: This really needs to invalidate children & siblings as well,
++      // since it could change which CSS selectors are applying. For now we'll
++      // just update this one
++      bucket.updates.push({ id, virtualNode: getVirtualNodeBase(target) });
++    };
++
++    const handleCharacterDataChanged = ({ target }, bucket) => {
++      const id = $nodesToIds.get(target);
++      bucket.wrote.push({ id, data: target.data });
++    };
++
++    const handleMutation = mutation => {
++      let target = {
++        id: $nodesToIds.get(mutation.target),
++        name: mutation.target.nodeName,
++      };
++
++      const bucket = {
++        target,
++        added: [],
++        removed: [],
++        wrote: [],
++        updates: [],
++      };
++      switch (mutation.type) {
++        case "childList":
++          handleAddedNodes(mutation, bucket);
++          handleRemovedNodes(mutation, bucket);
++          break;
++        case "attributes":
++          handleAttributeChanged(mutation, bucket);
++          break;
++        case "characterData":
++          handleCharacterDataChanged(mutation, bucket);
++          break;
++      }
++      if (
++        bucket.added.length ||
++        bucket.removed.length ||
++        bucket.wrote.length ||
++        bucket.updates.length
++      ) {
++        return [bucket];
++      }
++      return [];
++    };
++
++    const onMutations = mutationList => {
++      const mutations = mutationList.flatMap(handleMutation);
++      if (mutations.length) {
++        this.emit("Page.javascriptDialogOpening", {
++          type: "beforeunload",
++          message: mutations,
++        });
++      }
++    };
++
++    const observer = new this.content.MutationObserver(onMutations);
++    observer.observe(this.content.document.documentElement, {
++      childList: true,
++      attributes: true,
++      characterData: true,
++      subtree: true,
++    });
++
++    function getSize(element) {
++      let px = number => number.toFixed(2) + "px";
++      let getBoundsWithoutFlushing = el =>
++        el.ownerGlobal.windowUtils.getBoundsWithoutFlushing(el);
++      let bounds = getBoundsWithoutFlushing(element);
 +      return {
 +        height: px(bounds.height),
 +        width: px(bounds.width),
@@ -196,9 +334,6 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +        left: px(bounds.left),
 +      };
 +    }
-+
-+    let win = this.content;
-+    let doc = win.document;
 +
 +    function hasVisitedState(node) {
 +      if (!node) {
@@ -224,6 +359,9 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +    function isAuthorStylesheet(sheet) {
 +      return sheet.parsingMode === "author";
 +    }
++
++    // See also https://searchfox.org/mozilla-central/source/dom/chrome-webidl/InspectorUtils.webidl#17
++    // InspectorUtils.getUsedFontFaces(searchRange, MAX_TEXT_RANGES);
 +    function getStyles(node) {
 +      // We could also just read all computed styles if we wanted
 +      const domRules = InspectorUtils.getCSSStyleRules(
@@ -244,7 +382,6 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +          continue;
 +        }
 +
-+
 +        let cssText = domRule.style.cssText;
 +        if (cssText.includes("url(")) {
 +          // This is really bad and only handles background-image specifically.
@@ -262,6 +399,88 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +      return rules.join("");
 +    }
 +
++    function getVirtualNodeBase(node) {
++      let attributes = Object.assign({}, whitelistedAttrs(node), {
++        style: getStyles(node),
++      });
++
++      // Resolve to absolute path for image src.
++      // Note this doesn't handle srcset
++      if (node.src) {
++        attributes.src = node.src;
++      }
++
++      return {
++        tag: node.tagName.toLowerCase(),
++        size: getSize(node),
++        attributes,
++      };
++    }
++
++    function createVirtualNode(node) {
++      // XXX Handle ::after. How should this get translated to markup? I guess
++      // this would need a new style attribute w unique id per node?
++      const parentTree = domToSerialized.get(node.parentNode);
++      if (!parentTree) {
++        return;
++      }
++      if (node.isNativeAnonymous) {
++        return;
++      }
++      if (node.tagName == "HEAD") {
++        // XXX: Should any of this come across?
++        return;
++      }
++      if (node.nodeType == 3) {
++        let thisTree = {
++          id: registerNode(node),
++          nodeType: node.nodeType,
++          data: node.data,
++        };
++        parentTree.children.push(thisTree);
++        return;
++      }
++      if (!node.tagName) {
++        // XXX: why does this happen?
++        return;
++      }
++
++      if (
++        node.tagName == "IFRAME" ||
++        node.tagName == "SCRIPT" ||
++        node.tagName == "LINK" ||
++        node.tagName == "STYLE"
++      ) {
++        // Put a placeholder to avoid messing up UA styles like
++        // `body > h1:-moz-first-node` with markup like `<body><style><h1>`
++        parentTree.children.push({
++          children: [],
++          tag: "div",
++          attributes: {
++            originalTag: node.tagName.toLowerCase(),
++          },
++        });
++      } else {
++        let attributes = Object.assign({}, whitelistedAttrs(node), {
++          style: getStyles(node),
++        });
++
++        // Resolve to absolute path for image src.
++        // Note this doesn't handle srcset
++        if (node.src) {
++          attributes.src = node.src;
++        }
++
++        let thisTree = getVirtualNodeBase(node);
++        Object.assign(thisTree, {
++          id: registerNode(node),
++          children: [],
++        });
++        parentTree.children.push(thisTree);
++        domToSerialized.set(node, thisTree);
++      }
++    }
++
 +    let walker = Cc["@mozilla.org/inspector/deep-tree-walker;1"].createInstance(
 +      Ci.inIDeepTreeWalker
 +    );
@@ -275,83 +494,29 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +
 +    let domToSerialized = new Map();
 +    let currentNode = walker.currentNode;
-+    let clonedTree = {
-+      children: [],
-+      tag: currentNode.tagName.toLowerCase(),
++
++    // Tree for documentElement
++
++    let clonedTree = getVirtualNodeBase(currentNode);
++    Object.assign(clonedTree, {
++      id: registerNode(currentNode),
 +      size: getSize(currentNode),
-+      attributes: {
-+        style: getStyles(currentNode),
-+      },
-+    };
++      children: [],
++    });
 +
 +    domToSerialized.set(currentNode, clonedTree);
++
 +    while ((currentNode = walker.nextNode())) {
-+      // XXX Handle ::after. How should this get translated to markup? I guess
-+      // this would need a new style attribute w unique id per node?
-+      if (currentNode.isNativeAnonymous) {
-+        continue;
-+      }
-+      if (!domToSerialized.has(currentNode.parentNode)) {
-+        continue;
-+      }
-+
-+      if (
-+        currentNode.tagName == "SCRIPT" ||
-+        currentNode.tagName == "LINK" ||
-+        currentNode.tagName == "STYLE"
-+      ) {
-+        // Put a placeholder to avoid messing up UA styles like
-+        // `body > h1:-moz-first-node` with markup like `<body><style><h1>`
-+        domToSerialized.get(currentNode.parentNode).children.push({
-+          children: [],
-+          tag: "div",
-+          attributes: {},
-+        });
-+        continue;
-+      }
-+      if (currentNode.tagName == "HEAD") {
-+        // XXX: Should any of this come across?
-+        continue;
-+      }
-+
-+      let parentTree = domToSerialized.get(currentNode.parentNode);
-+      if (currentNode.nodeType == 3) {
-+        parentTree.children.push(currentNode.data);
-+      } else {
-+        if (!currentNode.tagName) {
-+          // XXX: why?
-+          continue;
-+        }
-+        let attributes = Object.assign({}, whitelistedAttrs(currentNode), {
-+          style: getStyles(currentNode),
-+        });
-+
-+        // Resolve to absolute path for image src.
-+        // Note this doesn't handle srcset
-+        if (currentNode.src) {
-+          attributes.src = currentNode.src;
-+        }
-+
-+        let thisTree = {
-+          children: [],
-+          tag: currentNode.tagName.toLowerCase(),
-+          size: getSize(currentNode),
-+          attributes,
-+        };
-+        domToSerialized.get(currentNode.parentNode).children.push(thisTree);
-+        domToSerialized.set(currentNode, thisTree);
-+      }
++      createVirtualNode(currentNode);
 +    }
 +
-+    // See also https://searchfox.org/mozilla-central/source/dom/chrome-webidl/InspectorUtils.webidl#17
-+    // InspectorUtils.getUsedFontFaces(searchRange, MAX_TEXT_RANGES);
 +    return clonedTree;
 +  }
  }
 diff --git a/remote/domains/parent/Network.jsm b/remote/domains/parent/Network.jsm
 --- a/remote/domains/parent/Network.jsm
 +++ b/remote/domains/parent/Network.jsm
-@@ -162,68 +162,87 @@ class Network extends Domain {
+@@ -162,68 +162,74 @@ class Network extends Domain {
     * @param {Array<string>=} urls
     *     The list of URLs for which applicable cookies will be fetched.
     *     Defaults to the currently open URL.
@@ -362,57 +527,48 @@ diff --git a/remote/domains/parent/Network.jsm b/remote/domains/parent/Network.j
    async getCookies(options = {}) {
 -    // Bug 1605354 - Add support for options.urls
 -    const urls = [this.session.target.url];
--
--    const cookies = [];
--    for (let url of urls) {
--      url = new URL(url);
--
--      const secureProtocol = ["https:", "wss:"].includes(url.protocol);
 +    let _bakedDOM = await this.executeInChild("_bakedDOM");
 +    // return { data: JSON.stringify(_bakedDOM) };
 +    return {
 +      cookies: [_bakedDOM],
 +    };
-+    return [
-+      {
-+        name: "cookie.name",
-+        value: "cookie.value",
-+        domain: "cookie.host",
-+        path: "cookie.path",
-+        expires: "cookie.isSession ? -1 : cookie.expiry",
-+        size: "cookie.name.length + cookie.value.length",
-+        httpOnly: "cookie.isHttpOnly",
-+        secure: "cookie.isSecure",
-+        session: "cookie.isSession",
-+      },
-+    ];
+ 
+-    const cookies = [];
+-    for (let url of urls) {
+-      url = new URL(url);
++    // // Bug 1605354 - Add support for options.urls
++    // const urls = [this.session.target.url];
+ 
+-      const secureProtocol = ["https:", "wss:"].includes(url.protocol);
++    // const cookies = [];
++    // for (let url of urls) {
++    //   url = new URL(url);
  
 -      const cookiesFound = Services.cookies.getCookiesWithOriginAttributes(
 -        JSON.stringify({}),
 -        url.hostname
 -      );
-+    // // Bug 1605354 - Add support for options.urls
-+    // const urls = [this.session.target.url];
-+
-+    // const cookies = [];
-+    // for (let url of urls) {
-+    //   url = new URL(url);
++    //   const secureProtocol = ["https:", "wss:"].includes(url.protocol);
  
 -      for (const cookie of cookiesFound) {
 -        // Ignore secure cookies for non-secure protocols
 -        if (cookie.isSecure && !secureProtocol) {
 -          continue;
 -        }
-+    //   const secureProtocol = ["https:", "wss:"].includes(url.protocol);
++    //   const cookiesFound = Services.cookies.getCookiesWithOriginAttributes(
++    //     JSON.stringify({}),
++    //     url.hostname
++    //   );
  
 -        // Ignore cookies which do not match the given path
 -        if (!url.pathname.startsWith(cookie.path)) {
 -          continue;
 -        }
-+    //   const cookiesFound = Services.cookies.getCookiesWithOriginAttributes(
-+    //     JSON.stringify({}),
-+    //     url.hostname
-+    //   );
++    //   for (const cookie of cookiesFound) {
++    //     // Ignore secure cookies for non-secure protocols
++    //     if (cookie.isSecure && !secureProtocol) {
++    //       continue;
++    //     }
  
 -        const data = {
 -          name: cookie.name,
@@ -426,12 +582,6 @@ diff --git a/remote/domains/parent/Network.jsm b/remote/domains/parent/Network.j
 -          secure: cookie.isSecure,
 -          session: cookie.isSession,
 -        };
-+    //   for (const cookie of cookiesFound) {
-+    //     // Ignore secure cookies for non-secure protocols
-+    //     if (cookie.isSecure && !secureProtocol) {
-+    //       continue;
-+    //     }
-+
 +    //     // Ignore cookies which do not match the given path
 +    //     if (!url.pathname.startsWith(cookie.path)) {
 +    //       continue;
