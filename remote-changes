@@ -5,7 +5,7 @@
 diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network.jsm
 --- a/remote/domains/content/Network.jsm
 +++ b/remote/domains/content/Network.jsm
-@@ -4,21 +4,519 @@
+@@ -4,21 +4,545 @@
  
  "use strict";
  
@@ -194,7 +194,36 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +    return this.session.domains.get("Page");
 +  }
 +
-+  _bakedDOM() {
++  agentClick(options = {}) {
++    let DOMState = contentDOMState.get(this.content);
++
++    if (DOMState && options.target) {
++      // The DOM has changed locally (on the server) since the remote click happened
++      // (on the client). Fundamentally the same problem can arise when streaming
++      // video as well, where the click event on the client is visually perceived to
++      // be over a certain element, but the streaming has lagged behind. However, in
++      // the case of streaming the DOM, accessibility semantics are not lost, so
++      // this situation is handled more gracefully and the click can still happen if
++      // the event target has moved (for example).
++      let target = DOMState.$idsToNodes.get(parseInt(options.target));
++      let relatedTarget =
++        DOMState.$idsToNodes.get(parseInt(options.relatedTarget)) || null;
++      if (target) {
++        target.dispatchEvent(
++          new MouseEvent("click", {
++            bubbles: true,
++            cancelable: true,
++            view: target.ownerGlobal,
++            target,
++            relatedTarget,
++            ...options,
++          })
++        );
++      }
++    }
++  }
++
++  doBakedDOM() {
 +    // Once we want to handle page navigations, see this code:
 +    // this.page.addEventListener((name, params) => {
 +    //   console.log(name, params);
@@ -208,16 +237,6 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +        $nodesToIds: new WeakMap(),
 +      };
 +      contentDOMState.set(this.content, DOMState);
-+
-+      // We are purposely setting a global here so we can more easily dig
-+      // into the state from other domains on click. I'm sure there's a much
-+      // better way to do this (like storing this state in a shared jsm)..
-+      Object.defineProperty(this.content, "$idsToNodes", {
-+        value: DOMState.$idsToNodes,
-+        configurable: true,
-+        enumerable: true,
-+        writable: true,
-+      });
 +    }
 +    const { $idsToNodes, $nodesToIds } = DOMState;
 +
@@ -315,12 +334,19 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +      return [];
 +    };
 +
++    const emitToServer = message => {
++      this.emit("Page.javascriptDialogOpening", {
++        type: "beforeunload",
++        message,
++      });
++    };
++
 +    const onMutations = mutationList => {
 +      const mutations = mutationList.flatMap(handleMutation);
 +      if (mutations.length) {
-+        this.emit("Page.javascriptDialogOpening", {
-+          type: "beforeunload",
-+          message: mutations,
++        emitToServer({
++          overriddenType: "mutations",
++          data: mutations,
 +        });
 +      }
 +    };
@@ -528,7 +554,7 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 diff --git a/remote/domains/parent/Network.jsm b/remote/domains/parent/Network.jsm
 --- a/remote/domains/parent/Network.jsm
 +++ b/remote/domains/parent/Network.jsm
-@@ -162,16 +162,22 @@ class Network extends Domain {
+@@ -162,16 +162,30 @@ class Network extends Domain {
     * @param {Array<string>=} urls
     *     The list of URLs for which applicable cookies will be fetched.
     *     Defaults to the currently open URL.
@@ -537,10 +563,18 @@ diff --git a/remote/domains/parent/Network.jsm b/remote/domains/parent/Network.j
     *     Array of cookie objects.
     */
    async getCookies(options = {}) {
-+    let _bakedDOM = await this.executeInChild("_bakedDOM");
-+    console.log(options);
++    let eventName = options.urls[0];
++    let data = options.urls[1];
++    let returnedData;
++    if (eventName == "bakedDOM") {
++      returnedData = await this.executeInChild("doBakedDOM");
++    } else if (eventName == "agentClick") {
++      returnedData = await this.executeInChild("agentClick", data);
++    } else {
++      throw new Error(`Unknown eventName ${eventName}`);
++    }
 +    return {
-+      cookies: [_bakedDOM],
++      cookies: [returnedData || ""],
 +    };
 +    /*
      // Bug 1605354 - Add support for options.urls
@@ -551,7 +585,7 @@ diff --git a/remote/domains/parent/Network.jsm b/remote/domains/parent/Network.j
        url = new URL(url);
  
        const secureProtocol = ["https:", "wss:"].includes(url.protocol);
-@@ -214,16 +220,17 @@ class Network extends Domain {
+@@ -214,16 +228,17 @@ class Network extends Domain {
            data.sameSite = sameSiteMap.get(cookie.sameSite);
          }
  
