@@ -5,7 +5,7 @@
 diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network.jsm
 --- a/remote/domains/content/Network.jsm
 +++ b/remote/domains/content/Network.jsm
-@@ -4,21 +4,543 @@
+@@ -4,21 +4,581 @@
  
  "use strict";
  
@@ -177,89 +177,59 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +  "width",
 +  "wrap",
 +]);
- 
- class Network extends ContentProcessDomain {
-   // commands
- 
-   /**
-    * Internal methods: the following methods are not part of CDP;
-    * note the _ prefix.
-    */
- 
-   _updateLoadFlags(flags) {
-     this.docShell.defaultLoadFlags = flags;
-   }
 +
-+  get page() {
-+    return this.session.domains.get("Page");
++class DOMBaker {
++  constructor(networkDomain) {
++    this.network = networkDomain;
++    this.win = this.network.content;
++
++    this.$idsToNodes = new Map();
++    this.$nodesToIds = new WeakMap();
 +  }
 +
-+  getNodeFromRemoteID(remoteID) {
-+    let DOMState = contentDOMState.get(this.content);
-+    let node;
-+    if (DOMState && remoteID) {
-+      node = DOMState.$idsToNodes.get(parseInt(remoteID));
-+    }
-+
-+    return node || null;
-+  }
-+
-+  agentClick(options = {}) {
-+    let target = this.getNodeFromRemoteID(options.target);
-+    let relatedTarget = this.getNodeFromRemoteID(options.relatedTarget);
-+    if (target) {
-+      target.dispatchEvent(
-+        new MouseEvent("click", {
-+          bubbles: true,
-+          cancelable: true,
-+          view: target.ownerGlobal,
-+          target,
-+          relatedTarget,
-+          ...options,
-+        })
-+      );
-+    }
-+  }
-+
-+  doBakedDOM() {
-+    // Once we want to handle page navigations, see this code:
-+    // this.page.addEventListener((name, params) => {
-+    //   console.log(name, params);
-+    // });
-+    let win = this.content;
-+    let doc = win.document;
-+    let DOMState = contentDOMState.get(this.content);
-+    if (!contentDOMState.has(this.content)) {
-+      DOMState = {
-+        $idsToNodes: new Map(),
-+        $nodesToIds: new WeakMap(),
-+      };
-+      contentDOMState.set(this.content, DOMState);
-+    }
-+    const { $idsToNodes, $nodesToIds } = DOMState;
-+
-+    const deregisterNode = node => {
-+      const id = $nodesToIds.get(node);
-+      if (!id) {
-+        return null;
++  getVirtualNodeBase(node) {
++    function whitelistedAttrs(node) {
++      let returnedAttrs = {};
++      for (let attr of node.attributes) {
++        if (WHITELISTED_ATTRS.has(attr.name)) {
++          returnedAttrs[attr.name] = attr.value;
++        }
 +      }
-+      $idsToNodes.delete(id);
-+      $nodesToIds.delete(node);
-+      return id;
-+    };
++      return returnedAttrs;
++    }
++    let attributes = Object.assign({}, whitelistedAttrs(node), {
++      style: this.getStyles(node),
++    });
 +
-+    const registerNode = node => {
-+      const id = ExtensionUtils.getUniqueId();
-+      $idsToNodes.set(id, node);
-+      $nodesToIds.set(node, id);
-+      return id;
++    // Resolve to absolute path for image src.
++    // Note this doesn't handle srcset
++    if (node.src) {
++      attributes.src = node.src;
++    }
++
++    return {
++      tag: node.tagName.toLowerCase(),
++      size: this.getSize(node),
++      attributes,
 +    };
++  }
++
++  stopWatching() {
++    // Do we actually need to bother if the document is going to be GC'ed?
++    if (this.observer) {
++      this.observer.disconnect();
++      this.observer = null;
++    }
++  }
++
++  startWatching() {
++    const { $nodesToIds } = this;
 +
 +    const handleAddedNodes = ({ addedNodes }, bucket) => {
 +      // TODO: Should all added nodes be appended? Not sure how mutation observers work.
 +      //    No, see MutationRecord.previousSibling and MutationRecord.nextSibling
 +      for (const node of addedNodes) {
-+        let virtualNode = createVirtualNode(node);
++        let virtualNode = this.createVirtualNode(node);
 +        if (virtualNode) {
 +          // Also, this needs to invalidate styles since it could change selectors like
 +          // :empty
@@ -270,7 +240,7 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +
 +    const handleRemovedNodes = ({ removedNodes }, bucket) => {
 +      for (const node of removedNodes) {
-+        const id = deregisterNode(node);
++        const id = this.deregisterNode(node);
 +        if (id) {
 +          bucket.removed.push({ id, name: node.nodeName });
 +        }
@@ -282,7 +252,7 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +      // XXX: This really needs to invalidate children & siblings as well,
 +      // since it could change which CSS selectors are applying. For now we'll
 +      // just update this one
-+      bucket.updates.push({ id, virtualNode: getVirtualNodeBase(target) });
++      bucket.updates.push({ id, virtualNode: this.getVirtualNodeBase(target) });
 +    };
 +
 +    const handleCharacterDataChanged = ({ target }, bucket) => {
@@ -332,44 +302,57 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +      return [];
 +    };
 +
-+    const emitToServer = message => {
-+      this.emit("Page.javascriptDialogOpening", {
-+        type: "beforeunload",
-+        message,
-+      });
-+    };
-+
 +    const onMutations = mutationList => {
 +      const mutations = mutationList.flatMap(handleMutation);
 +      if (mutations.length) {
-+        emitToServer({
++        this.network.emitToUAServer({
 +          overriddenType: "mutations",
 +          data: mutations,
 +        });
 +      }
 +    };
 +
-+    const observer = new this.content.MutationObserver(onMutations);
-+    observer.observe(this.content.document.documentElement, {
++    this.observer = new this.win.MutationObserver(onMutations);
++    this.observer.observe(this.win.document.documentElement, {
 +      childList: true,
 +      attributes: true,
 +      characterData: true,
 +      subtree: true,
 +    });
-+
-+    function getSize(element) {
-+      let px = number => number.toFixed(2) + "px";
-+      let getBoundsWithoutFlushing = el =>
-+        el.ownerGlobal.windowUtils.getBoundsWithoutFlushing(el);
-+      let bounds = getBoundsWithoutFlushing(element);
-+      return {
-+        height: px(bounds.height),
-+        width: px(bounds.width),
-+        top: px(bounds.top),
-+        left: px(bounds.left),
-+      };
++  }
++  deregisterNode(node) {
++    const { $idsToNodes, $nodesToIds } = this;
++    const id = $nodesToIds.get(node);
++    if (!id) {
++      return null;
 +    }
++    $idsToNodes.delete(id);
++    $nodesToIds.delete(node);
++    return id;
++  }
 +
++  registerNode(node) {
++    const { $idsToNodes, $nodesToIds } = this;
++    const id = ExtensionUtils.getUniqueId();
++    $idsToNodes.set(id, node);
++    $nodesToIds.set(node, id);
++    return id;
++  }
++
++  getSize(element) {
++    let px = number => number.toFixed(2) + "px";
++    let getBoundsWithoutFlushing = el =>
++      el.ownerGlobal.windowUtils.getBoundsWithoutFlushing(el);
++    let bounds = getBoundsWithoutFlushing(element);
++    return {
++      height: px(bounds.height),
++      width: px(bounds.width),
++      top: px(bounds.top),
++      left: px(bounds.left),
++    };
++  }
++
++  getStyles(node) {
 +    function hasVisitedState(node) {
 +      if (!node) {
 +        return false;
@@ -382,77 +365,50 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +        InspectorUtils.hasPseudoClassLock(node, ":visited")
 +      );
 +    }
-+    function whitelistedAttrs(node) {
-+      let returnedAttrs = {};
-+      for (let attr of node.attributes) {
-+        if (WHITELISTED_ATTRS.has(attr.name)) {
-+          returnedAttrs[attr.name] = attr.value;
-+        }
-+      }
-+      return returnedAttrs;
-+    }
 +    function isAuthorStylesheet(sheet) {
 +      return sheet.parsingMode === "author";
 +    }
 +
 +    // See also https://searchfox.org/mozilla-central/source/dom/chrome-webidl/InspectorUtils.webidl#17
 +    // InspectorUtils.getUsedFontFaces(searchRange, MAX_TEXT_RANGES);
-+    function getStyles(node) {
-+      // We could also just read all computed styles if we wanted
-+      const domRules = InspectorUtils.getCSSStyleRules(
-+        node,
-+        null,
-+        hasVisitedState(node)
-+      );
++    // We could also just read all computed styles if we wanted
++    const domRules = InspectorUtils.getCSSStyleRules(
++      node,
++      null,
++      hasVisitedState(node)
++    );
 +
-+      const rules = [];
++    const rules = [];
 +
-+      // getCSSStyleRules returns ordered from least-specific to
-+      // most-specific.
-+      for (let i = 0; i < domRules.length; i++) {
-+        const domRule = domRules[i];
++    // getCSSStyleRules returns ordered from least-specific to
++    // most-specific.
++    for (let i = 0; i < domRules.length; i++) {
++      const domRule = domRules[i];
 +
-+        const isSystem = !isAuthorStylesheet(domRule.parentStyleSheet);
-+        if (isSystem) {
-+          continue;
-+        }
-+
-+        let cssText = domRule.style.cssText;
-+        if (cssText.includes("url(")) {
-+          // This is really bad and only handles background-image specifically.
-+          // TODO: see what devtools does to resolve paths in style rules.
-+          let backgroundImage = node.ownerGlobal.getComputedStyle(node)[
-+            "background-image"
-+          ];
-+          cssText = cssText.replace(/url\((.*)\)/, `${backgroundImage}`);
-+        }
-+        rules.push(cssText);
++      const isSystem = !isAuthorStylesheet(domRule.parentStyleSheet);
++      if (isSystem) {
++        continue;
 +      }
 +
-+      rules.push(node.style.cssText);
-+
-+      return rules.join("");
-+    }
-+
-+    function getVirtualNodeBase(node) {
-+      let attributes = Object.assign({}, whitelistedAttrs(node), {
-+        style: getStyles(node),
-+      });
-+
-+      // Resolve to absolute path for image src.
-+      // Note this doesn't handle srcset
-+      if (node.src) {
-+        attributes.src = node.src;
++      let cssText = domRule.style.cssText;
++      if (cssText.includes("url(")) {
++        // This is really bad and only handles background-image specifically.
++        // TODO: see what devtools does to resolve paths in style rules.
++        let backgroundImage = node.ownerGlobal.getComputedStyle(node)[
++          "background-image"
++        ];
++        cssText = cssText.replace(/url\((.*)\)/, `${backgroundImage}`);
 +      }
-+
-+      return {
-+        tag: node.tagName.toLowerCase(),
-+        size: getSize(node),
-+        attributes,
-+      };
++      rules.push(cssText);
 +    }
 +
-+    function createVirtualNode(node) {
++    rules.push(node.style.cssText);
++
++    return rules.join("");
++  }
++
++  bake() {
++    const createVirtualNode = node => {
 +      // XXX Handle ::after. How should this get translated to markup? I guess
 +      // this would need a new style attribute w unique id per node?
 +      const parentTree = domToSerialized.get(node.parentNode);
@@ -468,7 +424,7 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +      }
 +      if (node.nodeType == 3) {
 +        let thisTree = {
-+          id: registerNode(node),
++          id: this.registerNode(node),
 +          nodeType: node.nodeType,
 +          data: node.data,
 +        };
@@ -497,25 +453,15 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +          },
 +        });
 +      } else {
-+        let attributes = Object.assign({}, whitelistedAttrs(node), {
-+          style: getStyles(node),
-+        });
-+
-+        // Resolve to absolute path for image src.
-+        // Note this doesn't handle srcset
-+        if (node.src) {
-+          attributes.src = node.src;
-+        }
-+
-+        let thisTree = getVirtualNodeBase(node);
++        let thisTree = this.getVirtualNodeBase(node);
 +        Object.assign(thisTree, {
-+          id: registerNode(node),
++          id: this.registerNode(node),
 +          children: [],
 +        });
 +        parentTree.children.push(thisTree);
 +        domToSerialized.set(node, thisTree);
 +      }
-+    }
++    };
 +
 +    let walker = Cc["@mozilla.org/inspector/deep-tree-walker;1"].createInstance(
 +      Ci.inIDeepTreeWalker
@@ -524,7 +470,7 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +    walker.showSubDocuments = true;
 +    walker.showDocumentsAsNodes = true;
 +    walker.init(
-+      doc.documentElement,
++      this.win.document.documentElement,
 +      nodeFilterConstants.SHOW_TEXT | nodeFilterConstants.SHOW_ELEMENT
 +    );
 +
@@ -533,10 +479,10 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +
 +    // Tree for documentElement
 +
-+    let clonedTree = getVirtualNodeBase(currentNode);
++    let clonedTree = this.getVirtualNodeBase(currentNode);
 +    Object.assign(clonedTree, {
-+      id: registerNode(currentNode),
-+      size: getSize(currentNode),
++      id: this.registerNode(currentNode),
++      size: this.getSize(currentNode),
 +      children: [],
 +    });
 +
@@ -546,7 +492,99 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +      createVirtualNode(currentNode);
 +    }
 +
++    this.startWatching();
 +    return clonedTree;
++  }
++}
+ 
+ class Network extends ContentProcessDomain {
+   // commands
+ 
+   /**
+    * Internal methods: the following methods are not part of CDP;
+    * note the _ prefix.
+    */
+ 
+   _updateLoadFlags(flags) {
+     this.docShell.defaultLoadFlags = flags;
+   }
++
++  get page() {
++    return this.session.domains.get("Page");
++  }
++
++  getNodeFromRemoteID(remoteID) {
++    let DOMState = contentDOMState.get(this.content);
++    let node;
++    if (DOMState && remoteID) {
++      node = DOMState.$idsToNodes.get(parseInt(remoteID));
++    }
++
++    return node || null;
++  }
++
++  emitToUAServer(message) {
++    this.emit("Page.javascriptDialogOpening", {
++      type: "beforeunload",
++      message,
++    });
++  }
++
++  agentClick(options = {}) {
++    let target = this.getNodeFromRemoteID(options.target);
++    let relatedTarget = this.getNodeFromRemoteID(options.relatedTarget);
++    if (target) {
++      target.dispatchEvent(
++        new MouseEvent("click", {
++          bubbles: true,
++          cancelable: true,
++          view: target.ownerGlobal,
++          target,
++          relatedTarget,
++          ...options,
++        })
++      );
++    }
++  }
++
++  createDOMStateForCurrentWindow() {
++    let DOMState = contentDOMState.get(this.content);
++    if (!contentDOMState.has(this.content)) {
++      DOMState = new DOMBaker(this);
++      contentDOMState.set(this.content, DOMState);
++    }
++    return DOMState;
++  }
++
++  doBakedDOM() {
++    let win = this.content;
++    // Once we want to handle page navigations, see this code:
++    this.page.addEventListener((name, params) => {
++      // this.chromeEventHandler.removeEventListener("unload", this, {
++      //   mozSystemGroup: true,
++      //   capture: true,
++      // });
++      if (name == "Page.domContentEventFired") {
++        // XXX or Page.frameNavigated
++        let DOMState = this.createDOMStateForCurrentWindow();
++        let initialBaked = DOMState.bake();
++
++        this.emitToUAServer({
++          overriddenType: "bakedDOM",
++          data: initialBaked,
++        });
++      } else if (name == "Page.frameStartedLoading") {
++        // XXX: maybe on this.content.chromeEventHandler "unload" instead?
++        let DOMState = contentDOMState.get(this.content);
++        if (DOMState) {
++          DOMState.stopWatching();
++          contentDOMState.delete(this.content);
++        }
++      }
++      console.log(name, params);
++    });
++    let DOMState = this.createDOMStateForCurrentWindow();
++    return DOMState.bake();
 +  }
  }
 diff --git a/remote/domains/parent/Network.jsm b/remote/domains/parent/Network.jsm
