@@ -182,36 +182,11 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +  constructor(networkDomain) {
 +    this.network = networkDomain;
 +    this.win = this.network.content;
++    this.doc = this.win.document;
 +
 +    this.$idsToNodes = new Map();
 +    this.$nodesToIds = new WeakMap();
-+  }
-+
-+  getVirtualNodeBase(node) {
-+    function whitelistedAttrs(node) {
-+      let returnedAttrs = {};
-+      for (let attr of node.attributes) {
-+        if (WHITELISTED_ATTRS.has(attr.name)) {
-+          returnedAttrs[attr.name] = attr.value;
-+        }
-+      }
-+      return returnedAttrs;
-+    }
-+    let attributes = Object.assign({}, whitelistedAttrs(node), {
-+      style: this.getStyles(node),
-+    });
-+
-+    // Resolve to absolute path for image src.
-+    // Note this doesn't handle srcset
-+    if (node.src) {
-+      attributes.src = node.src;
-+    }
-+
-+    return {
-+      tag: node.tagName.toLowerCase(),
-+      size: this.getSize(node),
-+      attributes,
-+    };
++    this.$nodesToVirtualNodes = new WeakMap();
 +  }
 +
 +  stopWatching() {
@@ -229,6 +204,7 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +      // TODO: Should all added nodes be appended? Not sure how mutation observers work.
 +      //    No, see MutationRecord.previousSibling and MutationRecord.nextSibling
 +      for (const node of addedNodes) {
++        // XXX: This isn't implemented on the instance yet
 +        let virtualNode = this.createVirtualNode(node);
 +        if (virtualNode) {
 +          // Also, this needs to invalidate styles since it could change selectors like
@@ -407,62 +383,96 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +    return rules.join("");
 +  }
 +
-+  bake() {
-+    const createVirtualNode = node => {
-+      // XXX Handle ::after. How should this get translated to markup? I guess
-+      // this would need a new style attribute w unique id per node?
-+      const parentTree = domToSerialized.get(node.parentNode);
-+      if (!parentTree) {
-+        return;
++  getVirtualNodeBase(node) {
++    function whitelistedAttrs(node) {
++      let returnedAttrs = {};
++      for (let attr of node.attributes) {
++        if (WHITELISTED_ATTRS.has(attr.name)) {
++          returnedAttrs[attr.name] = attr.value;
++        }
 +      }
-+      if (node.isNativeAnonymous) {
-+        return;
-+      }
-+      if (node.tagName == "HEAD") {
-+        // XXX: Should any of this come across?
-+        return;
-+      }
-+      if (node.nodeType == 3) {
-+        let thisTree = {
-+          id: this.registerNode(node),
-+          nodeType: node.nodeType,
-+          data: node.data,
-+        };
-+        parentTree.children.push(thisTree);
-+        return;
-+      }
-+      if (!node.tagName) {
-+        // XXX: why does this happen?
-+        return;
-+      }
++      return returnedAttrs;
++    }
++    let attributes = Object.assign({}, whitelistedAttrs(node), {
++      style: this.getStyles(node),
++    });
 +
-+      if (
-+        node.tagName == "IFRAME" ||
-+        node.tagName == "VIDEO" ||
-+        node.tagName == "SCRIPT" ||
-+        node.tagName == "LINK" ||
-+        node.tagName == "STYLE"
-+      ) {
-+        // Put a placeholder to avoid messing up UA styles like
-+        // `body > h1:-moz-first-node` with markup like `<body><style><h1>`
-+        parentTree.children.push({
-+          children: [],
-+          tag: "div",
-+          attributes: {
-+            originalTag: node.tagName.toLowerCase(),
-+          },
-+        });
-+      } else {
-+        let thisTree = this.getVirtualNodeBase(node);
-+        Object.assign(thisTree, {
-+          id: this.registerNode(node),
-+          children: [],
-+        });
-+        parentTree.children.push(thisTree);
-+        domToSerialized.set(node, thisTree);
-+      }
++    // Resolve to absolute path for image src.
++    // Note this doesn't handle srcset
++    if (node.src) {
++      attributes.src = node.src;
++    }
++
++    return {
++      tag: node.tagName.toLowerCase(),
++      size: this.getSize(node),
++      attributes,
 +    };
++  }
 +
++  createVirtualNode(node) {
++    let { $nodesToVirtualNodes } = this;
++    let isDocElement = node == this.doc.documentElement;
++
++    const parentTree = $nodesToVirtualNodes.get(node.parentNode);
++    if (!parentTree && !isDocElement) {
++      return;
++    }
++    // XXX Handle ::after/::before with CSS.
++    if (node.isNativeAnonymous) {
++      return;
++    }
++    if (node.tagName == "HEAD") {
++      // XXX: Should any of this come across?
++      return;
++    }
++    if (node.nodeType == 3) {
++      let thisTree = {
++        id: this.registerNode(node),
++        nodeType: node.nodeType,
++        data: node.data,
++      };
++      parentTree.children.push(thisTree);
++      return;
++    }
++    if (!node.tagName) {
++      // XXX: why does this happen?
++      return;
++    }
++
++    if (
++      node.tagName == "IFRAME" ||
++      node.tagName == "VIDEO" ||
++      node.tagName == "SCRIPT" ||
++      node.tagName == "LINK" ||
++      node.tagName == "STYLE"
++    ) {
++      // Put a placeholder to avoid messing up UA styles like
++      // `body > h1:-moz-first-node` with markup like `<body><style><h1>`
++      parentTree.children.push({
++        children: [],
++        tag: "div",
++        attributes: {
++          originalTag: node.tagName.toLowerCase(),
++        },
++      });
++    } else {
++      let thisTree = this.getVirtualNodeBase(node);
++      Object.assign(thisTree, {
++        id: this.registerNode(node),
++        children: [],
++      });
++      if (!isDocElement) {
++        parentTree.children.push(thisTree);
++      }
++      $nodesToVirtualNodes.set(node, thisTree);
++    }
++  }
++
++  bake() {
++    let { $nodesToVirtualNodes } = this;
++
++    let documentElement = this.doc.documentElement;
 +    let walker = Cc["@mozilla.org/inspector/deep-tree-walker;1"].createInstance(
 +      Ci.inIDeepTreeWalker
 +    );
@@ -470,30 +480,20 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +    walker.showSubDocuments = true;
 +    walker.showDocumentsAsNodes = true;
 +    walker.init(
-+      this.win.document.documentElement,
++      documentElement,
 +      nodeFilterConstants.SHOW_TEXT | nodeFilterConstants.SHOW_ELEMENT
 +    );
 +
-+    let domToSerialized = new Map();
 +    let currentNode = walker.currentNode;
++    do {
++      this.createVirtualNode(currentNode);
++    } while ((currentNode = walker.nextNode()));
 +
-+    // Tree for documentElement
-+
-+    let clonedTree = this.getVirtualNodeBase(currentNode);
-+    Object.assign(clonedTree, {
-+      id: this.registerNode(currentNode),
-+      size: this.getSize(currentNode),
-+      children: [],
-+    });
-+
-+    domToSerialized.set(currentNode, clonedTree);
-+
-+    while ((currentNode = walker.nextNode())) {
-+      createVirtualNode(currentNode);
++    if (!$nodesToVirtualNodes.has(documentElement)) {
++      throw new Error("Missing documentElement, this shouldn't have happened");
 +    }
-+
 +    this.startWatching();
-+    return clonedTree;
++    return $nodesToVirtualNodes.get(documentElement);
 +  }
 +}
  
