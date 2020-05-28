@@ -5,7 +5,7 @@
 diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network.jsm
 --- a/remote/domains/content/Network.jsm
 +++ b/remote/domains/content/Network.jsm
-@@ -4,21 +4,581 @@
+@@ -4,21 +4,629 @@
  
  "use strict";
  
@@ -198,18 +198,21 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +  }
 +
 +  startWatching() {
-+    const { $nodesToIds } = this;
++    const { $nodesToIds, $nodesToVirtualNodes } = this;
 +
 +    const handleAddedNodes = ({ addedNodes }, bucket) => {
++      let { $nodesToVirtualNodes } = this;
++
 +      // TODO: Should all added nodes be appended? Not sure how mutation observers work.
-+      //    No, see MutationRecord.previousSibling and MutationRecord.nextSibling
++      //    No, see MutationRecord.previousSibling and MutationRecord.nextSibling.
++      // I think we should probably actually worry about getting the vdom in sync (child reordering, etc)
++      // and calculate a diff to send to the client separately.
 +      for (const node of addedNodes) {
-+        // XXX: This isn't implemented on the instance yet
-+        let virtualNode = this.createVirtualNode(node);
-+        if (virtualNode) {
++        this.createVirtualNodeAndChildren(node);
++        if ($nodesToVirtualNodes.has(node)) {
 +          // Also, this needs to invalidate styles since it could change selectors like
 +          // :empty
-+          bucket.added.push(virtualNode);
++          bucket.added.push($nodesToVirtualNodes.get(node));
 +        }
 +      }
 +    };
@@ -224,17 +227,26 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +    };
 +
 +    const handleAttributeChanged = ({ target }, bucket) => {
-+      const id = $nodesToIds.get(target);
-+      // XXX: This really needs to invalidate children & siblings as well,
-+      // since it could change which CSS selectors are applying. For now we'll
-+      // just update this one
-+      bucket.updates.push({ id, virtualNode: this.getVirtualNodeBase(target) });
++      const virtualNode = $nodesToVirtualNodes.get(target);
++
++      if (virtualNode) {
++        Object.assign(virtualNode, this.getVirtualNodeBase(target));
++        // XXX: This really needs to invalidate children & siblings as well,
++        // since it could change which CSS selectors are applying. For now we'll
++        // just update this one
++        bucket.updates.push({
++          id: virtualNode.id,
++          virtualNode,
++        });
++      }
 +    };
 +
 +    const handleCharacterDataChanged = ({ target }, bucket) => {
-+      const id = $nodesToIds.get(target);
-+      if (id) {
-+        bucket.wrote.push({ id, data: target.data });
++      const virtualNode = $nodesToVirtualNodes.get(target);
++      if (virtualNode) {
++        // XXX: Share code for updating this with creation as much as possible.
++        virtualNode.data = target.data;
++        bucket.wrote.push({ id: virtualNode.id, data: target.data });
 +      }
 +    };
 +
@@ -257,8 +269,8 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +      };
 +      switch (mutation.type) {
 +        case "childList":
-+          handleAddedNodes(mutation, bucket);
 +          handleRemovedNodes(mutation, bucket);
++          handleAddedNodes(mutation, bucket);
 +          break;
 +        case "attributes":
 +          handleAttributeChanged(mutation, bucket);
@@ -297,22 +309,36 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +    });
 +  }
 +  deregisterNode(node) {
-+    const { $idsToNodes, $nodesToIds } = this;
-+    const id = $nodesToIds.get(node);
-+    if (!id) {
++    const { $idsToNodes, $nodesToIds, $nodesToVirtualNodes } = this;
++    const virtualNode = $nodesToVirtualNodes.get(node);
++    if (!virtualNode) {
 +      return null;
 +    }
-+    $idsToNodes.delete(id);
++    $idsToNodes.delete(virtualNode.id);
++    // XXX: Remove $nodesToIds and instead query for ID via virtual node
 +    $nodesToIds.delete(node);
-+    return id;
++    $nodesToVirtualNodes.delete(node);
++
++    // Remove from parent
++    let parentTree = $nodesToVirtualNodes.get(
++      $idsToNodes.get(virtualNode.parentID)
++    );
++    if (parentTree) {
++      let index = parentTree.children.indexOf(virtualNode);
++      if (index == -1) {
++        throw new Error("Child doesn't exist in parent. This shouldn't happen");
++      }
++      parentTree.children.splice(index, 1);
++    }
++
++    return virtualNode.id;
 +  }
 +
-+  registerNode(node) {
-+    const { $idsToNodes, $nodesToIds } = this;
-+    const id = ExtensionUtils.getUniqueId();
-+    $idsToNodes.set(id, node);
-+    $nodesToIds.set(node, id);
-+    return id;
++  registerNode(node, virtualNode) {
++    const { $idsToNodes, $nodesToIds, $nodesToVirtualNodes } = this;
++    $idsToNodes.set(virtualNode.id, node);
++    $nodesToIds.set(node, virtualNode.id);
++    $nodesToVirtualNodes.set(node, virtualNode);
 +  }
 +
 +  getSize(element) {
@@ -413,66 +439,69 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +  createVirtualNode(node) {
 +    let { $nodesToVirtualNodes } = this;
 +    let isDocElement = node == this.doc.documentElement;
-+
 +    const parentTree = $nodesToVirtualNodes.get(node.parentNode);
-+    if (!parentTree && !isDocElement) {
++    if ((!parentTree || parentTree.IGNORE_CHILDREN) && !isDocElement) {
 +      return;
 +    }
 +    // XXX Handle ::after/::before with CSS.
 +    if (node.isNativeAnonymous) {
 +      return;
 +    }
-+    if (node.tagName == "HEAD") {
++    if (
++      node.tagName == "HEAD" ||
++      node.tagName == "SCRIPT" ||
++      node.tagName == "LINK" ||
++      node.tagName == "STYLE"
++    ) {
 +      // XXX: Should any of this come across?
 +      return;
 +    }
 +    if (node.nodeType == 3) {
-+      let thisTree = {
-+        id: this.registerNode(node),
++      let virtualNode = {
++        id: ExtensionUtils.getUniqueId(),
++        parentID: parentTree.id,
 +        nodeType: node.nodeType,
 +        data: node.data,
 +      };
-+      parentTree.children.push(thisTree);
-+      return;
++      this.registerNode(node, virtualNode);
++      parentTree.children.push(virtualNode);
 +    }
 +    if (!node.tagName) {
 +      // XXX: why does this happen?
 +      return;
 +    }
 +
-+    if (
-+      node.tagName == "IFRAME" ||
-+      node.tagName == "VIDEO" ||
-+      node.tagName == "SCRIPT" ||
-+      node.tagName == "LINK" ||
-+      node.tagName == "STYLE"
-+    ) {
++    if (node.tagName == "IFRAME" || node.tagName == "VIDEO") {
 +      // Put a placeholder to avoid messing up UA styles like
 +      // `body > h1:-moz-first-node` with markup like `<body><style><h1>`
-+      parentTree.children.push({
++      let virtualNode = {
 +        children: [],
++        id: ExtensionUtils.getUniqueId(),
++        parentID: parentTree.id,
++        originalTag: node.tagName.toLowerCase(),
++        IGNORE_CHILDREN: true,
 +        tag: "div",
-+        attributes: {
-+          originalTag: node.tagName.toLowerCase(),
-+        },
-+      });
++        attributes: {},
++      };
++
++      // XXX: move the parentTree.children positioning into registerNode
++      this.registerNode(node, virtualNode);
++      parentTree.children.push(virtualNode);
 +    } else {
-+      let thisTree = this.getVirtualNodeBase(node);
-+      Object.assign(thisTree, {
-+        id: this.registerNode(node),
++      let virtualNode = this.getVirtualNodeBase(node);
++      Object.assign(virtualNode, {
++        id: ExtensionUtils.getUniqueId(),
++        parentID: isDocElement ? null : parentTree.id,
 +        children: [],
 +      });
++      this.registerNode(node, virtualNode);
 +      if (!isDocElement) {
-+        parentTree.children.push(thisTree);
++        parentTree.children.push(virtualNode);
 +      }
-+      $nodesToVirtualNodes.set(node, thisTree);
 +    }
 +  }
 +
-+  bake() {
-+    let { $nodesToVirtualNodes } = this;
-+
-+    let documentElement = this.doc.documentElement;
++  createWalker(rootNode) {
 +    let walker = Cc["@mozilla.org/inspector/deep-tree-walker;1"].createInstance(
 +      Ci.inIDeepTreeWalker
 +    );
@@ -480,15 +509,34 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +    walker.showSubDocuments = true;
 +    walker.showDocumentsAsNodes = true;
 +    walker.init(
-+      documentElement,
++      rootNode,
 +      nodeFilterConstants.SHOW_TEXT | nodeFilterConstants.SHOW_ELEMENT
 +    );
++    return walker;
++  }
 +
++  createVirtualNodeAndChildren(node) {
++    let { $nodesToVirtualNodes } = this;
++    let walker = this.createWalker(node);
 +    let currentNode = walker.currentNode;
 +    do {
-+      this.createVirtualNode(currentNode);
++      if ($nodesToVirtualNodes.has(currentNode)) {
++        console.log(
++          `Attempting to create a node that already exists (${
++            $nodesToVirtualNodes.get(currentNode).id
++          })`
++        );
++      } else {
++        this.createVirtualNode(currentNode);
++      }
 +    } while ((currentNode = walker.nextNode()));
++  }
 +
++  bake() {
++    let { $nodesToVirtualNodes } = this;
++
++    let documentElement = this.doc.documentElement;
++    this.createVirtualNodeAndChildren(documentElement);
 +    if (!$nodesToVirtualNodes.has(documentElement)) {
 +      throw new Error("Missing documentElement, this shouldn't have happened");
 +    }
@@ -581,7 +629,7 @@ diff --git a/remote/domains/content/Network.jsm b/remote/domains/content/Network
 +          contentDOMState.delete(this.content);
 +        }
 +      }
-+      console.log(name, params);
++      // console.log(name, params);
 +    });
 +    let DOMState = this.createDOMStateForCurrentWindow();
 +    return DOMState.bake();
