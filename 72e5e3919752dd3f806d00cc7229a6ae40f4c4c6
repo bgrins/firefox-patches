@@ -1,0 +1,926 @@
+
+# HG changeset patch
+# User Emilio Cobos Álvarez <emilio@crisal.io>
+# Date 1592262334 -7200
+# Node ID 72e5e3919752dd3f806d00cc7229a6ae40f4c4c6
+# Parent  2cd1c8dfc1c547c9f04051365e016fdf88a2e0fe
+First pass at the new Element.commit() API.
+
+diff --git a/dom/base/CharacterData.cpp b/dom/base/CharacterData.cpp
+--- a/dom/base/CharacterData.cpp
++++ b/dom/base/CharacterData.cpp
+@@ -433,20 +433,16 @@ nsresult CharacterData::BindToTree(BindC
+     } else {
+       SetFlags(NODE_IS_IN_SHADOW_TREE);
+       MOZ_ASSERT(aParent.IsContent() &&
+                  aParent.AsContent()->GetContainingShadow());
+       ExtendedContentSlots()->mContainingShadow =
+           aParent.AsContent()->GetContainingShadow();
+     }
+ 
+-    if (aParent.HasFlag(NODE_IS_IN_OPAQUE_SHADOW_TREE)) {
+-      SetFlags(NODE_IS_IN_OPAQUE_SHADOW_TREE);
+-    }
+-
+     if (IsInComposedDoc() && mText.IsBidi()) {
+       aContext.OwnerDoc().SetBidiEnabled();
+     }
+ 
+     // Clear the lazy frame construction bits.
+     UnsetFlags(NODE_NEEDS_FRAME | NODE_DESCENDANTS_NEED_FRAMES);
+   } else {
+     // If we're not in the doc and not in a shadow tree,
+diff --git a/dom/base/Document.h b/dom/base/Document.h
+--- a/dom/base/Document.h
++++ b/dom/base/Document.h
+@@ -581,16 +581,25 @@ class Document : public nsINode,
+   // You should probably not be using this function, since it performs no checks
+   // to ensure that the partitioned principal should really be used here.  It is
+   // only designed to be used in very specific circumstances, such as when
+   // inheriting the document/storage principal.
+   nsIPrincipal* PartitionedPrincipal() final { return mPartitionedPrincipal; }
+ 
+   void ClearActiveStoragePrincipal() { mActiveStoragePrincipal = nullptr; }
+ 
++  // Implemented on Element.cpp for convenience.
++  void DoBlockOnPendingLayoutWork();
++  void BlockOnPendingLayoutWork() {
++    if (mPendingConcurrentLayoutRoots.IsEmpty()) {
++      return;
++    }
++    DoBlockOnPendingLayoutWork();
++  }
++
+   nsIPrincipal* GetContentBlockingAllowListPrincipal() const {
+     return mContentBlockingAllowListPrincipal;
+   }
+ 
+   // EventTarget
+   void GetEventTargetParent(EventChainPreVisitor& aVisitor) override;
+   EventListenerManager* GetOrCreateListenerManager() override;
+   EventListenerManager* GetExistingListenerManager() const override;
+@@ -3052,16 +3061,26 @@ class Document : public nsINode,
+   void UnscheduleSVGUseElementShadowTreeUpdate(SVGUseElement& aElement) {
+     mSVGUseElementsNeedingShadowTreeUpdate.RemoveEntry(&aElement);
+   }
+ 
+   bool SVGUseElementNeedsShadowTreeUpdate(SVGUseElement& aElement) const {
+     return mSVGUseElementsNeedingShadowTreeUpdate.GetEntry(&aElement);
+   }
+ 
++  using ElementSet = nsTHashtable<nsPtrHashKey<Element>>;
++  void AddConcurrentLayoutRoot(Element& aElement) {
++    MOZ_RELEASE_ASSERT(
++        mPendingConcurrentLayoutRoots.EnsureInserted(&aElement));
++  }
++
++  void RemoveConcurrentLayoutRoot(Element& aElement) {
++    mPendingConcurrentLayoutRoots.RemoveEntry(&aElement);
++  }
++
+   using ShadowRootSet = nsTHashtable<nsPtrHashKey<ShadowRoot>>;
+ 
+   void AddComposedDocShadowRoot(ShadowRoot& aShadowRoot) {
+     mComposedShadowRoots.PutEntry(&aShadowRoot);
+   }
+ 
+   void RemoveComposedDocShadowRoot(ShadowRoot& aShadowRoot) {
+     mComposedShadowRoots.RemoveEntry(&aShadowRoot);
+@@ -4219,16 +4238,18 @@ class Document : public nsINode,
+   RefPtr<css::Loader> mCSSLoader;
+   RefPtr<css::ImageLoader> mStyleImageLoader;
+   RefPtr<nsHTMLStyleSheet> mAttrStyleSheet;
+   RefPtr<nsHTMLCSSStyleSheet> mStyleAttrStyleSheet;
+ 
+   // Tracking for images in the document.
+   RefPtr<dom::ImageTracker> mImageTracker;
+ 
++  ElementSet mPendingConcurrentLayoutRoots;
++
+   // A hashtable of ShadowRoots belonging to the composed doc.
+   //
+   // See ShadowRoot::Bind and ShadowRoot::Unbind.
+   ShadowRootSet mComposedShadowRoots;
+ 
+   using SVGUseElementSet = nsTHashtable<nsPtrHashKey<SVGUseElement>>;
+ 
+   // The set of <svg:use> elements that need a shadow tree reclone because the
+diff --git a/dom/base/Element.cpp b/dom/base/Element.cpp
+--- a/dom/base/Element.cpp
++++ b/dom/base/Element.cpp
+@@ -5,34 +5,38 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ /*
+  * Base class for all element classes; this provides an implementation
+  * of DOM Core's Element, implements nsIContent, provides
+  * utility methods for subclasses, and so forth.
+  */
+ 
++#include <mutex>
++#include <condition_variable>
+ #include "mozilla/dom/ElementInlines.h"
+ 
+ #include "AnimationCommon.h"
+ #include "ExpandedPrincipal.h"
+ #include "mozilla/DebugOnly.h"
++#include "mozilla/PresShellInlines.h"
+ #include "mozilla/StaticPrefs_dom.h"
+ #include "mozilla/StaticPrefs_layout.h"
+ #include "mozilla/StaticPrefs_full_screen_api.h"
+ #include "mozilla/dom/Animation.h"
+ #include "mozilla/dom/Attr.h"
+ #include "mozilla/dom/BindContext.h"
+ #include "mozilla/dom/Flex.h"
+ #include "mozilla/dom/Grid.h"
+ #include "mozilla/dom/Link.h"
+ #include "mozilla/dom/MutationObservers.h"
+ #include "mozilla/dom/ScriptLoader.h"
+ #include "mozilla/dom/Text.h"
+ #include "mozilla/dom/nsCSPContext.h"
++#include "mozilla/dom/ShadowIncludingTreeIterator.h"
+ #include "mozilla/gfx/Matrix.h"
+ #include "nsAtom.h"
+ #include "nsDocShell.h"
+ #include "nsDOMAttributeMap.h"
+ #include "nsIContentInlines.h"
+ #include "mozilla/dom/NodeInfo.h"
+ #include "mozilla/dom/DocumentTimeline.h"
+ #include "nsFlexContainerFrame.h"
+@@ -267,16 +271,158 @@ EventStates Element::IntrinsicState() co
+ void Element::NotifyStateChange(EventStates aStates) {
+   Document* doc = GetComposedDoc();
+   if (doc) {
+     nsAutoScriptBlocker scriptBlocker;
+     doc->ContentStateChanged(this, aStates);
+   }
+ }
+ 
++StaticRefPtr<nsIThread> sLayoutThread;
++
++void SignalLayoutWorkDone(Element& aElement) {
++  MOZ_ASSERT(!NS_IsMainThread());
++  aElement.GetExistingExtendedDOMSlots()->mPendingLayoutWork.notify_all();
++}
++
++struct LayoutTask : public Runnable {
++  LayoutTask(PresShell* aPresShell, Element* aElement,
++             PresShell::DirtyRootsList aRoots)
++      : Runnable("LayoutTask"), mPresShell(aPresShell), mElement(aElement),
++        mRoots(std::move(aRoots)) {}
++
++  NS_IMETHOD Run() override {
++    mPresShell->ReflowDirtyRoots(mRoots);
++    SignalLayoutWorkDone(*mElement);
++    return NS_OK;
++  }
++
++  // These raw pointers are ~fine. The shadow root waits for us on destruction.
++  //
++  // The PresShell waits for all layout work to be done too.
++  PresShell* const mPresShell;
++  Element* const mElement;
++  PresShell::DirtyRootsList mRoots;
++};
++
++static void ReportError(const nsINode& aChild,
++                        nsIFrame::CanBeReflowRoot aError) {
++  nsAutoString message;
++  message.Append(aChild.NodeInfo()->LocalName());
++  if (auto* element = Element::FromNode(aChild)) {
++    if (nsAtom* id = element->GetID()) {
++      message.AppendLiteral(u" with id '");
++      message.Append(nsDependentAtomString(id));
++      message.Append(char16_t('\''));
++    }
++  }
++
++  message.AppendLiteral(u" can't be laid out in parallel because ");
++  switch (aError) {
++    case nsIFrame::CanBeReflowRoot::NotEnabled:
++      message.AppendLiteral(u"dynamic reflow roots are not enabled");
++      break;
++    case nsIFrame::CanBeReflowRoot::FlexBasis:
++      message.AppendLiteral(u"it is a flex item with non-fixed flex-basis");
++      break;
++    case nsIFrame::CanBeReflowRoot::InlineOrRubyOrTableOrXul:
++      message.AppendLiteral(
++          u"it is a box which depends on its context (text, table, inline, "
++          u"ruby, xul)");
++      break;
++    case nsIFrame::CanBeReflowRoot::NonFixedSize:
++      message.AppendLiteral(u"it doesn't have a fixed size");
++      break;
++    case nsIFrame::CanBeReflowRoot::NotFixedContainingBlock:
++      message.AppendLiteral(
++          u"it is not a containing-block for fixed-position descendants");
++      break;
++    case nsIFrame::CanBeReflowRoot::NotFlowRoot:
++      message.AppendLiteral(
++          u"it is not a flow-root: floats can bleed through and margins can "
++          u"collapse around it");
++      break;
++    case nsIFrame::CanBeReflowRoot::Subgrid:
++      message.AppendLiteral(u"it is a subgrid");
++      break;
++    case nsIFrame::CanBeReflowRoot::SplitFrame:
++      message.AppendLiteral(u"frame is in a fragmentainer");
++      break;
++    case nsIFrame::CanBeReflowRoot::Yes:
++      MOZ_ASSERT_UNREACHABLE("How?");
++      break;
++  }
++
++  nsContentUtils::ReportToConsoleNonLocalized(
++      message, nsIScriptError::warningFlag, NS_LITERAL_CSTRING("DOM Core"),
++      aChild.OwnerDoc());
++}
++
++void Document::DoBlockOnPendingLayoutWork() {
++  auto roots = std::move(mPendingConcurrentLayoutRoots);
++  for (auto iter = roots.Iter(); !iter.Done(); iter.Next()) {
++    Element* element = iter.Get()->GetKey();
++    auto* slots = element->GetExistingExtendedDOMSlots();
++    {
++      std::unique_lock<std::mutex> lock(slots->mLayoutWorkMutex);
++      if (!slots->mHasPendingLayoutWork) {
++        continue;
++      }
++      slots->mPendingLayoutWork.wait(lock);
++    }
++  }
++}
++
++void Element::Commit() {
++  MOZ_ASSERT(NS_IsMainThread());
++
++  // We flush style and frame changes synchronously here, to figure out whether
++  // we can do layout off the main thread.
++  //
++  // Frame construction changes are much harder, because you do need to know the
++  // boxes of your ancestors for a bunch of stuff. You could optimistically
++  // assume that you're not display: none and you're not going to be in one of
++  // these uncommon cases, not getting you blockified, etc...
++  //
++  // For our purposes, for now, update style synchronously here and if we get
++  // the right frame kind to schedule.
++  nsIFrame* frame = GetPrimaryFrame(FlushType::Frames);
++  if (!frame) {
++    return;
++  }
++
++  auto dynamicReflowRoot = frame->CanBeDynamicReflowRoot();
++  if (dynamicReflowRoot != nsIFrame::CanBeReflowRoot::Yes) {
++    ReportError(*this, dynamicReflowRoot);
++    return;
++  }
++
++  PresShell* ps = frame->PresShell();
++  auto dirtyRoots = ps->TakeDirtyRootsUnder(frame);
++  if (dirtyRoots.IsEmpty()) {
++    return;
++  }
++
++  if (MOZ_UNLIKELY(!sLayoutThread)) {
++    RefPtr<nsIThread> t;
++    NS_NewNamedThread("LayoutThread", getter_AddRefs(t));
++    if (MOZ_UNLIKELY(!t)) {
++      return;
++    }
++    sLayoutThread = std::move(t);
++  }
++
++  OwnerDoc()->AddConcurrentLayoutRoot(*this);
++
++  auto* slots = ExtendedDOMSlots();
++  slots->mHasPendingLayoutWork = true;
++  sLayoutThread->Dispatch(MakeAndAddRef<LayoutTask>(ps, this, std::move(dirtyRoots)));
++
++}
++
+ void Element::UpdateLinkState(EventStates aState) {
+   MOZ_ASSERT(!aState.HasAtLeastOneOfStates(
+                  ~(NS_EVENT_STATE_VISITED | NS_EVENT_STATE_UNVISITED)),
+              "Unexpected link state bits");
+   mState =
+       (mState & ~(NS_EVENT_STATE_VISITED | NS_EVENT_STATE_UNVISITED)) | aState;
+ }
+ 
+@@ -1567,20 +1713,16 @@ nsresult Element::BindToTree(BindContext
+     } else {
+       SetFlags(NODE_IS_IN_SHADOW_TREE);
+       MOZ_ASSERT(aParent.IsContent() &&
+                  aParent.AsContent()->GetContainingShadow());
+       ExtendedDOMSlots()->mContainingShadow =
+           aParent.AsContent()->GetContainingShadow();
+     }
+ 
+-    if (aParent.HasFlag(NODE_IS_IN_OPAQUE_SHADOW_TREE)) {
+-      SetFlags(NODE_IS_IN_OPAQUE_SHADOW_TREE);
+-    }
+-
+     // Clear the lazy frame construction bits.
+     UnsetFlags(NODE_NEEDS_FRAME | NODE_DESCENDANTS_NEED_FRAMES);
+   } else {
+     // If we're not in the doc and not in a shadow tree,
+     // update our subtree pointer.
+     SetSubtreeRootPointer(aParent.SubtreeRoot());
+   }
+ 
+@@ -1806,20 +1948,16 @@ void Element::UnbindFromTree(bool aNullP
+ 
+   if (aNullParent || !mParent->IsInShadowTree()) {
+     UnsetFlags(NODE_IS_IN_SHADOW_TREE);
+ 
+     // Begin keeping track of our subtree root.
+     SetSubtreeRootPointer(aNullParent ? this : mParent->SubtreeRoot());
+   }
+ 
+-  if (aNullParent || !mParent->HasFlag(NODE_IS_IN_OPAQUE_SHADOW_TREE)) {
+-    UnsetFlags(NODE_IS_IN_OPAQUE_SHADOW_TREE);
+-  }
+-
+   if (nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+     if (aNullParent || !mParent->IsInShadowTree()) {
+       slots->mContainingShadow = nullptr;
+     }
+   }
+ 
+   if (document) {
+     // Disconnected must be enqueued whenever a connected custom element becomes
+diff --git a/dom/base/Element.h b/dom/base/Element.h
+--- a/dom/base/Element.h
++++ b/dom/base/Element.h
+@@ -800,16 +800,18 @@ class Element : public FragmentOrElement
+    * @return whether an attribute exists
+    */
+   inline bool HasAttr(int32_t aNameSpaceID, const nsAtom* aName) const;
+ 
+   bool HasAttr(const nsAtom* aAttr) const {
+     return HasAttr(kNameSpaceID_None, aAttr);
+   }
+ 
++  void Commit();
++
+   /**
+    * Determine if an attribute has been set to a non-empty string value. If the
+    * attribute is not set at all, this will return false.
+    *
+    * @param aNameSpaceId the namespace id of the attribute (defaults to
+    *                     kNameSpaceID_None in the overload that omits this arg)
+    * @param aAttr the attribute name
+    */
+diff --git a/dom/base/FragmentOrElement.h b/dom/base/FragmentOrElement.h
+--- a/dom/base/FragmentOrElement.h
++++ b/dom/base/FragmentOrElement.h
+@@ -8,16 +8,17 @@
+  * Base class for all element classes as well as nsDocumentFragment.  This
+  * provides an implementation of nsINode, implements nsIContent, provides
+  * utility methods for subclasses, and so forth.
+  */
+ 
+ #ifndef FragmentOrElement_h___
+ #define FragmentOrElement_h___
+ 
++#include <condition_variable>
+ #include "mozilla/Attributes.h"
+ #include "mozilla/MemoryReporting.h"
+ #include "mozilla/UniquePtr.h"
+ #include "nsCycleCollectionParticipant.h"  // NS_DECL_CYCLE_*
+ #include "nsIContent.h"                    // base class
+ #include "nsIHTMLCollection.h"
+ #include "nsDataHashtable.h"
+ 
+@@ -159,16 +160,20 @@ class FragmentOrElement : public nsICont
+     nsExtendedDOMSlots();
+     ~nsExtendedDOMSlots();
+ 
+     void TraverseExtendedSlots(nsCycleCollectionTraversalCallback&) final;
+     void UnlinkExtendedSlots() final;
+ 
+     size_t SizeOfExcludingThis(MallocSizeOf aMallocSizeOf) const final;
+ 
++    std::mutex mLayoutWorkMutex;
++    std::condition_variable mPendingLayoutWork;
++    Atomic<bool, Relaxed> mHasPendingLayoutWork;
++
+     /**
+      * SMIL Overridde style rules (for SMIL animation of CSS properties)
+      * @see Element::GetSMILOverrideStyle
+      */
+     RefPtr<nsDOMCSSAttributeDeclaration> mSMILOverrideStyle;
+ 
+     /**
+      * Holds any SMIL override style declaration for this element.
+@@ -285,16 +290,17 @@ class FragmentOrElement : public nsICont
+ 
+     if (!slots->GetExtendedContentSlots()) {
+       slots->SetExtendedContentSlots(CreateExtendedSlots(), true);
+     }
+ 
+     return static_cast<nsExtendedDOMSlots*>(slots->GetExtendedContentSlots());
+   }
+ 
++ public: // HACK
+   const nsExtendedDOMSlots* GetExistingExtendedDOMSlots() const {
+     return static_cast<const nsExtendedDOMSlots*>(
+         GetExistingExtendedContentSlots());
+   }
+ 
+   nsExtendedDOMSlots* GetExistingExtendedDOMSlots() {
+     return static_cast<nsExtendedDOMSlots*>(GetExistingExtendedContentSlots());
+   }
+diff --git a/dom/base/OpaqueShadowRoot.cpp b/dom/base/OpaqueShadowRoot.cpp
+--- a/dom/base/OpaqueShadowRoot.cpp
++++ b/dom/base/OpaqueShadowRoot.cpp
+@@ -134,157 +134,16 @@ void OpaqueShadowRoot::Render(const nsTA
+           }
+         }
+         break;
+       }
+       case ChangeType::EndGuard_:
+         break;
+     }
+   }
+-  AfterRender();
+-}
+-
+-static void ReportError(const nsINode& aChild,
+-                        nsIFrame::CanBeReflowRoot aError) {
+-  nsAutoString message;
+-  message.Append(aChild.NodeInfo()->LocalName());
+-  if (auto* element = Element::FromNode(aChild)) {
+-    if (nsAtom* id = element->GetID()) {
+-      message.AppendLiteral(u" with id '");
+-      message.Append(nsDependentAtomString(id));
+-      message.Append(char16_t('\''));
+-    }
+-  }
+-
+-  message.AppendLiteral(u" can't be laid out in parallel because ");
+-  switch (aError) {
+-    case nsIFrame::CanBeReflowRoot::NotEnabled:
+-      message.AppendLiteral(u"dynamic reflow roots are not enabled");
+-      break;
+-    case nsIFrame::CanBeReflowRoot::FlexBasis:
+-      message.AppendLiteral(u"it is a flex item with non-fixed flex-basis");
+-      break;
+-    case nsIFrame::CanBeReflowRoot::InlineOrRubyOrTableOrXul:
+-      message.AppendLiteral(
+-          u"it is a box which depends on its context (text, table, inline, "
+-          u"ruby, xul)");
+-      break;
+-    case nsIFrame::CanBeReflowRoot::NonFixedSize:
+-      message.AppendLiteral(u"it doesn't have a fixed size");
+-      break;
+-    case nsIFrame::CanBeReflowRoot::NotFixedContainingBlock:
+-      message.AppendLiteral(
+-          u"it is not a containing-block for fixed-position descendants");
+-      break;
+-    case nsIFrame::CanBeReflowRoot::NotFlowRoot:
+-      message.AppendLiteral(
+-          u"it is not a flow-root: floats can bleed through and margins can "
+-          u"collapse around it");
+-      break;
+-    case nsIFrame::CanBeReflowRoot::Subgrid:
+-      message.AppendLiteral(u"it is a subgrid");
+-      break;
+-    case nsIFrame::CanBeReflowRoot::Yes:
+-      MOZ_ASSERT_UNREACHABLE("How?");
+-      break;
+-  }
+-
+-  nsContentUtils::ReportToConsoleNonLocalized(
+-      message, nsIScriptError::warningFlag, NS_LITERAL_CSTRING("DOM Core"),
+-      aChild.OwnerDoc());
+-}
+-
+-StaticRefPtr<nsIThread> sLayoutThread;
+-
+-struct LayoutTask : public Runnable {
+-  LayoutTask(PresShell* aPresShell, ShadowRoot* aShadow,
+-             PresShell::DirtyRootsList aRoots)
+-      : Runnable("LayoutTask"), mPresShell(aPresShell), mShadow(aShadow),
+-        mRoots(std::move(aRoots)) {
+-    mShadow->SetHasPendingLayoutWork();
+-  }
+-
+-  NS_IMETHOD Run() override {
+-    mPresShell->ReflowDirtyRoots(mRoots);
+-    mShadow->SignalLayoutWorkDone();
+-    return NS_OK;
+-  }
+-
+-  // These raw pointers are ~fine. The shadow root waits for us on destruction.
+-  //
+-  // The PresShell waits for all layout work to be done too.
+-  PresShell* const mPresShell;
+-  ShadowRoot* const mShadow;
+-  PresShell::DirtyRootsList mRoots;
+-};
+-
+-void OpaqueShadowRoot::AfterRender() {
+-  MOZ_ASSERT(NS_IsMainThread());
+-  if (MOZ_UNLIKELY(!sLayoutThread)) {
+-    RefPtr<nsIThread> t;
+-    NS_NewNamedThread("LayoutThread", getter_AddRefs(t));
+-    if (MOZ_UNLIKELY(!t)) {
+-      return;
+-    }
+-    sLayoutThread = std::move(t);
+-  }
+-
+-  // We flush style and frame changes synchronously here, to figure out whether
+-  // we can do layout off the main thread.
+-  //
+-  // We could theoretically also run styling off the main thread, with some
+-  // constraints like:
+-  //
+-  //  * It couldn't inherit from the outside. So that's not amazing.
+-  //  * It couldn't use stuff like :host() selectors with descendant combinators
+-  //    and so on.
+-  //
+-  // Frame construction changes are much harder, because you do need to know the
+-  // boxes of your ancestors for a bunch of stuff. You could optimistically
+-  // assume that you're not display: none and you're not going to be in one of
+-  // these uncommon cases, not getting you blockified, etc...
+-  //
+-  // For our purposes, for now, update style synchronously here and if we get
+-  // the right frame kind to schedule.
+-  mShadowRoot->OwnerDoc()->FlushPendingNotifications(FlushType::Frames);
+-
+-  PresShell::DirtyRootsList dirtyRoots;
+-  PresShell* ps = nullptr;
+-  for (auto* child = mShadowRoot->GetFirstChild(); child;
+-       child = child->GetNextSibling()) {
+-    auto* frame = child->AsContent()->GetPrimaryFrame();
+-    if (!frame) {
+-      continue;
+-    }
+-    auto dynamicReflowRoot = frame->CanBeDynamicReflowRoot();
+-    if (dynamicReflowRoot != nsIFrame::CanBeReflowRoot::Yes) {
+-      ReportError(*child, dynamicReflowRoot);
+-      continue;
+-    }
+-
+-    ps = frame->PresShell();
+-    auto roots = ps->TakeDirtyRootsUnder(frame);
+-    if (roots.IsEmpty()) {
+-      continue;
+-    }
+-    if (dirtyRoots.IsEmpty()) {
+-      dirtyRoots = std::move(roots);
+-    } else {
+-      // FIXME: Could probably be better.
+-      do {
+-        dirtyRoots.Add(roots.PopShallowestRoot());
+-      } while (!roots.IsEmpty());
+-    }
+-  }
+-
+-  if (dirtyRoots.IsEmpty()) {
+-    return;
+-  }
+-
+-  sLayoutThread->Dispatch(MakeAndAddRef<LayoutTask>(ps, mShadowRoot, std::move(dirtyRoots)));
+ }
+ 
+ JSObject* OpaqueShadowRoot::WrapObject(JSContext* aCx,
+                                        JS::Handle<JSObject*> aGivenProto) {
+   return OpaqueShadowRoot_Binding::Wrap(aCx, this, aGivenProto);
+ }
+ 
+ }  // namespace dom
+diff --git a/dom/base/ShadowRoot.cpp b/dom/base/ShadowRoot.cpp
+--- a/dom/base/ShadowRoot.cpp
++++ b/dom/base/ShadowRoot.cpp
+@@ -59,43 +59,17 @@ ShadowRoot::ShadowRoot(Element* aElement
+   ClearSubtreeRootPointer();
+ 
+   SetFlags(NODE_IS_IN_SHADOW_TREE);
+   Bind();
+ 
+   ExtendedDOMSlots()->mContainingShadow = this;
+ }
+ 
+-void ShadowRoot::WaitForLayoutWork() {
+-  MOZ_ASSERT(NS_IsMainThread());
+-  std::unique_lock<std::mutex> lock(mLayoutWorkMutex);
+-  if (mPendingLayoutWork) {
+-    mLayoutWorkNotifier.wait(lock);
+-    MOZ_ASSERT(!mPendingLayoutWork);
+-  }
+-}
+-
+-void ShadowRoot::SetHasPendingLayoutWork() {
+-  WaitForLayoutWork();
+-  mPendingLayoutWork = true;
+-}
+-
+-void ShadowRoot::SignalLayoutWorkDone() {
+-  MOZ_ASSERT(!NS_IsMainThread());
+-
+-  std::lock_guard<std::mutex> lock(mLayoutWorkMutex);
+-
+-  MOZ_ASSERT(mPendingLayoutWork);
+-  mPendingLayoutWork = false;
+-  mLayoutWorkNotifier.notify_all();
+-}
+-
+ ShadowRoot::~ShadowRoot() {
+-  WaitForLayoutWork();
+-
+   if (IsInComposedDoc()) {
+     OwnerDoc()->RemoveComposedDocShadowRoot(*this);
+   }
+ 
+   MOZ_DIAGNOSTIC_ASSERT(!OwnerDoc()->IsComposedDocShadowRoot(*this));
+ 
+   UnsetFlags(NODE_IS_IN_SHADOW_TREE);
+ 
+@@ -136,16 +110,17 @@ void ShadowRoot::CloneInternalDataFrom(S
+ }
+ 
+ nsresult ShadowRoot::Bind() {
+   MOZ_ASSERT(!IsInComposedDoc(), "Forgot to unbind?");
+   if (Host()->IsInComposedDoc()) {
+     SetIsConnected(true);
+     Document* doc = OwnerDoc();
+     doc->AddComposedDocShadowRoot(*this);
++
+     // If our stylesheets somehow mutated when we were disconnected, we need to
+     // ensure that our style data gets flushed as appropriate.
+     if (mServoStyles && Servo_AuthorStyles_IsDirty(mServoStyles.get())) {
+       doc->RecordShadowStyleChange(*this);
+     }
+   }
+ 
+   BindContext context(*this);
+diff --git a/dom/base/ShadowRoot.h b/dom/base/ShadowRoot.h
+--- a/dom/base/ShadowRoot.h
++++ b/dom/base/ShadowRoot.h
+@@ -249,20 +249,16 @@ class ShadowRoot final : public Document
+   virtual bool GetValueMissingState(const nsAString& aName) const override {
+     return DocumentOrShadowRoot::GetValueMissingState(aName);
+   }
+   virtual void SetValueMissingState(const nsAString& aName,
+                                     bool aValue) override {
+     return DocumentOrShadowRoot::SetValueMissingState(aName, aValue);
+   }
+ 
+-  void SetHasPendingLayoutWork();
+-  void SignalLayoutWorkDone();
+-  void WaitForLayoutWork();
+-
+  protected:
+   // FIXME(emilio): This will need to become more fine-grained.
+   void ApplicableRulesChanged();
+ 
+   virtual ~ShadowRoot();
+ 
+   nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+ 
+@@ -277,20 +273,15 @@ class ShadowRoot final : public Document
+   // the given name. The slots are stored as a weak pointer because the elements
+   // are in the shadow tree and should be kept alive by its parent.
+   nsClassHashtable<nsStringHashKey, SlotArray> mSlotMap;
+ 
+   // Unordered array of all elements that have a part attribute in this shadow
+   // tree.
+   nsTArray<const Element*> mParts;
+ 
+-  // FIXME: I suspect this could be more light-weight.
+-  std::mutex mLayoutWorkMutex;
+-  std::condition_variable mLayoutWorkNotifier;
+-  Atomic<bool> mPendingLayoutWork {false};
+-
+   bool mIsUAWidget;
+ };
+ 
+ }  // namespace dom
+ }  // namespace mozilla
+ 
+ #endif  // mozilla_dom_shadowroot_h__
+diff --git a/dom/base/nsINode.cpp b/dom/base/nsINode.cpp
+--- a/dom/base/nsINode.cpp
++++ b/dom/base/nsINode.cpp
+@@ -2739,16 +2739,23 @@ already_AddRefed<AccessibleNode> nsINode
+     }
+   }
+   return anode.forget();
+ #else
+   return nullptr;
+ #endif
+ }
+ 
++void nsINode::BlockOnPendingLayoutWorkIfNeeded(MutationKind) {
++  // TODO(emilio): This blocks unconditionally, which is needed to handle
++  // removal of ancestors of the layout roots. However, this could be be
++  // improved relatively straight-forward.
++  OwnerDoc()->BlockOnPendingLayoutWork();
++}
++
+ void nsINode::AddSizeOfExcludingThis(nsWindowSizes& aSizes,
+                                      size_t* aNodeSize) const {
+   EventListenerManager* elm = GetExistingListenerManager();
+   if (elm) {
+     *aNodeSize += elm->SizeOfIncludingThis(aSizes.mState.mMallocSizeOf);
+   }
+ 
+   // Measurement of the following members may be added later if DMD finds it is
+@@ -2956,18 +2963,16 @@ Element* nsINode::GetElementById(const n
+       return kid->AsElement();
+     }
+   }
+   return nullptr;
+ }
+ 
+ JSObject* nsINode::WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) {
+-  MOZ_RELEASE_ASSERT(!HasFlag(NODE_IS_IN_OPAQUE_SHADOW_TREE));
+-
+   // Make sure one of these is true
+   // (1) our owner document has a script handling object,
+   // (2) Our owner document has had a script handling object, or has been marked
+   //     to have had one,
+   // (3) we are running a privileged script.
+   // Event handling is possible only if (1). If (2) event handling is
+   // prevented.
+   // If the document has never had a script handling object, untrusted
+diff --git a/dom/base/nsINode.h b/dom/base/nsINode.h
+--- a/dom/base/nsINode.h
++++ b/dom/base/nsINode.h
+@@ -184,19 +184,18 @@ enum {
+ 
+   NODE_HAS_BEEN_IN_UA_WIDGET = NODE_FLAG_BIT(15),
+ 
+   // Set if the node has a nonce value and a header delivered CSP.
+   NODE_HAS_NONCE_AND_HEADER_CSP = NODE_FLAG_BIT(16),
+ 
+   NODE_KEEPS_DOMARENA = NODE_FLAG_BIT(17),
+ 
+-  NODE_IS_IN_OPAQUE_SHADOW_TREE = NODE_FLAG_BIT(18),
+   // Remaining bits are node type specific.
+-  NODE_TYPE_SPECIFIC_BITS_OFFSET = 19
++  NODE_TYPE_SPECIFIC_BITS_OFFSET = 18
+ };
+ 
+ // Make sure we have space for our bits
+ #define ASSERT_NODE_FLAGS_SPACE(n)                         \
+   static_assert(WRAPPER_CACHE_FLAGS_BITS_USED + (n) <=     \
+                     sizeof(nsWrapperCache::FlagsType) * 8, \
+                 "Not enough space for our bits")
+ ASSERT_NODE_FLAGS_SPACE(NODE_TYPE_SPECIFIC_BITS_OFFSET);
+@@ -1928,16 +1927,22 @@ class nsINode : public mozilla::dom::Eve
+   // After calling UnbindObject nsINode object doesn't keep
+   // aObject alive anymore.
+   void UnbindObject(nsISupports* aObject);
+ 
+   void GenerateXPath(nsAString& aResult);
+ 
+   already_AddRefed<mozilla::dom::AccessibleNode> GetAccessibleNode();
+ 
++  enum class MutationKind {
++    Removal,
++    InsertionOrChange,
++  };
++  void BlockOnPendingLayoutWorkIfNeeded(MutationKind);
++
+   /**
+    * Returns the length of this node, as specified at
+    * <http://dvcs.w3.org/hg/domcore/raw-file/tip/Overview.html#concept-node-length>
+    */
+   uint32_t Length() const;
+ 
+   void GetNodeName(mozilla::dom::DOMString& aNodeName) {
+     const nsString& nodeName = NodeName();
+diff --git a/dom/webidl/Element.webidl b/dom/webidl/Element.webidl
+--- a/dom/webidl/Element.webidl
++++ b/dom/webidl/Element.webidl
+@@ -57,16 +57,18 @@ interface Element : Node {
+   void removeAttributeNS(DOMString? namespace, DOMString localName);
+   [Pure]
+   boolean hasAttribute(DOMString name);
+   [Pure]
+   boolean hasAttributeNS(DOMString? namespace, DOMString localName);
+   [Pure]
+   boolean hasAttributes();
+ 
++  void commit();
++
+   [Throws, Pure]
+   Element? closest(DOMString selector);
+ 
+   [Throws, Pure]
+   boolean matches(DOMString selector);
+   [Throws, Pure, BinaryName="matches"]
+   boolean webkitMatchesSelector(DOMString selector);
+ 
+diff --git a/layout/base/PresShell.cpp b/layout/base/PresShell.cpp
+--- a/layout/base/PresShell.cpp
++++ b/layout/base/PresShell.cpp
+@@ -4110,24 +4110,17 @@ void PresShell::DoFlushPendingNotificati
+   };
+   // clang-format on
+   AUTO_PROFILER_LABEL_DYNAMIC_CSTR_NONSENSITIVE(
+       "PresShell::DoFlushPendingNotifications", LAYOUT,
+       flushTypeNames[flushType]);
+ #endif
+ 
+   if (flushType >= FlushType::InterruptibleLayout) {
+-    // FIXME: Unsound, should either be all shadow roots, or we should keep
+-    // track of the ones that actually have pending layout activity.
+-    //
+-    // Fine for our demo purposes though.
+-    auto& set = mDocument->ComposedShadowRoots();
+-    for (auto iter = set.ConstIter(); !iter.Done(); iter.Next()) {
+-      iter.Get()->GetKey()->WaitForLayoutWork();
+-    }
++    mDocument->BlockOnPendingLayoutWork();
+   }
+ 
+ #ifdef ACCESSIBILITY
+ #  ifdef DEBUG
+   if (nsAccessibilityService* accService = GetAccService()) {
+     NS_ASSERTION(!accService->IsProcessingRefreshDriverNotification(),
+                  "Flush during accessible tree update!");
+   }
+@@ -4341,16 +4334,19 @@ void PresShell::DoFlushPendingNotificati
+ MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::CharacterDataChanged(
+     nsIContent* aContent, const CharacterDataChangeInfo& aInfo) {
+   MOZ_ASSERT(!nsContentUtils::IsSafeToRunScript());
+   MOZ_ASSERT(!mIsDocumentGone, "Unexpected CharacterDataChanged");
+   MOZ_ASSERT(aContent->OwnerDoc() == mDocument, "Unexpected document");
+ 
+   nsAutoCauseReflowNotifier crNotifier(this);
+ 
++  aContent->BlockOnPendingLayoutWorkIfNeeded(
++      nsINode::MutationKind::InsertionOrChange);
++
+   mPresContext->RestyleManager()->CharacterDataChanged(aContent, aInfo);
+   mFrameConstructor->CharacterDataChanged(aContent, aInfo);
+ }
+ 
+ MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::ContentStateChanged(
+     Document* aDocument, nsIContent* aContent, EventStates aStateMask) {
+   MOZ_ASSERT(!nsContentUtils::IsSafeToRunScript());
+   MOZ_ASSERT(!mIsDocumentGone, "Unexpected ContentStateChanged");
+@@ -4425,16 +4421,19 @@ MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShe
+              aFirstNewContent->GetParent()->IsShadowRoot());
+ 
+   if (!mDidInitialize) {
+     return;
+   }
+ 
+   nsAutoCauseReflowNotifier crNotifier(this);
+ 
++  aFirstNewContent->GetParentNode()->BlockOnPendingLayoutWorkIfNeeded(
++      nsINode::MutationKind::InsertionOrChange);
++
+   // Call this here so it only happens for real content mutations and
+   // not cases when the frame constructor calls its own methods to force
+   // frame reconstruction.
+   mPresContext->RestyleManager()->ContentAppended(aFirstNewContent);
+ 
+   mFrameConstructor->ContentAppended(
+       aFirstNewContent, nsCSSFrameConstructor::InsertionKind::Async);
+ }
+@@ -4446,32 +4445,37 @@ MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShe
+   MOZ_ASSERT(aChild->OwnerDoc() == mDocument, "Unexpected document");
+ 
+   if (!mDidInitialize) {
+     return;
+   }
+ 
+   nsAutoCauseReflowNotifier crNotifier(this);
+ 
++  aChild->GetParentNode()->BlockOnPendingLayoutWorkIfNeeded(
++      nsINode::MutationKind::InsertionOrChange);
++
+   // Call this here so it only happens for real content mutations and
+   // not cases when the frame constructor calls its own methods to force
+   // frame reconstruction.
+   mPresContext->RestyleManager()->ContentInserted(aChild);
+ 
+   mFrameConstructor->ContentInserted(
+       aChild, nsCSSFrameConstructor::InsertionKind::Async);
+ }
+ 
+ MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::ContentRemoved(
+     nsIContent* aChild, nsIContent* aPreviousSibling) {
+   MOZ_ASSERT(!nsContentUtils::IsSafeToRunScript());
+   MOZ_ASSERT(!mIsDocumentGone, "Unexpected ContentRemoved");
+   MOZ_ASSERT(aChild->OwnerDoc() == mDocument, "Unexpected document");
+   nsINode* container = aChild->GetParentNode();
+ 
++  container->BlockOnPendingLayoutWorkIfNeeded(nsINode::MutationKind::Removal);
++
+   // Notify the ESM that the content has been removed, so that
+   // it can clean up any state related to the content.
+ 
+   mPresContext->EventStateManager()->ContentRemoved(mDocument, aChild);
+ 
+   nsAutoCauseReflowNotifier crNotifier(this);
+ 
+   // Call this here so it only happens for real content mutations and
+

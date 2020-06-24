@@ -1,0 +1,1451 @@
+
+# HG changeset patch
+# User Emilio Cobos Álvarez <emilio@crisal.io>
+# Date 1585080872 -3600
+# Node ID 24c71c926169a4b08a85f18fd2885a7ebdf11532
+# Parent  b628c12b324a4ad770f64fb0533019e5edb44121
+Multiple fixes mostly to avoid refcounting stuff off the main thread.
+
+diff --git a/build/clang-plugin/ThreadAllows.txt b/build/clang-plugin/ThreadAllows.txt
+--- a/build/clang-plugin/ThreadAllows.txt
++++ b/build/clang-plugin/ThreadAllows.txt
+@@ -41,16 +41,17 @@ HTML5 Parser
+ ICS parser
+ IMAP
+ IPC Launch
+ IPDL Background
+ IdentityCrypto
+ ImageBridgeChld
+ LS Thread
+ LayerScope
++LayoutThread
+ MDCDMThread
+ MWQThread
+ MediaCache
+ MediaTelemetry
+ MediaTrackGrph
+ mtransport
+ NamedPipeSrv
+ NetPredictClean
+diff --git a/dom/base/CharacterData.cpp b/dom/base/CharacterData.cpp
+--- a/dom/base/CharacterData.cpp
++++ b/dom/base/CharacterData.cpp
+@@ -528,17 +528,17 @@ nsresult CharacterData::SetText(const ch
+ }
+ 
+ nsresult CharacterData::AppendText(const char16_t* aBuffer, uint32_t aLength,
+                                    bool aNotify) {
+   return SetTextInternal(mText.GetLength(), 0, aBuffer, aLength, aNotify);
+ }
+ 
+ bool CharacterData::TextIsOnlyWhitespace() {
+-  MOZ_ASSERT(NS_IsMainThread());
++  // MOZ_ASSERT(NS_IsMainThread());
+   if (!ThreadSafeTextIsOnlyWhitespace()) {
+     UnsetFlags(NS_TEXT_IS_ONLY_WHITESPACE);
+     SetFlags(NS_CACHED_TEXT_IS_ONLY_WHITESPACE);
+     return false;
+   }
+ 
+   SetFlags(NS_CACHED_TEXT_IS_ONLY_WHITESPACE | NS_TEXT_IS_ONLY_WHITESPACE);
+   return true;
+diff --git a/dom/base/Element.cpp b/dom/base/Element.cpp
+--- a/dom/base/Element.cpp
++++ b/dom/base/Element.cpp
+@@ -1119,30 +1119,25 @@ already_AddRefed<ShadowRoot> Element::At
+   }
+ 
+   /**
+    * 6. Return shadow.
+    */
+   return shadowRoot.forget();
+ }
+ 
+-constexpr nsLiteralString kTestingString = NS_LITERAL_STRING(
+-  "<div id='test'>Test</div>");
+-
+ already_AddRefed<OpaqueShadowRoot> Element::AttachOpaqueShadow(
+     ErrorResult& aRv) {
+   ShadowRootInit init;
+   init.mMode = ShadowRootMode::Closed;
+   RefPtr<ShadowRoot> shadow = AttachShadow(init, aRv);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
+-  ShadowRoot* s = shadow.get();
+   auto opaque = MakeRefPtr<OpaqueShadowRoot>(std::move(shadow));
+-  s->SetInnerHTML(kTestingString, IgnoreErrors());
+   return opaque.forget();
+ }
+ 
+ void Element::AttachAndSetUAShadowRoot() {
+   MOZ_DIAGNOSTIC_ASSERT(!CanAttachShadowDOM(),
+                         "Cannot be used to attach UI shadow DOM");
+ 
+   // Attach the UA Widget Shadow Root in a runnable so that the code runs
+diff --git a/dom/base/OpaqueShadowRoot.cpp b/dom/base/OpaqueShadowRoot.cpp
+--- a/dom/base/OpaqueShadowRoot.cpp
++++ b/dom/base/OpaqueShadowRoot.cpp
+@@ -8,16 +8,18 @@
+ #include "nsHashKeys.h"
+ #include "nsTextNode.h"
+ #include "mozilla/dom/Document.h"
+ #include "mozilla/dom/Element.h"
+ #include "mozilla/dom/ShadowRoot.h"
+ #include "mozilla/dom/OpaqueShadowRootBinding.h"
+ #include "nsIFrame.h"
+ #include "nsIScriptError.h"
++#include "nsThread.h"
++#include "nsThreadUtils.h"
+ 
+ #include <condition_variable>
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(OpaqueShadowRoot, mShadowRoot,
+                                       mIdentifierMap)
+@@ -39,18 +41,17 @@ void OpaqueShadowRoot::Render(const nsTA
+   for (auto& change : aChanges) {
+     if (change.mId.IsEmpty()) {
+       return aError.ThrowTypeError("Need the id");
+     }
+ 
+     switch (change.mType) {
+       case ChangeType::CreateElement: {
+         if (!change.mTagName.WasPassed() || change.mTagName.Value().IsEmpty()) {
+-          aError.ThrowTypeError("Need a non-empty tagName for CreateElement");
+-          return;
++          return aError.ThrowTypeError("Need a non-empty tagName for CreateElement");
+         }
+         RefPtr<nsINode>& node = mIdentifierMap.GetOrInsert(change.mId);
+         if (node) {
+           return aError.ThrowTypeError("Already have a node with this id");
+         }
+         RefPtr<Element> element = mShadowRoot->OwnerDoc()->CreateElement(
+             change.mTagName.Value(), ElementCreationOptionsOrString(), aError);
+         if (aError.Failed()) {
+@@ -133,16 +134,17 @@ void OpaqueShadowRoot::Render(const nsTA
+           }
+         }
+         break;
+       }
+       case ChangeType::EndGuard_:
+         break;
+     }
+   }
++  AfterRender();
+ }
+ 
+ static void ReportError(const nsINode& aChild,
+                         nsIFrame::CanBeReflowRoot aError) {
+   nsAutoString message;
+   message.Append(aChild.NodeInfo()->LocalName());
+   if (auto* element = Element::FromNode(aChild)) {
+     if (nsAtom* id = element->GetID()) {
+@@ -185,17 +187,51 @@ static void ReportError(const nsINode& a
+       break;
+   }
+ 
+   nsContentUtils::ReportToConsoleNonLocalized(
+       message, nsIScriptError::warningFlag, NS_LITERAL_CSTRING("DOM Core"),
+       aChild.OwnerDoc());
+ }
+ 
++StaticRefPtr<nsIThread> sLayoutThread;
++
++struct LayoutTask : public Runnable {
++  LayoutTask(PresShell* aPresShell, ShadowRoot* aShadow,
++             PresShell::DirtyRootsList aRoots)
++      : Runnable("LayoutTask"), mPresShell(aPresShell), mShadow(aShadow),
++        mRoots(std::move(aRoots)) {
++    mShadow->SetHasPendingLayoutWork();
++  }
++
++  NS_IMETHOD Run() override {
++    mPresShell->ReflowDirtyRoots(mRoots);
++    mShadow->SignalLayoutWorkDone();
++    return NS_OK;
++  }
++
++  // These raw pointers are ~fine. The shadow root waits for us on destruction.
++  //
++  // The PresShell waits for all layout work to be done too.
++  PresShell* const mPresShell;
++  ShadowRoot* const mShadow;
++  PresShell::DirtyRootsList mRoots;
++};
++
+ void OpaqueShadowRoot::AfterRender() {
++  MOZ_ASSERT(NS_IsMainThread());
++  if (MOZ_UNLIKELY(!sLayoutThread)) {
++    RefPtr<nsIThread> t;
++    NS_NewNamedThread("LayoutThread", getter_AddRefs(t));
++    if (MOZ_UNLIKELY(!t)) {
++      return;
++    }
++    sLayoutThread = std::move(t);
++  }
++
+   // We flush style and frame changes synchronously here, to figure out whether
+   // we can do layout off the main thread.
+   //
+   // We could theoretically also run styling off the main thread, with some
+   // constraints like:
+   //
+   //  * It couldn't inherit from the outside. So that's not amazing.
+   //  * It couldn't use stuff like :host() selectors with descendant combinators
+@@ -205,33 +241,50 @@ void OpaqueShadowRoot::AfterRender() {
+   // boxes of your ancestors for a bunch of stuff. You could optimistically
+   // assume that you're not display: none and you're not going to be in one of
+   // these uncommon cases, not getting you blockified, etc...
+   //
+   // For our purposes, for now, update style synchronously here and if we get
+   // the right frame kind to schedule.
+   mShadowRoot->OwnerDoc()->FlushPendingNotifications(FlushType::Frames);
+ 
++  PresShell::DirtyRootsList dirtyRoots;
++  PresShell* ps = nullptr;
+   for (auto* child = mShadowRoot->GetFirstChild(); child;
+        child = child->GetNextSibling()) {
+     auto* frame = child->AsContent()->GetPrimaryFrame();
+     if (!frame) {
+       continue;
+     }
+     auto dynamicReflowRoot = frame->CanBeDynamicReflowRoot();
+     if (dynamicReflowRoot != nsIFrame::CanBeReflowRoot::Yes) {
+       ReportError(*child, dynamicReflowRoot);
+       continue;
+     }
+ 
+-    auto dirtyRoots = frame->PresShell()->TakeDirtyRootsUnder(frame);
+-    if (dirtyRoots.IsEmpty()) {
++    ps = frame->PresShell();
++    auto roots = ps->TakeDirtyRootsUnder(frame);
++    if (roots.IsEmpty()) {
+       continue;
+     }
++    if (dirtyRoots.IsEmpty()) {
++      dirtyRoots = std::move(roots);
++    } else {
++      // FIXME: Could probably be better.
++      do {
++        dirtyRoots.Add(roots.PopShallowestRoot());
++      } while (!roots.IsEmpty());
++    }
+   }
++
++  if (dirtyRoots.IsEmpty()) {
++    return;
++  }
++
++  sLayoutThread->Dispatch(MakeAndAddRef<LayoutTask>(ps, mShadowRoot, std::move(dirtyRoots)));
+ }
+ 
+ JSObject* OpaqueShadowRoot::WrapObject(JSContext* aCx,
+                                        JS::Handle<JSObject*> aGivenProto) {
+   return OpaqueShadowRoot_Binding::Wrap(aCx, this, aGivenProto);
+ }
+ 
+ }  // namespace dom
+diff --git a/dom/base/ShadowRoot.cpp b/dom/base/ShadowRoot.cpp
+--- a/dom/base/ShadowRoot.cpp
++++ b/dom/base/ShadowRoot.cpp
+@@ -59,17 +59,43 @@ ShadowRoot::ShadowRoot(Element* aElement
+   ClearSubtreeRootPointer();
+ 
+   SetFlags(NODE_IS_IN_SHADOW_TREE);
+   Bind();
+ 
+   ExtendedDOMSlots()->mContainingShadow = this;
+ }
+ 
++void ShadowRoot::WaitForLayoutWork() {
++  MOZ_ASSERT(NS_IsMainThread());
++  std::unique_lock<std::mutex> lock(mLayoutWorkMutex);
++  if (mPendingLayoutWork) {
++    mLayoutWorkNotifier.wait(lock);
++    MOZ_ASSERT(!mPendingLayoutWork);
++  }
++}
++
++void ShadowRoot::SetHasPendingLayoutWork() {
++  WaitForLayoutWork();
++  mPendingLayoutWork = true;
++}
++
++void ShadowRoot::SignalLayoutWorkDone() {
++  MOZ_ASSERT(!NS_IsMainThread());
++
++  std::lock_guard<std::mutex> lock(mLayoutWorkMutex);
++
++  MOZ_ASSERT(mPendingLayoutWork);
++  mPendingLayoutWork = false;
++  mLayoutWorkNotifier.notify_all();
++}
++
+ ShadowRoot::~ShadowRoot() {
++  WaitForLayoutWork();
++
+   if (IsInComposedDoc()) {
+     OwnerDoc()->RemoveComposedDocShadowRoot(*this);
+   }
+ 
+   MOZ_DIAGNOSTIC_ASSERT(!OwnerDoc()->IsComposedDocShadowRoot(*this));
+ 
+   UnsetFlags(NODE_IS_IN_SHADOW_TREE);
+ 
+diff --git a/dom/base/ShadowRoot.h b/dom/base/ShadowRoot.h
+--- a/dom/base/ShadowRoot.h
++++ b/dom/base/ShadowRoot.h
+@@ -13,16 +13,18 @@
+ #include "mozilla/dom/NameSpaceConstants.h"
+ #include "mozilla/dom/ShadowRootBinding.h"
+ #include "mozilla/ServoBindings.h"
+ #include "nsCOMPtr.h"
+ #include "nsCycleCollectionParticipant.h"
+ #include "nsIRadioGroupContainer.h"
+ #include "nsStubMutationObserver.h"
+ #include "nsTHashtable.h"
++#include <mutex>
++#include <condition_variable>
+ 
+ class nsAtom;
+ class nsIContent;
+ class nsXBLPrototypeBinding;
+ 
+ namespace mozilla {
+ 
+ class EventChainPreVisitor;
+@@ -247,16 +249,20 @@ class ShadowRoot final : public Document
+   virtual bool GetValueMissingState(const nsAString& aName) const override {
+     return DocumentOrShadowRoot::GetValueMissingState(aName);
+   }
+   virtual void SetValueMissingState(const nsAString& aName,
+                                     bool aValue) override {
+     return DocumentOrShadowRoot::SetValueMissingState(aName, aValue);
+   }
+ 
++  void SetHasPendingLayoutWork();
++  void SignalLayoutWorkDone();
++  void WaitForLayoutWork();
++
+  protected:
+   // FIXME(emilio): This will need to become more fine-grained.
+   void ApplicableRulesChanged();
+ 
+   virtual ~ShadowRoot();
+ 
+   nsresult Clone(dom::NodeInfo*, nsINode** aResult) const override;
+ 
+@@ -271,15 +277,20 @@ class ShadowRoot final : public Document
+   // the given name. The slots are stored as a weak pointer because the elements
+   // are in the shadow tree and should be kept alive by its parent.
+   nsClassHashtable<nsStringHashKey, SlotArray> mSlotMap;
+ 
+   // Unordered array of all elements that have a part attribute in this shadow
+   // tree.
+   nsTArray<const Element*> mParts;
+ 
++  // FIXME: I suspect this could be more light-weight.
++  std::mutex mLayoutWorkMutex;
++  std::condition_variable mLayoutWorkNotifier;
++  Atomic<bool> mPendingLayoutWork {false};
++
+   bool mIsUAWidget;
+ };
+ 
+ }  // namespace dom
+ }  // namespace mozilla
+ 
+ #endif  // mozilla_dom_shadowroot_h__
+diff --git a/dom/base/nsINode.cpp b/dom/base/nsINode.cpp
+--- a/dom/base/nsINode.cpp
++++ b/dom/base/nsINode.cpp
+@@ -299,16 +299,22 @@ class IsItemInRangeComparator {
+   const uint32_t mEndOffset;
+   nsContentUtils::ComparePointsCache* mCache;
+ };
+ 
+ bool nsINode::IsSelected(const uint32_t aStartOffset,
+                          const uint32_t aEndOffset) const {
+   MOZ_ASSERT(aStartOffset <= aEndOffset);
+ 
++  // FIXME: nsRange::IsInSelection uses WeakPtr so can't be used OMT... can /
++  // should be fixed though.
++  if (!NS_IsMainThread()) {
++    return false;
++  }
++
+   const nsINode* n = GetClosestCommonInclusiveAncestorForRangeInSelection(this);
+   NS_ASSERTION(n || !IsMaybeSelected(),
+                "A node without a common inclusive ancestor for a range in "
+                "Selection is for sure not selected.");
+ 
+   // Collect the selection objects for potential ranges.
+   nsTHashtable<nsPtrHashKey<Selection>> ancestorSelections;
+   Selection* prevSelection = nullptr;
+diff --git a/gfx/thebes/gfxTextRun.h b/gfx/thebes/gfxTextRun.h
+--- a/gfx/thebes/gfxTextRun.h
++++ b/gfx/thebes/gfxTextRun.h
+@@ -83,17 +83,17 @@ struct gfxTextRunDrawCallbacks {
+  * not actually do anything to explicitly account for line breaks). Initially
+  * there are no line breaks. The textrun can record line breaks before or after
+  * any given cluster. (Line breaks specified inside clusters are ignored.)
+  *
+  * It is important that zero-length substrings are handled correctly. This will
+  * be on the test!
+  */
+ class gfxTextRun : public gfxShapedText {
+-  NS_INLINE_DECL_REFCOUNTING(gfxTextRun);
++  NS_INLINE_DECL_THREADSAFE_REFCOUNTING(gfxTextRun);
+ 
+  protected:
+   // Override operator delete to properly free the object that was
+   // allocated via malloc.
+   void operator delete(void* p) { free(p); }
+ 
+   virtual ~gfxTextRun();
+ 
+diff --git a/layout/base/FrameProperties.h b/layout/base/FrameProperties.h
+--- a/layout/base/FrameProperties.h
++++ b/layout/base/FrameProperties.h
+@@ -380,39 +380,39 @@ inline void* FrameProperties::GetInterna
+           *aFoundResult = false;
+         }
+         return nullptr;
+       });
+ }
+ 
+ inline void FrameProperties::SetInternal(UntypedDescriptor aProperty,
+                                          void* aValue, const nsIFrame* aFrame) {
+-  MOZ_ASSERT(NS_IsMainThread());
++  // MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(aProperty, "Null property?");
+ 
+   mProperties.ApplyIf(
+       aProperty, 0, PropertyComparator(),
+       [&](PropertyValue& aPV) {
+         aPV.DestroyValueFor(aFrame);
+         aPV.mValue = aValue;
+       },
+       [&]() { mProperties.AppendElement(PropertyValue(aProperty, aValue)); });
+ }
+ 
+ inline void FrameProperties::AddInternal(UntypedDescriptor aProperty,
+                                          void* aValue) {
+-  MOZ_ASSERT(NS_IsMainThread());
++  // MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(aProperty, "Null property?");
+ 
+   mProperties.AppendElement(PropertyValue(aProperty, aValue));
+ }
+ 
+ inline void* FrameProperties::TakeInternal(UntypedDescriptor aProperty,
+                                            bool* aFoundResult) {
+-  MOZ_ASSERT(NS_IsMainThread());
++  // MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(aProperty, "Null property?");
+ 
+   auto index = mProperties.IndexOf(aProperty, 0, PropertyComparator());
+   if (index == nsTArray<PropertyValue>::NoIndex) {
+     if (aFoundResult) {
+       *aFoundResult = false;
+     }
+     return nullptr;
+@@ -425,17 +425,17 @@ inline void* FrameProperties::TakeIntern
+   void* result = mProperties.Elements()[index].mValue;
+   mProperties.RemoveElementAt(index);
+ 
+   return result;
+ }
+ 
+ inline void FrameProperties::RemoveInternal(UntypedDescriptor aProperty,
+                                             const nsIFrame* aFrame) {
+-  MOZ_ASSERT(NS_IsMainThread());
++  // MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(aProperty, "Null property?");
+ 
+   auto index = mProperties.IndexOf(aProperty, 0, PropertyComparator());
+   if (index != nsTArray<PropertyValue>::NoIndex) {
+     mProperties.Elements()[index].DestroyValueFor(aFrame);
+     mProperties.RemoveElementAt(index);
+   }
+ }
+diff --git a/layout/base/PresShell.cpp b/layout/base/PresShell.cpp
+--- a/layout/base/PresShell.cpp
++++ b/layout/base/PresShell.cpp
+@@ -827,16 +827,17 @@ PresShell::PresShell(Document* aDocument
+       mFontSizeInflationEmPerLine(0),
+       mFontSizeInflationMinTwips(0),
+       mFontSizeInflationLineThreshold(0),
+       mSelectionFlags(nsISelectionDisplay::DISPLAY_TEXT |
+                       nsISelectionDisplay::DISPLAY_IMAGES),
+       mChangeNestCount(0),
+       mRenderingStateFlags(RenderingStateFlags::None),
+       mInFlush(false),
++      mHasPendingAsyncLayout(false),
+       mCaretEnabled(false),
+       mNeedLayoutFlush(true),
+       mNeedStyleFlush(true),
+       mNeedThrottledAnimationFlush(true),
+       mVisualViewportSizeSet(false),
+       mDidInitialize(false),
+       mIsDestroying(false),
+       mIsReflowing(false),
+@@ -4108,16 +4109,27 @@ void PresShell::DoFlushPendingNotificati
+     "Display"
+   };
+   // clang-format on
+   AUTO_PROFILER_LABEL_DYNAMIC_CSTR_NONSENSITIVE(
+       "PresShell::DoFlushPendingNotifications", LAYOUT,
+       flushTypeNames[flushType]);
+ #endif
+ 
++  if (flushType >= FlushType::InterruptibleLayout) {
++    // FIXME: Unsound, should either be all shadow roots, or we should keep
++    // track of the ones that actually have pending layout activity.
++    //
++    // Fine for our demo purposes though.
++    auto& set = mDocument->ComposedShadowRoots();
++    for (auto iter = set.ConstIter(); !iter.Done(); iter.Next()) {
++      iter.Get()->GetKey()->WaitForLayoutWork();
++    }
++  }
++
+ #ifdef ACCESSIBILITY
+ #  ifdef DEBUG
+   if (nsAccessibilityService* accService = GetAccService()) {
+     NS_ASSERTION(!accService->IsProcessingRefreshDriverNotification(),
+                  "Flush during accessible tree update!");
+   }
+ #  endif
+ #endif
+@@ -6177,18 +6189,17 @@ void PresShell::EnsureFrameInApproximate
+     // We inserted a new entry.
+     aFrame->IncApproximateVisibleCount();
+   }
+ }
+ 
+ void PresShell::RemoveFrameFromApproximatelyVisibleList(nsIFrame* aFrame) {
+ #ifdef DEBUG
+   // Make sure it's in this pres shell.
+-  nsCOMPtr<nsIContent> content = aFrame->GetContent();
+-  if (content) {
++  if (nsIContent* content = aFrame->GetContent()) {
+     PresShell* presShell = content->OwnerDoc()->GetPresShell();
+     MOZ_ASSERT(!presShell || presShell == this, "wrong shell");
+   }
+ #endif
+ 
+   if (AssumeAllFramesVisible()) {
+     MOZ_ASSERT(mApproximatelyVisibleFrames.Count() == 0,
+                "Shouldn't have any frames in the table");
+@@ -9405,22 +9416,16 @@ void PresShell::WillCauseReflow() {
+ 
+ void PresShell::DidCauseReflow() {
+   NS_ASSERTION(mChangeNestCount != 0, "Unexpected call to DidCauseReflow()");
+   --mChangeNestCount;
+   nsContentUtils::RemoveScriptBlocker();
+ }
+ 
+ void PresShell::WillDoReflow() {
+-  mDocument->FlushUserFontSet();
+-
+-  mPresContext->FlushCounterStyles();
+-
+-  mPresContext->FlushFontFeatureValues();
+-
+   mLastReflowStart = GetPerformanceNowUnclamped();
+ }
+ 
+ void PresShell::DidDoReflow(bool aInterruptible) {
+   HandlePostedReflowCallbacks(aInterruptible);
+   if (mIsDestroying) {
+     return;
+   }
+@@ -9483,43 +9488,41 @@ bool PresShell::DoReflow(nsIFrame* targe
+                          OverflowChangedTracker* aOverflowTracker) {
+ #ifdef MOZ_GECKO_PROFILER
+   nsIURI* uri = mDocument->GetDocumentURI();
+   AUTO_PROFILER_LABEL_DYNAMIC_NSCSTRING(
+       "Reflow", LAYOUT_Reflow,
+       uri ? uri->GetSpecOrDefault() : NS_LITERAL_CSTRING("N/A"));
+ #endif
+ 
+-  LAYOUT_TELEMETRY_RECORD_BASE(Reflow);
+-
+-  PerfStats::AutoMetricRecording<PerfStats::Metric::Reflowing> autoRecording;
+-
+-  gfxTextPerfMetrics* tp = mPresContext->GetTextPerfMetrics();
+-  TimeStamp timeStart;
+-  if (tp) {
+-    tp->Accumulate();
+-    tp->reflowCount++;
+-    timeStart = TimeStamp::Now();
+-  }
++  // LAYOUT_TELEMETRY_RECORD_BASE(Reflow);
++  // PerfStats::AutoMetricRecording<PerfStats::Metric::Reflowing> autoRecording;
++
++  // gfxTextPerfMetrics* tp = mPresContext->GetTextPerfMetrics();
++  // TimeStamp timeStart;
++  // if (tp) {
++  //   tp->Accumulate();
++  //   tp->reflowCount++;
++  //   timeStart = TimeStamp::Now();
++  // }
+ 
+   // Schedule a paint, but don't actually mark this frame as changed for
+   // retained DL building purposes. If any child frames get moved, then
+-  // they will schedule paint again. We could probaby skip this, and just
++  // they will schedule paint again. We could probably skip this, and just
+   // schedule a similar paint when a frame is deleted.
+   target->SchedulePaint(nsIFrame::PAINT_DEFAULT, false);
+ 
+-  nsDocShell* docShell =
+-      static_cast<nsDocShell*>(GetPresContext()->GetDocShell());
+-  RefPtr<TimelineConsumers> timelines = TimelineConsumers::Get();
+-  bool isTimelineRecording = timelines && timelines->HasConsumer(docShell);
+-
+-  if (isTimelineRecording) {
+-    timelines->AddMarkerForDocShell(docShell, "Reflow",
+-                                    MarkerTracingType::START);
+-  }
++  // nsDocShell* docShell =
++  //     static_cast<nsDocShell*>(GetPresContext()->GetDocShell());
++  // RefPtr<TimelineConsumers> timelines = TimelineConsumers::Get();
++  // bool isTimelineRecording = timelines && timelines->HasConsumer(docShell);
++  // if (isTimelineRecording) {
++  //   timelines->AddMarkerForDocShell(docShell, "Reflow",
++  //                                   MarkerTracingType::START);
++  // }
+ 
+ #ifdef MOZ_GECKO_PROFILER
+   Maybe<uint64_t> innerWindowID;
+   if (auto* window = mDocument->GetInnerWindow()) {
+     innerWindowID = Some(window->WindowID());
+   }
+   AutoProfilerTracing tracingLayoutFlush(
+       "Paint", "Reflow", JS::ProfilingCategoryPair::LAYOUT,
+@@ -9704,28 +9707,27 @@ bool PresShell::DoReflow(nsIFrame* targe
+     // Any FlushPendingNotifications with interruptible reflows
+     // should be suppressed now. We don't want to do extra reflow work
+     // before our reflow event happens.
+     mWasLastReflowInterrupted = true;
+     MaybeScheduleReflow();
+   }
+ 
+   // dump text perf metrics for reflows with significant text processing
+-  if (tp) {
+-    if (tp->current.numChars > 100) {
+-      TimeDuration reflowTime = TimeStamp::Now() - timeStart;
+-      LogTextPerfStats(tp, this, tp->current, reflowTime.ToMilliseconds(),
+-                       eLog_reflow, nullptr);
+-    }
+-    tp->Accumulate();
+-  }
+-
+-  if (isTimelineRecording) {
+-    timelines->AddMarkerForDocShell(docShell, "Reflow", MarkerTracingType::END);
+-  }
++  // if (tp) {
++  //   if (tp->current.numChars > 100) {
++  //     TimeDuration reflowTime = TimeStamp::Now() - timeStart;
++  //     LogTextPerfStats(tp, this, tp->current, reflowTime.ToMilliseconds(),
++  //                      eLog_reflow, nullptr);
++  //   }
++  //   tp->Accumulate();
++  // }
++  // if (isTimelineRecording) {
++  //   timelines->AddMarkerForDocShell(docShell, "Reflow", MarkerTracingType::END);
++  // }
+ 
+   return !interrupted;
+ }
+ 
+ #ifdef DEBUG
+ void PresShell::DoVerifyReflow() {
+   if (GetVerifyReflowEnable()) {
+     // First synchronously render what we have so far so that we can
+@@ -9746,77 +9748,94 @@ void PresShell::DoVerifyReflow() {
+     }
+   }
+ }
+ #endif
+ 
+ // used with Telemetry metrics
+ #define NS_LONG_REFLOW_TIME_MS 5000
+ 
+-bool PresShell::ProcessReflowCommands(bool aInterruptible) {
+-  if (mDirtyRoots.IsEmpty() && !mShouldUnsuppressPainting) {
++
++void PresShell::SetHasPendingAsyncLayout() {
++  mHasPendingAsyncLayout = true;
++}
++
++MOZ_CAN_RUN_SCRIPT_BOUNDARY void PresShell::ReflowDirtyRoots(DirtyRootsList& aDirtyRoots) {
++  ProcessReflowCommands(false, &aDirtyRoots);
++}
++
++bool PresShell::ProcessReflowCommands(bool aInterruptible,
++                                      DirtyRootsList* aDirtyRoots) {
++  auto& dirtyRoots = aDirtyRoots ? *aDirtyRoots : mDirtyRoots;
++  if (dirtyRoots.IsEmpty() && !mShouldUnsuppressPainting) {
+     // Nothing to do; bail out
+     return true;
+   }
+ 
+-  mozilla::TimeStamp timerStart = mozilla::TimeStamp::Now();
++  TimeStamp timerStart = TimeStamp::Now();
+   bool interrupted = false;
+-  if (!mDirtyRoots.IsEmpty()) {
++  if (!dirtyRoots.IsEmpty() || mHasPendingAsyncLayout) {
+ #ifdef DEBUG
+     if (VerifyReflowFlags::DumpCommands & gVerifyReflowFlags) {
+       printf("ProcessReflowCommands: begin incremental reflow\n");
+     }
+ #endif
+ 
+     // If reflow is interruptible, then make a note of our deadline.
+     const PRIntervalTime deadline =
+         aInterruptible
+             ? PR_IntervalNow() + PR_MicrosecondsToInterval(gMaxRCProcessingTime)
+             : (PRIntervalTime)0;
+ 
+     // Scope for the reflow entry point
+     {
+-      nsAutoScriptBlocker scriptBlocker;
+-      WillDoReflow();
++      Maybe<nsAutoScriptBlocker> blocker;
++      Maybe<nsViewManager::AutoDisableRefresh> refreshBlocker;
++      if (!aDirtyRoots) {
++        blocker.emplace();
++        WillDoReflow();
++        refreshBlocker.emplace(mViewManager);
++      }
+       AUTO_LAYOUT_PHASE_ENTRY_POINT(GetPresContext(), Reflow);
+-      nsViewManager::AutoDisableRefresh refreshBlocker(mViewManager);
+-
+-      OverflowChangedTracker overflowTracker;
+-
+-      do {
+-        // Send an incremental reflow notification to the target frame.
+-        nsIFrame* target = mDirtyRoots.PopShallowestRoot();
+-
+-        if (!NS_SUBTREE_DIRTY(target)) {
+-          // It's not dirty anymore, which probably means the notification
+-          // was posted in the middle of a reflow (perhaps with a reflow
+-          // root in the middle).  Don't do anything.
+-          continue;
++
++      if (!dirtyRoots.IsEmpty()) {
++        OverflowChangedTracker overflowTracker;
++
++        do {
++          // Send an incremental reflow notification to the target frame.
++          nsIFrame* target = dirtyRoots.PopShallowestRoot();
++
++          if (!NS_SUBTREE_DIRTY(target)) {
++            // It's not dirty anymore, which probably means the notification
++            // was posted in the middle of a reflow (perhaps with a reflow
++            // root in the middle).  Don't do anything.
++            continue;
++          }
++
++          interrupted = !DoReflow(target, aInterruptible, &overflowTracker);
++
++          // Keep going until we're out of reflow commands, or we've run
++          // past our deadline, or we're interrupted.
++        } while (!interrupted && !dirtyRoots.IsEmpty() &&
++                 (!aInterruptible || PR_IntervalNow() < deadline));
++
++        interrupted = !dirtyRoots.IsEmpty();
++
++        overflowTracker.Flush();
++
++        if (!interrupted && !aDirtyRoots) {
++          // We didn't get interrupted. Go ahead and perform scroll anchor
++          // adjustments.
++          FlushPendingScrollAnchorAdjustments();
+         }
+-
+-        interrupted = !DoReflow(target, aInterruptible, &overflowTracker);
+-
+-        // Keep going until we're out of reflow commands, or we've run
+-        // past our deadline, or we're interrupted.
+-      } while (!interrupted && !mDirtyRoots.IsEmpty() &&
+-               (!aInterruptible || PR_IntervalNow() < deadline));
+-
+-      interrupted = !mDirtyRoots.IsEmpty();
+-
+-      overflowTracker.Flush();
+-
+-      if (!interrupted) {
+-        // We didn't get interrupted. Go ahead and perform scroll anchor
+-        // adjustments.
+-        FlushPendingScrollAnchorAdjustments();
+       }
+     }
+ 
+     // Exiting the scriptblocker might have killed us
+-    if (!mIsDestroying) {
++    if (!mIsDestroying && !aDirtyRoots) {
+       DidDoReflow(aInterruptible);
+     }
+ 
+     // DidDoReflow might have killed us
+     if (!mIsDestroying) {
+ #ifdef DEBUG
+       if (VerifyReflowFlags::DumpCommands & gVerifyReflowFlags) {
+         printf("\nPresShell::ProcessReflowCommands() finished: this=%p\n",
+@@ -9825,43 +9844,48 @@ bool PresShell::ProcessReflowCommands(bo
+       DoVerifyReflow();
+ #endif
+ 
+       // If any new reflow commands were enqueued during the reflow, schedule
+       // another reflow event to process them.  Note that we want to do this
+       // after DidDoReflow(), since that method can change whether there are
+       // dirty roots around by flushing, and there's no point in posting a
+       // reflow event just to have the flush revoke it.
+-      if (!mDirtyRoots.IsEmpty()) {
++      if (!dirtyRoots.IsEmpty()) {
+         MaybeScheduleReflow();
+         // And record that we might need flushing
+         SetNeedLayoutFlush();
+       }
+     }
+   }
+ 
+-  if (!mIsDestroying && mShouldUnsuppressPainting && mDirtyRoots.IsEmpty()) {
++  if (!mIsDestroying && mShouldUnsuppressPainting && mDirtyRoots.IsEmpty() &&
++      !aDirtyRoots) {
+     // We only unlock if we're out of reflows.  It's pointless
+     // to unlock if reflows are still pending, since reflows
+     // are just going to thrash the frames around some more.  By
+     // waiting we avoid an overeager "jitter" effect.
+     mShouldUnsuppressPainting = false;
+     UnsuppressAndInvalidate();
+   }
+ 
+-  if (mDocument->GetRootElement()) {
++  if (!aDirtyRoots && mDocument->GetRootElement()) {
+     TimeDuration elapsed = TimeStamp::Now() - timerStart;
+     int32_t intElapsed = int32_t(elapsed.ToMilliseconds());
+ 
+     if (intElapsed > NS_LONG_REFLOW_TIME_MS) {
+       Telemetry::Accumulate(Telemetry::LONG_REFLOW_INTERRUPTIBLE,
+                             aInterruptible ? 1 : 0);
+     }
+   }
+ 
++  if (!aDirtyRoots) {
++    mHasPendingAsyncLayout = false;
++  }
++
+   return !interrupted;
+ }
+ 
+ void PresShell::WindowSizeMoveDone() {
+   if (mPresContext) {
+     EventStateManager::ClearGlobalActiveContent(nullptr);
+     ClearMouseCapture(nullptr);
+   }
+diff --git a/layout/base/PresShell.h b/layout/base/PresShell.h
+--- a/layout/base/PresShell.h
++++ b/layout/base/PresShell.h
+@@ -1777,19 +1777,23 @@ class PresShell final : public nsStubDoc
+   void MaybeScheduleReflow();
+   // Actually schedules a reflow.  This should only be called by
+   // MaybeScheduleReflow and the reflow timer ScheduleReflowOffTimer
+   // sets up.
+   void ScheduleReflow();
+ 
+   friend class ::AutoPointerEventTargetUpdater;
+ 
++ public:
++  class DirtyRootsList;
++
++ private:
+   // ProcessReflowCommands returns whether we processed all our dirty roots
+   // without interruptions.
+-  MOZ_CAN_RUN_SCRIPT bool ProcessReflowCommands(bool aInterruptible);
++  MOZ_CAN_RUN_SCRIPT bool ProcessReflowCommands(bool aInterruptible, DirtyRootsList* = nullptr);
+ 
+   /**
+    * Callback handler for whether reflow happened.
+    *
+    * @param aInterruptible Whether or not reflow interruption is allowed.
+    */
+   MOZ_CAN_RUN_SCRIPT void DidDoReflow(bool aInterruptible);
+ 
+@@ -2839,16 +2843,18 @@ class PresShell final : public nsStubDoc
+ 
+   // A list of stack weak frames. This is a pointer to the last item in the
+   // list.
+   AutoWeakFrame* mAutoWeakFrames;
+ 
+   // A hash table of heap allocated weak frames.
+   nsTHashtable<nsPtrHashKey<WeakFrame>> mWeakFrames;
+ 
++ public:
++
+   class DirtyRootsList {
+    public:
+     // Add a dirty root.
+     void Add(nsIFrame* aFrame);
+     // Remove this frame if present.
+     void Remove(nsIFrame* aFrame);
+     // Remove and return one of the shallowest dirty roots from the list.
+     // (If two roots are at the same depth, order is indeterminate.)
+@@ -2886,21 +2892,20 @@ class PresShell final : public nsStubDoc
+     };
+     // List of all known dirty roots, sorted by decreasing depths.
+     nsTArray<FrameAndDepth> mList;
+   };
+ 
+   // Reflow roots that need to be reflowed.
+   DirtyRootsList mDirtyRoots;
+ 
+-
+- public:
+-
+   bool FrameIsAncestorOfDirtyRoot(nsIFrame* aFrame) const;
+   DirtyRootsList TakeDirtyRootsUnder(nsIFrame* aFrame);
++  void SetHasPendingAsyncLayout();
++  void ReflowDirtyRoots(DirtyRootsList&);
+ 
+  private:
+ 
+ #ifdef MOZ_GECKO_PROFILER
+   // These two fields capture call stacks of any changes that require a restyle
+   // or a reflow. Only the first change per restyle / reflow is recorded (the
+   // one that caused a call to SetNeedStyleFlush() / SetNeedLayoutFlush()).
+   UniqueProfilerBacktrace mStyleCause;
+@@ -3029,16 +3034,18 @@ class PresShell final : public nsStubDoc
+   RenderingStateFlags mRenderingStateFlags;
+ 
+   // Whether we're currently under a FlushPendingNotifications.
+   // This is used to handle flush reentry correctly.
+   // NOTE: This can't be a bitfield since AutoRestore has a reference to this
+   // variable.
+   bool mInFlush;
+ 
++  bool mHasPendingAsyncLayout : 1;
++
+   bool mCaretEnabled : 1;
+ 
+   // True if a layout flush might not be a no-op
+   bool mNeedLayoutFlush : 1;
+ 
+   // True if a style flush might not be a no-op
+   bool mNeedStyleFlush : 1;
+ 
+diff --git a/layout/base/nsPresArena.cpp b/layout/base/nsPresArena.cpp
+--- a/layout/base/nsPresArena.cpp
++++ b/layout/base/nsPresArena.cpp
+@@ -33,17 +33,17 @@ nsPresArena<ArenaSize, ObjectId, ObjectI
+     entry->mEntries.Clear();
+   }
+ #endif
+ }
+ 
+ template <size_t ArenaSize, typename ObjectId, size_t ObjectIdCount>
+ void* nsPresArena<ArenaSize, ObjectId, ObjectIdCount>::Allocate(ObjectId aCode,
+                                                                 size_t aSize) {
+-  MOZ_ASSERT(NS_IsMainThread());
++  // MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(aSize > 0, "PresArena cannot allocate zero bytes");
+   MOZ_ASSERT(size_t(aCode) < ArrayLength(mFreeLists));
+ 
+   // We only hand out aligned sizes
+   aSize = mPool.AlignedSize(aSize);
+ 
+   FreeList* list = &mFreeLists[size_t(aCode)];
+ 
+@@ -98,17 +98,17 @@ void* nsPresArena<ArenaSize, ObjectId, O
+   // Allocate a new chunk from the arena
+   list->mEntriesEverAllocated++;
+   return mPool.Allocate(aSize);
+ }
+ 
+ template <size_t ArenaSize, typename ObjectId, size_t ObjectIdCount>
+ void nsPresArena<ArenaSize, ObjectId, ObjectIdCount>::Free(ObjectId aCode,
+                                                            void* aPtr) {
+-  MOZ_ASSERT(NS_IsMainThread());
++  // MOZ_ASSERT(NS_IsMainThread());
+   MOZ_ASSERT(size_t(aCode) < ArrayLength(mFreeLists));
+ 
+   // Try to recycle this entry.
+   FreeList* list = &mFreeLists[size_t(aCode)];
+   MOZ_ASSERT(list->mEntrySize > 0, "object of this type was never allocated");
+ 
+   mozWritePoison(aPtr, list->mEntrySize);
+ 
+diff --git a/layout/base/nsPresContext.cpp b/layout/base/nsPresContext.cpp
+--- a/layout/base/nsPresContext.cpp
++++ b/layout/base/nsPresContext.cpp
+@@ -874,19 +874,17 @@ nsIWidget* nsPresContext::GetNearestWidg
+ }
+ 
+ nsIWidget* nsPresContext::GetRootWidget() const {
+   NS_ENSURE_TRUE(mPresShell, nullptr);
+   nsViewManager* vm = mPresShell->GetViewManager();
+   if (!vm) {
+     return nullptr;
+   }
+-  nsCOMPtr<nsIWidget> widget;
+-  vm->GetRootWidget(getter_AddRefs(widget));
+-  return widget.get();
++  return vm->GetRootWidget();
+ }
+ 
+ // We may want to replace this with something faster, maybe caching the root
+ // prescontext
+ nsRootPresContext* nsPresContext::GetRootPresContext() const {
+   nsPresContext* pc = const_cast<nsPresContext*>(this);
+   for (;;) {
+     nsPresContext* parent = pc->GetParentPresContext();
+diff --git a/layout/base/nsRefreshDriver.cpp b/layout/base/nsRefreshDriver.cpp
+--- a/layout/base/nsRefreshDriver.cpp
++++ b/layout/base/nsRefreshDriver.cpp
+@@ -1388,19 +1388,19 @@ void nsRefreshDriver::RunDelayedEventsSo
+   mDelayedResizeEventFlushObservers.Clear();
+ 
+   EnsureTimerStarted();
+ }
+ 
+ void nsRefreshDriver::EnsureTimerStarted(EnsureTimerStartedFlags aFlags) {
+   // FIXME: Bug 1346065: We should also assert the case where we have
+   // STYLO_THREADS=1.
+-  MOZ_ASSERT(!ServoStyleSet::IsInServoTraversal() || NS_IsMainThread(),
+-             "EnsureTimerStarted should be called only when we are not "
+-             "in servo traversal or on the main-thread");
++  // MOZ_ASSERT(!ServoStyleSet::IsInServoTraversal() || NS_IsMainThread(),
++  //            "EnsureTimerStarted should be called only when we are not "
++  //            "in servo traversal or on the main-thread");
+ 
+   if (mTestControllingRefreshes) return;
+ 
+   // will it already fire, and no other changes needed?
+   if (mActiveTimer && !(aFlags & eForceAdjustTimer)) return;
+ 
+   if (IsFrozen() || !mPresContext) {
+     // If we don't want to start it now, or we've been disconnected.
+@@ -2492,18 +2492,18 @@ void nsRefreshDriver::DoRefresh() {
+ bool nsRefreshDriver::IsRefreshObserver(nsARefreshObserver* aObserver,
+                                         FlushType aFlushType) {
+   ObserverArray& array = ArrayFor(aFlushType);
+   return array.Contains(aObserver);
+ }
+ #endif
+ 
+ void nsRefreshDriver::ScheduleViewManagerFlush() {
+-  NS_ASSERTION(mPresContext->IsRoot(),
+-               "Should only schedule view manager flush on root prescontexts");
++  // NS_ASSERTION(mPresContext->IsRoot(),
++  //              "Should only schedule view manager flush on root prescontexts");
+   mViewManagerFlushIsPending = true;
+   mHasScheduleFlush = true;
+   EnsureTimerStarted(eNeverAdjustTimer);
+ }
+ 
+ void nsRefreshDriver::ScheduleFrameRequestCallbacks(Document* aDocument) {
+   NS_ASSERTION(mFrameRequestCallbackDocs.IndexOf(aDocument) ==
+                        mFrameRequestCallbackDocs.NoIndex &&
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -623,16 +623,19 @@ bool nsIFrame::IsPrimaryFrameOfRootOrBod
+ void nsFrame::Init(nsIContent* aContent, nsContainerFrame* aParent,
+                    nsIFrame* aPrevInFlow) {
+   MOZ_ASSERT(nsQueryFrame::FrameIID(mClass) == GetFrameId());
+   MOZ_ASSERT(!mContent, "Double-initing a frame?");
+   NS_ASSERTION(IsFrameOfType(eDEBUGAllFrames) && !IsFrameOfType(eDEBUGNoFrames),
+                "IsFrameOfType implementation that doesn't call base class");
+ 
+   mContent = aContent;
++  if (!aPrevInFlow) {
++    NS_IF_ADDREF(mContent);
++  }
+   mParent = aParent;
+   MOZ_DIAGNOSTIC_ASSERT(!mParent || PresShell() == mParent->PresShell());
+ 
+   if (aPrevInFlow) {
+     mWritingMode = aPrevInFlow->GetWritingMode();
+ 
+     // Copy some state bits from prev-in-flow (the bits that should apply
+     // throughout a continuation chain). The bits are sorted according to their
+@@ -781,17 +784,17 @@ void nsFrame::Init(nsIContent* aContent,
+   // prev-in-flow, and the animation code cares only primary frames.
+   if (!IsPlaceholderFrame() && !aPrevInFlow) {
+     UpdateVisibleDescendantsState();
+   }
+ }
+ 
+ void nsFrame::DestroyFrom(nsIFrame* aDestructRoot,
+                           PostDestroyData& aPostDestroyData) {
+-  NS_ASSERTION(!nsContentUtils::IsSafeToRunScript(),
++  NS_ASSERTION(!NS_IsMainThread() || !nsContentUtils::IsSafeToRunScript(),
+                "destroy called on frame while scripts not blocked");
+   NS_ASSERTION(!GetNextSibling() && !GetPrevSibling(),
+                "Frames should be removed before destruction.");
+   NS_ASSERTION(aDestructRoot, "Must specify destruct root");
+   MOZ_ASSERT(!HasAbsolutelyPositionedChildren());
+   MOZ_ASSERT(!HasAnyStateBits(NS_FRAME_PART_OF_IBSPLIT),
+              "NS_FRAME_PART_OF_IBSPLIT set on non-nsContainerFrame?");
+ 
+@@ -873,18 +876,21 @@ void nsFrame::DestroyFrom(nsIFrame* aDes
+   // Make sure that our deleted frame can't be returned from GetPrimaryFrame()
+   if (IsPrimaryFrame()) {
+     mContent->SetPrimaryFrame(nullptr);
+ 
+     // Pass the root of a generated content subtree (e.g. ::after/::before) to
+     // aPostDestroyData to unbind it after frame destruction is done.
+     if (HasAnyStateBits(NS_FRAME_GENERATED_CONTENT) &&
+         mContent->IsRootOfNativeAnonymousSubtree()) {
+-      aPostDestroyData.AddAnonymousContent(mContent.forget());
+-    }
++      aPostDestroyData.AddAnonymousContent(dont_AddRef(mContent));
++      mContent = nullptr;
++    }
++    NS_IF_RELEASE(mContent);
++    mContent = nullptr;
+   }
+ 
+   // Remove all properties attached to the frame, to ensure any property
+   // destructors that need the frame pointer are handled properly.
+   RemoveAllProperties();
+ 
+   // Must retrieve the object ID before calling destructors, so the
+   // vtable is still valid.
+@@ -6978,21 +6984,17 @@ static void InvalidateRenderingObservers
+ static void SchedulePaintInternal(
+     nsIFrame* aDisplayRoot, nsIFrame* aFrame,
+     nsIFrame::PaintType aType = nsIFrame::PAINT_DEFAULT) {
+   MOZ_ASSERT(aDisplayRoot == nsLayoutUtils::GetDisplayRootFrame(aFrame));
+   nsPresContext* pres = aDisplayRoot->PresContext()->GetRootPresContext();
+ 
+   // No need to schedule a paint for an external document since they aren't
+   // painted directly.
+-  if (!pres || (pres->Document() && pres->Document()->IsResourceDoc())) {
+-    return;
+-  }
+-  if (!pres->GetContainerWeak()) {
+-    NS_WARNING("Shouldn't call SchedulePaint in a detached pres context");
++  if (!pres || !pres->Document() || pres->Document()->IsResourceDoc()) {
+     return;
+   }
+ 
+   pres->PresShell()->ScheduleViewManagerFlush(
+       aType == nsIFrame::PAINT_DELAYED_COMPRESS ? PaintType::DelayedCompress
+                                                 : PaintType::Default);
+ 
+   if (aType == nsIFrame::PAINT_DELAYED_COMPRESS) {
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -4663,17 +4663,18 @@ class nsIFrame : public nsQueryFrame {
+    * To be overridden by frame classes that have a varying IsLeaf() state and
+    * is indicating that with DynamicLeaf in FrameIdList.h.
+    * @see IsLeaf()
+    */
+   virtual bool IsLeafDynamic() const { return false; }
+ 
+   // Members
+   nsRect mRect;
+-  nsCOMPtr<nsIContent> mContent;
++  // Strong if you're the first continuation, weak otherwise.
++  nsIContent* mContent = nullptr;
+   RefPtr<ComputedStyle> mComputedStyle;
+ 
+  private:
+   nsPresContext* const mPresContext;
+   nsContainerFrame* mParent;
+   nsIFrame* mNextSibling;  // doubly-linked list of frames
+   nsIFrame* mPrevSibling;  // Do not touch outside SetNextSibling!
+ 
+diff --git a/layout/painting/FrameLayerBuilder.h b/layout/painting/FrameLayerBuilder.h
+--- a/layout/painting/FrameLayerBuilder.h
++++ b/layout/painting/FrameLayerBuilder.h
+@@ -138,25 +138,24 @@ class DisplayItemData final {
+   /**
+    * Removes any references to this object from frames
+    * in mFrameList.
+    */
+   ~DisplayItemData();
+ 
+   void Destroy() {
+     // Get the pres context.
+-    RefPtr<nsPresContext> presContext = mFrameList[0]->PresContext();
++    nsPresContext* pc = mFrameList[0]->PresContext();
+ 
+     // Call our destructor.
+     this->~DisplayItemData();
+ 
+     // Don't let the memory be freed, since it will be recycled
+     // instead. Don't call the global operator delete.
+-    presContext->PresShell()->FreeByObjectID(eArenaObjectID_DisplayItemData,
+-                                             this);
++    pc->PresShell()->FreeByObjectID(eArenaObjectID_DisplayItemData, this);
+   }
+ 
+   /**
+    * Associates this DisplayItemData with a frame, and adds it
+    * to the LayerManagerDataProperty list on the frame.
+    */
+   void AddFrame(nsIFrame* aFrame);
+   void RemoveFrame(nsIFrame* aFrame);
+diff --git a/layout/xul/nsBoxLayoutState.h b/layout/xul/nsBoxLayoutState.h
+--- a/layout/xul/nsBoxLayoutState.h
++++ b/layout/xul/nsBoxLayoutState.h
+@@ -63,17 +63,17 @@ class MOZ_STACK_CLASS nsBoxLayoutState {
+ 
+   // The HTML reflow input that lives outside the box-block boundary.
+   // May not be set reliably yet.
+   const ReflowInput* OuterReflowInput() { return mOuterReflowInput; }
+ 
+   uint16_t GetReflowDepth() { return mReflowDepth; }
+ 
+  private:
+-  RefPtr<nsPresContext> mPresContext;
++  nsPresContext* const mPresContext;
+   gfxContext* mRenderingContext;
+   const ReflowInput* mOuterReflowInput;
+   nsIFrame::ReflowChildFlags mLayoutFlags;
+   uint16_t mReflowDepth;
+   bool mPaintingDisabled;
+ };
+ 
+ #endif
+diff --git a/layout/xul/nsScrollbarFrame.h b/layout/xul/nsScrollbarFrame.h
+--- a/layout/xul/nsScrollbarFrame.h
++++ b/layout/xul/nsScrollbarFrame.h
+@@ -125,17 +125,18 @@ class nsScrollbarFrame final : public ns
+ 
+   void UpdateChildrenAttributeValue(nsAtom* aAttribute, bool aNotify);
+ 
+  protected:
+   int32_t mIncrement;  // Amount to scroll, in CSSPixels
+   bool mSmoothScroll;
+ 
+  private:
+-  nsCOMPtr<nsIContent> mScrollbarMediator;
++  // Always an ancestor in the content tree.
++  nsIContent* mScrollbarMediator = nullptr;
+ 
+   nsCOMPtr<Element> mUpTopButton;
+   nsCOMPtr<Element> mDownTopButton;
+   nsCOMPtr<Element> mSlider;
+   nsCOMPtr<Element> mThumb;
+   nsCOMPtr<Element> mUpBottomButton;
+   nsCOMPtr<Element> mDownBottomButton;
+ };  // class nsScrollbarFrame
+diff --git a/layout/xul/nsSliderFrame.cpp b/layout/xul/nsSliderFrame.cpp
+--- a/layout/xul/nsSliderFrame.cpp
++++ b/layout/xul/nsSliderFrame.cpp
+@@ -55,19 +55,18 @@ using mozilla::layers::ScrollbarData;
+ using mozilla::layers::ScrollDirection;
+ 
+ bool nsSliderFrame::gMiddlePref = false;
+ int32_t nsSliderFrame::gSnapMultiplier;
+ 
+ // Turn this on if you want to debug slider frames.
+ #undef DEBUG_SLIDER
+ 
+-static already_AddRefed<nsIContent> GetContentOfBox(nsIFrame* aBox) {
+-  nsCOMPtr<nsIContent> content = aBox->GetContent();
+-  return content.forget();
++static nsIContent* GetContentOfBox(nsIFrame* aBox) {
++  return aBox->GetContent();
+ }
+ 
+ nsIFrame* NS_NewSliderFrame(PresShell* aPresShell, ComputedStyle* aStyle) {
+   return new (aPresShell) nsSliderFrame(aStyle, aPresShell->GetPresContext());
+ }
+ 
+ NS_IMPL_FRAMEARENA_HELPERS(nsSliderFrame)
+ 
+@@ -175,17 +174,17 @@ nsresult nsSliderFrame::AttributeChanged
+   // if the current position changes
+   if (aAttribute == nsGkAtoms::curpos) {
+     CurrentPositionChanged();
+   } else if (aAttribute == nsGkAtoms::minpos ||
+              aAttribute == nsGkAtoms::maxpos) {
+     // bounds check it.
+ 
+     nsIFrame* scrollbarBox = GetScrollbar();
+-    nsCOMPtr<nsIContent> scrollbar = GetContentOfBox(scrollbarBox);
++    nsIContent* scrollbar = GetContentOfBox(scrollbarBox);
+     int32_t current = GetCurrentPosition(scrollbar);
+     int32_t min = GetMinPosition(scrollbar);
+     int32_t max = GetMaxPosition(scrollbar);
+ 
+     if (current < min || current > max) {
+       int32_t direction = 0;
+       if (current < min || max < min) {
+         current = min;
+@@ -384,17 +383,17 @@ nsSliderFrame::DoXULLayout(nsBoxLayoutSt
+   EnsureOrient();
+ 
+   // get the content area inside our borders
+   nsRect clientRect;
+   GetXULClientRect(clientRect);
+ 
+   // get the scrollbar
+   nsIFrame* scrollbarBox = GetScrollbar();
+-  nsCOMPtr<nsIContent> scrollbar = GetContentOfBox(scrollbarBox);
++  nsIContent* scrollbar = GetContentOfBox(scrollbarBox);
+ 
+   // get the thumb's pref size
+   nsSize thumbSize = thumbBox->GetXULPrefSize(aState);
+ 
+   if (IsXULHorizontal())
+     thumbSize.height = clientRect.height;
+   else
+     thumbSize.width = clientRect.width;
+@@ -480,18 +479,17 @@ nsresult nsSliderFrame::HandleEvent(nsPr
+   }
+ 
+   if (!mDragFinished && !isDraggingThumb()) {
+     StopDrag();
+     return NS_OK;
+   }
+ 
+   nsIFrame* scrollbarBox = GetScrollbar();
+-  nsCOMPtr<nsIContent> scrollbar;
+-  scrollbar = GetContentOfBox(scrollbarBox);
++  nsIContent* scrollbar = GetContentOfBox(scrollbarBox);
+   bool isHorizontal = IsXULHorizontal();
+ 
+   if (isDraggingThumb()) {
+     switch (aEvent->mMessage) {
+       case eTouchMove:
+       case eMouseMove: {
+         if (mScrollingWithAPZ) {
+           break;
+@@ -678,18 +676,17 @@ nsIFrame* nsSliderFrame::GetScrollbar() 
+ }
+ 
+ void nsSliderFrame::PageUpDown(nscoord change) {
+   // on a page up or down get our page increment. We get this by getting the
+   // scrollbar we are in and asking it for the current position and the page
+   // increment. If we are not in a scrollbar we will get the values from our own
+   // node.
+   nsIFrame* scrollbarBox = GetScrollbar();
+-  nsCOMPtr<nsIContent> scrollbar;
+-  scrollbar = GetContentOfBox(scrollbarBox);
++  nsIContent* scrollbar = GetContentOfBox(scrollbarBox);
+ 
+   nscoord pageIncrement = GetPageIncrement(scrollbar);
+   int32_t curpos = GetCurrentPosition(scrollbar);
+   int32_t minpos = GetMinPosition(scrollbar);
+   int32_t maxpos = GetMaxPosition(scrollbar);
+ 
+   // get the new position and make sure it is in bounds
+   int32_t newpos = curpos + change * pageIncrement;
+@@ -700,17 +697,17 @@ void nsSliderFrame::PageUpDown(nscoord c
+ 
+   SetCurrentPositionInternal(scrollbar, newpos, true);
+ }
+ 
+ // called when the current position changed and we need to update the thumb's
+ // location
+ void nsSliderFrame::CurrentPositionChanged() {
+   nsIFrame* scrollbarBox = GetScrollbar();
+-  nsCOMPtr<nsIContent> scrollbar = GetContentOfBox(scrollbarBox);
++  nsIContent* scrollbar = GetContentOfBox(scrollbarBox);
+ 
+   // get the current position
+   int32_t curPos = GetCurrentPosition(scrollbar);
+ 
+   // do nothing if the position did not change
+   if (mCurPos == curPos) return;
+ 
+   // get our current min and max position from our content node
+diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
+--- a/modules/libpref/init/StaticPrefList.yaml
++++ b/modules/libpref/init/StaticPrefList.yaml
+@@ -6135,17 +6135,17 @@
+ 
+ - name: layout.display-list.flatten-transform
+   type: RelaxedAtomicBool
+   value: true
+   mirror: always
+ 
+ # Are dynamic reflow roots enabled?
+ - name: layout.dynamic-reflow-roots.enabled
+-  type: bool
++  type: RelaxedAtomicBool
+   value: @IS_EARLY_BETA_OR_EARLIER@
+   mirror: always
+ 
+ # Pref to control browser frame rate, in Hz. A value <= 0 means choose
+ # automatically based on knowledge of the platform (or 60Hz if no platform-
+ # specific information is available).
+ - name: layout.frame_rate
+   type: RelaxedAtomicInt32
+diff --git a/view/nsViewManager.cpp b/view/nsViewManager.cpp
+--- a/view/nsViewManager.cpp
++++ b/view/nsViewManager.cpp
+@@ -964,30 +964,30 @@ nsViewManager* nsViewManager::IncrementD
+ 
+ void nsViewManager::DecrementDisableRefreshCount() {
+   NS_ASSERTION(IsRootVM(), "Should only be called on root");
+   --mRefreshDisableCount;
+   NS_ASSERTION(mRefreshDisableCount >= 0, "Invalid refresh disable count!");
+ }
+ 
+ void nsViewManager::GetRootWidget(nsIWidget** aWidget) {
++  NS_IF_ADDREF(*aWidget = GetRootWidget());
++}
++
++nsIWidget* nsViewManager::GetRootWidget() {
+   if (!mRootView) {
+-    *aWidget = nullptr;
+-    return;
++    return nullptr;
+   }
+   if (mRootView->HasWidget()) {
+-    *aWidget = mRootView->GetWidget();
+-    NS_ADDREF(*aWidget);
+-    return;
++    return mRootView->GetWidget();
+   }
+   if (mRootView->GetParent()) {
+-    mRootView->GetParent()->GetViewManager()->GetRootWidget(aWidget);
+-    return;
++    return mRootView->GetParent()->GetViewManager()->GetRootWidget();
+   }
+-  *aWidget = nullptr;
++  return nullptr;
+ }
+ 
+ LayoutDeviceIntRect nsViewManager::ViewToWidget(nsView* aView,
+                                                 const nsRect& aRect) const {
+   NS_ASSERTION(aView->GetViewManager() == this, "wrong view manager");
+ 
+   // account for the view's origin not lining up with the widget's
+   nsRect rect = aRect + aView->ViewToWidgetOffset();
+diff --git a/view/nsViewManager.h b/view/nsViewManager.h
+--- a/view/nsViewManager.h
++++ b/view/nsViewManager.h
+@@ -278,16 +278,18 @@ class nsViewManager final {
+ 
+  public:
+   /**
+    * Retrieve the widget at the root of the nearest enclosing
+    * view manager whose root view has a widget.
+    */
+   void GetRootWidget(nsIWidget** aWidget);
+ 
++  nsIWidget* GetRootWidget();
++
+   /**
+    * Indicate whether the viewmanager is currently painting
+    *
+    * @param aPainting true if the viewmanager is painting
+    *                  false otherwise
+    */
+   void IsPainting(bool& aIsPainting);
+ 
+

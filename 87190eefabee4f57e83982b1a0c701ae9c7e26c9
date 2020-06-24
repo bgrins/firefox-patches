@@ -1,0 +1,157 @@
+
+# HG changeset patch
+# User Emilio Cobos Álvarez <emilio@crisal.io>
+# Date 1584012768 -3600
+# Node ID 87190eefabee4f57e83982b1a0c701ae9c7e26c9
+# Parent  e5846fa0e13da8d0a837147bd70d7f2061649df5
+Flag nodes in opaque shadow trees.
+
+diff --git a/dom/base/CharacterData.cpp b/dom/base/CharacterData.cpp
+--- a/dom/base/CharacterData.cpp
++++ b/dom/base/CharacterData.cpp
+@@ -433,16 +433,20 @@ nsresult CharacterData::BindToTree(BindC
+     } else {
+       SetFlags(NODE_IS_IN_SHADOW_TREE);
+       MOZ_ASSERT(aParent.IsContent() &&
+                  aParent.AsContent()->GetContainingShadow());
+       ExtendedContentSlots()->mContainingShadow =
+           aParent.AsContent()->GetContainingShadow();
+     }
+ 
++    if (aParent.HasFlag(NODE_IS_IN_OPAQUE_SHADOW_TREE)) {
++      SetFlags(NODE_IS_IN_OPAQUE_SHADOW_TREE);
++    }
++
+     if (IsInComposedDoc() && mText.IsBidi()) {
+       aContext.OwnerDoc().SetBidiEnabled();
+     }
+ 
+     // Clear the lazy frame construction bits.
+     UnsetFlags(NODE_NEEDS_FRAME | NODE_DESCENDANTS_NEED_FRAMES);
+   } else {
+     // If we're not in the doc and not in a shadow tree,
+diff --git a/dom/base/Element.cpp b/dom/base/Element.cpp
+--- a/dom/base/Element.cpp
++++ b/dom/base/Element.cpp
+@@ -1119,25 +1119,30 @@ already_AddRefed<ShadowRoot> Element::At
+   }
+ 
+   /**
+    * 6. Return shadow.
+    */
+   return shadowRoot.forget();
+ }
+ 
++constexpr nsLiteralString kTestingString = NS_LITERAL_STRING(
++  "<div id='test'>Test</div>");
++
+ already_AddRefed<OpaqueShadowRoot> Element::AttachOpaqueShadow(
+     ErrorResult& aRv) {
+   ShadowRootInit init;
+   init.mMode = ShadowRootMode::Closed;
+   RefPtr<ShadowRoot> shadow = AttachShadow(init, aRv);
+   if (aRv.Failed()) {
+     return nullptr;
+   }
++  ShadowRoot* s = shadow.get();
+   auto opaque = MakeRefPtr<OpaqueShadowRoot>(std::move(shadow));
++  s->SetInnerHTML(kTestingString, IgnoreErrors());
+   return opaque.forget();
+ }
+ 
+ void Element::AttachAndSetUAShadowRoot() {
+   MOZ_DIAGNOSTIC_ASSERT(!CanAttachShadowDOM(),
+                         "Cannot be used to attach UI shadow DOM");
+ 
+   // Attach the UA Widget Shadow Root in a runnable so that the code runs
+@@ -1566,16 +1571,21 @@ nsresult Element::BindToTree(BindContext
+       SetIsInDocument();
+     } else {
+       SetFlags(NODE_IS_IN_SHADOW_TREE);
+       MOZ_ASSERT(aParent.IsContent() &&
+                  aParent.AsContent()->GetContainingShadow());
+       ExtendedDOMSlots()->mContainingShadow =
+           aParent.AsContent()->GetContainingShadow();
+     }
++
++    if (aParent.HasFlag(NODE_IS_IN_OPAQUE_SHADOW_TREE)) {
++      SetFlags(NODE_IS_IN_OPAQUE_SHADOW_TREE);
++    }
++
+     // Clear the lazy frame construction bits.
+     UnsetFlags(NODE_NEEDS_FRAME | NODE_DESCENDANTS_NEED_FRAMES);
+   } else {
+     // If we're not in the doc and not in a shadow tree,
+     // update our subtree pointer.
+     SetSubtreeRootPointer(aParent.SubtreeRoot());
+   }
+ 
+@@ -1801,16 +1811,20 @@ void Element::UnbindFromTree(bool aNullP
+ 
+   if (aNullParent || !mParent->IsInShadowTree()) {
+     UnsetFlags(NODE_IS_IN_SHADOW_TREE);
+ 
+     // Begin keeping track of our subtree root.
+     SetSubtreeRootPointer(aNullParent ? this : mParent->SubtreeRoot());
+   }
+ 
++  if (aNullParent || !mParent->HasFlag(NODE_IS_IN_OPAQUE_SHADOW_TREE)) {
++    UnsetFlags(NODE_IS_IN_OPAQUE_SHADOW_TREE);
++  }
++
+   if (nsExtendedDOMSlots* slots = GetExistingExtendedDOMSlots()) {
+     if (aNullParent || !mParent->IsInShadowTree()) {
+       slots->mContainingShadow = nullptr;
+     }
+   }
+ 
+   if (document) {
+     // Disconnected must be enqueued whenever a connected custom element becomes
+diff --git a/dom/base/nsINode.cpp b/dom/base/nsINode.cpp
+--- a/dom/base/nsINode.cpp
++++ b/dom/base/nsINode.cpp
+@@ -2950,16 +2950,18 @@ Element* nsINode::GetElementById(const n
+       return kid->AsElement();
+     }
+   }
+   return nullptr;
+ }
+ 
+ JSObject* nsINode::WrapObject(JSContext* aCx,
+                               JS::Handle<JSObject*> aGivenProto) {
++  MOZ_RELEASE_ASSERT(!HasFlag(NODE_IS_IN_OPAQUE_SHADOW_TREE));
++
+   // Make sure one of these is true
+   // (1) our owner document has a script handling object,
+   // (2) Our owner document has had a script handling object, or has been marked
+   //     to have had one,
+   // (3) we are running a privileged script.
+   // Event handling is possible only if (1). If (2) event handling is
+   // prevented.
+   // If the document has never had a script handling object, untrusted
+diff --git a/dom/base/nsINode.h b/dom/base/nsINode.h
+--- a/dom/base/nsINode.h
++++ b/dom/base/nsINode.h
+@@ -183,18 +183,20 @@ enum {
+   NODE_ALL_DIRECTION_FLAGS = NODE_HAS_DIRECTION_LTR | NODE_HAS_DIRECTION_RTL,
+ 
+   NODE_HAS_BEEN_IN_UA_WIDGET = NODE_FLAG_BIT(15),
+ 
+   // Set if the node has a nonce value and a header delivered CSP.
+   NODE_HAS_NONCE_AND_HEADER_CSP = NODE_FLAG_BIT(16),
+ 
+   NODE_KEEPS_DOMARENA = NODE_FLAG_BIT(17),
++
++  NODE_IS_IN_OPAQUE_SHADOW_TREE = NODE_FLAG_BIT(18),
+   // Remaining bits are node type specific.
+-  NODE_TYPE_SPECIFIC_BITS_OFFSET = 18
++  NODE_TYPE_SPECIFIC_BITS_OFFSET = 19
+ };
+ 
+ // Make sure we have space for our bits
+ #define ASSERT_NODE_FLAGS_SPACE(n)                         \
+   static_assert(WRAPPER_CACHE_FLAGS_BITS_USED + (n) <=     \
+                     sizeof(nsWrapperCache::FlagsType) * 8, \
+                 "Not enough space for our bits")
+ ASSERT_NODE_FLAGS_SPACE(NODE_TYPE_SPECIFIC_BITS_OFFSET);
+

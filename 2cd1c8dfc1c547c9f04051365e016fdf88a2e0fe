@@ -1,0 +1,151 @@
+
+# HG changeset patch
+# User Emilio Cobos Álvarez <emilio@crisal.io>
+# Date 1592246692 -7200
+# Node ID 2cd1c8dfc1c547c9f04051365e016fdf88a2e0fe
+# Parent  24c71c926169a4b08a85f18fd2885a7ebdf11532
+Rebase fixups.
+
+diff --git a/layout/generic/nsFrame.cpp b/layout/generic/nsFrame.cpp
+--- a/layout/generic/nsFrame.cpp
++++ b/layout/generic/nsFrame.cpp
+@@ -2473,32 +2473,32 @@ static inline bool IsIntrinsicKeyword(co
+   if (!aSize.IsExtremumLength()) {
+     return false;
+   }
+ 
+   // All of the keywords except for '-moz-available' depend on intrinsic sizes.
+   return aSize.AsExtremumLength() != StyleExtremumLength::MozAvailable;
+ }
+ 
+-bool nsIFrame::CanBeDynamicReflowRoot() const {
++auto nsIFrame::CanBeDynamicReflowRoot() const -> CanBeReflowRoot {
+   if (!StaticPrefs::layout_dynamic_reflow_roots_enabled()) {
+-    return false;
++    return CanBeReflowRoot::NotEnabled;
+   }
+ 
+   auto& display = *StyleDisplay();
+   if (IsFrameOfType(nsIFrame::eLineParticipant) ||
+       nsStyleDisplay::IsRubyDisplayType(display.mDisplay) ||
+       display.DisplayOutside() == StyleDisplayOutside::InternalTable ||
+       display.DisplayInside() == StyleDisplayInside::Table ||
+       (GetParent() && GetParent()->IsXULBoxFrame())) {
+     // We have a display type where 'width' and 'height' don't actually set the
+     // width or height (i.e., the size depends on content).
+     MOZ_ASSERT(!HasAnyStateBits(NS_FRAME_DYNAMIC_REFLOW_ROOT),
+                "should not have dynamic reflow root bit");
+-    return false;
++    return CanBeReflowRoot::InlineOrRubyOrTableOrXul;
+   }
+ 
+   // We can't serve as a dynamic reflow root if our used 'width' and 'height'
+   // might be influenced by content.
+   //
+   // FIXME: For display:block, we should probably optimize inline-size: auto.
+   // FIXME: Other flex and grid cases?
+   auto& pos = *StylePosition();
+@@ -2506,71 +2506,71 @@ bool nsIFrame::CanBeDynamicReflowRoot() 
+   const auto& height = pos.mHeight;
+   if (!width.IsLengthPercentage() || width.HasPercent() ||
+       !height.IsLengthPercentage() || height.HasPercent() ||
+       IsIntrinsicKeyword(pos.mMinWidth) || IsIntrinsicKeyword(pos.mMaxWidth) ||
+       IsIntrinsicKeyword(pos.mMinHeight) ||
+       IsIntrinsicKeyword(pos.mMaxHeight) ||
+       ((pos.mMinWidth.IsAuto() || pos.mMinHeight.IsAuto()) &&
+        IsFlexOrGridItem())) {
+-    return false;
++    return CanBeReflowRoot::NonFixedSize;
+   }
+ 
+   // If our flex-basis is 'auto', it'll defer to 'width' (or 'height') which
+   // we've already checked. Otherwise, it preempts them, so we need to
+   // perform the same "could-this-value-be-influenced-by-content" checks that
+   // we performed for 'width' and 'height' above.
+   if (IsFlexItem()) {
+     const auto& flexBasis = pos.mFlexBasis;
+     if (!flexBasis.IsAuto()) {
+       if (!flexBasis.IsSize() || !flexBasis.AsSize().IsLengthPercentage() ||
+           flexBasis.AsSize().HasPercent()) {
+-        return false;
++        return CanBeReflowRoot::FlexBasis;
+       }
+     }
+   }
+ 
+   if (!IsFixedPosContainingBlock()) {
+     // We can't treat this frame as a reflow root, since dynamic changes
+     // to absolutely-positioned frames inside of it require that we
+     // reflow the placeholder before we reflow the absolutely positioned
+     // frame.
+     // FIXME:  Alternatively, we could sort the reflow roots in
+     // PresShell::ProcessReflowCommands by depth in the tree, from
+     // deepest to least deep.  However, for performance (FIXME) we
+     // should really be sorting them in the opposite order!
+-    return false;
++    return CanBeReflowRoot::NotFixedContainingBlock;
+   }
+ 
+   // If we participate in a container's block reflow context, or margins
+   // can collapse through us, we can't be a dynamic reflow root.
+   if (IsBlockFrameOrSubclass() &&
+       !HasAllStateBits(NS_BLOCK_FLOAT_MGR | NS_BLOCK_MARGIN_ROOT)) {
+-    return false;
++    return CanBeReflowRoot::NotFlowRoot;
+   }
+ 
+   // Subgrids are never reflow roots, but 'contain:layout/paint' prevents
+   // creating a subgrid in the first place.
+   if (pos.mGridTemplateColumns.IsSubgrid() ||
+       pos.mGridTemplateRows.IsSubgrid()) {
+     // NOTE: we could check that 'display' of our parent's primary frame is
+     // '[inline-]grid' here but that's probably not worth it in practice.
+     if (!display.IsContainLayout() && !display.IsContainPaint()) {
+-      return false;
++      return CanBeReflowRoot::Subgrid;
+     }
+   }
+ 
+   // If we are split, we can't be a dynamic reflow root. Our reflow status may
+   // change after reflow, and our parent is responsible to create or delete our
+   // next-in-flow.
+   if (GetPrevContinuation() || GetNextContinuation()) {
+-    return false;
+-  }
+-
+-  return true;
++    return CanBeReflowRoot::SplitFrame;
++  }
++
++  return CanBeReflowRoot::Yes;
+ }
+ 
+ /********************************************************
+  * Refreshes each content's frame
+  *********************************************************/
+ 
+ void nsFrame::DisplayOutlineUnconditional(nsDisplayListBuilder* aBuilder,
+                                           const nsDisplayListSet& aLists) {
+diff --git a/layout/generic/nsIFrame.h b/layout/generic/nsIFrame.h
+--- a/layout/generic/nsIFrame.h
++++ b/layout/generic/nsIFrame.h
+@@ -881,16 +881,18 @@ class nsIFrame : public nsQueryFrame {
+     FlexBasis,
+     // The frame isn't a fixed-pos containing block, and thus could have
+     // escaping descendants.
+     NotFixedContainingBlock,
+     // Not a flow root: Floats can escape from us and collapse around us.
+     NotFlowRoot,
+     // Subgrid can't be a reflow root.
+     Subgrid,
++    // Fragmented frames need to be reflowed by their parent.
++    SplitFrame,
+     // We can be a reflow root!
+     Yes,
+   };
+ 
+   CanBeReflowRoot CanBeDynamicReflowRoot() const;
+ 
+   /**
+    * Gets the parent of a frame, using the parent of the placeholder for
+

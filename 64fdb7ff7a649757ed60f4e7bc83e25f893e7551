@@ -1,0 +1,296 @@
+
+# HG changeset patch
+# User Peter Van der Beken <peterv@propagandism.org>
+# Date 1584040824 -3600
+# Node ID 64fdb7ff7a649757ed60f4e7bc83e25f893e7551
+# Parent  87190eefabee4f57e83982b1a0c701ae9c7e26c9
+First stab at changesets
+
+diff --git a/dom/base/DocumentFragment.h b/dom/base/DocumentFragment.h
+--- a/dom/base/DocumentFragment.h
++++ b/dom/base/DocumentFragment.h
+@@ -4,27 +4,27 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_DocumentFragment_h__
+ #define mozilla_dom_DocumentFragment_h__
+ 
+ #include "mozilla/Attributes.h"
+ #include "mozilla/dom/BorrowedAttrInfo.h"
++#include "mozilla/dom/Element.h"
+ #include "mozilla/dom/FragmentOrElement.h"
+ #include "nsStringFwd.h"
+ 
+ class nsAtom;
+ class nsIContent;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+ class Document;
+-class Element;
+ 
+ class DocumentFragment : public FragmentOrElement {
+  private:
+   void Init() {
+     MOZ_ASSERT(mNodeInfo->NodeType() == DOCUMENT_FRAGMENT_NODE &&
+                    mNodeInfo->Equals(nsGkAtoms::documentFragmentNodeName,
+                                      kNameSpaceID_None),
+                "Bad NodeType in aNodeInfo");
+diff --git a/dom/base/OpaqueShadowRoot.cpp b/dom/base/OpaqueShadowRoot.cpp
+--- a/dom/base/OpaqueShadowRoot.cpp
++++ b/dom/base/OpaqueShadowRoot.cpp
+@@ -1,37 +1,156 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "OpaqueShadowRoot.h"
++#include "nsHashKeys.h"
++#include "nsTextNode.h"
++#include "mozilla/dom/Element.h"
+ #include "mozilla/dom/ShadowRoot.h"
+ #include "mozilla/dom/OpaqueShadowRootBinding.h"
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+-
+-NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(OpaqueShadowRoot, mShadowRoot)
++NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(OpaqueShadowRoot, mShadowRoot,
++                                      mIdentifierMap)
+ 
+ NS_IMPL_CYCLE_COLLECTION_ROOT_NATIVE(OpaqueShadowRoot, AddRef)
+ NS_IMPL_CYCLE_COLLECTION_UNROOT_NATIVE(OpaqueShadowRoot, Release)
+ 
+ nsISupports* OpaqueShadowRoot::GetParentObject() const {
+   return ToSupports(mShadowRoot);
+ }
+ 
+ OpaqueShadowRoot::OpaqueShadowRoot(RefPtr<ShadowRoot> aRoot)
+-  : mShadowRoot(std::move(aRoot)) {
++    : mShadowRoot(std::move(aRoot)) {
+   MOZ_ASSERT(mShadowRoot);
+ }
+ 
+-void OpaqueShadowRoot::Render() { /* TODO */ }
++void OpaqueShadowRoot::Render(const nsTArray<Change>& aChanges,
++                              ErrorResult& aError) {
++  for (auto& change : aChanges) {
++    if (change.mId.IsEmpty()) {
++      aError.ThrowTypeError("Need the id");
++      return;
++    }
++
++    switch (change.mType) {
++      case ChangeType::CreateElement: {
++        if (!change.mTagName.WasPassed() || change.mTagName.Value().IsEmpty()) {
++          aError.ThrowTypeError("Need a non-empty tagName for CreateElement");
++          return;
++        }
++        RefPtr<nsINode>& node = mIdentifierMap.GetOrInsert(change.mId);
++        if (node) {
++          aError.ThrowTypeError("Already have a node with this id");
++          return;
++        }
++        RefPtr<Element> element = mShadowRoot->OwnerDoc()->CreateElement(
++            change.mTagName.Value(), ElementCreationOptionsOrString(), aError);
++        if (aError.Failed()) {
++          return;
++        }
++        element->SetId(change.mId);
++        node = element.forget();
++        break;
++      }
++      case ChangeType::CreateTextNode: {
++        if (!change.mTextContent.WasPassed()) {
++          aError.ThrowTypeError("Need textContent for CreateTextNode");
++          return;
++        }
++        RefPtr<nsINode>& node = mIdentifierMap.GetOrInsert(change.mId);
++        if (node) {
++          aError.ThrowTypeError("Already have a node with this id");
++          return;
++        }
++        node = mShadowRoot->OwnerDoc()->CreateTextNode(
++            change.mTextContent.Value());
++        break;
++      }
++      case ChangeType::Append: {
++        nsINode* parent;
++        if (!change.mParentId.WasPassed() ||
++            change.mParentId.Value().IsEmpty()) {
++          parent = mShadowRoot;
++        } else {
++          parent = mIdentifierMap.GetWeak(change.mParentId.Value());
++          if (!parent) {
++            aError.ThrowTypeError("Appending to a non-existent parent");
++            return;
++          }
++        }
++
++        nsINode* child = mIdentifierMap.GetWeak(change.mId);
++        if (!child) {
++          aError.ThrowTypeError("Appending a non-existent child");
++          return;
++        }
++
++        parent->AppendChild(*child, aError);
++        break;
++      }
++      case ChangeType::Remove: {
++        nsCOMPtr<nsINode> node = mIdentifierMap.Get(change.mId);
++        if (!node) {
++          aError.ThrowTypeError("Removing a non-existent node");
++          return;
++        }
++        node->Remove();
++        // FIXME Do we want to remove node from mIdentifierMap here?
++        break;
++      }
++      case ChangeType::SetTextContent: {
++        nsINode* node = mIdentifierMap.GetWeak(change.mId);
++        if (!node) {
++          aError.ThrowTypeError("Setting textContent on a non-existent node");
++          return;
++        }
++        if (!change.mTextContent.WasPassed()) {
++          aError.ThrowTypeError("Need textContent for SetTextContent");
++          return;
++        }
++
++        node->SetTextContent(change.mTextContent.Value(), aError);
++        break;
++      }
++      case ChangeType::SetAttribute: {
++        nsINode* node = mIdentifierMap.GetWeak(change.mId);
++        if (!node || !node->IsElement()) {
++          if (node) {
++            aError.ThrowTypeError(
++                "Setting attribute on a node that's not an element");
++          } else {
++            aError.ThrowTypeError("Setting attribute on a non-existent node");
++          }
++          return;
++        }
++        if (!change.mAttributes.WasPassed()) {
++          aError.ThrowTypeError(
++              "Need the attribute names and values for SetAttribute");
++          return;
++        }
++        for (auto& attr : change.mAttributes.Value().Entries()) {
++          node->AsElement()->SetAttribute(attr.mKey, attr.mValue, aError);
++          if (aError.Failed()) {
++            return;
++          }
++        }
++        break;
++      }
++      case ChangeType::EndGuard_:
++        break;
++    }
++  }
++}
+ 
+ JSObject* OpaqueShadowRoot::WrapObject(JSContext* aCx,
+                                        JS::Handle<JSObject*> aGivenProto) {
+   return OpaqueShadowRoot_Binding::Wrap(aCx, this, aGivenProto);
+ }
+ 
+-}
+-}
++}  // namespace dom
++}  // namespace mozilla
+diff --git a/dom/base/OpaqueShadowRoot.h b/dom/base/OpaqueShadowRoot.h
+--- a/dom/base/OpaqueShadowRoot.h
++++ b/dom/base/OpaqueShadowRoot.h
+@@ -2,39 +2,47 @@
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_dom_OpaqueShadowRoot_h__
+ #define mozilla_dom_OpaqueShadowRoot_h__
+ 
++#include "nsRefPtrHashtable.h"
++#include "nsTArrayForwardDeclare.h"
+ #include "nsWrapperCache.h"
+-#include "nsCycleCollectionParticipant.h"
++
++class nsINode;
++class nsStringHashKey;
+ 
+ namespace mozilla {
+ 
++class ErrorResult;
++
+ namespace dom {
+ 
++struct Change;
+ class ShadowRoot;
+ 
+ class OpaqueShadowRoot final : public nsWrapperCache {
+   NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(OpaqueShadowRoot)
+   NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_NATIVE_CLASS(OpaqueShadowRoot)
+ 
+  public:
+   explicit OpaqueShadowRoot(RefPtr<ShadowRoot>);
+-  void Render();
++  void Render(const nsTArray<Change>& aChanges, ErrorResult& aError);
+ 
+   nsISupports* GetParentObject() const;
+   JSObject* WrapObject(JSContext*, JS::Handle<JSObject*> aGivenProto) final;
+ 
+  private:
+   virtual ~OpaqueShadowRoot() = default;
+ 
+   RefPtr<ShadowRoot> mShadowRoot;
++  nsRefPtrHashtable<nsStringHashKey, nsINode> mIdentifierMap;
+ };
+ 
+-} // namespace dom
++}  // namespace dom
+ 
+-} // namespace mozilla
++}  // namespace mozilla
+ 
+ #endif
+diff --git a/dom/webidl/OpaqueShadowRoot.webidl b/dom/webidl/OpaqueShadowRoot.webidl
+--- a/dom/webidl/OpaqueShadowRoot.webidl
++++ b/dom/webidl/OpaqueShadowRoot.webidl
+@@ -1,10 +1,29 @@
+ /* -*- Mode: IDL; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this file,
+  * You can obtain one at http://mozilla.org/MPL/2.0/.
+  */
+ 
++enum ChangeType {
++  "CreateElement",
++  "CreateTextNode",
++  "Append",
++  "Remove",
++  "SetTextContent",
++  "SetAttribute"
++};
++
++dictionary Change {
++  required ChangeType type;
++  required DOMString id;
++  DOMString tagName;
++  DOMString parentId;
++  DOMString textContent;
++  record<DOMString, DOMString> attributes;
++};
++
+ [Exposed=Window]
+ interface OpaqueShadowRoot {
+-  void render();
++  [Throws]
++  void render(sequence<Change> changes);
+ };
+
