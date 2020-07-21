@@ -1,0 +1,199 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  5a8bb8c71dfedf959e7873df9185537fb681a6d4
+
+diff --git a/embedder.c b/embedder.c
+--- a/embedder.c
++++ b/embedder.c
+@@ -2,12 +2,14 @@
+ // clang -std=gnu99 dumb.c XUL -o GeckoView && ./GeckoView
+ 
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <dlfcn.h>
+ 
+ extern int GeckoViewStart(int argc, char *[]);
++extern int GeckoViewMessage(int in);
+ 
+ int main(int argc, char *argv[]) {
+   GeckoViewStart(argc, argv);
++  GeckoViewMessage(1);
+ }
+diff --git a/mozglue/geckoview/GeckoViewDesktop.cpp b/mozglue/geckoview/GeckoViewDesktop.cpp
+--- a/mozglue/geckoview/GeckoViewDesktop.cpp
++++ b/mozglue/geckoview/GeckoViewDesktop.cpp
+@@ -45,38 +45,41 @@ static nsresult InitXPCOMGlue(LibLoading
+   }
+ 
+   // This will set this thread as the main thread.
+   gBootstrap->NS_LogInit();
+ 
+   return NS_OK;
+ }
+ 
+-extern "C" NS_EXPORT int GeckoViewMessage(int msg) {
+-
++extern "C" NS_EXPORT int GeckoViewMessage(int in) {
++  return in + 1;
+ }
+ 
+ extern "C" NS_EXPORT int GeckoViewStart(int argc, char *argv[]) {
+   mozilla::TimeStamp start = mozilla::TimeStamp::Now();
+ 
+   AUTO_BASE_PROFILER_INIT;
+   AUTO_BASE_PROFILER_LABEL("GeckoViewStart", OTHER);
+ 
+   nsresult rv = InitXPCOMGlue(LibLoadingStrategy::ReadAhead);
+   if (NS_FAILED(rv)) {
+     return 255;
+   }
+ 
+   gBootstrap->XRE_StartupTimelineRecord(mozilla::StartupTimeline::START, start);
+ 
+   // See do_main at https://searchfox.org/mozilla-central/rev/3b6958c26049c1e27b2790a43154caaba9f6dd4a/browser/app/nsBrowserApp.cpp#150
+-  BootstrapConfig config;
+-  config.appData = &sAppData;
+-  config.appDataPath = kDesktopFolder;
+-  int result = gBootstrap->XRE_main(argc, argv, config);
++  // BootstrapConfig config;
++  // config.appData = &sAppData;
++  // config.appDataPath = kDesktopFolder;
++  // int result = gBootstrap->XRE_main(argc, argv, config);
++
++
++  gBootstrap->GeckoStart(argc, argv, sAppData);
+ 
+   // InitXPCOMGlue calls NS_LogInit, so we need to balance it here.
+   gBootstrap->NS_LogTerm();
+ 
+ #ifdef XP_MACOSX
+   // Allow writes again. While we would like to catch writes from static
+   // destructors to allow early exits to use _exit, we know that there is
+   // at least one such write that we don't control (see bug 826029). For
+diff --git a/toolkit/xre/Bootstrap.cpp b/toolkit/xre/Bootstrap.cpp
+--- a/toolkit/xre/Bootstrap.cpp
++++ b/toolkit/xre/Bootstrap.cpp
+@@ -86,16 +86,23 @@ class BootstrapImpl final : public Boots
+   virtual void XRE_WriteLLVMProfData() override {
+     __android_log_print(ANDROID_LOG_INFO, "GeckoLibLoad",
+                         "Calling __llvm_profile_dump()");
+     __llvm_profile_dump();
+   }
+ #  endif
+ #endif
+ 
++#ifndef MOZ_WIDGET_ANDROID
++  virtual void GeckoStart(int argc, char *argv[],
++                          const StaticXREAppData& aAppData) override {
++    ::GeckoStart(argc, argv, aAppData);
++  }
++#endif
++
+ #ifdef LIBFUZZER
+   virtual void XRE_LibFuzzerSetDriver(LibFuzzerDriver aDriver) override {
+     ::XRE_LibFuzzerSetDriver(aDriver);
+   }
+ #endif
+ 
+ #ifdef MOZ_IPDL_TESTS
+   virtual int XRE_RunIPDLTest(int argc, char** argv) override {
+diff --git a/toolkit/xre/Bootstrap.h b/toolkit/xre/Bootstrap.h
+--- a/toolkit/xre/Bootstrap.h
++++ b/toolkit/xre/Bootstrap.h
+@@ -18,16 +18,21 @@
+ 
+ #ifdef MOZ_WIDGET_ANDROID
+ #  include "jni.h"
+ 
+ extern "C" NS_EXPORT void GeckoStart(JNIEnv* aEnv, char** argv, int argc,
+                                      const mozilla::StaticXREAppData& aAppData);
+ #endif
+ 
++#ifndef MOZ_WIDGET_ANDROID
++extern "C" NS_EXPORT void GeckoStart(int argc, char *argv[],
++                                     const mozilla::StaticXREAppData& aAppData);
++#endif
++
+ #if defined(XP_WIN) && defined(MOZ_SANDBOX)
+ namespace sandbox {
+ class BrokerServices;
+ }
+ #endif
+ 
+ namespace mozilla {
+ 
+@@ -114,16 +119,21 @@ class Bootstrap {
+ 
+   virtual void XRE_SetAndroidChildFds(JNIEnv* aEnv,
+                                       const XRE_AndroidChildFds& fds) = 0;
+ #  ifdef MOZ_PROFILE_GENERATE
+   virtual void XRE_WriteLLVMProfData() = 0;
+ #  endif
+ #endif
+ 
++#ifndef MOZ_WIDGET_ANDROID
++  virtual void GeckoStart(int argc, char *argv[],
++                          const StaticXREAppData& aAppData) = 0;
++#endif
++
+ #ifdef LIBFUZZER
+   virtual void XRE_LibFuzzerSetDriver(LibFuzzerDriver aDriver) = 0;
+ #endif
+ 
+ #ifdef MOZ_IPDL_TESTS
+   virtual int XRE_RunIPDLTest(int argc, char** argv) = 0;
+ #endif
+ 
+diff --git a/toolkit/xre/moz.build b/toolkit/xre/moz.build
+--- a/toolkit/xre/moz.build
++++ b/toolkit/xre/moz.build
+@@ -118,16 +118,20 @@ if CONFIG['MOZ_X11']:
+     ]
+ 
+ if CONFIG['MOZ_WIDGET_TOOLKIT'] == 'android':
+     UNIFIED_SOURCES += [
+         'nsAndroidStartup.cpp',
+     ]
+ 
+ UNIFIED_SOURCES += [
++    'nsGeckoViewDesktopStartup.cpp',
++]
++
++UNIFIED_SOURCES += [
+     '/toolkit/mozapps/update/common/commonupdatedir.cpp',
+     'AutoSQLiteLifetime.cpp',
+     'Bootstrap.cpp',
+     'CmdLineAndEnvUtils.cpp',
+     'CreateAppData.cpp',
+     'nsAppStartupNotifier.cpp',
+     'nsConsoleWriter.cpp',
+     'nsEmbeddingModule.cpp',
+diff --git a/toolkit/xre/nsGeckoViewDesktopStartup.cpp b/toolkit/xre/nsGeckoViewDesktopStartup.cpp
+new file mode 100644
+--- /dev/null
++++ b/toolkit/xre/nsGeckoViewDesktopStartup.cpp
+@@ -0,0 +1,23 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 2 -*-
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "nsTArray.h"
++#include "nsString.h"
++#include "nsAppRunner.h"
++#include "nsExceptionHandler.h"
++#include "mozilla/Bootstrap.h"
++
++using namespace mozilla;
++
++extern "C" NS_EXPORT void GeckoStart(int argc, char *argv[],
++                                     const StaticXREAppData& aAppData) {
++  BootstrapConfig config;
++  config.appData = &aAppData;
++  config.appDataPath = nullptr;
++
++  int result = XRE_main(argc, argv, config);
++
++  if (result) printf("XRE_main returned %d", result);
++}
