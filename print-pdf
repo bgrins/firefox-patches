@@ -1,0 +1,430 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Parent  fb9bece74468639f918adb5b97bc14badb2e5928
+
+diff --git a/browser/components/BrowserContentHandler.jsm b/browser/components/BrowserContentHandler.jsm
+--- a/browser/components/BrowserContentHandler.jsm
++++ b/browser/components/BrowserContentHandler.jsm
+@@ -973,17 +973,27 @@ nsDefaultCommandLineHandler.prototype = 
+       }
+     } catch (e) {
+       Cu.reportError(e);
+     }
+ 
+     if (cmdLine.findFlag("screenshot", true) != -1) {
+       HeadlessShell.handleCmdLineArgs(
+         cmdLine,
+-        urilist.filter(shouldLoadURI).map(u => u.spec)
++        urilist.filter(shouldLoadURI).map(u => u.spec),
++        "screenshot"
++      );
++      return;
++    }
++
++    if (cmdLine.findFlag("print-to-pdf", true) != -1) {
++      HeadlessShell.handleCmdLineArgs(
++        cmdLine,
++        urilist.filter(shouldLoadURI).map(u => u.spec),
++        "print-to-pdf"
+       );
+       return;
+     }
+ 
+     for (let i = 0; i < cmdLine.length; ++i) {
+       var curarg = cmdLine.getArgument(i);
+       if (curarg.match(/^-/)) {
+         Cu.reportError(
+diff --git a/browser/components/shell/HeadlessShell.jsm b/browser/components/shell/HeadlessShell.jsm
+--- a/browser/components/shell/HeadlessShell.jsm
++++ b/browser/components/shell/HeadlessShell.jsm
+@@ -10,33 +10,46 @@ const { E10SUtils } = ChromeUtils.import
+   "resource://gre/modules/E10SUtils.jsm"
+ );
+ const { HiddenFrame } = ChromeUtils.import(
+   "resource://gre/modules/HiddenFrame.jsm"
+ );
+ const { OS } = ChromeUtils.import("resource://gre/modules/osfile.jsm");
+ const { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm");
+ 
++const { XPCOMUtils } = ChromeUtils.import(
++  "resource://gre/modules/XPCOMUtils.jsm"
++);
++
++XPCOMUtils.defineLazyModuleGetters(this, {
++  setInterval: "resource://gre/modules/Timer.jsm",
++  clearInterval: "resource://gre/modules/Timer.jsm",
++});
++
+ // Refrences to the progress listeners to keep them from being gc'ed
+ // before they are called.
+ const progressListeners = new Set();
+ 
+ class ScreenshotParent extends JSWindowActorParent {
+-  takeScreenshot(params) {
+-    return this.sendQuery("TakeScreenshot", params);
++  takeScreenshotOrPDF(params) {
++    if (params.isScreenshot) {
++      return this.sendQuery("TakeScreenshot", params);
++    }
++    return takePDF(params, params.browser);
++    // return this.sendQuery("TakePDF", params);
+   }
+ }
+ 
+ ChromeUtils.registerWindowActor("Screenshot", {
+   parent: {
+     moduleURI: "resource:///modules/HeadlessShell.jsm",
+   },
+   child: {
+     moduleURI: "resource:///modules/ScreenshotChild.jsm",
+-    messages: ["TakeScreenshot"],
++    messages: ["TakeScreenshot", "TakePDF"],
+   },
+ });
+ 
+ function loadContentWindow(browser, url) {
+   let uri;
+   try {
+     uri = Services.io.newURI(url);
+   } catch (e) {
+@@ -81,23 +94,192 @@ function loadContentWindow(browser, url)
+     progressListeners.add(progressListener);
+     webProgress.addProgressListener(
+       progressListener,
+       Ci.nsIWebProgress.NOTIFY_LOCATION
+     );
+   });
+ }
+ 
+-async function takeScreenshot(
++// XXX: Copied from https://searchfox.org/mozilla-central/rev/828f2319c0195d7f561ed35533aef6fe183e68e3/remote/domains/parent/Page.jsm#530
++
++/**
++ * Print page as PDF.
++ *
++ * @param {Object} options
++ * @param {boolean=} options.displayHeaderFooter
++ *     Display header and footer. Defaults to false.
++ * @param {string=} options.footerTemplate (not supported)
++ *     HTML template for the print footer.
++ * @param {string=} options.headerTemplate (not supported)
++ *     HTML template for the print header. Should use the same format
++ *     as the footerTemplate.
++ * @param {boolean=} options.ignoreInvalidPageRanges
++ *     Whether to silently ignore invalid but successfully parsed page ranges,
++ *     such as '3-2'. Defaults to false.
++ * @param {boolean=} options.landscape
++ *     Paper orientation. Defaults to false.
++ * @param {number=} options.marginBottom
++ *     Bottom margin in inches. Defaults to 1cm (~0.4 inches).
++ * @param {number=} options.marginLeft
++ *     Left margin in inches. Defaults to 1cm (~0.4 inches).
++ * @param {number=} options.marginRight
++ *     Right margin in inches. Defaults to 1cm (~0.4 inches).
++ * @param {number=} options.marginTop
++ *     Top margin in inches. Defaults to 1cm (~0.4 inches).
++ * @param {string=} options.pageRanges (not supported)
++ *     Paper ranges to print, e.g., '1-5, 8, 11-13'.
++ *     Defaults to the empty string, which means print all pages.
++ * @param {number=} options.paperHeight
++ *     Paper height in inches. Defaults to 11 inches.
++ * @param {number=} options.paperWidth
++ *     Paper width in inches. Defaults to 8.5 inches.
++ * @param {boolean=} options.preferCSSPageSize
++ *     Whether or not to prefer page size as defined by CSS.
++ *     Defaults to false, in which case the content will be scaled
++ *     to fit the paper size.
++ * @param {boolean=} options.printBackground
++ *     Print background graphics. Defaults to false.
++ * @param {number=} options.scale
++ *     Scale of the webpage rendering. Defaults to 1.
++ * @param {string=} options.transferMode
++ *     Return as base64-encoded string (ReturnAsBase64),
++ *     or stream (ReturnAsStream). Defaults to ReturnAsBase64.
++ *
++ * @return {Promise<{data:string, stream:string}>
++ *     Based on the transferMode setting data is a base64-encoded string,
++ *     or stream is a handle to a OS.File stream.
++ */
++async function takePDF(options = {}, browser) {
++  const PRINT_MAX_SCALE_VALUE = 2.0;
++  const PRINT_MIN_SCALE_VALUE = 0.1;
++
++  const PDF_TRANSFER_MODES = {
++    base64: "ReturnAsBase64",
++    stream: "ReturnAsStream",
++  };
++  const {
++    displayHeaderFooter = false,
++    // Bug 1601570 - Implement templates for header and footer
++    // headerTemplate = "",
++    // footerTemplate = "",
++    landscape = false,
++    marginBottom = 0.39,
++    marginLeft = 0.39,
++    marginRight = 0.39,
++    marginTop = 0.39,
++    // Bug 1601571 - Implement handling of page ranges
++    // TODO: pageRanges = "",
++    // TODO: ignoreInvalidPageRanges = false,
++    paperHeight = 11.0,
++    paperWidth = 8.5,
++    preferCSSPageSize = false,
++    printBackground = false,
++    scale = 1.0,
++    transferMode = PDF_TRANSFER_MODES.base64,
++  } = options;
++
++  if (marginBottom < 0) {
++    throw new TypeError("marginBottom is negative");
++  }
++  if (marginLeft < 0) {
++    throw new TypeError("marginLeft is negative");
++  }
++  if (marginRight < 0) {
++    throw new TypeError("marginRight is negative");
++  }
++  if (marginTop < 0) {
++    throw new TypeError("marginTop is negative");
++  }
++  if (scale < PRINT_MIN_SCALE_VALUE || scale > PRINT_MAX_SCALE_VALUE) {
++    throw new TypeError("scale is outside [0.1 - 2] range");
++  }
++  if (paperHeight <= 0) {
++    throw new TypeError("paperHeight is zero or negative");
++  }
++  if (paperWidth <= 0) {
++    throw new TypeError("paperWidth is zero or negative");
++  }
++
++  // Create a unique filename for the temporary PDF file
++  // const basePath = OS.Path.join(OS.Constants.Path.tmpDir, "remote-agent.pdf");
++  let filePath = options.path;
++  // const { file, path: filePath } = await OS.File.openUnique(basePath);
++  // await file.close();
++
++  const psService = Cc["@mozilla.org/gfx/printsettings-service;1"].getService(
++    Ci.nsIPrintSettingsService
++  );
++
++  const printSettings = psService.newPrintSettings;
++  printSettings.isInitializedFromPrinter = true;
++  printSettings.isInitializedFromPrefs = true;
++  printSettings.outputFormat = Ci.nsIPrintSettings.kOutputFormatPDF;
++  printSettings.printerName = "";
++  printSettings.printSilent = true;
++  printSettings.printToFile = true;
++  printSettings.showPrintProgress = false;
++  printSettings.toFileName = filePath;
++
++  printSettings.paperSizeUnit = Ci.nsIPrintSettings.kPaperSizeInches;
++  printSettings.paperWidth = paperWidth;
++  printSettings.paperHeight = paperHeight;
++
++  printSettings.marginBottom = marginBottom;
++  printSettings.marginLeft = marginLeft;
++  printSettings.marginRight = marginRight;
++  printSettings.marginTop = marginTop;
++
++  printSettings.printBGColors = printBackground;
++  printSettings.printBGImages = printBackground;
++  printSettings.scaling = scale;
++  printSettings.shrinkToFit = preferCSSPageSize;
++
++  if (!displayHeaderFooter) {
++    printSettings.headerStrCenter = "";
++    printSettings.headerStrLeft = "";
++    printSettings.headerStrRight = "";
++    printSettings.footerStrCenter = "";
++    printSettings.footerStrLeft = "";
++    printSettings.footerStrRight = "";
++  }
++
++  if (landscape) {
++    printSettings.orientation = Ci.nsIPrintSettings.kLandscapeOrientation;
++  }
++  await browser.print(browser.outerWindowID, printSettings);
++  // const { linkedBrowser } = this.session.target.tab;
++
++  // await linkedBrowser.print(linkedBrowser.outerWindowID, printSettings);
++
++  // Bug 1603739 - With e10s enabled the promise returned by print() resolves
++  // too early, which means the file hasn't been completely written.
++  await new Promise(resolve => {
++    const DELAY_CHECK_FILE_COMPLETELY_WRITTEN = 100;
++
++    let lastSize = 0;
++    const timerId = setInterval(async () => {
++      const fileInfo = await OS.File.stat(filePath);
++      if (lastSize > 0 && fileInfo.size == lastSize) {
++        clearInterval(timerId);
++        resolve();
++      }
++      lastSize = fileInfo.size;
++    }, DELAY_CHECK_FILE_COMPLETELY_WRITTEN);
++  });
++}
++
++async function takeScreenshotOrPDF(
+   fullWidth,
+   fullHeight,
+   contentWidth,
+   contentHeight,
+   path,
+-  url
++  url,
++  isScreenshot
+ ) {
+   let frame;
+   try {
+     frame = new HiddenFrame();
+     let windowlessBrowser = await frame.get();
+ 
+     let doc = windowlessBrowser.document;
+     let browser = doc.createXULElement("browser");
+@@ -109,42 +291,54 @@ async function takeScreenshot(
+     );
+     doc.documentElement.appendChild(browser);
+ 
+     await loadContentWindow(browser, url);
+ 
+     let actor = browser.browsingContext.currentWindowGlobal.getActor(
+       "Screenshot"
+     );
+-    let blob = await actor.takeScreenshot({
++    let blob = await actor.takeScreenshotOrPDF({
+       fullWidth,
+       fullHeight,
++      isScreenshot,
++      path,
++      browser,
+     });
+ 
+-    let reader = await new Promise(resolve => {
+-      let fr = new FileReader();
+-      fr.onloadend = () => resolve(fr);
+-      fr.readAsArrayBuffer(blob);
+-    });
++    if (isScreenshot) {
++      let reader = await new Promise(resolve => {
++        let fr = new FileReader();
++        fr.onloadend = () => resolve(fr);
++        fr.readAsArrayBuffer(blob);
++      });
+ 
+-    await OS.File.writeAtomic(path, new Uint8Array(reader.result), {
+-      flush: true,
+-    });
++      await OS.File.writeAtomic(path, new Uint8Array(reader.result), {
++        flush: true,
++      });
++    }
+     dump("Screenshot saved to: " + path + "\n");
+   } catch (e) {
+     dump("Failure taking screenshot: " + e + "\n");
+   } finally {
+     if (frame) {
+       frame.destroy();
+     }
+   }
+ }
+ 
+ let HeadlessShell = {
+-  async handleCmdLineArgs(cmdLine, URLlist) {
++  async handleCmdLineArgs(cmdLine, URLlist, methodName) {
++    let isPDF = methodName == "print-to-pdf";
++    let isScreenshot = methodName == "screenshot";
++    let fileName = isScreenshot ? "screenshot.png" : "output.pdf";
++    if (!isPDF && !isScreenshot) {
++      throw new Error("Invalid method name");
++    }
++
+     try {
+       // Don't quit even though we don't create a window
+       Services.startup.enterLastWindowClosingSurvivalArea();
+ 
+       // Default options
+       let fullWidth = true;
+       let fullHeight = true;
+       // Most common screen resolution of Firefox users
+@@ -182,38 +376,39 @@ let HeadlessShell = {
+           dump("expected format: --window-size width[,height]\n");
+           return;
+         }
+       }
+ 
+       // Only command line argument left should be `screenshot`
+       // There could still be URLs however
+       try {
+-        var path = cmdLine.handleFlagWithParam("screenshot", true);
++        var path = cmdLine.handleFlagWithParam(methodName, true);
+         if (!cmdLine.length && !URLlist.length) {
+           URLlist.push(path); // Assume the user wanted to specify a URL
+-          path = OS.Path.join(cmdLine.workingDirectory.path, "screenshot.png");
++          path = OS.Path.join(cmdLine.workingDirectory.path, fileName);
+         }
+       } catch (e) {
+-        path = OS.Path.join(cmdLine.workingDirectory.path, "screenshot.png");
+-        cmdLine.handleFlag("screenshot", true); // Remove `screenshot`
++        path = OS.Path.join(cmdLine.workingDirectory.path, fileName);
++        cmdLine.handleFlag(methodName, true); // Remove `screenshot`
+       }
+ 
+       for (let i = 0; i < cmdLine.length; ++i) {
+         URLlist.push(cmdLine.getArgument(i)); // Assume that all remaining arguments are URLs
+       }
+ 
+       if (URLlist.length == 1) {
+-        await takeScreenshot(
++        await takeScreenshotOrPDF(
+           fullWidth,
+           fullHeight,
+           contentWidth,
+           contentHeight,
+           path,
+-          URLlist[0]
++          URLlist[0],
++          isScreenshot
+         );
+       } else {
+         dump("expected exactly one URL when using `screenshot`\n");
+       }
+     } finally {
+       Services.startup.exitLastWindowClosingSurvivalArea();
+       Services.startup.quit(Ci.nsIAppStartup.eForceQuit);
+     }
+diff --git a/browser/components/shell/ScreenshotChild.jsm b/browser/components/shell/ScreenshotChild.jsm
+--- a/browser/components/shell/ScreenshotChild.jsm
++++ b/browser/components/shell/ScreenshotChild.jsm
+@@ -1,21 +1,31 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ "use strict";
+ 
+ const EXPORTED_SYMBOLS = ["ScreenshotChild"];
+ 
++const { OS } = ChromeUtils.import("resource://gre/modules/osfile.jsm");
++const { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm");
++
+ class ScreenshotChild extends JSWindowActorChild {
+   receiveMessage(message) {
+     if (message.name == "TakeScreenshot") {
+       return this.takeScreenshot(message.data);
+     }
++    if (message.name == "TakePDF") {
++      console.log(this.browsingContext);
++      return this.takePDF(
++        message.data,
++        this.browsingContext.top.embedderElement
++      );
++    }
+     return null;
+   }
+ 
+   async takeScreenshot(params) {
+     if (this.document.readyState != "complete") {
+       await new Promise(resolve =>
+         this.contentWindow.addEventListener("load", resolve, { once: true })
+       );
