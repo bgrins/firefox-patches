@@ -115,7 +115,7 @@ diff --git a/browser/components/companion/content/companion.css b/browser/compon
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/companion/content/companion.css
-@@ -0,0 +1,58 @@
+@@ -0,0 +1,127 @@
 +html {
 +  appearance: auto;
 +  -moz-default-appearance: dialog;
@@ -128,7 +128,6 @@ new file mode 100644
 +  padding: 0;
 +  overflow: hidden;
 +}
-+
 +
 +body {
 +  --toolbar-bgcolor: #fbfbfb;
@@ -154,37 +153,108 @@ new file mode 100644
 +  /* dark colours */
 +}
 +
-+#controls {
-+  padding: 3px;
-+  border-bottom: 2px solid var(--toolbar-border);
-+  background: var(--toolbar-bgcolor);
-+  box-sizing: border-box;
-+  /* position: fixed;
-+  width: 100%;
-+  top: 0;
-+  */
-+}
-+
 +body {
 +  display: grid;
-+  grid-template-columns: auto 1fr;
++  grid-template-rows: auto minmax(0, 1fr);
 +}
 +
-+body > aside {
++#main {
++  padding: 0 var(--card-padding);
++  background: green;
++  overflow: scroll;
++  flex-grow: 1;
 +}
-+body > main {
++#main-inner {
++
++}
++#main-inner ul {
++  /* display: grid;
++  align-items: center;
++  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); */
++}
++named-deck > section {
++  display: flex;
++  height: 100%;
++}
++
++
++/* #sidebar {
++  border-right: 1px solid var(--in-content-box-border-color);
++  padding: 0 var(--card-padding);
++} */
++
++#timeline {
++  text-align: center;
++}
++
++.tab-group {
++  margin-top: 0 !important;
++  padding: 0 var(--card-padding) !important;
++}
++button.tab-button {
++  padding: 4px 6px !important;
++}
++/* Copied from aboutaddons.css */
++
++.tab-group {
++  display: block;
++  margin-top: 8px;
++  /* Pull the buttons flush with the side of the card */
++  margin-inline: calc(var(--card-padding) * -1);
++  border-bottom: 1px solid var(--in-content-box-border-color);
++  border-top: 1px solid var(--in-content-box-border-color);
++  font-size: 0;
++  line-height: 0;
++}
++
++button.tab-button {
++  appearance: none;
++  border-inline: none;
++  border-block: 2px solid transparent;
++  border-radius: 0;
++  background: transparent;
++  font-size: 14px;
++  line-height: 20px;
++  margin: 0;
++  padding: 4px 16px;
++  color: var(--in-content-text-color);
++}
++
++button.tab-button:hover {
++  background-color: var(--in-content-button-background);
++  border-top-color: var(--in-content-box-border-color);
++}
++
++button.tab-button:hover:active {
++  background-color: var(--in-content-button-background-hover);
++}
++
++button.tab-button[selected] {
++  border-top-color: var(--in-content-border-highlight);
++  color: var(--in-content-category-text-selected) !important;
++}
++
++button.tab-button:-moz-focusring {
++  outline-offset: -2px;
++  -moz-outline-radius: 0;
++}
++
++.tab-group[last-input-type="mouse"] > button.tab-button:-moz-focusring {
++  outline: none;
++  box-shadow: none;
 +}
 \ No newline at end of file
 diff --git a/browser/components/companion/content/companion.html b/browser/components/companion/content/companion.html
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/companion/content/companion.html
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,146 @@
 +<!-- This Source Code Form is subject to the terms of the Mozilla Public
 +   - License, v. 2.0. If a copy of the MPL was not distributed with this
 +   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
 +<!DOCTYPE html>
 +<html dir="" windowtype="browser:companion" width="900" height="350" persist="screenX screenY width height sizemode">
++
 +<head>
 +  <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
 +  <link rel="stylesheet" href="chrome://global/skin/global.css" />
@@ -195,26 +265,41 @@ new file mode 100644
 +  <link rel="stylesheet" href="chrome://browser/content/companion/companion.css" />
 +  <script src="chrome://mozapps/content/extensions/named-deck.js"></script>
 +</head>
++
 +<body role="application">
-+    <aside id="sidebar">
-+        <button-group class="tab-group">
-+          <button is="named-deck-button" deck="details-deck" name="details" data-l10n-id="details-addon-button" class="tab-button">Timeline</button>
-+          <button is="named-deck-button" deck="details-deck" name="preferences" data-l10n-id="preferences-addon-button" class="tab-button">Windows</button>
-+          <button is="named-deck-button" deck="details-deck" name="permissions" data-l10n-id="permissions-addon-button" class="tab-button">Tasks</button>
-+        </button-group>
-+        <named-deck id="details-deck">
-+          <section name="details">
-+            details
-+          </section>
-+          <section name="preferences">
-+            asdf
-+          </section>
-+          <section name="permissions">
-+            a</section>
-+        </named-deck>
-+    </aside>
-+    <main id="main"></main>
-+<!--
++  <button-group class="tab-group">
++    <button is="named-deck-button" deck="details-deck" name="details" data-l10n-id="details-addon-button"
++      class="tab-button">Timeline</button>
++    <button is="named-deck-button" deck="details-deck" name="preferences" data-l10n-id="preferences-addon-button"
++      class="tab-button">Windows</button>
++    <button is="named-deck-button" deck="details-deck" name="permissions" data-l10n-id="permissions-addon-button"
++      class="tab-button">Tasks</button>
++  </button-group>
++  <named-deck id="details-deck">
++    <section name="details">
++      <aside>
++        <div id="timeline">
++          <div><button>Today</button></div>
++          <div>.</div>
++          <div>.</div>
++          <div><button>Yesterday</button></div>
++          <div>.</div>
++          <div>.</div>
++          <div>.</div>
++          <div><button>Last week</button></div>
++        </div>
++      </aside>
++      <div id="main">
++        <div id="main-inner"></div>
++      </div>
++    </section>
++    <section name="preferences">
++      asdf
++    </section>
++    <section name="permissions">
++      a</section>
++  </named-deck>
++  <!--
 +  <div id="root">
 +  <link rel="stylesheet" href="chrome://activity-stream/content/css/activity-stream.css" />
 +
@@ -332,14 +417,14 @@ new file mode 100644
 +  BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.jsm",
 +});
 +
-+console.log("Hello from companion");
++console.log("Hello from companion", window);
 +
 +function render() {
-+  let outerContainer = document.querySelector("main");
++  let outerContainer = document.querySelector("#main-inner");
 +  let container = document.createElement("ul");
 +  for (let window of BrowserWindowTracker.orderedWindows) {
 +    let winContainer = document.createElement("li");
-+    winContainer.textContent = window;
++    winContainer.textContent = window.document.title;
 +    container.append(winContainer);
 +  }
 +  outerContainer.textContent = "";
@@ -347,7 +432,7 @@ new file mode 100644
 +}
 +
 +// XXX Make windowtracker an eventtarget and only render when necessary
-+setInterval(render, 1000);
++// setInterval(render, 1000);
 +render();
 diff --git a/browser/components/companion/content/jar.mn b/browser/components/companion/content/jar.mn
 new file mode 100644
