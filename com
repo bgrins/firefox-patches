@@ -23,7 +23,7 @@ diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
    DownloadsCommon: "resource:///modules/DownloadsCommon.jsm",
    DownloadUtils: "resource://gre/modules/DownloadUtils.jsm",
    E10SUtils: "resource://gre/modules/E10SUtils.jsm",
-@@ -1725,16 +1726,28 @@ var gBrowserInit = {
+@@ -1725,16 +1726,27 @@ var gBrowserInit = {
      window.browserDOMWindow = new nsBrowserAccess();
  
      gBrowser = window._gBrowser;
@@ -32,7 +32,6 @@ diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
  
      BrowserWindowTracker.track(window);
  
-+    CompanionWindow.init();
 +    window.addEventListener("keydown", e => {
 +      if (e.key == "F10") {
 +        CompanionWindow.focus();
@@ -52,6 +51,47 @@ diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
      for (let area of areas) {
        let node = document.getElementById(area);
        CustomizableUI.registerToolbarNode(node);
+diff --git a/browser/components/BrowserGlue.jsm b/browser/components/BrowserGlue.jsm
+--- a/browser/components/BrowserGlue.jsm
++++ b/browser/components/BrowserGlue.jsm
+@@ -28,16 +28,17 @@ XPCOMUtils.defineLazyModuleGetters(this,
+   AsyncShutdown: "resource://gre/modules/AsyncShutdown.jsm",
+   Blocklist: "resource://gre/modules/Blocklist.jsm",
+   BookmarkHTMLUtils: "resource://gre/modules/BookmarkHTMLUtils.jsm",
+   BookmarkJSONUtils: "resource://gre/modules/BookmarkJSONUtils.jsm",
+   BrowserSearchTelemetry: "resource:///modules/BrowserSearchTelemetry.jsm",
+   BrowserUsageTelemetry: "resource:///modules/BrowserUsageTelemetry.jsm",
+   BrowserUtils: "resource://gre/modules/BrowserUtils.jsm",
+   BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.jsm",
++  CompanionWindow: "resource:///modules/Companion.jsm",
+   ContextualIdentityService:
+     "resource://gre/modules/ContextualIdentityService.jsm",
+   Corroborate: "resource://gre/modules/Corroborate.jsm",
+   DeferredTask: "resource://gre/modules/DeferredTask.jsm",
+   Discovery: "resource:///modules/Discovery.jsm",
+   DoHController: "resource:///modules/DoHController.jsm",
+   DownloadsViewableInternally:
+     "resource:///modules/DownloadsViewableInternally.jsm",
+@@ -1754,16 +1755,19 @@ BrowserGlue.prototype = {
+         update(latest);
+       }
+     );
+     update(this._firstPartyIsolated);
+   },
+ 
+   // the first browser window has finished initializing
+   _onFirstWindowLoaded: function BG__onFirstWindowLoaded(aWindow) {
++
++    CompanionWindow.init();
++
+     AboutNewTab.init();
+ 
+     TabCrashHandler.init();
+ 
+     ProcessHangMonitor.init();
+ 
+     // A channel for "remote troubleshooting" code...
+     let channel = new WebChannel(
 diff --git a/browser/components/companion/Companion.jsm b/browser/components/companion/Companion.jsm
 new file mode 100644
 --- /dev/null
@@ -115,7 +155,7 @@ diff --git a/browser/components/companion/content/companion.css b/browser/compon
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/companion/content/companion.css
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,151 @@
 +html {
 +  appearance: auto;
 +  -moz-default-appearance: dialog;
@@ -158,25 +198,49 @@ new file mode 100644
 +  grid-template-rows: auto minmax(0, 1fr);
 +}
 +
-+#main {
++aside ul {
++  padding: 0;
++  margin: 0;
++}
++aside li {
++  list-style: none;
++  margin: 3px;
++}
++.main {
 +  padding: 0 var(--card-padding);
-+  background: green;
-+  overflow: scroll;
++  background: rgba(0, 255, 0, .1);
++  overflow: auto;
 +  flex-grow: 1;
 +}
-+#main-inner {
++.main-inner {
 +
 +}
-+#main-inner ul {
-+  /* display: grid;
++.main-inner ul {
++  display: grid;
 +  align-items: center;
-+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); */
++  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
 +}
++.main-inner ul li {
++  list-style: none;
++  width: 220px;
++  height: 100px;
++  margin: 3px auto;
++  border: solid 1px;
++  border-radius: 5px;
++}
++
 +named-deck > section {
 +  display: flex;
 +  height: 100%;
 +}
++.tab-button[name="account"] {
++  float: right;
++}
 +
++.tab-button::before {
++  content: "";
++  background-image: url(chrome://browser/skin/fxa/avatar-empty.svg);
++}
 +
 +/* #sidebar {
 +  border-right: 1px solid var(--in-content-box-border-color);
@@ -248,7 +312,7 @@ diff --git a/browser/components/companion/content/companion.html b/browser/compo
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/companion/content/companion.html
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,171 @@
 +<!-- This Source Code Form is subject to the terms of the Mozilla Public
 +   - License, v. 2.0. If a copy of the MPL was not distributed with this
 +   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
@@ -268,15 +332,14 @@ new file mode 100644
 +
 +<body role="application">
 +  <button-group class="tab-group">
-+    <button is="named-deck-button" deck="details-deck" name="details" data-l10n-id="details-addon-button"
-+      class="tab-button">Timeline</button>
-+    <button is="named-deck-button" deck="details-deck" name="preferences" data-l10n-id="preferences-addon-button"
-+      class="tab-button">Windows</button>
-+    <button is="named-deck-button" deck="details-deck" name="permissions" data-l10n-id="permissions-addon-button"
-+      class="tab-button">Tasks</button>
++    <button is="named-deck-button" deck="details-deck" name="windows" class="tab-button">Windows</button>
++    <button is="named-deck-button" deck="details-deck" name="timeline" class="tab-button">Timeline</button>
++    <button is="named-deck-button" deck="details-deck" name="tasks" class="tab-button">Tasks</button>
++    <button is="named-deck-button" deck="details-deck" name="account" class="tab-button">Account</button>
 +  </button-group>
++
 +  <named-deck id="details-deck">
-+    <section name="details">
++    <section name="timeline">
 +      <aside>
 +        <div id="timeline">
 +          <div><button>Today</button></div>
@@ -289,15 +352,41 @@ new file mode 100644
 +          <div><button>Last week</button></div>
 +        </div>
 +      </aside>
-+      <div id="main">
-+        <div id="main-inner"></div>
++      <div class="main">
++        <div class="main-inner">
++          hi
++        </div>
 +      </div>
 +    </section>
-+    <section name="preferences">
-+      asdf
++    <section name="windows">
++      <aside>
++      </aside>
++      <div class="main">
++        <div class="main-inner">
++
++          <button id="new-window">New Window</button>
++          <ul id="window-list"></ul>
++        </div>
++      </div>
 +    </section>
-+    <section name="permissions">
-+      a</section>
++    <section name="tasks">
++      <aside>
++        <ul>
++          <li><button>+ Add</button></li>
++          <li><button>Personal</button></li>
++          <li><button>Work</button></li>
++          <li><button>Banking</button></li>
++          <li><button>Shopping</button></li>
++        </ul>
++      </aside>
++      <div class="main">
++        <div class="main-inner">
++        </div>
++      </div>
++    </section>
++    <section name="account">
++
++    </section>
 +  </named-deck>
 +  <!--
 +  <div id="root">
@@ -400,7 +489,7 @@ diff --git a/browser/components/companion/content/companion.js b/browser/compone
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/companion/content/companion.js
-@@ -0,0 +1,34 @@
+@@ -0,0 +1,45 @@
 +var { XPCOMUtils } = ChromeUtils.import(
 +  "resource://gre/modules/XPCOMUtils.jsm"
 +);
@@ -417,24 +506,35 @@ new file mode 100644
 +  BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.jsm",
 +});
 +
-+console.log("Hello from companion", window);
++// console.log("Hello from companion", window);
 +
 +function render() {
-+  let outerContainer = document.querySelector("#main-inner");
-+  let container = document.createElement("ul");
++  let container = document.querySelector("#window-list");
++  container.textContent = "";
 +  for (let window of BrowserWindowTracker.orderedWindows) {
 +    let winContainer = document.createElement("li");
 +    winContainer.textContent = window.document.title;
++    for (let tab of window.ownerGlobal.gBrowser.tabs) {
++      winContainer.append(
++        ` | ${window.ownerGlobal.gBrowser.getTabTooltip(tab)}`
++      );
++    }
 +    container.append(winContainer);
 +  }
-+  outerContainer.textContent = "";
-+  outerContainer.append(container);
 +}
 +
 +BrowserWindowTracker.addEventListener("onwindowadded", render);
 +BrowserWindowTracker.addEventListener("onwindowremoved", render);
++BrowserWindowTracker.addEventListener("onwindowchanged", render);
 +
 +render();
++
++document.querySelector("#new-window").addEventListener("click", () => {
++  let win = BrowserWindowTracker.getTopWindow({ private: false });
++  if (win) {
++    win.OpenBrowserWindow();
++  }
++});
 diff --git a/browser/components/companion/content/jar.mn b/browser/components/companion/content/jar.mn
 new file mode 100644
 --- /dev/null
@@ -497,7 +597,27 @@ diff --git a/browser/components/moz.build b/browser/components/moz.build
 diff --git a/browser/modules/BrowserWindowTracker.jsm b/browser/modules/BrowserWindowTracker.jsm
 --- a/browser/modules/BrowserWindowTracker.jsm
 +++ b/browser/modules/BrowserWindowTracker.jsm
-@@ -115,44 +115,50 @@ var WindowHelper = {
+@@ -55,16 +55,19 @@ function _updateCurrentContentOuterWindo
+   let windowIDWrapper = Cc["@mozilla.org/supports-PRUint64;1"].createInstance(
+     Ci.nsISupportsPRUint64
+   );
+   windowIDWrapper.data = _lastTopLevelWindowID;
+   Services.obs.notifyObservers(
+     windowIDWrapper,
+     "net:current-toplevel-outer-content-windowid"
+   );
++
++  let event = new CustomEvent("onwindowchanged");
++  BrowserWindowTracker.dispatchEvent(event);
+ }
+ 
+ function _handleEvent(event) {
+   switch (event.type) {
+     case "TabBrowserInserted":
+       if (
+         event.target.ownerGlobal.gBrowser.selectedBrowser ===
+         event.target.linkedBrowser
+@@ -115,44 +118,50 @@ var WindowHelper = {
      WINDOW_EVENTS.forEach(function(event) {
        window.addEventListener(event, _handleEvent);
      });
@@ -549,7 +669,7 @@ diff --git a/browser/modules/BrowserWindowTracker.jsm b/browser/modules/BrowserW
     *            only, false to restrict the search to non-private only.
     *            Omit the property to search in both groups.
     *        * allowPopups: true if popup windows are permissable.
-@@ -165,51 +171,53 @@ this.BrowserWindowTracker = {
+@@ -165,51 +174,53 @@ this.BrowserWindowTracker = {
          (!("private" in options) ||
            PrivateBrowsingUtils.permanentPrivateBrowsing ||
            PrivateBrowsingUtils.isWindowPrivate(win) == options.private)
