@@ -400,7 +400,7 @@ diff --git a/browser/components/companion/content/companion.js b/browser/compone
 new file mode 100644
 --- /dev/null
 +++ b/browser/components/companion/content/companion.js
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,34 @@
 +var { XPCOMUtils } = ChromeUtils.import(
 +  "resource://gre/modules/XPCOMUtils.jsm"
 +);
@@ -431,8 +431,9 @@ new file mode 100644
 +  outerContainer.append(container);
 +}
 +
-+// XXX Make windowtracker an eventtarget and only render when necessary
-+// setInterval(render, 1000);
++BrowserWindowTracker.addEventListener("onwindowadded", render);
++BrowserWindowTracker.addEventListener("onwindowremoved", render);
++
 +render();
 diff --git a/browser/components/companion/content/jar.mn b/browser/components/companion/content/jar.mn
 new file mode 100644
@@ -493,3 +494,119 @@ diff --git a/browser/components/moz.build b/browser/components/moz.build
      "extensions",
      "fxmonitor",
      "migration",
+diff --git a/browser/modules/BrowserWindowTracker.jsm b/browser/modules/BrowserWindowTracker.jsm
+--- a/browser/modules/BrowserWindowTracker.jsm
++++ b/browser/modules/BrowserWindowTracker.jsm
+@@ -115,44 +115,50 @@ var WindowHelper = {
+     WINDOW_EVENTS.forEach(function(event) {
+       window.addEventListener(event, _handleEvent);
+     });
+ 
+     _trackWindowOrder(window);
+ 
+     // Update the selected tab's content outer window ID.
+     _updateCurrentContentOuterWindowID(window.gBrowser.selectedBrowser);
++
++    let event = new CustomEvent("onwindowadded");
++    BrowserWindowTracker.dispatchEvent(event);
+   },
+ 
+   removeWindow(window) {
+     _untrackWindowOrder(window);
+ 
+     // Remove the event listeners
+     TAB_EVENTS.forEach(function(event) {
+       window.gBrowser.tabContainer.removeEventListener(event, _handleEvent);
+     });
+     WINDOW_EVENTS.forEach(function(event) {
+       window.removeEventListener(event, _handleEvent);
+     });
++
++    let event = new CustomEvent("onwindowremoved");
++    BrowserWindowTracker.dispatchEvent(event);
+   },
+ 
+   onActivate(window) {
+     // If this window was the last focused window, we don't need to do anything
+     if (window == _trackedWindows[0]) {
+       return;
+     }
+ 
+     _untrackWindowOrder(window);
+     _trackWindowOrder(window);
+ 
+     _updateCurrentContentOuterWindowID(window.gBrowser.selectedBrowser);
+   },
+ };
+ 
+-this.BrowserWindowTracker = {
++class BWT extends EventTarget {
+   /**
+    * Get the most recent browser window.
+    *
+    * @param options an object accepting the arguments for the search.
+    *        * private: true to restrict the search to private windows
+    *            only, false to restrict the search to non-private only.
+    *            Omit the property to search in both groups.
+    *        * allowPopups: true if popup windows are permissable.
+@@ -165,51 +171,53 @@ this.BrowserWindowTracker = {
+         (!("private" in options) ||
+           PrivateBrowsingUtils.permanentPrivateBrowsing ||
+           PrivateBrowsingUtils.isWindowPrivate(win) == options.private)
+       ) {
+         return win;
+       }
+     }
+     return null;
+-  },
++  }
+ 
+   windowCreated(browser) {
+     if (browser === browser.ownerGlobal.gBrowser.selectedBrowser) {
+       _updateCurrentContentOuterWindowID(browser);
+     }
+-  },
++  }
+ 
+   /**
+    * Number of currently open browser windows.
+    */
+   get windowCount() {
+     return _trackedWindows.length;
+-  },
++  }
+ 
+   /**
+    * Array of browser windows ordered by z-index, in reverse order.
+    * This means that the top-most browser window will be the first item.
+    */
+   get orderedWindows() {
+     // Clone the windows array immediately as it may change during iteration,
+     // we'd rather have an outdated order than skip/revisit windows.
+     return [..._trackedWindows];
+-  },
++  }
+ 
+   getAllVisibleTabs() {
+     let tabs = [];
+     for (let win of BrowserWindowTracker.orderedWindows) {
+       for (let tab of win.gBrowser.visibleTabs) {
+         // Only use tabs which are not discarded / unrestored
+         if (tab.linkedPanel) {
+           let { contentTitle, browserId } = tab.linkedBrowser;
+           tabs.push({ contentTitle, browserId });
+         }
+       }
+     }
+     return tabs;
+-  },
++  }
+ 
+   track(window) {
+     return WindowHelper.addWindow(window);
+-  },
+-};
++  }
++}
++
++this.BrowserWindowTracker = new BWT();
