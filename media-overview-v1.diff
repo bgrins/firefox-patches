@@ -1,0 +1,1099 @@
+# HG changeset patch
+# User Matt Woodrow <mwoodrow@mozilla.com>
+# Date 1616116848 -46800
+#      Fri Mar 19 14:20:48 2021 +1300
+# Node ID e053de2d76d497fd1ac1202e6d06032d0cb5e668
+# Parent  43dcdf18316852cd0937bd932d37d5c8fca4aab7
+Media overview v1
+
+diff --git a/dom/bindings/Bindings.conf b/dom/bindings/Bindings.conf
+--- a/dom/bindings/Bindings.conf
++++ b/dom/bindings/Bindings.conf
+@@ -462,16 +462,20 @@ DOMInterfaces = {
+     'headerFile': 'mozilla/extensions/MatchPattern.h',
+     'nativeType': 'mozilla::extensions::MatchPatternSet',
+ },
+ 
+ 'MediaCapabilitiesInfo' : {
+     'wrapperCache': False,
+ },
+ 
++'MediaElementParent' : {
++    'concrete': True
++},
++
+ 'MediaStream': {
+     'headerFile': 'DOMMediaStream.h',
+     'nativeType': 'mozilla::DOMMediaStream'
+ },
+ 
+ 'MediaStreamList': {
+     'headerFile': 'MediaStreamList.h',
+ },
+diff --git a/dom/chrome-webidl/WindowGlobalActors.webidl b/dom/chrome-webidl/WindowGlobalActors.webidl
+--- a/dom/chrome-webidl/WindowGlobalActors.webidl
++++ b/dom/chrome-webidl/WindowGlobalActors.webidl
+@@ -34,16 +34,27 @@ interface WindowContext {
+ // Keep this in sync with nsIContentViewer::PermitUnloadAction.
+ enum PermitUnloadAction {
+   "prompt",
+   "dontUnload",
+   "unload",
+ };
+ 
+ [Exposed=Window, ChromeOnly]
++interface MediaElementParent {
++  readonly attribute boolean isVideo;
++  readonly attribute boolean isAudible;
++  readonly attribute boolean isPaused;
++
++  void play();
++  void pause();
++  void toggleMute();
++};
++
++[Exposed=Window, ChromeOnly]
+ interface WindowGlobalParent : WindowContext {
+   readonly attribute boolean isClosed;
+   readonly attribute boolean isInProcess;
+ 
+   readonly attribute boolean isCurrentGlobal;
+ 
+   readonly attribute unsigned long long outerWindowId;
+   readonly attribute unsigned long long contentParentId;
+@@ -132,16 +143,19 @@ interface WindowGlobalParent : WindowCon
+    * thus it will work on regular HTTPS pages as well as certificate
+    * error pages.
+    *
+    * This returns a Promise which resolves to an nsITransportSecurity
+    * object with certificate data or undefined if no security info is available.
+    */
+   [Throws]
+   Promise<nsITransportSecurityInfo> getSecurityInfo();
++
++  [Cached, Frozen, Pure]
++  readonly attribute sequence<MediaElementParent> mediaElements;
+ };
+ 
+ [Exposed=Window, ChromeOnly]
+ interface WindowGlobalChild {
+   readonly attribute boolean isClosed;
+   readonly attribute boolean isInProcess;
+   readonly attribute BrowsingContext browsingContext;
+   readonly attribute WindowContext windowContext;
+diff --git a/dom/html/HTMLMediaElement.cpp b/dom/html/HTMLMediaElement.cpp
+--- a/dom/html/HTMLMediaElement.cpp
++++ b/dom/html/HTMLMediaElement.cpp
+@@ -70,26 +70,28 @@
+ #include "mozilla/dom/ContentMediaController.h"
+ #include "mozilla/dom/ElementInlines.h"
+ #include "mozilla/dom/HTMLAudioElement.h"
+ #include "mozilla/dom/HTMLInputElement.h"
+ #include "mozilla/dom/HTMLMediaElementBinding.h"
+ #include "mozilla/dom/HTMLSourceElement.h"
+ #include "mozilla/dom/HTMLVideoElement.h"
+ #include "mozilla/dom/MediaControlUtils.h"
++#include "mozilla/dom/MediaElementChild.h"
+ #include "mozilla/dom/MediaEncryptedEvent.h"
+ #include "mozilla/dom/MediaErrorBinding.h"
+ #include "mozilla/dom/MediaSource.h"
+ #include "mozilla/dom/PlayPromise.h"
+ #include "mozilla/dom/Promise.h"
+ #include "mozilla/dom/TextTrack.h"
+ #include "mozilla/dom/UserActivation.h"
+ #include "mozilla/dom/VideoPlaybackQuality.h"
+ #include "mozilla/dom/VideoTrack.h"
+ #include "mozilla/dom/VideoTrackList.h"
++#include "mozilla/dom/WindowGlobalChild.h"
+ #include "mozilla/dom/WakeLock.h"
+ #include "mozilla/dom/power/PowerManagerService.h"
+ #include "mozilla/net/UrlClassifierFeatureFactory.h"
+ #include "nsAttrValueInlines.h"
+ #include "nsContentPolicyUtils.h"
+ #include "nsContentUtils.h"
+ #include "nsCycleCollectionParticipant.h"
+ #include "nsDisplayList.h"
+@@ -4179,16 +4181,24 @@ void HTMLMediaElement::Init() {
+ #if defined(MOZ_WIDGET_ANDROID)
+   GVAutoplayPermissionRequestor::AskForPermissionIfNeeded(
+       OwnerDoc()->GetInnerWindow());
+ #endif
+ 
+   OwnerDoc()->SetDocTreeHadMedia();
+   mShutdownObserver->Subscribe(this);
+   mInitialized = true;
++
++  if (WindowGlobalChild* wgc = OwnerDoc()->GetWindowGlobalChild()) {
++    mProxyActor = new MediaElementChild(this);
++    if (!wgc->SendPMediaElementConstructor(mProxyActor, IsVideo(), Paused(),
++                                           IsAudible())) {
++      mProxyActor = nullptr;
++    }
++  }
+ }
+ 
+ HTMLMediaElement::~HTMLMediaElement() {
+   MOZ_ASSERT(mInitialized,
+              "HTMLMediaElement must be initialized before it is destroyed.");
+   NS_ASSERTION(
+       !mHasSelfReference,
+       "How can we be destroyed if we're still holding a self reference?");
+@@ -7101,16 +7111,19 @@ void HTMLMediaElement::NotifyAudioPlayba
+   // We would start the listener after media becomes audible.
+   const bool isAudible = IsAudible();
+   if (isAudible && !mMediaControlKeyListener->IsStarted()) {
+     StartMediaControlKeyListenerIfNeeded();
+   }
+   mMediaControlKeyListener->UpdateMediaAudibleState(isAudible);
+   // only request wake lock for audible media.
+   UpdateWakeLock();
++  if (mProxyActor) {
++    mProxyActor->SendSetAudible(isAudible);
++  }
+ }
+ 
+ void HTMLMediaElement::SetMediaInfo(const MediaInfo& aInfo) {
+   const bool oldHasAudio = mMediaInfo.HasAudio();
+   mMediaInfo = aInfo;
+   if ((aInfo.HasAudio() != oldHasAudio) && mResumeDelayedPlaybackAgent) {
+     mResumeDelayedPlaybackAgent->UpdateAudibleState(this, IsAudible());
+   }
+@@ -7533,16 +7546,19 @@ void HTMLMediaElement::CreateResumeDelay
+ void HTMLMediaElement::ClearResumeDelayedMediaPlaybackAgentIfNeeded() {
+   if (mResumeDelayedPlaybackAgent) {
+     mResumePlaybackRequest.DisconnectIfExists();
+     mResumeDelayedPlaybackAgent = nullptr;
+   }
+ }
+ 
+ void HTMLMediaElement::NotifyMediaControlPlaybackStateChanged() {
++  if (mProxyActor) {
++    mProxyActor->SendSetPaused(mPaused);
++  }
+   if (!mMediaControlKeyListener->IsStarted()) {
+     return;
+   }
+   if (mPaused) {
+     mMediaControlKeyListener->NotifyMediaStoppedPlaying();
+   } else {
+     mMediaControlKeyListener->NotifyMediaStartedPlaying();
+   }
+diff --git a/dom/html/HTMLMediaElement.h b/dom/html/HTMLMediaElement.h
+--- a/dom/html/HTMLMediaElement.h
++++ b/dom/html/HTMLMediaElement.h
+@@ -94,16 +94,17 @@ namespace dom {
+ 
+ class MediaError;
+ class MediaSource;
+ class PlayPromise;
+ class Promise;
+ class TextTrackList;
+ class AudioTrackList;
+ class VideoTrackList;
++class MediaElementChild;
+ 
+ enum class StreamCaptureType : uint8_t { CAPTURE_ALL_TRACKS, CAPTURE_AUDIO };
+ 
+ enum class StreamCaptureBehavior : uint8_t {
+   CONTINUE_WHEN_ENDED,
+   FINISH_WHEN_ENDED
+ };
+ 
+@@ -1609,16 +1610,18 @@ class HTMLMediaElement : public nsGeneri
+   RefPtr<MediaKeys> mMediaKeys;
+   RefPtr<MediaKeys> mIncomingMediaKeys;
+   // The dom promise is used for HTMLMediaElement::SetMediaKeys.
+   RefPtr<DetailedPromise> mSetMediaKeysDOMPromise;
+   // Used to indicate if the MediaKeys attaching operation is on-going or not.
+   bool mAttachingMediaKey = false;
+   MozPromiseRequestHolder<SetCDMPromise> mSetCDMRequest;
+ 
++  RefPtr<MediaElementChild> mProxyActor;
++
+   // Stores the time at the start of the current 'played' range.
+   double mCurrentPlayRangeStart = 1.0;
+ 
+   // True if loadeddata has been fired.
+   bool mLoadedDataFired = false;
+ 
+   // Indicates whether current playback is a result of user action
+   // (ie. calling of the Play method), or automatic playback due to
+diff --git a/dom/ipc/VsyncChild.cpp b/dom/ipc/MediaElementChild.cpp
+copy from dom/ipc/VsyncChild.cpp
+copy to dom/ipc/MediaElementChild.cpp
+--- a/dom/ipc/VsyncChild.cpp
++++ b/dom/ipc/MediaElementChild.cpp
+@@ -1,75 +1,30 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-#include "VsyncChild.h"
+-
+-#include "mozilla/SchedulerGroup.h"
+-#include "mozilla/VsyncDispatcher.h"
+-#include "nsThreadUtils.h"
++#include "MediaElementChild.h"
+ 
+ namespace mozilla::dom {
+ 
+-VsyncChild::VsyncChild()
+-    : mIsShutdown(false), mVsyncRate(TimeDuration::Forever()) {
+-  MOZ_ASSERT(NS_IsMainThread());
+-}
+-
+-VsyncChild::~VsyncChild() { MOZ_ASSERT(NS_IsMainThread()); }
+-
+-void VsyncChild::AddChildRefreshTimer(VsyncObserver* aVsyncObserver) {
+-  MOZ_ASSERT(NS_IsMainThread());
+-  MOZ_ASSERT(!mObservers.Contains(aVsyncObserver));
+-
+-  if (mIsShutdown) {
+-    return;
+-  }
+-
+-  if (mObservers.IsEmpty()) {
+-    Unused << PVsyncChild::SendObserve();
+-  }
+-  mObservers.AppendElement(std::move(aVsyncObserver));
++void MediaElementChild::ActorDestroy(ActorDestroyReason aActorDestroyReason) {
++  mElement = nullptr;
+ }
+ 
+-void VsyncChild::RemoveChildRefreshTimer(VsyncObserver* aVsyncObserver) {
+-  MOZ_ASSERT(NS_IsMainThread());
+-  if (mIsShutdown) {
+-    return;
+-  }
+-
+-  if (mObservers.RemoveElement(aVsyncObserver) && mObservers.IsEmpty()) {
+-    Unused << PVsyncChild::SendUnobserve();
+-  }
+-}
+-
+-void VsyncChild::ActorDestroy(ActorDestroyReason aActorDestroyReason) {
+-  MOZ_ASSERT(NS_IsMainThread());
+-  MOZ_ASSERT(!mIsShutdown);
+-  mIsShutdown = true;
+-
+-  if (!mObservers.IsEmpty()) {
+-    Unused << PVsyncChild::SendUnobserve();
+-  }
+-  mObservers.Clear();
+-}
+-
+-mozilla::ipc::IPCResult VsyncChild::RecvNotify(const VsyncEvent& aVsync,
+-                                               const float& aVsyncRate) {
+-  MOZ_ASSERT(NS_IsMainThread());
+-  MOZ_ASSERT(!mIsShutdown);
+-
+-  SchedulerGroup::MarkVsyncRan();
+-
+-  mVsyncRate = TimeDuration::FromMilliseconds(aVsyncRate);
+-
+-  for (VsyncObserver* observer : mObservers.ForwardRange()) {
+-    observer->NotifyVsync(aVsync);
+-  }
++mozilla::ipc::IPCResult MediaElementChild::RecvPlay() {
++  mElement->Play();
+   return IPC_OK();
+ }
+ 
+-TimeDuration VsyncChild::GetVsyncRate() { return mVsyncRate; }
++mozilla::ipc::IPCResult MediaElementChild::RecvPause() {
++  mElement->Pause();
++  return IPC_OK();
++}
++
++mozilla::ipc::IPCResult MediaElementChild::RecvToggleMute() {
++  mElement->SetMuted(!mElement->Muted());
++  return IPC_OK();
++}
+ 
+ }  // namespace mozilla::dom
+diff --git a/dom/ipc/VsyncChild.h b/dom/ipc/MediaElementChild.h
+copy from dom/ipc/VsyncChild.h
+copy to dom/ipc/MediaElementChild.h
+--- a/dom/ipc/VsyncChild.h
++++ b/dom/ipc/MediaElementChild.h
+@@ -1,53 +1,37 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-#ifndef mozilla_dom_ipc_VsyncChild_h
+-#define mozilla_dom_ipc_VsyncChild_h
++#ifndef mozilla_dom_ipc_MediaElementChild_h
++#define mozilla_dom_ipc_MediaElementChild_h
+ 
+-#include "mozilla/dom/PVsyncChild.h"
++#include "mozilla/dom/PMediaElementChild.h"
+ #include "mozilla/RefPtr.h"
+-#include "nsISupportsImpl.h"
+-#include "nsTObserverArray.h"
++#include "mozilla/dom/HTMLMediaElement.h"
+ 
+ namespace mozilla {
+-
+-class VsyncObserver;
+-
+ namespace dom {
+ 
+-// The PVsyncChild actor receives a vsync event from the main process and
+-// delivers it to the child process. Currently this is restricted to the main
+-// thread only. The actor will stay alive until the process dies or its
+-// PVsyncParent actor dies.
+-class VsyncChild final : public PVsyncChild {
+-  NS_INLINE_DECL_REFCOUNTING(VsyncChild)
+-
+-  friend class PVsyncChild;
++class MediaElementChild final : public PMediaElementChild {
++  NS_INLINE_DECL_REFCOUNTING(MediaElementChild)
+ 
+  public:
+-  VsyncChild();
++  MediaElementChild(HTMLMediaElement* aElement) : mElement(aElement) {}
+ 
+-  void AddChildRefreshTimer(VsyncObserver* aVsyncObserver);
+-  void RemoveChildRefreshTimer(VsyncObserver* aVsyncObserver);
+-
+-  TimeDuration GetVsyncRate();
++  mozilla::ipc::IPCResult RecvPlay();
++  mozilla::ipc::IPCResult RecvPause();
++  mozilla::ipc::IPCResult RecvToggleMute();
++  virtual void ActorDestroy(ActorDestroyReason aActorDestroyReason) override;
+ 
+  private:
+-  virtual ~VsyncChild();
++  virtual ~MediaElementChild() = default;
+ 
+-  mozilla::ipc::IPCResult RecvNotify(const VsyncEvent& aVsync,
+-                                     const float& aVsyncRate);
+-  virtual void ActorDestroy(ActorDestroyReason aActorDestroyReason) override;
+-
+-  bool mIsShutdown;
+-  TimeDuration mVsyncRate;
+-  nsTObserverArray<VsyncObserver*> mObservers;
++  HTMLMediaElement* mElement;
+ };
+ 
+ }  // namespace dom
+ }  // namespace mozilla
+ 
+-#endif  // mozilla_dom_ipc_VsyncChild_h
++#endif  // mozilla_dom_ipc_MediaElementChild_h
+diff --git a/dom/ipc/VsyncParent.cpp b/dom/ipc/MediaElementParent.cpp
+copy from dom/ipc/VsyncParent.cpp
+copy to dom/ipc/MediaElementParent.cpp
+--- a/dom/ipc/VsyncParent.cpp
++++ b/dom/ipc/MediaElementParent.cpp
+@@ -1,107 +1,42 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-#include "VsyncParent.h"
+-
+-#include "BackgroundParent.h"
+-#include "BackgroundParentImpl.h"
+-#include "gfxPlatform.h"
+-#include "mozilla/Unused.h"
+-#include "nsThreadUtils.h"
+-#include "VsyncSource.h"
++#include "MediaElementParent.h"
++#include "mozilla/dom/WindowGlobalActorsBinding.h"
+ 
+ namespace mozilla::dom {
+ 
+-VsyncParent::VsyncParent()
+-    : mObservingVsync(false),
+-      mDestroyed(false),
+-      mInitialThread(NS_GetCurrentThread()) {}
++void MediaElementParent::ActorDestroy(ActorDestroyReason aActorDestroyReason) {}
+ 
+-void VsyncParent::UpdateVsyncSource(
+-    const RefPtr<gfx::VsyncSource>& aVsyncSource) {
+-  mVsyncSource = aVsyncSource;
+-  if (!mVsyncSource) {
+-    mVsyncSource = gfxPlatform::GetPlatform()->GetHardwareVsync();
+-  }
+-
+-  if (mObservingVsync && mVsyncDispatcher) {
+-    mVsyncDispatcher->RemoveChildRefreshTimer(this);
+-  }
+-  mVsyncDispatcher = mVsyncSource->GetRefreshTimerVsyncDispatcher();
+-  if (mObservingVsync) {
+-    mVsyncDispatcher->AddChildRefreshTimer(this);
+-  }
++nsIGlobalObject* MediaElementParent::GetParentObject() {
++  return xpc::NativeGlobal(xpc::PrivilegedJunkScope());
+ }
+ 
+-bool VsyncParent::NotifyVsync(const VsyncEvent& aVsync) {
+-  if (IsOnInitialThread()) {
+-    DispatchVsyncEvent(aVsync);
+-    return true;
+-  }
+-
+-  // Called on hardware vsync thread. We should post to current ipc thread.
+-  nsCOMPtr<nsIRunnable> vsyncEvent = NewRunnableMethod<VsyncEvent>(
+-      "dom::VsyncParent::DispatchVsyncEvent", this,
+-      &VsyncParent::DispatchVsyncEvent, aVsync);
+-  MOZ_ALWAYS_SUCCEEDS(mInitialThread->Dispatch(vsyncEvent, NS_DISPATCH_NORMAL));
+-  return true;
++JSObject* MediaElementParent::WrapObject(JSContext* aCx,
++                                         JS::Handle<JSObject*> aGivenProto) {
++  return MediaElementParent_Binding::Wrap(aCx, this, aGivenProto);
+ }
+ 
+-void VsyncParent::DispatchVsyncEvent(const VsyncEvent& aVsync) {
+-  AssertIsOnInitialThread();
++NS_INTERFACE_MAP_BEGIN_CYCLE_COLLECTION(MediaElementParent)
++  NS_WRAPPERCACHE_INTERFACE_MAP_ENTRY
++  NS_INTERFACE_MAP_ENTRY(nsISupports)
++NS_INTERFACE_MAP_END
+ 
+-  // If we call NotifyVsync() when we handle ActorDestroy() message, we might
+-  // still call DispatchVsyncEvent().
+-  // Similarly, we might also receive RecvUnobserveVsync() when call
+-  // NotifyVsync(). We use mObservingVsync and mDestroyed flags to skip this
+-  // notification.
+-  if (mObservingVsync && !mDestroyed) {
+-    TimeDuration vsyncRate = mVsyncSource->GetGlobalDisplay().GetVsyncRate();
+-    Unused << SendNotify(aVsync, vsyncRate.ToMilliseconds());
+-  }
+-}
+-
+-mozilla::ipc::IPCResult VsyncParent::RecvObserve() {
+-  AssertIsOnInitialThread();
+-  if (!mObservingVsync) {
+-    if (mVsyncDispatcher) {
+-      mVsyncDispatcher->AddChildRefreshTimer(this);
+-    }
+-    mObservingVsync = true;
+-    return IPC_OK();
+-  }
+-  return IPC_FAIL_NO_REASON(this);
+-}
++NS_IMPL_CYCLE_COLLECTING_ADDREF(MediaElementParent)
++NS_IMPL_CYCLE_COLLECTING_RELEASE(MediaElementParent)
+ 
+-mozilla::ipc::IPCResult VsyncParent::RecvUnobserve() {
+-  AssertIsOnInitialThread();
+-  if (mObservingVsync) {
+-    if (mVsyncDispatcher) {
+-      mVsyncDispatcher->RemoveChildRefreshTimer(this);
+-    }
+-    mObservingVsync = false;
+-    return IPC_OK();
+-  }
+-  return IPC_FAIL_NO_REASON(this);
+-}
++NS_IMPL_CYCLE_COLLECTION_CLASS(MediaElementParent)
+ 
+-void VsyncParent::ActorDestroy(ActorDestroyReason aActorDestroyReason) {
+-  MOZ_ASSERT(!mDestroyed);
+-  AssertIsOnInitialThread();
+-  if (mObservingVsync && mVsyncDispatcher) {
+-    mVsyncDispatcher->RemoveChildRefreshTimer(this);
+-  }
+-  mVsyncDispatcher = nullptr;
+-  mDestroyed = true;
+-}
++NS_IMPL_CYCLE_COLLECTION_UNLINK_BEGIN(MediaElementParent)
++  NS_IMPL_CYCLE_COLLECTION_UNLINK_PRESERVED_WRAPPER
++NS_IMPL_CYCLE_COLLECTION_UNLINK_END
+ 
+-bool VsyncParent::IsOnInitialThread() {
+-  return NS_GetCurrentThread() == mInitialThread;
+-}
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_BEGIN(MediaElementParent)
++NS_IMPL_CYCLE_COLLECTION_TRAVERSE_END
+ 
+-void VsyncParent::AssertIsOnInitialThread() { MOZ_ASSERT(IsOnInitialThread()); }
++NS_IMPL_CYCLE_COLLECTION_TRACE_WRAPPERCACHE(MediaElementParent)
+ 
+ }  // namespace mozilla::dom
+diff --git a/dom/ipc/VsyncParent.h b/dom/ipc/MediaElementParent.h
+copy from dom/ipc/VsyncParent.h
+copy to dom/ipc/MediaElementParent.h
+--- a/dom/ipc/VsyncParent.h
++++ b/dom/ipc/MediaElementParent.h
+@@ -1,54 +1,57 @@
+ /* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* vim: set ts=8 sts=2 et sw=2 tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-#ifndef mozilla_dom_ipc_VsyncParent_h
+-#define mozilla_dom_ipc_VsyncParent_h
++#ifndef mozilla_dom_ipc_MediaElementParent_h
++#define mozilla_dom_ipc_MediaElementParent_h
+ 
+-#include "mozilla/dom/PVsyncParent.h"
+-#include "mozilla/VsyncDispatcher.h"
++#include "mozilla/dom/PMediaElementParent.h"
+ #include "nsCOMPtr.h"
+ #include "mozilla/RefPtr.h"
+-#include "VsyncSource.h"
+-
+-class nsIThread;
++#include "nsWrapperCache.h"
+ 
+ namespace mozilla::dom {
+ 
+-// Use PBackground thread in the main process to send vsync notifications to
+-// content process. This actor will be released when its parent protocol calls
+-// DeallocPVsyncParent().
+-class VsyncParent final : public PVsyncParent, public VsyncObserver {
+-  friend class PVsyncParent;
++class MediaElementParent final : public nsISupports,
++                                 public nsWrapperCache,
++                                 public PMediaElementParent {
++  NS_DECL_CYCLE_COLLECTING_ISUPPORTS
++  NS_DECL_CYCLE_COLLECTION_SCRIPT_HOLDER_CLASS(MediaElementParent)
+ 
+  public:
+-  VsyncParent();
+-  void UpdateVsyncSource(const RefPtr<gfx::VsyncSource>& aVsyncSource);
++  MediaElementParent(bool aIsVideo, bool aIsPaused, bool aIsAudible)
++      : mIsVideo(aIsVideo), mIsPaused(aIsPaused), mIsAudible(aIsAudible) {}
++
++  bool IsVideo() { return mIsVideo; }
++  bool IsAudible() { return mIsAudible; }
++  bool IsPaused() { return mIsPaused; }
++  void Pause() { Unused << SendPause(); }
++  void Play() { Unused << SendPlay(); }
++  void ToggleMute() { Unused << SendToggleMute(); }
++
++  nsIGlobalObject* GetParentObject();
++  JSObject* WrapObject(JSContext* aCx,
++                       JS::Handle<JSObject*> aGivenProto) override;
++
++  mozilla::ipc::IPCResult RecvSetAudible(bool aIsAudible) {
++    mIsAudible = aIsAudible;
++    return IPC_OK();
++  }
++  mozilla::ipc::IPCResult RecvSetPaused(bool aIsPaused) {
++    mIsPaused = aIsPaused;
++    return IPC_OK();
++  }
++  virtual void ActorDestroy(ActorDestroyReason aActorDestroyReason) override;
+ 
+  private:
+-  virtual ~VsyncParent() = default;
+-
+-  virtual bool NotifyVsync(const VsyncEvent& aVsync) override;
+-  virtual void ActorDestroy(ActorDestroyReason aActorDestroyReason) override;
+-
+-  mozilla::ipc::IPCResult RecvObserve();
+-  mozilla::ipc::IPCResult RecvUnobserve();
+-
+-  void DispatchVsyncEvent(const VsyncEvent& aVsync);
+-  void UpdateVsyncRate();
+-
+-  bool IsOnInitialThread();
+-  void AssertIsOnInitialThread();
+-
+-  bool mObservingVsync;
+-  bool mDestroyed;
+-  nsCOMPtr<nsIThread> mInitialThread;
+-  RefPtr<gfx::VsyncSource> mVsyncSource;
+-  RefPtr<RefreshTimerVsyncDispatcher> mVsyncDispatcher;
++  virtual ~MediaElementParent() = default;
++  bool mIsVideo = false;
++  bool mIsPaused = true;
++  bool mIsAudible = false;
+ };
+ 
+ }  // namespace mozilla::dom
+ 
+-#endif  // mozilla_dom_ipc_VsyncParent_h
++#endif  // mozilla_dom_ipc_MediaElementParent_h
+diff --git a/dom/ipc/PVsync.ipdl b/dom/ipc/PMediaElement.ipdl
+copy from dom/ipc/PVsync.ipdl
+copy to dom/ipc/PMediaElement.ipdl
+--- a/dom/ipc/PVsync.ipdl
++++ b/dom/ipc/PMediaElement.ipdl
+@@ -1,40 +1,29 @@
+ /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-include protocol PBackground;
+-include protocol PBrowser;
+-include "mozilla/layers/LayersMessageUtils.h";
+-
+-using class mozilla::TimeStamp from "mozilla/TimeStamp.h";
+-using mozilla::VsyncEvent from "mozilla/VsyncDispatcher.h";
++include protocol PWindowGlobal;
+ 
+ namespace mozilla {
+ namespace dom {
+ 
+-/*
+- * The PVsync is a sub-protocol in PBackground or PBrowser and it is used to
+- * notify the vsync event from chrome to content process. It also provides the
+- * interfaces for content to observe/unobserve vsync event notifications.
+- */
+-async protocol PVsync
++async refcounted protocol PMediaElement
+ {
+-  manager PBackground or PBrowser;
++  manager PWindowGlobal;
+ 
+ child:
+-  // Send vsync event and vsync rate from chrome to content process.
+-  [Compress, Priority=high] async Notify(VsyncEvent aVsync, float aVsyncRate);
++  async Pause();
++  async Play();
++
++  async ToggleMute();
+ 
+ parent:
+-  // Content process use these messages to acquire the vsync event.
+-  async Observe();
+-  async Unobserve();
++  async SetAudible(bool isAudible);
++  async SetPaused(bool isPaused);
+ 
+-  // This message is never sent. Each PVsync actor will stay alive as long as
+-  // its PBackground or PBrowser manager.
+   async __delete__();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/ipc/PWindowGlobal.ipdl b/dom/ipc/PWindowGlobal.ipdl
+--- a/dom/ipc/PWindowGlobal.ipdl
++++ b/dom/ipc/PWindowGlobal.ipdl
+@@ -8,16 +8,17 @@ include "mozilla/dom/DocShellMessageUtil
+ include "mozilla/dom/FeaturePolicyUtils.h";
+ include "mozilla/dom/PermissionMessageUtils.h";
+ include "mozilla/ipc/TransportSecurityInfoUtils.h";
+ include "mozilla/ipc/URIUtils.h";
+ 
+ include protocol PBrowser;
+ include protocol PInProcess;
+ include protocol PBrowserBridge;
++include protocol PMediaElement;
+ 
+ include DOMTypes;
+ include ClientIPCTypes;
+ include NeckoChannelParams;
+ 
+ include "mozilla/layers/LayersMessageUtils.h";
+ 
+ using JSActorMessageKind from "mozilla/dom/JSActor.h";
+@@ -54,16 +55,17 @@ struct IPCWebShareData
+  * A PWindowGlobal actor has a lifetime matching that of a single Window Global,
+  * specifically a |nsGlobalWindowInner|. These actors will form a parent/child
+  * link either between the chrome/content process, or will be in-process, for
+  * documents which are loaded in the chrome process.
+  */
+ async refcounted protocol PWindowGlobal
+ {
+   manager PBrowser or PInProcess;
++  manages PMediaElement;
+ 
+ child:
+   async __delete__();
+ 
+   async MakeFrameLocal(MaybeDiscardedBrowsingContext aFrameContext,
+                        uint64_t aSwitchId);
+   async MakeFrameRemote(MaybeDiscardedBrowsingContext aFrameContext,
+                         ManagedEndpoint<PBrowserBridgeChild> aEndpoint,
+@@ -164,13 +166,15 @@ parent:
+   async ExpectPageUseCounters(MaybeDiscardedWindowContext aTop);
+ 
+   /**
+    * Accumulates use counter data from the document in this WindowGlobal into
+    * the document previously passed into the ExpectPageUseCounters call.
+    */
+   async AccumulatePageUseCounters(UseCounters aUseCounters);
+ 
++  async PMediaElement(bool aIsVideo, bool aIsPaused, bool aIsAudible);
++
+   async Destroy();
+ };
+ 
+ } // namespace dom
+ } // namespace mozilla
+diff --git a/dom/ipc/WindowGlobalParent.cpp b/dom/ipc/WindowGlobalParent.cpp
+--- a/dom/ipc/WindowGlobalParent.cpp
++++ b/dom/ipc/WindowGlobalParent.cpp
+@@ -473,16 +473,26 @@ IPCResult WindowGlobalParent::RecvRawMes
+ const nsACString& WindowGlobalParent::GetRemoteType() {
+   if (RefPtr<BrowserParent> browserParent = GetBrowserParent()) {
+     return browserParent->Manager()->GetRemoteType();
+   }
+ 
+   return NOT_REMOTE_TYPE;
+ }
+ 
++void WindowGlobalParent::GetMediaElements(
++    nsTArray<RefPtr<MediaElementParent>>& aMediaElements) {
++  const ManagedContainer<PMediaElementParent>& mediaElements =
++      ManagedPMediaElementParent();
++  for (auto iter = mediaElements.ConstIter(); !iter.Done(); iter.Next()) {
++    aMediaElements.AppendElement(
++        static_cast<MediaElementParent*>(iter.Get()->GetKey()));
++  }
++}
++
+ void WindowGlobalParent::NotifyContentBlockingEvent(
+     uint32_t aEvent, nsIRequest* aRequest, bool aBlocked,
+     const nsACString& aTrackingOrigin,
+     const nsTArray<nsCString>& aTrackingFullHashes,
+     const Maybe<ContentBlockingNotifier::StorageAccessPermissionGrantedReason>&
+         aReason) {
+   MOZ_ASSERT(NS_IsMainThread());
+   DebugOnly<bool> isCookiesBlocked =
+@@ -1179,16 +1189,22 @@ void WindowGlobalParent::ActorDestroy(Ac
+     obs->NotifyObservers(ToSupports(this), "window-global-destroyed", nullptr);
+   }
+ 
+   if (mOriginCounter) {
+     mOriginCounter->Accumulate();
+   }
+ }
+ 
++already_AddRefed<PMediaElementParent>
++WindowGlobalParent::AllocPMediaElementParent(bool aIsVideo, bool aIsPaused,
++                                             bool aIsAudible) {
++  return MakeAndAddRef<MediaElementParent>(aIsVideo, aIsPaused, aIsAudible);
++}
++
+ WindowGlobalParent::~WindowGlobalParent() = default;
+ 
+ JSObject* WindowGlobalParent::WrapObject(JSContext* aCx,
+                                          JS::Handle<JSObject*> aGivenProto) {
+   return WindowGlobalParent_Binding::Wrap(aCx, this, aGivenProto);
+ }
+ 
+ nsIGlobalObject* WindowGlobalParent::GetParentObject() {
+diff --git a/dom/ipc/WindowGlobalParent.h b/dom/ipc/WindowGlobalParent.h
+--- a/dom/ipc/WindowGlobalParent.h
++++ b/dom/ipc/WindowGlobalParent.h
+@@ -9,16 +9,17 @@
+ 
+ #include "mozilla/ContentBlockingLog.h"
+ #include "mozilla/ContentBlockingNotifier.h"
+ #include "mozilla/Maybe.h"
+ #include "mozilla/RefPtr.h"
+ #include "mozilla/dom/ClientInfo.h"
+ #include "mozilla/dom/ClientIPCTypes.h"
+ #include "mozilla/dom/DOMRect.h"
++#include "mozilla/dom/MediaElementParent.h"
+ #include "mozilla/dom/PWindowGlobalParent.h"
+ #include "mozilla/dom/WindowContext.h"
+ #include "mozilla/dom/WindowGlobalActorsBinding.h"
+ #include "nsTHashMap.h"
+ #include "nsRefPtrHashtable.h"
+ #include "nsWrapperCache.h"
+ #include "nsISupports.h"
+ #include "nsIDOMProcessParent.h"
+@@ -197,16 +198,18 @@ class WindowGlobalParent final : public 
+ 
+   void AddSecurityState(uint32_t aStateFlags);
+   uint32_t GetSecurityFlags() { return mSecurityState; }
+ 
+   nsITransportSecurityInfo* GetSecurityInfo() { return mSecurityInfo; }
+ 
+   const nsACString& GetRemoteType() override;
+ 
++  void GetMediaElements(nsTArray<RefPtr<MediaElementParent>>& aMediaElements);
++
+  protected:
+   already_AddRefed<JSActor> InitJSActor(JS::HandleObject aMaybeActor,
+                                         const nsACString& aName,
+                                         ErrorResult& aRv) override;
+   mozilla::ipc::IProtocol* AsNativeActor() override { return this; }
+ 
+   // IPC messages
+   mozilla::ipc::IPCResult RecvLoadURI(
+@@ -239,16 +242,19 @@ class WindowGlobalParent final : public 
+ 
+   mozilla::ipc::IPCResult RecvGetContentBlockingEvents(
+       GetContentBlockingEventsResolver&& aResolver);
+   mozilla::ipc::IPCResult RecvUpdateCookieJarSettings(
+       const CookieJarSettingsArgs& aCookieJarSettingsArgs);
+ 
+   void ActorDestroy(ActorDestroyReason aWhy) override;
+ 
++  already_AddRefed<PMediaElementParent> AllocPMediaElementParent(
++      bool aIsVideo, bool aIsPaused, bool aIsAudible);
++
+   void DrawSnapshotInternal(gfx::CrossProcessPaint* aPaint,
+                             const Maybe<IntRect>& aRect, float aScale,
+                             nscolor aBackgroundColor, uint32_t aFlags);
+ 
+   // WebShare API - try to share
+   mozilla::ipc::IPCResult RecvShare(IPCWebShareData&& aData,
+                                     ShareResolver&& aResolver);
+ 
+diff --git a/dom/ipc/moz.build b/dom/ipc/moz.build
+--- a/dom/ipc/moz.build
++++ b/dom/ipc/moz.build
+@@ -48,16 +48,18 @@ EXPORTS.mozilla.dom += [
+     "ContentProcessManager.h",
+     "CSPMessageUtils.h",
+     "DocShellMessageUtils.h",
+     "EffectsInfo.h",
+     "FilePickerParent.h",
+     "InProcessChild.h",
+     "InProcessParent.h",
+     "MaybeDiscarded.h",
++    "MediaElementChild.h",
++    "MediaElementParent.h",
+     "MemoryReportRequest.h",
+     "NativeThreadId.h",
+     "PermissionMessageUtils.h",
+     "ProcessActor.h",
+     "PropertyBagUtils.h",
+     "ReferrerInfoUtils.h",
+     "RefMessageBodyService.h",
+     "RemoteBrowser.h",
+@@ -98,16 +100,18 @@ UNIFIED_SOURCES += [
+     "ColorPickerParent.cpp",
+     "ContentParent.cpp",
+     "ContentProcess.cpp",
+     "ContentProcessManager.cpp",
+     "CSPMessageUtils.cpp",
+     "DocShellMessageUtils.cpp",
+     "FilePickerParent.cpp",
+     "InProcessImpl.cpp",
++    "MediaElementChild.cpp",
++    "MediaElementParent.cpp",
+     "MemMapSnapshot.cpp",
+     "MemoryReportRequest.cpp",
+     "MMPrinter.cpp",
+     "PermissionMessageUtils.cpp",
+     "PreallocatedProcessManager.cpp",
+     "ProcessActor.cpp",
+     "ProcessPriorityManager.cpp",
+     "PropertyBagUtils.cpp",
+@@ -147,16 +151,17 @@ IPDL_SOURCES += [
+     "MemoryReportTypes.ipdlh",
+     "PColorPicker.ipdl",
+     "PContentPermission.ipdlh",
+     "PContentPermissionRequest.ipdl",
+     "PCycleCollectWithLogs.ipdl",
+     "PFilePicker.ipdl",
+     "PInProcess.ipdl",
+     "PLoginReputation.ipdl",
++    "PMediaElement.ipdl",
+     "PPluginWidget.ipdl",
+     "PProcessHangMonitor.ipdl",
+     "PrefsTypes.ipdlh",
+     "PTabContext.ipdlh",
+     "PURLClassifier.ipdl",
+     "PURLClassifierInfo.ipdlh",
+     "PURLClassifierLocal.ipdl",
+     "PVsync.ipdl",
+diff --git a/toolkit/content/aboutwebrtc/aboutWebrtc.js b/toolkit/content/aboutwebrtc/aboutWebrtc.js
+--- a/toolkit/content/aboutwebrtc/aboutWebrtc.js
++++ b/toolkit/content/aboutwebrtc/aboutWebrtc.js
+@@ -14,16 +14,19 @@ ChromeUtils.defineModuleGetter(
+   "resource://gre/modules/FileUtils.jsm"
+ );
+ XPCOMUtils.defineLazyServiceGetter(
+   this,
+   "FilePicker",
+   "@mozilla.org/filepicker;1",
+   "nsIFilePicker"
+ );
++const { BrowserWindowTracker } = ChromeUtils.import(
++  "resource:///modules/BrowserWindowTracker.jsm"
++);
+ 
+ const WGI = WebrtcGlobalInformation;
+ 
+ const LOGFILE_NAME_DEFAULT = "aboutWebrtc.html";
+ const WEBRTC_TRACE_ALL = 65535;
+ 
+ async function getStats() {
+   const { reports } = await new Promise(r => WGI.getAllStats(r));
+@@ -249,19 +252,20 @@ class ShowTab extends Control {
+   let reports = await haveReports;
+   let log = await haveLog;
+ 
+   reports.sort((a, b) => a.browserId - b.browserId);
+ 
+   let peerConnections = renderElement("div");
+   let connectionLog = renderElement("div");
+   let userPrefs = renderElement("div");
++  let mediaElements = renderElement("div");
+ 
+   const content = document.querySelector("#content");
+-  content.append(peerConnections, connectionLog, userPrefs);
++  content.append(peerConnections, connectionLog, userPrefs, mediaElements);
+ 
+   function refresh() {
+     const pcDiv = renderElements("div", { className: "stats" }, [
+       renderElements("span", { className: "section-heading" }, [
+         renderElement("h3", {}, "about-webrtc-stats-heading"),
+         renderElement(
+           "button",
+           {
+@@ -297,23 +301,129 @@ class ShowTab extends Control {
+     if (log.length) {
+       const div = renderFoldableSection(logDiv, {
+         showMsg: "about-webrtc-log-show-msg",
+         hideMsg: "about-webrtc-log-hide-msg",
+       });
+       div.append(...log.map(line => renderText("p", line)));
+       logDiv.append(div);
+     }
++
++    // TODO: We can implement a mute-all button by iterating all
++    // <browser> elements, and calling notifyMediaMutedChanged(true)
++    // on the CanonicalBrowsingContext in each.
++
++    // TODO: The state below only refreshes itself in response to user clicks,
++    // but doesn't handle external changes (new tabs, media finishing etc). We probably
++    // want to regularly refresh it, or to add events for the changes we care about.
++
++    function timeout(ms) {
++      return new Promise(resolve => setTimeout(resolve, ms));
++    }
++
++    const mediaDiv = renderElements("div", { className: "log" }, []);
++    // TODO: This just uses the current top window, we probably want to iterate
++    // all of them
++    let win = BrowserWindowTracker.getTopWindow();
++    for (let browser of win.gBrowser.browsers) {
++      if (browser.browsingContext) {
++        // Check to see if this tab has registered a MediaSession, and present information
++        // (and maybe controls?) using that
++        try {
++          // Create a title for the tab using the MediaSession metadata. We may have artwork here too which
++          // we could use.
++          let metadata = browser.browsingContext.mediaController.getMetadata();
++          mediaDiv.append(
++            renderText(
++              "p",
++              metadata.title + " - " + metadata.artist + " - " + metadata.album
++            )
++          );
++
++          // MediaController also exposes state (like audible, playing) as well as controls (play, pause, nextTrack),
++          // so we probably want to expose those as the default controls when the page has provided them.
++        } catch (e) {
++          // Otherwise just use the tab title. Should we skip this entirely for tabs that don't
++          // have any media/MediaSession?
++          mediaDiv.append(renderText("p", browser.contentTitle));
++        }
++
++        // Iterate the underlying DOM media elements and present information and controls
++        // for them invididually. We may want to hide this by default for tabs that have
++        // a MediaSession, since that's generally going to give better results.
++        // There can be bugs when using these controls if it interferes with what state the page expects. For example,
++        // muting youtube this way doesn't show in the youtube player controls (but does work, and does remove the audible
++        // icon in the firefox tab strip).
++        // These controls should be ok for simpler uses of media, as well as for power users who really want to override
++        // the per-page global controls provided by MediaSession.
++        if (browser.browsingContext.currentWindowGlobal) {
++          for (let media of browser.browsingContext.currentWindowGlobal
++            .mediaElements) {
++            let prefix = media.isVideo ? "Video" : "Media";
++            const inner = renderElements("div", { className: "log" }, [
++              renderText(
++                "p",
++                prefix +
++                  " Element - Playing? " +
++                  !media.isPaused +
++                  " Audible? " +
++                  media.isAudible
++              ),
++              renderElement(
++                "button",
++                {
++                  className: "no-print",
++                  onclick: async () => {
++                    media.play();
++                    await timeout(1000);
++                    refresh();
++                  },
++                },
++                "about-webrtc-play"
++              ),
++              renderElement(
++                "button",
++                {
++                  className: "no-print",
++                  onclick: async () => {
++                    media.pause();
++                    await timeout(1000);
++                    refresh();
++                  },
++                },
++                "about-webrtc-pause"
++              ),
++              renderElement(
++                "button",
++                {
++                  className: "no-print",
++                  onclick: async () => {
++                    media.toggleMute();
++                    await timeout(1000);
++                    refresh();
++                  },
++                },
++                "about-webrtc-mute"
++              ),
++            ]);
++            mediaDiv.append(inner);
++          }
++        }
++      }
++    }
++
+     // Replace previous info
+     peerConnections.replaceWith(pcDiv);
+     connectionLog.replaceWith(logDiv);
+     userPrefs.replaceWith((userPrefs = renderUserPrefs()));
++    mediaElements.replaceWith(mediaDiv);
+ 
+     peerConnections = pcDiv;
+     connectionLog = logDiv;
++    mediaElements = mediaDiv;
+   }
+   refresh();
+ 
+   window.setInterval(
+     async history => {
+       userPrefs.replaceWith((userPrefs = renderUserPrefs()));
+       const reports = await getStats();
+       reports.forEach(report => {
+diff --git a/toolkit/locales/en-US/toolkit/about/aboutWebrtc.ftl b/toolkit/locales/en-US/toolkit/about/aboutWebrtc.ftl
+--- a/toolkit/locales/en-US/toolkit/about/aboutWebrtc.ftl
++++ b/toolkit/locales/en-US/toolkit/about/aboutWebrtc.ftl
+@@ -88,16 +88,19 @@ about-webrtc-debug-mode-on-state-label =
+ about-webrtc-stats-heading = Session Statistics
+ about-webrtc-stats-clear = Clear History
+ about-webrtc-log-heading = Connection Log
+ about-webrtc-log-clear = Clear Log
+ about-webrtc-log-show-msg = show log
+     .title = click to expand this section
+ about-webrtc-log-hide-msg = hide log
+     .title = click to collapse this section
++about-webrtc-play = Play
++about-webrtc-pause = Pause
++about-webrtc-mute = Mute/Unmute 
+ 
+ ## These are used to display a header for a PeerConnection.
+ ## Variables:
+ ##  $browser-id (Number) - A numeric id identifying the browser tab for the PeerConnection.
+ ##  $id (String) - A globally unique identifier for the PeerConnection.
+ ##  $url (String) - The url of the site which opened the PeerConnection.
+ ##  $now (Date) - The JavaScript timestamp at the time the report was generated.
+ 

@@ -1,0 +1,2831 @@
+# HG changeset patch
+# User Mark Striemer <mstriemer@mozilla.com>
+# Date 1616080123 0
+#      Thu Mar 18 15:08:43 2021 +0000
+# Node ID 8571960c70fa729feff87ff280dce77577daf844
+# Parent  963df76dc6553a8739372c75c8e2d87c3d1c9cfb
+Bug 1666247 - Simplify page mode
+
+New test toolkit/components/printing/tests/browser_print_simplified_mode.js leaks in debug builds
+
+Differential Revision: https://phabricator.services.mozilla.com/D102356
+
+diff --git a/browser/actors/PromptParent.jsm b/browser/actors/PromptParent.jsm
+--- a/browser/actors/PromptParent.jsm
++++ b/browser/actors/PromptParent.jsm
+@@ -330,7 +330,7 @@ class PromptParent extends JSWindowActor
+             allowFocusCheckbox: args.allowFocusCheckbox,
+           },
+           bag
+-        );
++        ).closedPromise;
+       } else {
+         // Ensure we set the correct modal type at this point.
+         // If we use window prompts as a fallback it may not be set.
+diff --git a/browser/base/content/browser.css b/browser/base/content/browser.css
+--- a/browser/base/content/browser.css
++++ b/browser/base/content/browser.css
+@@ -1433,8 +1433,9 @@ toolbarpaletteitem:not([place="palette"]
+   transition: opacity 60ms;
+ }
+ 
+-.previewStack[previewtype="primary"] > .printPreviewBrowser[previewtype="primary"],
+-.previewStack[previewtype="selection"] > .printPreviewBrowser[previewtype="selection"] {
++.previewStack[previewtype="source"] > .printPreviewBrowser[previewtype="source"],
++.previewStack[previewtype="selection"] > .printPreviewBrowser[previewtype="selection"],
++.previewStack[previewtype="simplified"] > .printPreviewBrowser[previewtype="simplified"] {
+   display: block;
+ }
+ 
+@@ -1453,11 +1454,11 @@ printpreview-pagination {
+   transition: opacity 100ms 500ms;
+ }
+ printpreview-pagination:focus-within,
+-.previewStack:hover > printpreview-pagination {
++.previewStack:hover printpreview-pagination {
+   opacity: 1;
+   transition: opacity 100ms;
+ }
+-.previewStack[rendering=true] > printpreview-pagination {
++.previewStack[rendering=true] printpreview-pagination {
+   opacity: 0;
+ }
+ 
+diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
+--- a/browser/base/content/browser.js
++++ b/browser/base/content/browser.js
+@@ -8987,7 +8987,9 @@ class TabDialogBox {
+    * Set to true to keep the dialog open for same origin navigation.
+    * @param {Number} [aOptions.modalType] - The modal type to create the dialog for.
+    * By default, we show the dialog for tab prompts.
+-   * @returns {Promise} - Resolves once the dialog has been closed.
++   * @returns {Object} [result] Returns an object { closedPromise, dialog }.
++   * @returns {Promise} [result.closedPromise] Resolves once the dialog has been closed.
++   * @returns {SubDialog} [result.dialog] A reference to the opened SubDialog.
+    */
+   open(
+     aURL,
+@@ -9001,54 +9003,55 @@ class TabDialogBox {
+     } = {},
+     ...aParams
+   ) {
+-    return new Promise(resolve => {
+-      // Get the dialog manager to open the prompt with.
+-      let dialogManager =
+-        modalType === Ci.nsIPrompt.MODAL_TYPE_CONTENT
+-          ? this.getContentDialogManager()
+-          : this._tabDialogManager;
+-      let hasDialogs =
+-        this._tabDialogManager.hasDialogs ||
+-        this._contentDialogManager?.hasDialogs;
+-
++    let resolveClosed;
++    let closedPromise = new Promise(resolve => (resolveClosed = resolve));
++    // Get the dialog manager to open the prompt with.
++    let dialogManager =
++      modalType === Ci.nsIPrompt.MODAL_TYPE_CONTENT
++        ? this.getContentDialogManager()
++        : this._tabDialogManager;
++    let hasDialogs =
++      this._tabDialogManager.hasDialogs ||
++      this._contentDialogManager?.hasDialogs;
++
++    if (!hasDialogs) {
++      this._onFirstDialogOpen();
++    }
++
++    let closingCallback = event => {
+       if (!hasDialogs) {
+-        this._onFirstDialogOpen();
+-      }
+-
+-      let closingCallback = event => {
+-        if (!hasDialogs) {
+-          this._onLastDialogClose();
+-        }
+-
+-        if (allowFocusCheckbox && !event.detail?.abort) {
+-          this.maybeSetAllowTabSwitchPermission(event.target);
+-        }
+-      };
+-
+-      if (modalType == Ci.nsIPrompt.MODAL_TYPE_CONTENT) {
+-        sizeTo = "limitheight";
+-      }
+-
+-      // Open dialog and resolve once it has been closed
+-      let dialog = dialogManager.open(
+-        aURL,
+-        {
+-          features,
+-          allowDuplicateDialogs,
+-          sizeTo,
+-          closingCallback,
+-          closedCallback: resolve,
+-        },
+-        ...aParams
+-      );
+-
+-      // Marking the dialog externally, instead of passing it as an option.
+-      // The SubDialog(Manager) does not care about navigation.
+-      // dialog can be null here if allowDuplicateDialogs = false.
+-      if (dialog) {
+-        dialog._keepOpenSameOriginNav = keepOpenSameOriginNav;
+-      }
+-    });
++        this._onLastDialogClose();
++      }
++
++      if (allowFocusCheckbox && !event.detail?.abort) {
++        this.maybeSetAllowTabSwitchPermission(event.target);
++      }
++    };
++
++    if (modalType == Ci.nsIPrompt.MODAL_TYPE_CONTENT) {
++      sizeTo = "limitheight";
++    }
++
++    // Open dialog and resolve once it has been closed
++    let dialog = dialogManager.open(
++      aURL,
++      {
++        features,
++        allowDuplicateDialogs,
++        sizeTo,
++        closingCallback,
++        closedCallback: resolveClosed,
++      },
++      ...aParams
++    );
++
++    // Marking the dialog externally, instead of passing it as an option.
++    // The SubDialog(Manager) does not care about navigation.
++    // dialog can be null here if allowDuplicateDialogs = false.
++    if (dialog) {
++      dialog._keepOpenSameOriginNav = keepOpenSameOriginNav;
++    }
++    return { closedPromise, dialog };
+   }
+ 
+   _onFirstDialogOpen() {
+diff --git a/browser/base/content/test/tabdialogs/browser_subdialog_esc.js b/browser/base/content/test/tabdialogs/browser_subdialog_esc.js
+--- a/browser/base/content/test/tabdialogs/browser_subdialog_esc.js
++++ b/browser/base/content/test/tabdialogs/browser_subdialog_esc.js
+@@ -28,7 +28,7 @@ add_task(async function test_subdialog_e
+     let dialogBox = gBrowser.getTabDialogBox(browser);
+     let dialogClose = dialogBox.open(TEST_DIALOG_PATH, {
+       keepOpenSameOriginNav: true,
+-    });
++    }).closedPromise;
+ 
+     let dialogs = dialogBox.getTabDialogManager()._dialogs;
+ 
+@@ -66,7 +66,7 @@ add_task(async function test_subdialog_e
+     let dialogBox = gBrowser.getTabDialogBox(browser);
+     let dialogClose = dialogBox.open(TEST_DIALOG_PATH, {
+       keepOpenSameOriginNav: true,
+-    });
++    }).closedPromise;
+ 
+     let dialogs = dialogBox.getTabDialogManager()._dialogs;
+ 
+diff --git a/browser/base/content/test/tabdialogs/browser_tabdialogbox_focus.js b/browser/base/content/test/tabdialogs/browser_tabdialogbox_focus.js
+--- a/browser/base/content/test/tabdialogs/browser_tabdialogbox_focus.js
++++ b/browser/base/content/test/tabdialogs/browser_tabdialogbox_focus.js
+@@ -87,15 +87,15 @@ add_task(async function test_tabdialogbo
+       {
+         testCustomFocusHandler: true,
+       }
+-    );
+-    let dialogBClose = dialogBox.open(TEST_DIALOG_PATH);
++    ).closedPromise;
++    let dialogBClose = dialogBox.open(TEST_DIALOG_PATH).closedPromise;
+     let dialogCClose = dialogBox.open(
+       TEST_DIALOG_PATH,
+       {},
+       {
+         testCustomFocusHandler: true,
+       }
+-    );
++    ).closedPromise;
+ 
+     let dialogs = dialogBox._tabDialogManager._dialogs;
+     let [dialogA, dialogB, dialogC] = dialogs;
+diff --git a/browser/base/content/test/tabdialogs/browser_tabdialogbox_navigation.js b/browser/base/content/test/tabdialogs/browser_tabdialogbox_navigation.js
+--- a/browser/base/content/test/tabdialogs/browser_tabdialogbox_navigation.js
++++ b/browser/base/content/test/tabdialogs/browser_tabdialogbox_navigation.js
+@@ -16,8 +16,8 @@ add_task(async function test_tabdialogbo
+     // Open two dialogs and wait for them to be ready.
+     let dialogBox = gBrowser.getTabDialogBox(browser);
+     let closedPromises = [
+-      dialogBox.open(TEST_DIALOG_PATH),
+-      dialogBox.open(TEST_DIALOG_PATH),
++      dialogBox.open(TEST_DIALOG_PATH).closedPromise,
++      dialogBox.open(TEST_DIALOG_PATH).closedPromise,
+     ];
+ 
+     let dialogs = dialogBox.getTabDialogManager()._dialogs;
+@@ -46,7 +46,7 @@ add_task(async function test_tabdialogbo
+   ) {
+     // Open a dialog and wait for it to be ready
+     let dialogBox = gBrowser.getTabDialogBox(browser);
+-    let closedPromise = dialogBox.open(TEST_DIALOG_PATH);
++    let { closedPromise } = dialogBox.open(TEST_DIALOG_PATH);
+ 
+     let dialog = dialogBox.getTabDialogManager()._topDialog;
+ 
+@@ -71,7 +71,7 @@ add_task(async function test_tabdialogbo
+     // Open a new dialog
+     closedPromise = dialogBox.open(TEST_DIALOG_PATH, {
+       keepOpenSameOriginNav: true,
+-    });
++    }).closedPromise;
+ 
+     info("Waiting for dialog to open.");
+     await dialog._dialogReady;
+@@ -118,8 +118,8 @@ add_task(async function test_tabdialogbo
+     let dialogBox = gBrowser.getTabDialogBox(browser);
+     let dialogBoxManager = dialogBox.getTabDialogManager();
+     let closedPromises = [
+-      dialogBox.open(TEST_DIALOG_PATH),
+-      dialogBox.open(TEST_DIALOG_PATH),
++      dialogBox.open(TEST_DIALOG_PATH).closedPromise,
++      dialogBox.open(TEST_DIALOG_PATH).closedPromise,
+     ];
+ 
+     let dialogs = dialogBox.getTabDialogManager()._dialogs;
+diff --git a/browser/components/extensions/test/browser/browser_ext_tabs_printPreview.js b/browser/components/extensions/test/browser/browser_ext_tabs_printPreview.js
+--- a/browser/components/extensions/test/browser/browser_ext_tabs_printPreview.js
++++ b/browser/components/extensions/test/browser/browser_ext_tabs_printPreview.js
+@@ -50,9 +50,10 @@ async function testPrintPreview() {
+     await BrowserTestUtils.waitForCondition(() => !window.gInPrintPreviewMode);
+   } else {
+     // Ensure we're showing the preview...
+-    await BrowserTestUtils.waitForCondition(
+-      () => !!document.querySelector(".printPreviewBrowser")
+-    );
++    await BrowserTestUtils.waitForCondition(() => {
++      let preview = document.querySelector(".printPreviewBrowser");
++      return preview && BrowserTestUtils.is_visible(preview);
++    });
+ 
+     gBrowser.getTabDialogBox(gBrowser.selectedBrowser).abortAllDialogs();
+     // Wait for the preview to go away
+diff --git a/toolkit/actors/PrintingChild.jsm b/toolkit/actors/PrintingChild.jsm
+--- a/toolkit/actors/PrintingChild.jsm
++++ b/toolkit/actors/PrintingChild.jsm
+@@ -191,160 +191,165 @@ class PrintingChild extends JSWindowActo
+       Cu.reportError(ex);
+     }
+ 
+-    // We make use of a web progress listener in order to know when the content we inject
+-    // into the DOM has finished rendering. If our layout engine is still painting, we
+-    // will wait for MozAfterPaint event to be fired.
+-    let actor = thisWindow.windowGlobalChild.getActor("Printing");
+-    let webProgressListener = {
+-      onStateChange(webProgress, req, flags, status) {
+-        if (flags & Ci.nsIWebProgressListener.STATE_STOP) {
+-          webProgress.removeProgressListener(webProgressListener);
+-          let domUtils = contentWindow.windowUtils;
+-          // Here we tell the parent that we have parsed the document successfully
+-          // using ReaderMode primitives and we are able to enter on preview mode.
+-          if (domUtils.isMozAfterPaintPending) {
+-            let onPaint = function() {
+-              contentWindow.removeEventListener("MozAfterPaint", onPaint);
++    await new Promise(resolve => {
++      // We make use of a web progress listener in order to know when the content we inject
++      // into the DOM has finished rendering. If our layout engine is still painting, we
++      // will wait for MozAfterPaint event to be fired.
++      let actor = thisWindow.windowGlobalChild.getActor("Printing");
++      let webProgressListener = {
++        onStateChange(webProgress, req, flags, status) {
++          if (flags & Ci.nsIWebProgressListener.STATE_STOP) {
++            webProgress.removeProgressListener(webProgressListener);
++            let domUtils = contentWindow.windowUtils;
++            // Here we tell the parent that we have parsed the document successfully
++            // using ReaderMode primitives and we are able to enter on preview mode.
++            if (domUtils.isMozAfterPaintPending) {
++              let onPaint = function() {
++                contentWindow.removeEventListener("MozAfterPaint", onPaint);
++                actor.sendAsyncMessage("Printing:Preview:ReaderModeReady");
++                resolve();
++              };
++              contentWindow.addEventListener("MozAfterPaint", onPaint);
++              // This timer is needed for when display list invalidation doesn't invalidate.
++              setTimeout(() => {
++                contentWindow.removeEventListener("MozAfterPaint", onPaint);
++                actor.sendAsyncMessage("Printing:Preview:ReaderModeReady");
++                resolve();
++              }, 100);
++            } else {
+               actor.sendAsyncMessage("Printing:Preview:ReaderModeReady");
+-            };
+-            contentWindow.addEventListener("MozAfterPaint", onPaint);
+-            // This timer is needed for when display list invalidation doesn't invalidate.
+-            setTimeout(() => {
+-              contentWindow.removeEventListener("MozAfterPaint", onPaint);
+-              actor.sendAsyncMessage("Printing:Preview:ReaderModeReady");
+-            }, 100);
+-          } else {
+-            actor.sendAsyncMessage("Printing:Preview:ReaderModeReady");
++              resolve();
++            }
+           }
+-        }
+-      },
+-
+-      QueryInterface: ChromeUtils.generateQI([
+-        "nsIWebProgressListener",
+-        "nsISupportsWeakReference",
+-        "nsIObserver",
+-      ]),
+-    };
+-
+-    // Here we QI the docShell into a nsIWebProgress passing our web progress listener in.
+-    let webProgress = thisWindow.docShell
+-      .QueryInterface(Ci.nsIInterfaceRequestor)
+-      .getInterface(Ci.nsIWebProgress);
+-    webProgress.addProgressListener(
+-      webProgressListener,
+-      Ci.nsIWebProgress.NOTIFY_STATE_REQUEST
+-    );
+-
+-    let document = thisWindow.document;
+-    document.head.innerHTML = "";
+-
+-    // Set base URI of document. Print preview code will read this value to
+-    // populate the URL field in print settings so that it doesn't show
+-    // "about:blank" as its URI.
+-    let headBaseElement = document.createElement("base");
+-    headBaseElement.setAttribute("href", URL);
+-    document.head.appendChild(headBaseElement);
+-
+-    // Create link element referencing aboutReader.css and append it to head
+-    let headStyleElement = document.createElement("link");
+-    headStyleElement.setAttribute("rel", "stylesheet");
+-    headStyleElement.setAttribute(
+-      "href",
+-      "chrome://global/skin/aboutReader.css"
+-    );
+-    headStyleElement.setAttribute("type", "text/css");
+-    document.head.appendChild(headStyleElement);
++        },
+ 
+-    // Create link element referencing simplifyMode.css and append it to head
+-    headStyleElement = document.createElement("link");
+-    headStyleElement.setAttribute("rel", "stylesheet");
+-    headStyleElement.setAttribute(
+-      "href",
+-      "chrome://global/content/simplifyMode.css"
+-    );
+-    headStyleElement.setAttribute("type", "text/css");
+-    document.head.appendChild(headStyleElement);
+-
+-    document.body.innerHTML = "";
+-
+-    // Create container div (main element) and append it to body
+-    let containerElement = document.createElement("div");
+-    containerElement.setAttribute("id", "container");
+-    document.body.appendChild(containerElement);
+-
+-    // Reader Mode might return null if there's a failure when parsing the document.
+-    // We'll render the error message for the Simplify Page document when that happens.
+-    if (article) {
+-      // Set title of document
+-      document.title = article.title;
+-
+-      // Create header div and append it to container
+-      let headerElement = document.createElement("div");
+-      headerElement.setAttribute("id", "reader-header");
+-      headerElement.setAttribute("class", "header");
+-      containerElement.appendChild(headerElement);
++        QueryInterface: ChromeUtils.generateQI([
++          "nsIWebProgressListener",
++          "nsISupportsWeakReference",
++          "nsIObserver",
++        ]),
++      };
+ 
+-      // Jam the article's title and byline into header div
+-      let titleElement = document.createElement("h1");
+-      titleElement.setAttribute("id", "reader-title");
+-      titleElement.textContent = article.title;
+-      headerElement.appendChild(titleElement);
+-
+-      let bylineElement = document.createElement("div");
+-      bylineElement.setAttribute("id", "reader-credits");
+-      bylineElement.setAttribute("class", "credits");
+-      bylineElement.textContent = article.byline;
+-      headerElement.appendChild(bylineElement);
+-
+-      // Display header element
+-      headerElement.style.display = "block";
+-
+-      // Create content div and append it to container
+-      let contentElement = document.createElement("div");
+-      contentElement.setAttribute("class", "content");
+-      containerElement.appendChild(contentElement);
+-
+-      // Jam the article's content into content div
+-      let readerContent = document.createElement("div");
+-      readerContent.setAttribute("id", "moz-reader-content");
+-      contentElement.appendChild(readerContent);
+-
+-      let articleUri = Services.io.newURI(article.url);
+-      let parserUtils = Cc["@mozilla.org/parserutils;1"].getService(
+-        Ci.nsIParserUtils
+-      );
+-      let contentFragment = parserUtils.parseFragment(
+-        article.content,
+-        Ci.nsIParserUtils.SanitizerDropForms |
+-          Ci.nsIParserUtils.SanitizerAllowStyle,
+-        false,
+-        articleUri,
+-        readerContent
++      // Here we QI the docShell into a nsIWebProgress passing our web progress listener in.
++      let webProgress = thisWindow.docShell
++        .QueryInterface(Ci.nsIInterfaceRequestor)
++        .getInterface(Ci.nsIWebProgress);
++      webProgress.addProgressListener(
++        webProgressListener,
++        Ci.nsIWebProgress.NOTIFY_STATE_REQUEST
+       );
+ 
+-      readerContent.appendChild(contentFragment);
++      let document = thisWindow.document;
++      document.head.innerHTML = "";
++
++      // Set base URI of document. Print preview code will read this value to
++      // populate the URL field in print settings so that it doesn't show
++      // "about:blank" as its URI.
++      let headBaseElement = document.createElement("base");
++      headBaseElement.setAttribute("href", URL);
++      document.head.appendChild(headBaseElement);
++
++      // Create link element referencing aboutReader.css and append it to head
++      let headStyleElement = document.createElement("link");
++      headStyleElement.setAttribute("rel", "stylesheet");
++      headStyleElement.setAttribute(
++        "href",
++        "chrome://global/skin/aboutReader.css"
++      );
++      headStyleElement.setAttribute("type", "text/css");
++      document.head.appendChild(headStyleElement);
+ 
+-      // Display reader content element
+-      readerContent.style.display = "block";
+-    } else {
+-      let aboutReaderStrings = Services.strings.createBundle(
+-        "chrome://global/locale/aboutReader.properties"
++      // Create link element referencing simplifyMode.css and append it to head
++      headStyleElement = document.createElement("link");
++      headStyleElement.setAttribute("rel", "stylesheet");
++      headStyleElement.setAttribute(
++        "href",
++        "chrome://global/content/simplifyMode.css"
+       );
+-      let errorMessage = aboutReaderStrings.GetStringFromName(
+-        "aboutReader.loadError"
+-      );
++      headStyleElement.setAttribute("type", "text/css");
++      document.head.appendChild(headStyleElement);
++
++      document.body.innerHTML = "";
++
++      // Create container div (main element) and append it to body
++      let containerElement = document.createElement("div");
++      containerElement.setAttribute("id", "container");
++      document.body.appendChild(containerElement);
++
++      // Reader Mode might return null if there's a failure when parsing the document.
++      // We'll render the error message for the Simplify Page document when that happens.
++      if (article) {
++        // Set title of document
++        document.title = article.title;
++
++        // Create header div and append it to container
++        let headerElement = document.createElement("div");
++        headerElement.setAttribute("id", "reader-header");
++        headerElement.setAttribute("class", "header");
++        containerElement.appendChild(headerElement);
++
++        // Jam the article's title and byline into header div
++        let titleElement = document.createElement("h1");
++        titleElement.setAttribute("id", "reader-title");
++        titleElement.textContent = article.title;
++        headerElement.appendChild(titleElement);
+ 
+-      document.title = errorMessage;
++        let bylineElement = document.createElement("div");
++        bylineElement.setAttribute("id", "reader-credits");
++        bylineElement.setAttribute("class", "credits");
++        bylineElement.textContent = article.byline;
++        headerElement.appendChild(bylineElement);
++
++        // Display header element
++        headerElement.style.display = "block";
++
++        // Create content div and append it to container
++        let contentElement = document.createElement("div");
++        contentElement.setAttribute("class", "content");
++        containerElement.appendChild(contentElement);
++
++        // Jam the article's content into content div
++        let readerContent = document.createElement("div");
++        readerContent.setAttribute("id", "moz-reader-content");
++        contentElement.appendChild(readerContent);
+ 
+-      // Create reader message div and append it to body
+-      let readerMessageElement = document.createElement("div");
+-      readerMessageElement.setAttribute("class", "reader-message");
+-      readerMessageElement.textContent = errorMessage;
+-      containerElement.appendChild(readerMessageElement);
++        let articleUri = Services.io.newURI(article.url);
++        let parserUtils = Cc["@mozilla.org/parserutils;1"].getService(
++          Ci.nsIParserUtils
++        );
++        let contentFragment = parserUtils.parseFragment(
++          article.content,
++          Ci.nsIParserUtils.SanitizerDropForms |
++            Ci.nsIParserUtils.SanitizerAllowStyle,
++          false,
++          articleUri,
++          readerContent
++        );
++
++        readerContent.appendChild(contentFragment);
+ 
+-      // Display reader message element
+-      readerMessageElement.style.display = "block";
+-    }
++        // Display reader content element
++        readerContent.style.display = "block";
++      } else {
++        let aboutReaderStrings = Services.strings.createBundle(
++          "chrome://global/locale/aboutReader.properties"
++        );
++        let errorMessage = aboutReaderStrings.GetStringFromName(
++          "aboutReader.loadError"
++        );
++
++        document.title = errorMessage;
++
++        // Create reader message div and append it to body
++        let readerMessageElement = document.createElement("div");
++        readerMessageElement.setAttribute("class", "reader-message");
++        readerMessageElement.textContent = errorMessage;
++        containerElement.appendChild(readerMessageElement);
++
++        // Display reader message element
++        readerMessageElement.style.display = "block";
++      }
++    });
+   }
+ 
+   enterPrintPreview(
+diff --git a/toolkit/components/printing/content/print.css b/toolkit/components/printing/content/print.css
+--- a/toolkit/components/printing/content/print.css
++++ b/toolkit/components/printing/content/print.css
+@@ -325,3 +325,9 @@ input[type="number"].photon-number::-moz
+   background-color: var(--in-content-button-background-hover);
+   color: var(--in-content-button-text-color-hover);
+ }
++
++input[type="checkbox"]:disabled + label,
++input[type="radio"]:disabled + label,
++input[type="radio"]:disabled + span > label {
++  opacity: 0.5;
++}
+diff --git a/toolkit/components/printing/content/print.html b/toolkit/components/printing/content/print.html
+--- a/toolkit/components/printing/content/print.html
++++ b/toolkit/components/printing/content/print.html
+@@ -202,6 +202,24 @@
+               </select>
+             </section>
+ 
++            <section id="source-version-section" class="section-block">
++              <label id="source-version-label" data-l10n-id="printui-source-label"></label>
++              <div role="radiogroup" aria-labelledby="source-version-label">
++                <label id="source-version-source" class="row cols-2">
++                  <input is="setting-radio" name="source-version" value="source" id="source-version-source-radio" data-setting-name="sourceVersion" checked>
++                  <span data-l10n-id="printui-source-radio"></span>
++                </label>
++                <label id="source-version-selection" class="row cols-2">
++                  <input is="setting-radio" name="source-version" value="selection" id="source-version-selection-radio" data-setting-name="sourceVersion">
++                  <span data-l10n-id="printui-selection-radio"></span>
++                </label>
++                <label id="source-version-simplified" class="row cols-2">
++                  <input is="setting-radio" name="source-version" value="simplified" id="source-version-simplified-radio" data-setting-name="sourceVersion">
++                  <span data-l10n-id="printui-simplify-page-radio"></span>
++                </label>
++              </div>
++            </section>
++
+             <section id="more-settings-options" class="section-block">
+               <label class="block-label" data-l10n-id="printui-options"></label>
+               <label id="headers-footers" class="row cols-2">
+@@ -209,13 +227,9 @@
+                 <span data-l10n-id="printui-headers-footers-checkbox"></span>
+               </label>
+               <label id="backgrounds" class="row cols-2">
+-                <input is="setting-checkbox" id="backgrounds-enabled" data-setting-name="printBackgrounds">
++                <input is="print-backgrounds" id="backgrounds-enabled" data-setting-name="printBackgrounds">
+                 <span data-l10n-id="printui-backgrounds-checkbox"></span>
+               </label>
+-              <label id="print-selection-container" class="row cols-2" hidden>
+-                <input is="setting-checkbox" id="print-selection-enabled" data-setting-name="printSelectionOnly">
+-                <span data-l10n-id="printui-selection-checkbox"></span>
+-              </label>
+             </section>
+ 
+           </details>
+diff --git a/toolkit/components/printing/content/print.js b/toolkit/components/printing/content/print.js
+--- a/toolkit/components/printing/content/print.js
++++ b/toolkit/components/printing/content/print.js
+@@ -88,7 +88,9 @@ function cancelDeferredTasks() {
+ document.addEventListener(
+   "DOMContentLoaded",
+   e => {
+-    window._initialized = PrintEventHandler.init();
++    window._initialized = PrintEventHandler.init().catch(e =>
++      Cu.reportError(e)
++    );
+     ourBrowser.setAttribute("flex", "0");
+     ourBrowser.classList.add("printSettingsBrowser");
+     ourBrowser.closest(".dialogBox")?.classList.add("printDialogBox");
+@@ -97,7 +99,6 @@ document.addEventListener(
+ );
+ 
+ window.addEventListener("dialogclosing", () => {
+-  PrintEventHandler.unload();
+   cancelDeferredTasks();
+ });
+ 
+@@ -115,8 +116,6 @@ var PrintEventHandler = {
+   allPaperSizes: {},
+   previewIsEmpty: false,
+   _delayedChanges: {},
+-  _hasRenderedSelectionPreview: false,
+-  _hasRenderedPrimaryPreview: false,
+   _userChangedSettings: {},
+   settingFlags: {
+     margins: Ci.nsIPrintSettings.kInitSaveMargins,
+@@ -140,70 +139,81 @@ var PrintEventHandler = {
+       Ci.nsIPrintSettings.kInitSaveBGColors |
+       Ci.nsIPrintSettings.kInitSaveBGImages,
+   },
+-  originalSourceContentTitle: null,
+-  originalSourceCurrentURI: null,
+-  previewBrowser: null,
+-  selectionPreviewBrowser: null,
+-  currentPreviewBrowser: null,
++
++  topContentTitle: null,
++  topCurrentURI: null,
++  activeContentTitle: null,
++  activeCurrentURI: null,
++
++  get activeURI() {
++    return this.viewSettings.sourceVersion == "selection"
++      ? this.activeCurrentURI
++      : this.topCurrentURI;
++  },
++  get activeTitle() {
++    return this.viewSettings.sourceVersion == "selection"
++      ? this.activeContentTitle
++      : this.topContentTitle;
++  },
+ 
+   // These settings do not have an associated pref value or flag, but
+   // changing them requires us to update the print preview.
+   _nonFlaggedUpdatePreviewSettings: new Set([
+     "pageRanges",
+     "numPagesPerSheet",
+-    "printSelectionOnly",
++    "sourceVersion",
+   ]),
+   _noPreviewUpdateSettings: new Set(["numCopies", "printDuplex"]),
+ 
+   async init() {
+     Services.telemetry.scalarAdd("printing.preview_opened_tm", 1);
+ 
++    this.printPreviewEl = ourBrowser.parentElement.querySelector(
++      "print-preview"
++    );
++
+     // Do not keep a reference to source browser, it may mutate after printing
+     // is initiated and the print preview clone must be a snapshot from the
+     // time that the print was started.
+-    let sourceBrowsingContext = this.getSourceBrowsingContext();
++    let sourceBrowsingContext = this.printPreviewEl.getSourceBrowsingContext();
+ 
+     let args = window.arguments[0];
+     this.printFrameOnly = args.getProperty("printFrameOnly");
+-
+-    ({
+-      previewBrowser: this.previewBrowser,
+-      selectionPreviewBrowser: this.selectionPreviewBrowser,
+-    } = PrintUtils.createPreviewBrowsers(
+-      sourceBrowsingContext,
+-      ourBrowser,
+-      this.printFrameOnly
+-    ));
+-
+     this.printSelectionOnly = args.getProperty("printSelectionOnly");
+-    this.hasSelection =
+-      args.getProperty("hasSelection") && this.selectionPreviewBrowser;
+-    // Get the temporary browser that will previously have been created for the
+-    // platform code to generate the static clone printing doc into if this
+-    // print is for a window.print() call.  In that case we steal the browser's
+-    // docshell to get the static clone, then discard it.
+-    let existingBrowser = args.getProperty("previewBrowser");
+-    if (existingBrowser) {
+-      sourceBrowsingContext = existingBrowser.browsingContext;
+-      this.previewBrowser.swapDocShells(existingBrowser);
+-      existingBrowser.remove();
++    this.isArticle = args.getProperty("isArticle");
++    try {
++      this.hasSelection = await this.checkForSelection(sourceBrowsingContext);
++    } catch (e) {
++      // In tests we sometimes close the dialog immediately, which can cause
++      // checkForSelection to fail. Just stop any work here and we should get
++      // cleaned up as the dialog closes.
++      Cu.reportError(e);
++      return;
+     }
+-    document.querySelector("#print-selection-container").hidden = !this
+-      .hasSelection;
+ 
+     let sourcePrincipal =
+       sourceBrowsingContext.currentWindowGlobal.documentPrincipal;
+     let sourceIsPdf =
+       !sourcePrincipal.isNullPrincipal && sourcePrincipal.spec == PDF_JS_URI;
+-    this.originalSourceContentTitle =
++    this.activeContentTitle =
+       sourceBrowsingContext.currentWindowContext.documentTitle;
+-    this.originalSourceCurrentURI =
++    this.activeCurrentURI =
+       sourceBrowsingContext.currentWindowContext.documentURI.spec;
++    let topWindowContext = sourceBrowsingContext.top.currentWindowContext;
++    this.topContentTitle = topWindowContext.documentTitle;
++    this.topCurrentURI = topWindowContext.documentURI.spec;
+ 
+-    this.nonSelectionBrowsingContextId = this.printFrameOnly
+-      ? sourceBrowsingContext.id
+-      : sourceBrowsingContext.top.id;
+-    this.selectionBrowsingContextId = sourceBrowsingContext.id;
++    let canPrintSelectionOnly =
++      this.hasSelection && this.printPreviewEl.canPrintSelectionOnly;
++    if (!canPrintSelectionOnly && !this.isArticle) {
++      document.getElementById("source-version-section").hidden = true;
++    } else {
++      document.getElementById(
++        "source-version-selection"
++      ).hidden = !canPrintSelectionOnly;
++      document.getElementById("source-version-simplified").hidden = !this
++        .isArticle;
++    }
+ 
+     // We don't need the sourceBrowsingContext anymore, get rid of it.
+     sourceBrowsingContext = undefined;
+@@ -239,6 +249,8 @@ var PrintEventHandler = {
+     PrintSettingsViewProxy.availablePrinters = printersByName;
+     PrintSettingsViewProxy.fallbackPaperList = fallbackPaperList;
+     PrintSettingsViewProxy.defaultSystemPrinter = defaultSystemPrinter;
++    PrintSettingsViewProxy._sourceVersion =
++      canPrintSelectionOnly && this.printSelectionOnly ? "selection" : "source";
+ 
+     logger.debug("availablePrinters: ", Object.keys(printersByName));
+     logger.debug("defaultSystemPrinter: ", defaultSystemPrinter);
+@@ -279,7 +291,8 @@ var PrintEventHandler = {
+       // Hide the dialog box before opening system dialog
+       // We cannot close the window yet because the browsing context for the
+       // print preview browser is needed to print the page.
+-      let sourceBrowser = this.getSourceBrowsingContext().top.embedderElement;
++      let sourceBrowser = this.printPreviewEl.getSourceBrowsingContext().top
++        .embedderElement;
+       let dialogBoxManager = PrintUtils.getTabDialogBox(
+         sourceBrowser
+       ).getTabDialogManager();
+@@ -297,7 +310,7 @@ var PrintEventHandler = {
+       // We set the title so that if the user chooses save-to-PDF from the
+       // system dialog the title will be used to generate the prepopulated
+       // filename in the file picker.
+-      settings.title = this.previewBrowser.browsingContext.embedderElement.contentTitle;
++      settings.title = this.activeTitle;
+       const PRINTPROMPTSVC = Cc[
+         "@mozilla.org/embedcomp/printingprompt-service;1"
+       ].getService(Ci.nsIPrintingPromptService);
+@@ -342,11 +355,6 @@ var PrintEventHandler = {
+       })
+     );
+ 
+-    await document.l10n.translateElements([this.previewBrowser]);
+-    if (this.selectionPreviewBrowser) {
+-      await document.l10n.translateElements([this.selectionPreviewBrowser]);
+-    }
+-
+     document.body.removeAttribute("loading");
+ 
+     await new Promise(resolve => window.requestAnimationFrame(resolve));
+@@ -359,11 +367,13 @@ var PrintEventHandler = {
+     await initialPreviewDone;
+   },
+ 
+-  unload() {
+-    this.previewBrowser.frameLoader.exitPrintPreview();
+-    if (this.selectionPreviewBrowser) {
+-      this.selectionPreviewBrowser.frameLoader.exitPrintPreview();
++  checkForSelection(browsingContext) {
++    let { currentWindowGlobal } = browsingContext;
++    if (!currentWindowGlobal) {
++      throw new Error("Unable to check selection, window likely closed");
+     }
++    let sourceActor = currentWindowGlobal.getActor("PrintingSelection");
++    return sourceActor.sendQuery("PrintingSelection:HasSelection", {});
+   },
+ 
+   async print(systemDialogSettings) {
+@@ -393,8 +403,8 @@ var PrintEventHandler = {
+     if (settings.printerName == PrintUtils.SAVE_TO_PDF_PRINTER) {
+       try {
+         settings.toFileName = await pickFileName(
+-          this.originalSourceContentTitle,
+-          this.originalSourceCurrentURI
++          this.activeTitle,
++          this.activeURI
+         );
+       } catch (e) {
+         return false;
+@@ -415,8 +425,7 @@ var PrintEventHandler = {
+           : "printui-print-progress-indicator";
+       document.l10n.setAttributes(this.printProgressIndicator, l10nId);
+       this.printProgressIndicator.hidden = false;
+-
+-      let bc = this.currentPreviewBrowser.browsingContext;
++      let bc = this.printPreviewEl.currentBrowsingContext;
+       await this._doPrint(bc, settings);
+     } catch (e) {
+       Cu.reportError(e);
+@@ -492,6 +501,17 @@ var PrintEventHandler = {
+       settingsToUpdate.printInColor = true;
+     }
+ 
++    if (settingsToUpdate.sourceVersion == "simplified") {
++      if (this.viewSettings.printBackgrounds) {
++        // Remember that this was true before so it gets restored if the
++        // format is changed to something else.
++        this._userChangedSettings.printBackgrounds = true;
++      }
++      // Backgrounds are removed in simplified mode and this setting changes
++      // the output subtly to be less legible.
++      settingsToUpdate.printBackgrounds = false;
++    }
++
+     if (
+       settingsToUpdate.printInColor != this._userChangedSettings.printInColor
+     ) {
+@@ -775,7 +795,6 @@ var PrintEventHandler = {
+   async updatePrintPreview() {
+     // Make sure the rendering state is set so we don't visibly update the
+     // sheet count with incomplete data.
+-    this._showRenderingIndicator();
+     this._updatePrintPreviewTask.arm();
+   },
+ 
+@@ -786,36 +805,10 @@ var PrintEventHandler = {
+    */
+   async _updatePrintPreview() {
+     let { settings } = this;
+-    let { printSelectionOnly } = this.viewSettings;
+-    if (!this.selectionPreviewBrowser) {
+-      printSelectionOnly = false;
+-    }
+ 
+     // We never want the progress dialog to show
+     settings.showPrintProgress = false;
+ 
+-    this._showRenderingIndicator();
+-
+-    let sourceBCId;
+-
+-    // If it's the first time loading this type of browser, get the stored window id.
+-    if (printSelectionOnly && !this._hasRenderedSelectionPreview) {
+-      sourceBCId = this.selectionBrowsingContextId;
+-      this._hasRenderedSelectionPreview = true;
+-    } else if (!printSelectionOnly && !this._hasRenderedPrimaryPreview) {
+-      sourceBCId = this.nonSelectionBrowsingContextId;
+-      this._hasRenderedPrimaryPreview = true;
+-    }
+-
+-    this.previewBrowser.parentElement.setAttribute(
+-      "previewtype",
+-      printSelectionOnly ? "selection" : "primary"
+-    );
+-
+-    this.currentPreviewBrowser = printSelectionOnly
+-      ? this.selectionPreviewBrowser
+-      : this.previewBrowser;
+-
+     const isFirstCall = !this.printInitiationTime;
+     if (isFirstCall) {
+       let params = new URLSearchParams(location.search);
+@@ -832,16 +825,20 @@ var PrintEventHandler = {
+     let totalPageCount, sheetCount, isEmpty;
+     try {
+       // This resolves with a PrintPreviewSuccessInfo dictionary.
++      let { sourceVersion } = this.viewSettings;
++      let sourceURI = this.activeURI;
++      this._lastPrintPreviewSettings = settings;
+       ({
+         totalPageCount,
+         sheetCount,
+         isEmpty,
+-      } = await this.currentPreviewBrowser.frameLoader.printPreview(
+-        settings,
+-        sourceBCId ? BrowsingContext.get(sourceBCId) : null
+-      ));
++      } = await this.printPreviewEl.printPreview(settings, {
++        sourceVersion,
++        sourceURI,
++      }));
+     } catch (e) {
+       this.reportPrintingError("PRINT_PREVIEW");
++      Cu.reportError(e);
+       throw e;
+     }
+ 
+@@ -861,9 +858,6 @@ var PrintEventHandler = {
+         detail: { sheetCount, totalPages: totalPageCount },
+       })
+     );
+-    this.currentPreviewBrowser.setAttribute("sheet-count", sheetCount);
+-
+-    this._hideRenderingIndicator();
+ 
+     if (isFirstCall) {
+       const elapsed = Date.now() - this.printInitiationTime;
+@@ -873,27 +867,6 @@ var PrintEventHandler = {
+     }
+   },
+ 
+-  _showRenderingIndicator() {
+-    let stack = this.previewBrowser.parentElement;
+-    stack.setAttribute("rendering", true);
+-    document.body.setAttribute("rendering", true);
+-  },
+-
+-  _hideRenderingIndicator() {
+-    let stack = this.previewBrowser.parentElement;
+-    stack.removeAttribute("rendering");
+-    document.body.removeAttribute("rendering");
+-  },
+-
+-  getSourceBrowsingContext() {
+-    let params = new URLSearchParams(location.search);
+-    let browsingContextId = params.get("browsingContextId");
+-    if (!browsingContextId) {
+-      return null;
+-    }
+-    return BrowsingContext.get(browsingContextId);
+-  },
+-
+   async getPrintDestinations() {
+     const printerList = Cc["@mozilla.org/gfx/printerlist;1"].createInstance(
+       Ci.nsIPrinterList
+@@ -1394,6 +1367,8 @@ var PrintSettingsViewProxy = {
+ 
+       case "numCopies":
+         return this.get(target, "willSaveToFile") ? 1 : target.numCopies;
++      case "sourceVersion":
++        return this._sourceVersion;
+     }
+     return target[name];
+   },
+@@ -1502,6 +1477,14 @@ var PrintSettingsViewProxy = {
+         );
+         break;
+ 
++      case "sourceVersion":
++        this._sourceVersion = value;
++        this.set(target, "printSelectionOnly", value == "selection");
++        if (value == "simplified") {
++          this.set(target, "printBackgrounds", false);
++        }
++        break;
++
+       default:
+         target[name] = value;
+     }
+@@ -1590,7 +1573,7 @@ class PrintUIForm extends PrintUIControl
+       "#margins",
+       "#headers-footers",
+       "#backgrounds",
+-      "#print-selection-container",
++      "#source-version-selection",
+     ];
+     for (let selector of selectors) {
+       this.querySelector(selector).remove();
+@@ -1830,6 +1813,27 @@ customElements.define("setting-checkbox"
+   extends: "input",
+ });
+ 
++class PrintSettingRadio extends PrintUIControlMixin(HTMLInputElement) {
++  connectedCallback() {
++    this.type = "radio";
++    this.settingName = this.dataset.settingName;
++    super.connectedCallback();
++  }
++
++  update(settings) {
++    this.checked = settings[this.settingName] == this.value;
++  }
++
++  handleEvent(e) {
++    this.dispatchSettingsChange({
++      [this.settingName]: this.value,
++    });
++  }
++}
++customElements.define("setting-radio", PrintSettingRadio, {
++  extends: "input",
++});
++
+ class DestinationPicker extends PrintSettingSelect {
+   initialize() {
+     super.initialize();
+@@ -2583,6 +2587,19 @@ class PageCount extends PrintUIControlMi
+ }
+ customElements.define("page-count", PageCount);
+ 
++class PrintBackgrounds extends PrintSettingCheckbox {
++  update(settings) {
++    super.update(settings);
++    let isSimplified = settings.sourceVersion == "simplified";
++    this.disabled = isSimplified;
++    this.toggleAttribute("disallowed", isSimplified);
++    this.checked = !isSimplified && settings.printBackgrounds;
++  }
++}
++customElements.define("print-backgrounds", PrintBackgrounds, {
++  extends: "input",
++});
++
+ class PrintButton extends PrintUIControlMixin(HTMLButtonElement) {
+   update(settings) {
+     let l10nId =
+diff --git a/toolkit/components/printing/content/printPreviewPagination.js b/toolkit/components/printing/content/printPreviewPagination.js
+--- a/toolkit/components/printing/content/printPreviewPagination.js
++++ b/toolkit/components/printing/content/printPreviewPagination.js
+@@ -31,12 +31,6 @@ customElements.define(
+     }
+ 
+     get previewBrowser() {
+-      if (!this._previewBrowser) {
+-        // Assuming we're a sibling of our preview browser.
+-        this._previewBrowser = this.parentNode.querySelector(
+-          ".printPreviewBrowser"
+-        );
+-      }
+       return this._previewBrowser;
+     }
+ 
+@@ -44,6 +38,18 @@ customElements.define(
+       this._previewBrowser = aBrowser;
+     }
+ 
++    observePreviewBrowser(browser) {
++      if (browser == this.previewBrowser || !this.isConnected) {
++        return;
++      }
++      this.previewBrowser = browser;
++      this.mutationObserver.disconnect();
++      this.mutationObserver.observe(browser, {
++        attributes: ["current-page", "sheet-count"],
++      });
++      this.updateFromBrowser();
++    }
++
+     connectedCallback() {
+       MozXULElement.insertFTLIfNeeded("toolkit/printing/printPreview.ftl");
+ 
+@@ -63,46 +69,9 @@ customElements.define(
+ 
+       this.shadowRoot.addEventListener("click", this);
+ 
+-      let knownAttrs = {
+-        "sheet-count": "sheetCount",
+-        "current-page": "currentPage",
+-      };
+-      this.mutationObserver = new MutationObserver(changes => {
+-        let opts = {};
+-        for (let change of changes) {
+-          let { attributeName, target, type } = change;
+-          if (type == "attributes" && attributeName in knownAttrs) {
+-            opts[knownAttrs[attributeName]] = parseInt(
+-              target.getAttribute(attributeName),
+-              10
+-            );
+-          }
+-        }
+-        if (opts.sheetCount || opts.currentPage) {
+-          this.update(opts);
+-        }
+-      });
+-      this.mutationObserver.observe(this.previewBrowser, {
+-        attributes: ["current-page", "sheet-count"],
+-      });
+-
+-      this.currentPreviewBrowserObserver = new MutationObserver(changes => {
+-        for (let change of changes) {
+-          if (change.attributeName == "previewtype") {
+-            let previewType = change.target.getAttribute("previewtype");
+-            this.previewBrowser = change.target.querySelector(
+-              `browser[previewtype="${previewType}"]`
+-            );
+-            this.mutationObserver.disconnect();
+-            this.mutationObserver.observe(this.previewBrowser, {
+-              attributes: ["current-page", "sheet-count"],
+-            });
+-          }
+-        }
+-      });
+-      this.currentPreviewBrowserObserver.observe(this.parentNode, {
+-        attributes: ["previewtype"],
+-      });
++      this.mutationObserver = new MutationObserver(() =>
++        this.updateFromBrowser()
++      );
+ 
+       // Initial render with some default values
+       // We'll be updated with real values when available
+@@ -186,10 +155,6 @@ customElements.define(
+ 
+     update(data = {}) {
+       if (data.sheetCount) {
+-        if (this.sheetCount !== data.sheetCount || this.currentSheet !== 1) {
+-          // when sheet count changes, scroll position will get reset
+-          this.currentSheet = 1;
+-        }
+         this.sheetCount = data.sheetCount;
+       }
+       if (data.currentPage) {
+@@ -204,5 +169,17 @@ customElements.define(
+         }
+       );
+     }
++
++    updateFromBrowser() {
++      let sheetCount = parseInt(
++        this.previewBrowser.getAttribute("sheet-count"),
++        10
++      );
++      let currentPage = parseInt(
++        this.previewBrowser.getAttribute("current-page"),
++        10
++      );
++      this.update({ sheetCount, currentPage });
++    }
+   }
+ );
+diff --git a/toolkit/components/printing/content/printUtils.js b/toolkit/components/printing/content/printUtils.js
+--- a/toolkit/components/printing/content/printUtils.js
++++ b/toolkit/components/printing/content/printUtils.js
+@@ -163,67 +163,6 @@ var PrintUtils = {
+     return gBrowser.createBrowser(params);
+   },
+ 
+-  createPreviewBrowsers(aBrowsingContext, aDialogBrowser, aPrintFrameOnly) {
+-    let _createPreviewBrowser = previewType => {
+-      // When we're not previewing the selection or printing only the frame, we
+-      // want to make sure that the top-level browser is being printed.
+-      let browsingContext =
+-        previewType == "selection" || aPrintFrameOnly
+-          ? aBrowsingContext
+-          : aBrowsingContext.top.embedderElement.browsingContext;
+-      let browser = this.createBrowser({
+-        remoteType: browsingContext.currentRemoteType,
+-        userContextId: browsingContext.originAttributes.userContextId,
+-        initialBrowsingContextGroupId: browsingContext.group.id,
+-        skipLoad: true,
+-        initiallyActive: true,
+-      });
+-      browser.addEventListener("DOMWindowClose", function(e) {
+-        // Ignore close events from printing, see the code creating browsers in
+-        // printUtils.js and nsDocumentViewer::OnDonePrinting.
+-        //
+-        // When we print with the new print UI we don't bother creating a new
+-        // <browser> element, so the close event gets dispatched to us.
+-        //
+-        // Ignoring it is harmless (and doesn't cause correctness issues, because
+-        // the preview document can't run script anyways).
+-        e.preventDefault();
+-        e.stopPropagation();
+-      });
+-      browser.addEventListener("contextmenu", function(e) {
+-        e.preventDefault();
+-      });
+-      browser.classList.add("printPreviewBrowser");
+-      browser.setAttribute("flex", "1");
+-      browser.setAttribute("printpreview", "true");
+-      browser.setAttribute("previewtype", previewType);
+-      document.l10n.setAttributes(browser, "printui-preview-label");
+-      return browser;
+-    };
+-
+-    let previewStack = document.importNode(
+-      document.getElementById("printPreviewStackTemplate").content,
+-      true
+-    ).firstElementChild;
+-
+-    let previewBrowser = _createPreviewBrowser("primary");
+-    previewStack.append(previewBrowser);
+-    let selectionPreviewBrowser;
+-    if (aBrowsingContext.currentRemoteType) {
+-      selectionPreviewBrowser = _createPreviewBrowser("selection");
+-      previewStack.append(selectionPreviewBrowser);
+-    }
+-
+-    // show the toolbar after we go into print preview mode so
+-    // that we can initialize the toolbar with total num pages
+-    let previewPagination = document.createElement("printpreview-pagination");
+-    previewPagination.classList.add("printPreviewNavigation");
+-    previewStack.append(previewPagination);
+-
+-    aDialogBrowser.parentElement.prepend(previewStack);
+-    return { previewBrowser, selectionPreviewBrowser };
+-  },
+-
+   /**
+    * Opens the tab modal version of the print UI for the current tab.
+    *
+@@ -243,25 +182,13 @@ var PrintUtils = {
+    * @return promise resolving when the dialog is open, rejected if the preview
+    *         fails.
+    */
+-  async _openTabModalPrint(
++  _openTabModalPrint(
+     aBrowsingContext,
+-    aExistingPreviewBrowser,
++    aOpenWindowInfo,
+     aPrintInitiationTime,
+     aPrintSelectionOnly,
+     aPrintFrameOnly
+   ) {
+-    let hasSelection = aPrintSelectionOnly;
+-    if (!aPrintSelectionOnly) {
+-      let sourceActor = aBrowsingContext.currentWindowGlobal.getActor(
+-        "PrintingSelection"
+-      );
+-      try {
+-        hasSelection = await sourceActor.sendQuery(
+-          "PrintingSelection:HasSelection"
+-        );
+-      } catch (ex) {}
+-    }
+-
+     let sourceBrowser = aBrowsingContext.top.embedderElement;
+     let previewBrowser = this.getPreviewBrowser(sourceBrowser);
+     if (previewBrowser) {
+@@ -270,25 +197,34 @@ var PrintUtils = {
+       // XXX This can be racy can't it? getPreviewBrowser looks at browser that
+       // we set up after opening the dialog. But I guess worst case we just
+       // open two dialogs so...
+-      if (aExistingPreviewBrowser) {
+-        aExistingPreviewBrowser.remove();
+-      }
+-      return Promise.reject();
++      return { promise: Promise.reject(), browser: null };
+     }
+ 
+-    // Create a preview browser.
++    // Create the print preview dialog.
+     let args = PromptUtils.objectToPropBag({
+-      previewBrowser: aExistingPreviewBrowser,
+       printSelectionOnly: !!aPrintSelectionOnly,
+-      hasSelection,
++      isArticle: sourceBrowser.isArticle,
+       printFrameOnly: !!aPrintFrameOnly,
+     });
+     let dialogBox = this.getTabDialogBox(sourceBrowser);
+-    return dialogBox.open(
+-      `chrome://global/content/print.html?browsingContextId=${aBrowsingContext.id}&printInitiationTime=${aPrintInitiationTime}`,
++    let { closedPromise, dialog } = dialogBox.open(
++      `chrome://global/content/print.html?printInitiationTime=${aPrintInitiationTime}`,
+       { features: "resizable=no", sizeTo: "available" },
+       args
+     );
++    let settingsBrowser = dialog._frame;
++    let printPreview = new PrintPreview({
++      sourceBrowsingContext: aBrowsingContext,
++      settingsBrowser,
++      topBrowsingContext: aBrowsingContext.top,
++      activeBrowsingContext: aBrowsingContext,
++      openWindowInfo: aOpenWindowInfo,
++      printFrameOnly: aPrintFrameOnly,
++    });
++    // This will create the source browser in connectedCallback() if we sent
++    // openWindowInfo. Otherwise the browser will be null.
++    settingsBrowser.parentElement.insertBefore(printPreview, settingsBrowser);
++    return { promise: closedPromise, browser: printPreview.sourceBrowser };
+   },
+ 
+   /**
+@@ -314,36 +250,20 @@ var PrintUtils = {
+     if (aOptions) {
+       ({ openWindowInfo, printSelectionOnly, printFrameOnly } = aOptions);
+     }
+-    let browser = null;
+-    if (openWindowInfo) {
+-      browser = document.createXULElement("browser");
+-      browser.openWindowInfo = openWindowInfo;
+-      browser.setAttribute("type", "content");
+-      let remoteType = aBrowsingContext.currentRemoteType;
+-      if (remoteType) {
+-        browser.setAttribute("remoteType", remoteType);
+-        browser.setAttribute("remote", "true");
+-      }
+-      // When the print process finishes, we get closed by
+-      // nsDocumentViewer::OnDonePrinting, or by the print preview code.
+-      //
+-      // When that happens, we should remove us from the DOM if connected.
+-      browser.addEventListener("DOMWindowClose", function(e) {
+-        if (browser.isConnected) {
+-          browser.remove();
+-        }
+-        e.stopPropagation();
+-        e.preventDefault();
+-      });
+-      browser.style.visibility = "collapse";
+-      document.documentElement.appendChild(browser);
+-    }
+-
+     if (
+       PRINT_TAB_MODAL &&
+       !PRINT_ALWAYS_SILENT &&
+       (!openWindowInfo || openWindowInfo.isForWindowDotPrint)
+     ) {
++      if (
++        aBrowsingContext.currentWindowGlobal.documentURI.spec ==
++        "about:sessionrestore"
++      ) {
++        // Tab modal print on about:sessionrestore causes a crash, disable it
++        // for now  (bug 1714639).
++        return null;
++      }
++
+       let browsingContext = aBrowsingContext;
+       let focusedBc = Services.focus.focusedContentBrowsingContext;
+       if (
+@@ -354,22 +274,26 @@ var PrintUtils = {
+       ) {
+         browsingContext = focusedBc;
+       }
+-      this._openTabModalPrint(
++      let { promise, browser } = this._openTabModalPrint(
+         browsingContext,
+-        browser,
++        openWindowInfo,
+         printInitiationTime,
+         printSelectionOnly,
+         printFrameOnly
+-      ).catch(e => {
++      );
++      promise.catch(e => {
+         Cu.reportError(e);
+-        if (browser) {
+-          browser.remove();
+-        }
+       });
+       return browser;
+     }
+ 
+-    if (browser) {
++    if (openWindowInfo) {
++      let printPreview = new PrintPreview({
++        sourceBrowsingContext: aBrowsingContext,
++        openWindowInfo,
++      });
++      let browser = printPreview.createPreviewBrowser("source");
++      document.documentElement.append(browser);
+       // Legacy print dialog or silent printing, the content process will print
+       // in this <browser>.
+       return browser;
+@@ -491,7 +415,7 @@ var PrintUtils = {
+         browsingContext,
+         /* aExistingPreviewBrowser = */ undefined,
+         Date.now()
+-      );
++      ).promise;
+     }
+ 
+     // If we already have a toolbar someone is calling printPreview() to get us
+@@ -942,6 +866,9 @@ var PrintUtils = {
+   },
+ 
+   readerModeReady(sourceBrowser) {
++    if (PRINT_TAB_MODAL) {
++      return;
++    }
+     let ppBrowser = this._listener.getSimplifiedPrintPreviewBrowser();
+     this.sendEnterPrintPreviewToChild(ppBrowser, sourceBrowser, true, true);
+   },
+@@ -1080,3 +1007,241 @@ var PrintUtils = {
+     }
+   },
+ };
++
++class PrintPreview extends MozElements.BaseControl {
++  constructor({
++    sourceBrowsingContext,
++    settingsBrowser,
++    topBrowsingContext,
++    activeBrowsingContext,
++    openWindowInfo,
++    printFrameOnly,
++  }) {
++    super();
++    this.sourceBrowsingContext = sourceBrowsingContext;
++    this.settingsBrowser = settingsBrowser;
++    this.topBrowsingContext = topBrowsingContext;
++    this.activeBrowsingContext = activeBrowsingContext;
++    this.openWindowInfo = openWindowInfo;
++    this.printFrameOnly = printFrameOnly;
++
++    this.printSelectionOnly = false;
++    this.simplifyPage = false;
++    this.sourceBrowser = null;
++    this.selectionBrowser = null;
++    this.simplifiedBrowser = null;
++    this.lastPreviewBrowser = null;
++  }
++
++  connectedCallback() {
++    if (this.childElementCount > 0) {
++      return;
++    }
++    this.setAttribute("flex", "1");
++    this.append(
++      MozXULElement.parseXULToFragment(`
++        <stack class="previewStack" rendering="true" flex="1" previewtype="primary">
++          <vbox class="previewRendering" flex="1">
++            <h1 class="print-pending-label" data-l10n-id="printui-loading"></h1>
++          </vbox>
++          <html:printpreview-pagination class="printPreviewNavigation"></html:printpreview-pagination>
++        </stack>
++    `)
++    );
++    this.stack = this.firstElementChild;
++    this.paginator = this.querySelector("printpreview-pagination");
++
++    if (this.openWindowInfo) {
++      // For window.print() we need a browser right away for the contents to be
++      // cloned into, create it now.
++      this.createPreviewBrowser("source");
++    }
++  }
++
++  disconnectedCallback() {
++    this.exitPrintPreview();
++  }
++
++  getSourceBrowsingContext() {
++    if (this.openWindowInfo) {
++      // If openWindowInfo is set this was for window.print() and the source
++      // contents have already been cloned into the preview browser.
++      return this.sourceBrowser.browsingContext;
++    }
++    return this.sourceBrowsingContext;
++  }
++
++  get canPrintSelectionOnly() {
++    return !!this.sourceBrowsingContext.currentRemoteType;
++  }
++
++  get currentBrowsingContext() {
++    return this.lastPreviewBrowser.browsingContext;
++  }
++
++  exitPrintPreview() {
++    this.sourceBrowser?.frameLoader?.exitPrintPreview();
++    this.simplifiedBrowser?.frameLoader?.exitPrintPreview();
++    this.selectionBrowser?.frameLoader?.exitPrintPreview();
++
++    this.textContent = "";
++  }
++
++  async printPreview(settings, { sourceVersion, sourceURI }) {
++    this.stack.setAttribute("rendering", true);
++
++    let result = await this._printPreview(settings, {
++      sourceVersion,
++      sourceURI,
++    });
++
++    let browser = this.lastPreviewBrowser;
++    this.stack.setAttribute("previewtype", browser.getAttribute("previewtype"));
++    browser.setAttribute("sheet-count", result.sheetCount);
++    // The view resets to the top of the document on update bug 1686737.
++    browser.setAttribute("current-page", 1);
++    this.paginator.observePreviewBrowser(browser);
++    await document.l10n.translateElements([browser]);
++
++    this.stack.removeAttribute("rendering");
++
++    return result;
++  }
++
++  async _printPreview(settings, { sourceVersion, sourceURI }) {
++    let printSelectionOnly =
++      sourceVersion == "selection" && this.canPrintSelectionOnly;
++    let simplifyPage = sourceVersion == "simplified";
++    let selectionTypeBrowser;
++    let previewBrowser;
++
++    // Select the existing preview browser elements, these could be null.
++    if (printSelectionOnly) {
++      selectionTypeBrowser = this.selectionBrowser;
++      previewBrowser = this.selectionBrowser;
++    } else {
++      selectionTypeBrowser = this.sourceBrowser;
++      previewBrowser = simplifyPage
++        ? this.simplifiedBrowser
++        : this.sourceBrowser;
++    }
++
++    settings.docURL = sourceURI;
++
++    if (previewBrowser) {
++      this.lastPreviewBrowser = previewBrowser;
++      if (this.openWindowInfo) {
++        // We only want to use openWindowInfo for the window.print() browser,
++        // we can get rid of it now.
++        this.openWindowInfo = null;
++      }
++      // This browser has been rendered already, just update it.
++      return previewBrowser.frameLoader.printPreview(settings, null);
++    }
++
++    if (!selectionTypeBrowser) {
++      // Need to create a non-simplified browser.
++      selectionTypeBrowser = this.createPreviewBrowser(
++        simplifyPage ? "source" : sourceVersion
++      );
++      let browsingContext =
++        printSelectionOnly || this.printFrameOnly
++          ? this.activeBrowsingContext
++          : this.topBrowsingContext;
++      let result = await selectionTypeBrowser.frameLoader.printPreview(
++        settings,
++        browsingContext
++      );
++      // If this isn't simplified then we're done.
++      if (!simplifyPage) {
++        this.lastPreviewBrowser = selectionTypeBrowser;
++        return result;
++      }
++    }
++
++    // We have the base selection/primary browser but need to simplify.
++    previewBrowser = this.createPreviewBrowser(sourceVersion);
++    await previewBrowser.browsingContext.currentWindowGlobal
++      .getActor("Printing")
++      .sendQuery("Printing:Preview:ParseDocument", {
++        URL: sourceURI,
++        windowID:
++          selectionTypeBrowser.browsingContext.currentWindowGlobal
++            .outerWindowId,
++      });
++
++    // We've parsed a simplified version into the preview browser. Convert that to
++    // a print preview as usual.
++    this.lastPreviewBrowser = previewBrowser;
++    return previewBrowser.frameLoader.printPreview(
++      settings,
++      previewBrowser.browsingContext
++    );
++  }
++
++  createPreviewBrowser(sourceVersion) {
++    let browser = document.createXULElement("browser");
++    let browsingContext =
++      sourceVersion == "selection" ||
++      this.printFrameOnly ||
++      (sourceVersion == "source" && this.openWindowInfo)
++        ? this.sourceBrowsingContext
++        : this.sourceBrowsingContext.top;
++    if (sourceVersion == "source" && this.openWindowInfo) {
++      browser.openWindowInfo = this.openWindowInfo;
++    } else {
++      let userContextId = browsingContext.originAttributes.userContextId;
++      if (userContextId) {
++        browser.setAttribute("usercontextid", userContextId);
++      }
++      browser.setAttribute(
++        "initialBrowsingContextGroupId",
++        browsingContext.group.id
++      );
++    }
++    browser.setAttribute("type", "content");
++    let remoteType = browsingContext.currentRemoteType;
++    if (remoteType) {
++      browser.setAttribute("remoteType", remoteType);
++      browser.setAttribute("remote", "true");
++    }
++    // When the print process finishes, we get closed by
++    // nsDocumentViewer::OnDonePrinting, or by the print preview code.
++    //
++    // When that happens, we should remove us from the DOM if connected.
++    browser.addEventListener("DOMWindowClose", function(e) {
++      if (this.isConnected) {
++        this.remove();
++      }
++      e.stopPropagation();
++      e.preventDefault();
++    });
++
++    if (this.settingsBrowser) {
++      browser.addEventListener("contextmenu", function(e) {
++        e.preventDefault();
++      });
++
++      browser.setAttribute("previewtype", sourceVersion);
++      browser.classList.add("printPreviewBrowser");
++      browser.setAttribute("flex", "1");
++      browser.setAttribute("printpreview", "true");
++      browser.setAttribute("nodefaultsrc", "true");
++      document.l10n.setAttributes(browser, "printui-preview-label");
++
++      this.stack.insertBefore(browser, this.paginator);
++
++      if (sourceVersion == "source") {
++        this.sourceBrowser = browser;
++      } else if (sourceVersion == "selection") {
++        this.selectionBrowser = browser;
++      } else if (sourceVersion == "simplified") {
++        this.simplifiedBrowser = browser;
++      }
++    } else {
++      browser.style.visibility = "collapse";
++    }
++    return browser;
++  }
++}
++customElements.define("print-preview", PrintPreview);
+diff --git a/toolkit/components/printing/tests/browser.ini b/toolkit/components/printing/tests/browser.ini
+--- a/toolkit/components/printing/tests/browser.ini
++++ b/toolkit/components/printing/tests/browser.ini
+@@ -39,12 +39,14 @@ support-files =
+   file_print_pdf_on_frame_load.html
+   file_multi_page_pdf.pdf
+ [browser_print_scaling.js]
++[browser_print_simplified_mode.js]
+ [browser_sheet_count.js]
+ [browser_ui_labels.js]
+ [browser_window_print.js]
+ support-files =
+   file_window_print.html
+   file_window_print_delayed_during_load.html
++  file_window_print_oop_iframe.html
+   file_window_print_sandboxed_iframe.html
+   file_window_print_another_iframe_and_remove.html
+   file_window_print_iframe_remove_on_afterprint.html
+diff --git a/toolkit/components/printing/tests/browser_preview_in_container.js b/toolkit/components/printing/tests/browser_preview_in_container.js
+--- a/toolkit/components/printing/tests/browser_preview_in_container.js
++++ b/toolkit/components/printing/tests/browser_preview_in_container.js
+@@ -10,7 +10,7 @@ const TEST_PATH = getRootDirectory(gTest
+ 
+ async function runTest() {
+   is(
+-    document.querySelector(".printPreviewBrowser"),
++    document.querySelector("print-preview"),
+     null,
+     "There shouldn't be any print preview browser"
+   );
+@@ -22,14 +22,20 @@ async function runTest() {
+   );
+ 
+   // Wait for window.print() to run and ensure we're showing the preview...
+-  await BrowserTestUtils.waitForCondition(
+-    () => !!document.querySelector(".printPreviewBrowser")
+-  );
++  await waitForPreviewVisible();
+ 
+-  let previewBrowser = document.querySelector(".printPreviewBrowser");
+-  let contentFound = await SpecialPowers.spawn(previewBrowser, [], () => {
+-    return !!content.document.getElementById("printed");
+-  });
++  let printPreviewEl = document.querySelector("print-preview");
++  await BrowserTestUtils.waitForCondition(
++    () => !!printPreviewEl.settingsBrowser.contentWindow._initialized
++  );
++  await printPreviewEl.settingsBrowser.contentWindow._initialized;
++  let contentFound = await SpecialPowers.spawn(
++    printPreviewEl.sourceBrowser,
++    [],
++    () => {
++      return !!content.document.getElementById("printed");
++    }
++  );
+   ok(contentFound, "We should find the preview content.");
+   BrowserTestUtils.removeTab(gBrowser.selectedTab);
+ }
+diff --git a/toolkit/components/printing/tests/browser_preview_navigation.js b/toolkit/components/printing/tests/browser_preview_navigation.js
+--- a/toolkit/components/printing/tests/browser_preview_navigation.js
++++ b/toolkit/components/printing/tests/browser_preview_navigation.js
+@@ -54,30 +54,37 @@ add_task(async function testToolbarVisib
+   await PrintHelper.withTestPage(async helper => {
+     await helper.startPrint();
+ 
+-    let paginationElem = document.querySelector(".printPreviewNavigation");
+     let previewStack = document.querySelector(".previewStack");
+ 
+     // The toolbar has 0 opacity until we hover or focus it
+-    is(getComputedStyle(paginationElem).opacity, "0", "Initially transparent");
++    is(
++      getComputedStyle(helper.paginationElem).opacity,
++      "0",
++      "Initially transparent"
++    );
+ 
+-    let visiblePromise = waitUntilVisible(paginationElem);
+-    paginationElem.shadowRoot.querySelector("#navigateEnd").focus();
++    let visiblePromise = waitUntilVisible(helper.paginationElem);
++    helper.paginationElem.shadowRoot.querySelector("#navigateEnd").focus();
+     await visiblePromise;
+     is(
+-      getComputedStyle(paginationElem).opacity,
++      getComputedStyle(helper.paginationElem).opacity,
+       "1",
+       "Opaque with button focused"
+     );
+ 
+     await EventUtils.synthesizeKey("KEY_Tab", {});
+-    await waitUntilTransparent(paginationElem);
+-    is(getComputedStyle(paginationElem).opacity, "0", "Returns to transparent");
++    await waitUntilTransparent(helper.paginationElem);
++    is(
++      getComputedStyle(helper.paginationElem).opacity,
++      "0",
++      "Returns to transparent"
++    );
+ 
+-    visiblePromise = waitUntilVisible(paginationElem);
++    visiblePromise = waitUntilVisible(helper.paginationElem);
+     info("Waiting for mousemove event, and for the toolbar to become opaque");
+     await mouseMoveAndWait(previewStack);
+     await visiblePromise;
+-    is(getComputedStyle(paginationElem).opacity, "1", "Opaque toolbar");
++    is(getComputedStyle(helper.paginationElem).opacity, "1", "Opaque toolbar");
+ 
+     // put the mouse back where it won't interfere with later tests
+     await mouseMoveAndWait(gURLBar.textbox);
+@@ -89,14 +96,9 @@ add_task(async function testPreviewSheet
+   await PrintHelper.withTestPage(async helper => {
+     await helper.startPrint();
+ 
+-    let paginationElem = document.querySelector(".printPreviewNavigation");
+-    let paginationSheetIndicator = paginationElem.shadowRoot.querySelector(
+-      "#sheetIndicator"
+-    );
+-
+     // We have to wait for the first _updatePrintPreview to get the sheet count
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 3 },
+       "Paginator indicates the correct number of sheets"
+     );
+@@ -106,7 +108,7 @@ add_task(async function testPreviewSheet
+       pageRanges: ["1", "1"],
+     });
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 1 },
+       "Indicates the updated number of sheets"
+     );
+@@ -119,17 +121,13 @@ add_task(async function testPreviewScrol
+   await PrintHelper.withTestPage(async helper => {
+     await helper.startPrint();
+ 
+-    let paginationElem = document.querySelector(".printPreviewNavigation");
+-    let paginationSheetIndicator = paginationElem.shadowRoot.querySelector(
+-      "#sheetIndicator"
+-    );
+     // Wait for the first _updatePrintPreview before interacting with the preview
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 3 },
+       "Paginator indicates the correct number of sheets"
+     );
+-    let previewBrowser = PrintUtils.getPreviewBrowser();
++    let previewBrowser = helper.currentPrintPreviewBrowser;
+ 
+     // scroll down the document
+     // and verify the indicator is updated correctly
+@@ -142,7 +140,7 @@ add_task(async function testPreviewScrol
+       EventUtils.synthesizeKey("VK_PAGE_DOWN", {}, content);
+     });
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 2, sheetCount: 3 },
+       "Indicator updates on scroll"
+     );
+@@ -157,13 +155,9 @@ add_task(async function testPreviewNavig
+   await PrintHelper.withTestPage(async helper => {
+     await helper.startPrint();
+ 
+-    let paginationElem = document.querySelector(".printPreviewNavigation");
+-    let paginationSheetIndicator = paginationElem.shadowRoot.querySelector(
+-      "#sheetIndicator"
+-    );
+     // Wait for the first _updatePrintPreview before interacting with the preview
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 3 },
+       "Paginator indicates the correct number of sheets"
+     );
+@@ -171,70 +165,70 @@ add_task(async function testPreviewNavig
+     // click the navigation buttons
+     // and verify the indicator is updated correctly
+     EventUtils.synthesizeMouseAtCenter(
+-      paginationElem.shadowRoot.querySelector("#navigateNext"),
++      helper.paginationElem.shadowRoot.querySelector("#navigateNext"),
+       {}
+     );
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 2, sheetCount: 3 },
+-      "Indicator updates on navigation"
++      "Indicator updates on navigation to next"
+     );
+ 
+     EventUtils.synthesizeMouseAtCenter(
+-      paginationElem.shadowRoot.querySelector("#navigatePrevious"),
++      helper.paginationElem.shadowRoot.querySelector("#navigatePrevious"),
+       {}
+     );
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 3 },
+       "Indicator updates on navigation to previous"
+     );
+ 
+     EventUtils.synthesizeMouseAtCenter(
+-      paginationElem.shadowRoot.querySelector("#navigateEnd"),
++      helper.paginationElem.shadowRoot.querySelector("#navigateEnd"),
+       {}
+     );
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 3, sheetCount: 3 },
+       "Indicator updates on navigation to end"
+     );
+ 
+     EventUtils.synthesizeMouseAtCenter(
+-      paginationElem.shadowRoot.querySelector("#navigateHome"),
++      helper.paginationElem.shadowRoot.querySelector("#navigateHome"),
+       {}
+     );
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 3 },
+       "Indicator updates on navigation to start"
+     );
+ 
+     // Test rapid clicks on the navigation buttons
+     EventUtils.synthesizeMouseAtCenter(
+-      paginationElem.shadowRoot.querySelector("#navigateNext"),
++      helper.paginationElem.shadowRoot.querySelector("#navigateNext"),
+       {}
+     );
+     EventUtils.synthesizeMouseAtCenter(
+-      paginationElem.shadowRoot.querySelector("#navigateNext"),
++      helper.paginationElem.shadowRoot.querySelector("#navigateNext"),
+       {}
+     );
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 3, sheetCount: 3 },
+       "2 successive 'next' clicks correctly update the sheet indicator"
+     );
+ 
+     EventUtils.synthesizeMouseAtCenter(
+-      paginationElem.shadowRoot.querySelector("#navigatePrevious"),
++      helper.paginationElem.shadowRoot.querySelector("#navigatePrevious"),
+       {}
+     );
+     EventUtils.synthesizeMouseAtCenter(
+-      paginationElem.shadowRoot.querySelector("#navigatePrevious"),
++      helper.paginationElem.shadowRoot.querySelector("#navigatePrevious"),
+       {}
+     );
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 3 },
+       "2 successive 'previous' clicks correctly update the sheet indicator"
+     );
+@@ -249,12 +243,9 @@ add_task(async function testMultiplePrev
+   await PrintHelper.withTestPage(async helper => {
+     await helper.startPrint();
+     const tab1 = gBrowser.selectedTab;
+-    let sheetIndicator = document
+-      .querySelector(".printPreviewNavigation")
+-      .shadowRoot.querySelector("#sheetIndicator");
+ 
+     await waitForPageStatusUpdate(
+-      sheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 3 },
+       "Indicator has the correct initial sheetCount"
+     );
+@@ -267,7 +258,7 @@ add_task(async function testMultiplePrev
+     await helper2.startPrint();
+ 
+     let [previewBrowser1, previewBrowser2] = document.querySelectorAll(
+-      ".printPreviewBrowser[previewtype='primary']"
++      ".printPreviewBrowser[previewtype='source']"
+     );
+     ok(previewBrowser1 && previewBrowser2, "There are 2 preview browsers");
+ 
+@@ -280,9 +271,11 @@ add_task(async function testMultiplePrev
+       previewBrowser1,
+       "toolbar1 has the correct previewBrowser"
+     );
+-    sheetIndicator = toolbar1.shadowRoot.querySelector("#sheetIndicator");
+     ok(
+-      compare10nArgs(sheetIndicator, { sheetNum: 1, sheetCount: 3 }),
++      compare10nArgs(helper.paginationSheetIndicator, {
++        sheetNum: 1,
++        sheetCount: 3,
++      }),
+       "First toolbar has the correct content"
+     );
+ 
+@@ -291,24 +284,25 @@ add_task(async function testMultiplePrev
+       previewBrowser2,
+       "toolbar2 has the correct previewBrowser"
+     );
+-    sheetIndicator = toolbar2.shadowRoot.querySelector("#sheetIndicator");
+     ok(
+-      compare10nArgs(sheetIndicator, { sheetNum: 1, sheetCount: 1 }),
++      compare10nArgs(helper2.paginationSheetIndicator, {
++        sheetNum: 1,
++        sheetCount: 1,
++      }),
+       "2nd toolbar has the correct content"
+     );
+ 
+     // Switch back to the first tab and ensure the correct preview navigation is updated when clicked
+     await BrowserTestUtils.switchTab(gBrowser, tab1);
+-    sheetIndicator = toolbar1.shadowRoot.querySelector("#sheetIndicator");
+ 
+     EventUtils.synthesizeMouseAtCenter(
+       toolbar1.shadowRoot.querySelector("#navigateNext"),
+       {}
+     );
+     await waitForPageStatusUpdate(
+-      sheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 2, sheetCount: 3 },
+-      "Indicator updates on navigation"
++      "Indicator updates on navigation multiple"
+     );
+ 
+     gBrowser.removeTab(tab2);
+@@ -324,13 +318,9 @@ add_task(async function testPreviewNavig
+ 
+     await helper.startPrint();
+ 
+-    let paginationElem = document.querySelector(".printPreviewNavigation");
+-    let paginationSheetIndicator = paginationElem.shadowRoot.querySelector(
+-      "#sheetIndicator"
+-    );
+     // Wait for the first _updatePrintPreview before interacting with the preview
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 3 },
+       "Paginator indicates the correct number of sheets"
+     );
+@@ -338,22 +328,22 @@ add_task(async function testPreviewNavig
+     // click a navigation button
+     // and verify the indicator is updated correctly
+     EventUtils.synthesizeMouseAtCenter(
+-      paginationElem.shadowRoot.querySelector("#navigateNext"),
++      helper.paginationElem.shadowRoot.querySelector("#navigateNext"),
+       {}
+     );
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 2, sheetCount: 3 },
+-      "Indicator updates on navigation"
++      "Indicator updates on navigation next selection"
+     );
+ 
+     await helper.openMoreSettings();
+-    let printSelect = helper.get("print-selection-container");
++    let printSelect = helper.get("source-version-selection-radio");
+     await helper.waitForPreview(() => helper.click(printSelect));
+ 
+     // Wait for the first _updatePrintPreview before interacting with the preview
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 2 },
+       "Paginator indicates the correct number of sheets"
+     );
+@@ -361,13 +351,13 @@ add_task(async function testPreviewNavig
+     // click a navigation button
+     // and verify the indicator is updated correctly
+     EventUtils.synthesizeMouseAtCenter(
+-      paginationElem.shadowRoot.querySelector("#navigateNext"),
++      helper.paginationElem.shadowRoot.querySelector("#navigateNext"),
+       {}
+     );
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 2, sheetCount: 2 },
+-      "Indicator updates on navigation"
++      "Indicator updates on navigation next selection 2"
+     );
+ 
+     // move focus before closing the dialog
+@@ -382,13 +372,9 @@ add_task(async function testPaginatorAft
+     helper.addMockPrinter(mockPrinterName);
+     await helper.startPrint();
+ 
+-    let paginationElem = document.querySelector(".printPreviewNavigation");
+-    let paginationSheetIndicator = paginationElem.shadowRoot.querySelector(
+-      "#sheetIndicator"
+-    );
+     // Wait for the first _updatePrintPreview before interacting with the preview
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 3 },
+       "Paginator indicates the correct number of sheets"
+     );
+@@ -396,24 +382,27 @@ add_task(async function testPaginatorAft
+     // click the navigation buttons
+     // and verify the indicator is updated correctly
+     EventUtils.synthesizeMouseAtCenter(
+-      paginationElem.shadowRoot.querySelector("#navigateNext"),
++      helper.paginationElem.shadowRoot.querySelector("#navigateNext"),
+       {}
+     );
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 2, sheetCount: 3 },
+-      "Indicator updates on navigation"
++      "Indicator updates on navigation next after update"
+     );
+ 
+     // Select a new printer
+     await helper.dispatchSettingsChange({ printerName: mockPrinterName });
+     await waitForPageStatusUpdate(
+-      paginationSheetIndicator,
++      helper.paginationSheetIndicator,
+       { sheetNum: 1, sheetCount: 3 },
+-      "Indicator updates on navigation"
++      "Indicator updates on navigation next after printer change"
+     );
+     ok(
+-      compare10nArgs(paginationSheetIndicator, { sheetNum: 1, sheetCount: 3 }),
++      compare10nArgs(helper.paginationSheetIndicator, {
++        sheetNum: 1,
++        sheetCount: 3,
++      }),
+       "Sheet indicator has correct value"
+     );
+ 
+diff --git a/toolkit/components/printing/tests/browser_preview_print_coop.js b/toolkit/components/printing/tests/browser_preview_print_coop.js
+--- a/toolkit/components/printing/tests/browser_preview_print_coop.js
++++ b/toolkit/components/printing/tests/browser_preview_print_coop.js
+@@ -38,3 +38,11 @@ add_task(async function test() {
+ 
+   BrowserTestUtils.removeTab(tab);
+ });
++
++add_task(async function testTabModal() {
++  await PrintHelper.withTestPage(async helper => {
++    await helper.startPrint();
++    ok(true, "We did not crash.");
++    await helper.closeDialog();
++  }, "file_coop_header.html");
++});
+diff --git a/toolkit/components/printing/tests/browser_print_context_menu.js b/toolkit/components/printing/tests/browser_print_context_menu.js
+--- a/toolkit/components/printing/tests/browser_print_context_menu.js
++++ b/toolkit/components/printing/tests/browser_print_context_menu.js
+@@ -43,19 +43,21 @@ add_task(async function testPrintFrame()
+     frameContextMenu.activateItem(item);
+     await popupHiddenPromise;
+ 
+-    await BrowserTestUtils.waitForCondition(
+-      () => !!document.querySelector(".printPreviewBrowser")
++    let helper = new PrintHelper(browser);
++
++    await helper.waitForDialog();
++
++    let previewBrowser = helper.currentPrintPreviewBrowser;
++    is(
++      previewBrowser.getAttribute("previewtype"),
++      "source",
++      "Source preview was rendered"
+     );
+ 
+-    let previewBrowser = document.querySelector(
+-      ".printPreviewBrowser[previewtype='primary']"
+-    );
+-    let helper = new PrintHelper(browser);
+-
+-    let textContent = await TestUtils.waitForCondition(() =>
+-      SpecialPowers.spawn(previewBrowser, [], function() {
+-        return content.document.body.textContent;
+-      })
++    let textContent = await SpecialPowers.spawn(
++      previewBrowser,
++      [],
++      () => content.document.body.textContent
+     );
+ 
+     is(textContent, "Inner frame", "Correct content loaded");
+diff --git a/toolkit/components/printing/tests/browser_print_frame.js b/toolkit/components/printing/tests/browser_print_frame.js
+--- a/toolkit/components/printing/tests/browser_print_frame.js
++++ b/toolkit/components/printing/tests/browser_print_frame.js
+@@ -41,12 +41,13 @@ add_task(async function print_frame() {
+           printFrameOnly: true,
+         });
+ 
+-        await helper.waitForDialog({ waitFor: "loadComplete" });
++        // Wait for the dialog to be fully ready. The initial preview will be
++        // done at this point.
++        await helper.waitForDialog();
+ 
+-        let previewBrowser = document.querySelector(".printPreviewBrowser");
+-        let previewText = () => getPreviewText(previewBrowser);
+-        // The preview process is async, wait for it to not be empty.
+-        let textContent = await TestUtils.waitForCondition(previewText);
++        let textContent = await getPreviewText(
++          helper.currentPrintPreviewBrowser
++        );
+         is(textContent, "some text", "Correct content loaded");
+ 
+         let file = helper.mockFilePicker(`browser_print_frame-${i++}.pdf`);
+diff --git a/toolkit/components/printing/tests/browser_print_pdf_on_frame_load.js b/toolkit/components/printing/tests/browser_print_pdf_on_frame_load.js
+--- a/toolkit/components/printing/tests/browser_print_pdf_on_frame_load.js
++++ b/toolkit/components/printing/tests/browser_print_pdf_on_frame_load.js
+@@ -29,9 +29,7 @@ add_task(async function test_print_pdf_o
+       );
+ 
+       let helper = new PrintHelper(browser);
+-      await TestUtils.waitForCondition(
+-        () => !!document.querySelector(".printPreviewBrowser")
+-      );
++      await waitForPreviewVisible();
+ 
+       info("Preview shown, waiting for it to be updated...");
+ 
+diff --git a/toolkit/components/printing/tests/browser_print_selection.js b/toolkit/components/printing/tests/browser_print_selection.js
+--- a/toolkit/components/printing/tests/browser_print_selection.js
++++ b/toolkit/components/printing/tests/browser_print_selection.js
+@@ -48,9 +48,7 @@ add_task(async function print_selection(
+           printSelectionOnly: true,
+         });
+ 
+-        await BrowserTestUtils.waitForCondition(
+-          () => !!document.querySelector(".printPreviewBrowser")
+-        );
++        await waitForPreviewVisible();
+ 
+         let previewBrowser = document.querySelector(
+           ".printPreviewBrowser[previewtype='selection']"
+@@ -62,8 +60,11 @@ add_task(async function print_selection(
+ 
+         let printSelect = document
+           .querySelector(".printSettingsBrowser")
+-          .contentDocument.querySelector("#print-selection-enabled");
+-        ok(!printSelect.hidden, "Print selection checkbox is shown");
++          .contentDocument.querySelector("#source-version-selection-radio");
++        ok(
++          BrowserTestUtils.is_visible(printSelect),
++          "Print selection checkbox is shown"
++        );
+         ok(printSelect.checked, "Print selection checkbox is checked");
+ 
+         let file = helper.mockFilePicker(`browser_print_selection-${i++}.pdf`);
+@@ -82,8 +83,11 @@ add_task(async function no_print_selecti
+     await helper.startPrint();
+     await helper.openMoreSettings();
+ 
+-    let printSelect = helper.get("print-selection-container");
+-    ok(printSelect.hidden, "Print selection checkbox is hidden");
++    let printSelect = helper.get("source-version-selection");
++    ok(
++      BrowserTestUtils.is_hidden(printSelect),
++      "Print selection checkbox is hidden"
++    );
+     await helper.closeDialog();
+   });
+ });
+@@ -97,22 +101,15 @@ add_task(async function print_selection_
+ 
+     await helper.startPrint();
+     await helper.openMoreSettings();
+-    let printSelect = helper.get("print-selection-container");
+-    ok(!printSelect.checked, "Print selection checkbox is not checked");
+-
+-    let selectionBrowser = document.querySelector(
+-      ".printPreviewBrowser[previewtype='selection']"
+-    );
+-    let primaryBrowser = document.querySelector(
+-      ".printPreviewBrowser[previewtype='primary']"
+-    );
+-
+-    let selectedText = "Article title";
+-    let fullText = await getPreviewText(primaryBrowser);
++    let printSource = helper.get("source-version-source-radio");
++    ok(printSource.checked, "Print source radio is checked");
++    let printSelect = helper.get("source-version-selection-radio");
++    ok(!printSelect.checked, "Print selection radio is not checked");
+ 
+     function getCurrentBrowser(previewType) {
+-      let browser =
+-        previewType == "selection" ? selectionBrowser : primaryBrowser;
++      let browser = document.querySelector(
++        `.printPreviewBrowser[previewtype="${previewType}"]`
++      );
+       is(
+         browser.parentElement.getAttribute("previewtype"),
+         previewType,
+@@ -121,16 +118,13 @@ add_task(async function print_selection_
+       return browser;
+     }
+ 
++    let selectedText = "Article title";
++    let fullText = await getPreviewText(getCurrentBrowser("source"));
++
+     helper.assertSettingsMatch({
+       printSelectionOnly: false,
+     });
+ 
+-    is(
+-      selectionBrowser.parentElement.getAttribute("previewtype"),
+-      "primary",
+-      "Print selection browser is not shown"
+-    );
+-
+     await helper.assertSettingsChanged(
+       { printSelectionOnly: false },
+       { printSelectionOnly: true },
+@@ -145,12 +139,8 @@ add_task(async function print_selection_
+       { printSelectionOnly: true },
+       { printSelectionOnly: false },
+       async () => {
+-        await helper.waitForPreview(() => helper.click(printSelect));
+-        let previewType = selectionBrowser.parentElement.getAttribute(
+-          "previewtype"
+-        );
+-        is(previewType, "primary", "Print selection browser is not shown");
+-        let text = await getPreviewText(getCurrentBrowser(previewType));
++        await helper.waitForPreview(() => helper.click(printSource));
++        let text = await getPreviewText(getCurrentBrowser("source"));
+         is(text, fullText, "Correct content loaded");
+       }
+     );
+diff --git a/toolkit/components/printing/tests/browser_print_simplified_mode.js b/toolkit/components/printing/tests/browser_print_simplified_mode.js
+new file mode 100644
+--- /dev/null
++++ b/toolkit/components/printing/tests/browser_print_simplified_mode.js
+@@ -0,0 +1,240 @@
++/* Any copyright is dedicated to the Public Domain.
++   http://creativecommons.org/publicdomain/zero/1.0/ */
++
++"use strict";
++
++add_task(async function switch_print_preview_browsers() {
++  await PrintHelper.withTestPage(async helper => {
++    // Wait for the article state to be determined.
++    await helper.waitForReaderModeReady();
++
++    // Start print preview.
++    await helper.startPrint();
++    let sourcePreviewBrowser = helper.currentPrintPreviewBrowser;
++
++    {
++      // Assert that we are showing the initial content on default print preview browser
++      let [headerText, headingText] = await SpecialPowers.spawn(
++        sourcePreviewBrowser,
++        [],
++        async function() {
++          return [
++            content.document.querySelector("header").textContent,
++            content.document.querySelector("h1").textContent,
++          ];
++        }
++      );
++      is(headerText, "Site header", "Should have initial content.");
++      is(headingText, "Article title", "Should have initial title.");
++    }
++
++    // Here we call simplified mode
++    await helper.openMoreSettings();
++    let simplifyRadio = helper.get("source-version-simplified-radio");
++    ok(!simplifyRadio.checked, "Simplify page is not checked");
++    ok(BrowserTestUtils.is_visible(simplifyRadio), "Simplify is shown");
++
++    await helper.waitForPreview(() => helper.click(simplifyRadio));
++    let simplifiedPreviewBrowser = helper.currentPrintPreviewBrowser;
++    is(
++      simplifiedPreviewBrowser.getAttribute("previewtype"),
++      "simplified",
++      "Simplified browser was rendered"
++    );
++    is(
++      simplifiedPreviewBrowser.closest("stack").getAttribute("previewtype"),
++      "simplified",
++      "Simplified browser is selected"
++    );
++    ok(
++      BrowserTestUtils.is_visible(simplifiedPreviewBrowser),
++      "Simplified browser is visible"
++    );
++    ok(simplifyRadio.checked, "Simplify page is checked");
++
++    {
++      // Assert that we are showing custom content on simplified print preview browser
++      let [hasHeader, headingText] = await SpecialPowers.spawn(
++        simplifiedPreviewBrowser,
++        [],
++        async function() {
++          return [
++            !!content.document.querySelector("header"),
++            content.document.querySelector("h1").textContent,
++          ];
++        }
++      );
++      ok(!hasHeader, "The header was simplified out");
++      is(headingText, "Article title", "The heading is still there");
++    }
++
++    // Switch back to default print preview content
++    let sourceRadio = helper.get("source-version-source-radio");
++    ok(!sourceRadio.checked, "Source is not checked");
++    await helper.waitForPreview(() => helper.click(sourceRadio));
++    is(
++      helper.currentPrintPreviewBrowser,
++      sourcePreviewBrowser,
++      "Source browser was rendered"
++    );
++    is(
++      sourcePreviewBrowser.getAttribute("previewtype"),
++      "source",
++      "Source browser was rendered"
++    );
++    is(
++      sourcePreviewBrowser.closest("stack").getAttribute("previewtype"),
++      "source",
++      "Source browser is selected"
++    );
++    ok(
++      BrowserTestUtils.is_visible(sourcePreviewBrowser),
++      "Source browser is visible"
++    );
++    ok(sourceRadio.checked, "Source version is checked");
++
++    {
++      // Assert that we are showing the initial content on default print preview browser
++      let headerText = await SpecialPowers.spawn(
++        sourcePreviewBrowser,
++        [],
++        async function() {
++          return content.document.querySelector("header").textContent;
++        }
++      );
++      is(headerText, "Site header", "Should have initial content.");
++    }
++
++    await helper.closeDialog();
++  }, "simplifyArticleSample.html");
++});
++
++add_task(async function testPrintBackgroundsDisabledSimplified() {
++  await PrintHelper.withTestPage(async helper => {
++    // Wait for the article state to be determined.
++    await helper.waitForReaderModeReady();
++    await helper.startPrint();
++
++    helper.assertPreviewedWithSettings({
++      printBGImages: false,
++      printBGColors: false,
++    });
++
++    await helper.openMoreSettings();
++
++    let printBackgrounds = helper.get("backgrounds-enabled");
++    ok(!printBackgrounds.checked, "Print backgrounds is not checked");
++    ok(!printBackgrounds.disabled, "Print backgrounds in not disabled");
++
++    await helper.assertSettingsChanged(
++      { printBGImages: false, printBGColors: false },
++      { printBGImages: true, printBGColors: true },
++      async () => {
++        await helper.waitForPreview(() => helper.click(printBackgrounds));
++      }
++    );
++
++    // Print backgrounds was enabled for preview.
++    ok(printBackgrounds.checked, "Print backgrounds is checked");
++    ok(!printBackgrounds.disabled, "Print backgrounds is not disabled");
++    helper.assertPreviewedWithSettings({
++      printBGImages: true,
++      printBGColors: true,
++    });
++
++    let simplifyRadio = helper.get("source-version-simplified-radio");
++    ok(!simplifyRadio.checked, "Simplify page is not checked");
++    ok(BrowserTestUtils.is_visible(simplifyRadio), "Simplify is shown");
++
++    // Switch to simplified mode.
++    await helper.waitForPreview(() => helper.click(simplifyRadio));
++
++    // Print backgrounds should be disabled, it's incompatible with simplified.
++    ok(!printBackgrounds.checked, "Print backgrounds is now unchecked");
++    ok(printBackgrounds.disabled, "Print backgrounds has been disabled");
++    helper.assertPreviewedWithSettings({
++      printBGImages: false,
++      printBGColors: false,
++    });
++
++    // Switch back to source, printBackgrounds is remembered.
++    let sourceRadio = helper.get("source-version-source-radio");
++    ok(!sourceRadio.checked, "Source is not checked");
++    ok(BrowserTestUtils.is_visible(sourceRadio), "Source is shown");
++
++    await helper.waitForPreview(() => helper.click(sourceRadio));
++
++    ok(printBackgrounds.checked, "Print backgrounds setting was remembered");
++    ok(!printBackgrounds.disabled, "Print backgrounds can be changed again");
++    helper.assertPreviewedWithSettings({
++      printBGImages: true,
++      printBGColors: true,
++    });
++
++    await helper.closeDialog();
++  }, "simplifyArticleSample.html");
++});
++
++add_task(async function testSimplifyHiddenNonArticle() {
++  await PrintHelper.withTestPage(async helper => {
++    await helper.startPrint();
++    await helper.openMoreSettings();
++    let sourceVersionSection = helper.get("source-version-section");
++    ok(
++      BrowserTestUtils.is_hidden(sourceVersionSection),
++      "Source version is hidden"
++    );
++    await helper.closeDialog();
++  }, "simplifyNonArticleSample.html");
++});
++
++add_task(async function testSimplifyNonArticleTabModal() {
++  await PrintHelper.withTestPage(async helper => {
++    let tab = gBrowser.selectedTab;
++
++    // Trick browser to think loaded tab has isArticle property set as true
++    tab.linkedBrowser.isArticle = true;
++
++    // Enter print preview
++    await helper.startPrint();
++
++    // Assert that we are showing the initial content on default print preview browser
++    await SpecialPowers.spawn(
++      helper.currentPrintPreviewBrowser,
++      [],
++      async () => {
++        is(
++          content.document.title,
++          "Non article title",
++          "Should have initial content."
++        );
++      }
++    );
++
++    await helper.openMoreSettings();
++
++    // Simplify the page.
++    let simplifyRadio = helper.get("source-version-simplified-radio");
++    ok(!simplifyRadio.checked, "Simplify is off");
++    await helper.waitForPreview(() => helper.click(simplifyRadio));
++    let simplifiedPreviewBrowser = helper.currentPrintPreviewBrowser;
++    is(
++      simplifiedPreviewBrowser.getAttribute("previewtype"),
++      "simplified",
++      "The simplified browser is shown"
++    );
++
++    // Assert that simplify page option is checked
++    ok(simplifyRadio.checked, "Should have simplify page option checked");
++
++    // Assert that we are showing recovery content on simplified print preview browser
++    await SpecialPowers.spawn(simplifiedPreviewBrowser, [], async () => {
++      await ContentTaskUtils.waitForCondition(
++        () => content.document.title === "Failed to load article from page",
++        "Simplified document title should be updated with recovery title."
++      );
++    });
++
++    await helper.closeDialog();
++  }, "simplifyNonArticleSample.html");
++});
+diff --git a/toolkit/components/printing/tests/browser_window_print.js b/toolkit/components/printing/tests/browser_window_print.js
+--- a/toolkit/components/printing/tests/browser_window_print.js
++++ b/toolkit/components/printing/tests/browser_window_print.js
+@@ -33,9 +33,8 @@ add_task(async function test_print_block
+         "Waiting for the first window.print() to run and ensure we're showing the preview..."
+       );
+ 
+-      await BrowserTestUtils.waitForCondition(
+-        () => !!document.querySelector(".printPreviewBrowser")
+-      );
++      let helper = new PrintHelper(browser);
++      await helper.waitForDialog();
+ 
+       {
+         let [before, afterFirst] = await SpecialPowers.spawn(
+@@ -55,9 +54,7 @@ add_task(async function test_print_block
+ 
+       gBrowser.getTabDialogBox(browser).abortAllDialogs();
+ 
+-      await BrowserTestUtils.waitForCondition(
+-        () => !!document.querySelector(".printPreviewBrowser")
+-      );
++      await helper.waitForDialog();
+ 
+       {
+         let [before, afterFirst, afterSecond] = await SpecialPowers.spawn(
+@@ -100,9 +97,8 @@ add_task(async function test_print_delay
+         "Waiting for the first window.print() to run and ensure we're showing the preview..."
+       );
+ 
+-      await BrowserTestUtils.waitForCondition(
+-        () => !!document.querySelector(".printPreviewBrowser")
+-      );
++      let helper = new PrintHelper(browser);
++      await helper.waitForDialog();
+ 
+       // The print dialog is open, should be open after onload.
+       {
+@@ -141,9 +137,8 @@ add_task(async function test_print_on_sa
+         "Waiting for the first window.print() to run and ensure we're showing the preview..."
+       );
+ 
+-      await BrowserTestUtils.waitForCondition(
+-        () => !!document.querySelector(".printPreviewBrowser")
+-      );
++      let helper = new PrintHelper(browser);
++      await helper.waitForDialog();
+ 
+       isnot(
+         document.querySelector(".printPreviewBrowser"),
+@@ -173,10 +168,7 @@ add_task(async function test_print_anoth
+       info("Clicking on the button in the first iframe");
+       BrowserTestUtils.synthesizeMouse("button", 0, 0, {}, firstFrame);
+ 
+-      info("Waiting for dialog");
+-      await BrowserTestUtils.waitForCondition(
+-        () => !!document.querySelector(".printPreviewBrowser")
+-      );
++      await new PrintHelper(browser).waitForDialog();
+ 
+       isnot(
+         document.querySelector(".printPreviewBrowser"),
+@@ -201,10 +193,7 @@ add_task(async function test_window_prin
+       "There shouldn't be any print preview browser"
+     );
+     await BrowserTestUtils.withNewTab(url, async function(browser) {
+-      info("Waiting for dialog");
+-      await BrowserTestUtils.waitForCondition(
+-        () => !!document.querySelector(".printPreviewBrowser")
+-      );
++      await new PrintHelper(browser).waitForDialog();
+ 
+       ok(true, "Shouldn't crash");
+       gBrowser.getTabDialogBox(browser).abortAllDialogs();
+@@ -223,11 +212,7 @@ add_task(async function test_window_prin
+   await BrowserTestUtils.withNewTab(
+     `${TEST_PATH}file_window_print_iframe_remove_on_afterprint.html`,
+     async function(browser) {
+-      info("Waiting for dialog");
+-      await BrowserTestUtils.waitForCondition(
+-        () => !!document.querySelector(".printPreviewBrowser")
+-      );
+-
++      await new PrintHelper(browser).waitForDialog();
+       let modalBefore = await SpecialPowers.spawn(browser, [], () => {
+         return content.windowUtils.isInModalState();
+       });
+@@ -295,3 +280,36 @@ add_task(async function test_focused_bro
+   BrowserTestUtils.removeTab(gBrowser.selectedTab);
+   BrowserTestUtils.removeTab(gBrowser.selectedTab);
+ });
++
++add_task(async function test_print_with_oop_iframe() {
++  // window.print() only shows print preview when print.tab_modal.enabled is
++  // true.
++  await SpecialPowers.pushPrefEnv({
++    set: [["print.tab_modal.enabled", true]],
++  });
++
++  is(
++    document.querySelector(".printPreviewBrowser"),
++    null,
++    "There shouldn't be any print preview browser"
++  );
++
++  await BrowserTestUtils.withNewTab(
++    `${TEST_PATH}file_window_print_oop_iframe.html`,
++    async function(browser) {
++      info(
++        "Waiting for window.print() to run and ensure we're showing the preview..."
++      );
++
++      let helper = new PrintHelper(browser);
++      await helper.waitForDialog();
++
++      isnot(
++        document.querySelector(".printPreviewBrowser"),
++        null,
++        "Should open the print preview correctly"
++      );
++      gBrowser.getTabDialogBox(browser).abortAllDialogs();
++    }
++  );
++});
+diff --git a/toolkit/components/printing/tests/file_window_print_oop_iframe.html b/toolkit/components/printing/tests/file_window_print_oop_iframe.html
+new file mode 100644
+--- /dev/null
++++ b/toolkit/components/printing/tests/file_window_print_oop_iframe.html
+@@ -0,0 +1,7 @@
++<!doctype html>
++<iframe src="https://example.com/document-builder.sjs?html=PASS"></iframe>
++<script>
++  onload = function() {
++    window.print();
++  };
++</script>
+diff --git a/toolkit/components/printing/tests/head.js b/toolkit/components/printing/tests/head.js
+--- a/toolkit/components/printing/tests/head.js
++++ b/toolkit/components/printing/tests/head.js
+@@ -134,8 +134,10 @@ class PrintHelper {
+ 
+     if (Object.keys(condition).length === 0) {
+       await this.win._initialized;
++      // Wait a frame so the rendering spinner is hidden.
++      await new Promise(resolve => requestAnimationFrame(resolve));
+     } else if (condition.waitFor == "loadComplete") {
+-      await BrowserTestUtils.waitForAttributeRemoval("loading", document.body);
++      await BrowserTestUtils.waitForAttributeRemoval("loading", this.doc.body);
+     }
+   }
+ 
+@@ -328,6 +330,18 @@ class PrintHelper {
+     );
+   }
+ 
++  get paginationElem() {
++    return this.dialog._box.querySelector(".printPreviewNavigation");
++  }
++
++  get paginationSheetIndicator() {
++    return this.paginationElem.shadowRoot.querySelector("#sheetIndicator");
++  }
++
++  get currentPrintPreviewBrowser() {
++    return this.win.PrintEventHandler.printPreviewEl.lastPreviewBrowser;
++  }
++
+   get _printBrowser() {
+     return this.dialog._frame;
+   }
+@@ -349,7 +363,34 @@ class PrintHelper {
+   }
+ 
+   get sourceURI() {
+-    return this.win.PrintEventHandler.originalSourceCurrentURI;
++    return this.win.PrintEventHandler.activeCurrentURI;
++  }
++
++  async waitForReaderModeReady() {
++    if (gBrowser.selectedBrowser.isArticle) {
++      return;
++    }
++    await new Promise(resolve => {
++      let onReaderModeChange = {
++        receiveMessage(message) {
++          if (
++            message.data &&
++            message.data.isArticle !== undefined &&
++            gBrowser.selectedBrowser.isArticle
++          ) {
++            AboutReaderParent.removeMessageListener(
++              "Reader:UpdateReaderButton",
++              onReaderModeChange
++            );
++            resolve();
++          }
++        },
++      };
++      AboutReaderParent.addMessageListener(
++        "Reader:UpdateReaderButton",
++        onReaderModeChange
++      );
++    });
+   }
+ 
+   async waitForPreview(changeFn) {
+@@ -434,6 +475,22 @@ class PrintHelper {
+     }
+   }
+ 
++  get _lastPrintPreviewSettings() {
++    return this.win.PrintEventHandler._lastPrintPreviewSettings;
++  }
++
++  assertPreviewedWithSettings(expected) {
++    let settings = this._lastPrintPreviewSettings;
++    ok(settings, "Last preview settings are available");
++    for (let [setting, value] of Object.entries(expected)) {
++      this._assertMatches(
++        settings[setting],
++        value,
++        `${setting} matches previewed setting`
++      );
++    }
++  }
++
+   async assertSettingsChanged(from, to, changeFn) {
+     is(
+       Object.keys(from).length,
+@@ -484,3 +541,10 @@ class PrintHelper {
+     return file;
+   }
+ }
++
++function waitForPreviewVisible() {
++  return BrowserTestUtils.waitForCondition(function() {
++    let preview = document.querySelector(".printPreviewBrowser");
++    return preview && BrowserTestUtils.is_visible(preview);
++  });
++}
+diff --git a/toolkit/locales/en-US/toolkit/printing/printUI.ftl b/toolkit/locales/en-US/toolkit/printing/printUI.ftl
+--- a/toolkit/locales/en-US/toolkit/printing/printUI.ftl
++++ b/toolkit/locales/en-US/toolkit/printing/printUI.ftl
+@@ -57,7 +57,21 @@ printui-two-sided-printing-short-edge = 
+ printui-options = Options
+ printui-headers-footers-checkbox = Print headers and footers
+ printui-backgrounds-checkbox = Print backgrounds
+-printui-selection-checkbox = Print selection only
++
++## The "Format" section, select a version of the website to print. Radio
++## options to select between the original page, selected text only, or a version
++## where the page is processed with "Reader View".
++
++# The section title.
++printui-source-label = Format
++# Option for printing the original page.
++printui-source-radio = Original
++# Option for printing just the content a user selected prior to printing.
++printui-selection-radio = Selection
++# Option for "simplifying" the page by printing the Reader View version.
++printui-simplify-page-radio = Simplified
++
++##
+ 
+ printui-color-mode-label = Color mode
+ printui-color-mode-color = Color
+diff --git a/toolkit/mozapps/handling/ContentDispatchChooser.jsm b/toolkit/mozapps/handling/ContentDispatchChooser.jsm
+--- a/toolkit/mozapps/handling/ContentDispatchChooser.jsm
++++ b/toolkit/mozapps/handling/ContentDispatchChooser.jsm
+@@ -541,7 +541,7 @@ class nsContentDispatchChooser {
+           keepOpenSameOriginNav: true,
+         },
+         aDialogArgs
+-      );
++      ).closedPromise;
+     }
+ 
+     // If we don't have a BrowsingContext, we need to show a standalone window.

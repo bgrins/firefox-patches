@@ -9,7 +9,7 @@ diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
    BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.jsm",
    CFRPageActions: "resource://activity-stream/lib/CFRPageActions.jsm",
    CharsetMenu: "resource://gre/modules/CharsetMenu.jsm",
-+  CompanionWindow: "resource:///modules/Companion.jsm",
++  FocusWindow: "resource:///modules/Focus.jsm",
    Color: "resource://gre/modules/Color.jsm",
    ContextualIdentityService:
      "resource://gre/modules/ContextualIdentityService.jsm",
@@ -19,11 +19,11 @@ diff --git a/browser/base/content/browser.js b/browser/base/content/browser.js
  
 +    window.addEventListener("keydown", e => {
 +      if (e.key == "F10") {
-+        CompanionWindow.focus();
++        FocusWindow.focus();
 +      }
 +      // if (e.key == "Control" || e.key == "Shift") {
 +      //   if (e.ctrlKey && e.shiftKey) {
-+      //     CompanionWindow.focus();
++      //     FocusWindow.focus();
 +      //   }
 +      // }
 +    });
@@ -22339,7 +22339,7 @@ diff --git a/browser/components/BrowserGlue.jsm b/browser/components/BrowserGlue
    BrowserUsageTelemetry: "resource:///modules/BrowserUsageTelemetry.jsm",
    BrowserUIUtils: "resource:///modules/BrowserUIUtils.jsm",
    BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.jsm",
-+  CompanionWindow: "resource:///modules/Companion.jsm",
++  FocusWindow: "resource:///modules/Focus.jsm",
    ContextualIdentityService:
      "resource://gre/modules/ContextualIdentityService.jsm",
    Corroborate: "resource://gre/modules/Corroborate.jsm",
@@ -22347,22 +22347,22 @@ diff --git a/browser/components/BrowserGlue.jsm b/browser/components/BrowserGlue
  
    // the first browser window has finished initializing
    _onFirstWindowLoaded: function BG__onFirstWindowLoaded(aWindow) {
-+    CompanionWindow.init();
++    FocusWindow.init();
 +
      AboutNewTab.init();
  
      TabCrashHandler.init();
-diff --git a/browser/components/companion/Companion.jsm b/browser/components/companion/Companion.jsm
+diff --git a/browser/components/focus/Focus.jsm b/browser/components/focus/Focus.jsm
 new file mode 100644
 --- /dev/null
-+++ b/browser/components/companion/Companion.jsm
++++ b/browser/components/focus/Focus.jsm
 @@ -0,0 +1,54 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 +"use strict";
 +
-+var EXPORTED_SYMBOLS = ["Companion", "CompanionWindow"];
++var EXPORTED_SYMBOLS = ["Focus", "FocusWindow"];
 +
 +const { Services } = ChromeUtils.import("resource://gre/modules/Services.jsm");
 +const { XPCOMUtils } = ChromeUtils.import(
@@ -22372,12 +22372,12 @@ new file mode 100644
 +  "resource://gre/modules/AppConstants.jsm"
 +);
 +
-+const CompanionWindow = {
++const FocusWindow = {
 +  init() {
 +    console.log("hi");
 +    this.win = Services.ww.openWindow(
 +      null,
-+      "chrome://browser/content/companion/companion.html",
++      "chrome://browser/content/focus/focus.html",
 +      "_blank",
 +      "chrome",
 +      []
@@ -22385,11 +22385,11 @@ new file mode 100644
 +
 +    this.win.addEventListener("keydown", e => {
 +      if (e.key == "F10") {
-+        CompanionWindow.blur();
++        FocusWindow.blur();
 +      }
 +      // if (e.key == "Control" || e.key == "Shift") {
 +      //   if (e.ctrlKey && e.shiftKey) {
-+      //     CompanionWindow.blur();
++      //     FocusWindow.blur();
 +      //   }
 +      // }
 +    });
@@ -22410,18 +22410,63 @@ new file mode 100644
 +  },
 +};
 +
-+const Companion = {};
-diff --git a/browser/components/companion/content/companion.css b/browser/components/companion/content/companion.css
++const Focus = {};
+diff --git a/browser/components/focus/content/focus.css b/browser/components/focus/content/focus.css
 new file mode 100644
 --- /dev/null
-+++ b/browser/components/companion/content/companion.css
-@@ -0,0 +1,190 @@
++++ b/browser/components/focus/content/focus.css
+@@ -0,0 +1,137 @@
++
++
++.urlbarView {
++  z-index: 1;
++  background: white;
++  /* position: absolute;
++  z-index: 1;
++  background: red;
++  top: 30px;
++  left: 0;
++  display: block;
++  right: 0; */
++}
++
++#urlbar[breakout] {
++  position: relative;
++  width: auto;
++  background: var(--focus-bg);
++  /* overflow: visible;
++  width: 100%;
++  padding: 5px;
++  position: static; */
++}
++/* 
++#urlbar-input, #urlbar-scheme, .searchbar-textbox {
++  -moz-box-flex: 1;
++  background-color: transparent;
++  color: inherit;
++  border: none;
++  margin: 0;
++  padding: 0;
++  outline: none;
++}
++
++#urlbar-input {
++  mask-repeat: no-repeat;
++  unicode-bidi: plaintext;
++  text-align: match-parent;
++} */
++
++* {
++  box-sizing: border-box;
++}
++
 +html {
 +  appearance: auto;
 +  -moz-default-appearance: dialog;
 +  background-color: #FFFFFF;
 +  color: -moz-DialogText;
 +}
++
 +body, html {
 +  height: 100vh;
 +  margin: 0;
@@ -22456,27 +22501,32 @@ new file mode 100644
 +body {
 +  display: grid;
 +  grid-template-rows: auto minmax(0, 1fr) auto;
-+
-+  background: rgb(222, 48, 113);
++  --focus-bg: rgb(222, 48, 113);
++  background: var(--focus-bg);
++  padding: 3px;
 +}
 +
-+body:not(.has-url) #erase,
-+body:not(.has-url) footer,
-+body:not(.has-url) #browser-container,
-+body.has-url #splash {
++body:not(.has-url) .when-url {
++  display: none;
++}
++body.has-url .when-no-url {
 +  display: none;
 +}
 +
 +header {
 +  display: grid;
-+  grid-template-columns: minmax(0, 1fr) auto;
++  grid-template-columns: minmax(0, 1fr) auto auto;
++  height: 32px;
++  position: relative;
 +}
-+
++body button {
++  margin: 0;
++} 
 +main {
 +  display: grid;
 +  position: relative;
 +  font-weight: bold;
-+  margin: 0 3px;
++  margin-top: 3px;
 +}
 +main label {
 +  grid-area: 1 / 1;
@@ -22488,130 +22538,26 @@ new file mode 100644
 +  align-self: stretch;
 +  justify-self: stretch;
 +}
++
 +main browser {
 +  width: 100%;
 +  height: 100%;
++
++  /* Macos */
++  border-bottom-left-radius: 7px;
++  border-bottom-right-radius: 7px;
 +}
 +
 +footer {
 +  display: grid;
 +  grid-template-columns: 1fr 1fr 1fr 1fr;
 +}
-+aside ul {
-+  padding: 0;
-+  margin: 0;
-+}
-+aside li {
-+  list-style: none;
-+  margin: 3px;
-+}
-+.main {
-+  padding: 0 var(--card-padding);
-+  background: rgba(0, 255, 0, .1);
-+  overflow: auto;
-+  flex-grow: 1;
-+}
-+.main-inner {
 +
-+}
-+.main-inner ul {
-+  display: grid;
-+  align-items: center;
-+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-+}
-+.main-inner ul li {
-+  list-style: none;
-+  width: 220px;
-+  height: 100px;
-+  margin: 3px auto;
-+  border: solid 1px;
-+  border-radius: 5px;
-+}
-+
-+named-deck > section {
-+  display: flex;
-+  height: 100%;
-+}
-+.tab-button[name="account"] {
-+  float: right;
-+}
-+
-+.tab-button::before {
-+  content: "";
-+  background-image: url(chrome://browser/skin/fxa/avatar-empty.svg);
-+}
-+
-+/* #sidebar {
-+  border-right: 1px solid var(--in-content-box-border-color);
-+  padding: 0 var(--card-padding);
-+} */
-+
-+#timeline {
-+  text-align: center;
-+}
-+
-+.tab-group {
-+  margin-top: 0 !important;
-+  padding: 0 var(--card-padding) !important;
-+}
-+button.tab-button {
-+  padding: 4px 6px !important;
-+}
-+/* Copied from aboutaddons.css */
-+
-+.tab-group {
-+  display: block;
-+  margin-top: 8px;
-+  /* Pull the buttons flush with the side of the card */
-+  margin-inline: calc(var(--card-padding) * -1);
-+  border-bottom: 1px solid var(--in-content-box-border-color);
-+  border-top: 1px solid var(--in-content-box-border-color);
-+  font-size: 0;
-+  line-height: 0;
-+}
-+
-+button.tab-button {
-+  appearance: none;
-+  border-inline: none;
-+  border-block: 2px solid transparent;
-+  border-radius: 0;
-+  background: transparent;
-+  font-size: 14px;
-+  line-height: 20px;
-+  margin: 0;
-+  padding: 4px 16px;
-+  color: var(--in-content-text-color);
-+}
-+
-+button.tab-button:hover {
-+  background-color: var(--in-content-button-background);
-+  border-top-color: var(--in-content-box-border-color);
-+}
-+
-+button.tab-button:hover:active {
-+  background-color: var(--in-content-button-background-hover);
-+}
-+
-+button.tab-button[selected] {
-+  border-top-color: var(--in-content-border-highlight);
-+  color: var(--in-content-category-text-selected) !important;
-+}
-+
-+button.tab-button:-moz-focusring {
-+  outline-offset: -2px;
-+  -moz-outline-radius: 0;
-+}
-+
-+.tab-group[last-input-type="mouse"] > button.tab-button:-moz-focusring {
-+  outline: none;
-+  box-shadow: none;
-+}
-\ No newline at end of file
-diff --git a/browser/components/companion/content/companion.html b/browser/components/companion/content/companion.html
+diff --git a/browser/components/focus/content/focus.html b/browser/components/focus/content/focus.html
 new file mode 100644
 --- /dev/null
-+++ b/browser/components/companion/content/companion.html
-@@ -0,0 +1,32 @@
++++ b/browser/components/focus/content/focus.html
+@@ -0,0 +1,50 @@
 +<!-- This Source Code Form is subject to the terms of the Mozilla Public
 +   - License, v. 2.0. If a copy of the MPL was not distributed with this
 +   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
@@ -22622,34 +22568,52 @@ new file mode 100644
 +<head>
 +   <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
 +   <link rel="stylesheet" href="chrome://global/skin/global.css" />
++   <!-- todo: only load awesomebar stuff -->
++   <link rel="stylesheet" href="chrome://browser/content/browser.css" />
++   <link rel="stylesheet" href="chrome://browser/skin/browser.css" />
 +
 +
-+   <link rel="stylesheet" href="chrome://global/skin/in-content/common.css">
-+   <link rel="stylesheet" href="chrome://global/skin/in-content/toggle-button.css">
-+   <link rel="stylesheet" href="chrome://browser/content/companion/companion.css" />
-+   <script src="chrome://mozapps/content/extensions/named-deck.js"></script>
++   <!-- <link rel="stylesheet" href="chrome://global/skin/in-content/common.css"> -->
++   <!-- <link rel="stylesheet" href="chrome://global/skin/in-content/toggle-button.css"> -->
++   <link rel="stylesheet" href="chrome://browser/content/focus/focus.css" />
++
++   <!-- <script src="chrome://mozapps/content/extensions/named-deck.js"></script> -->
++   <script src="chrome://global/content/globalOverlay.js"></script>
++   <script src="chrome://global/content/editMenuOverlay.js"></script>
++   <script src="chrome://browser/content/utilityOverlay.js"></script>
++   <script src="chrome://global/content/macWindowMenu.js"></script>
 +</head>
 +
 +<body role="application">
 +   <header>
-+      <input id="url" value="https://mozilla.org" placeholder="Enter a URL" />
-+      <button id="erase">Erase</button>
++      <div class="when-no-url">
++         <button id="go">Go</button>
++      </div>
++      <div class="when-url">
++         <button id="back">back</button>
++         <button id="forward">forward</button>
++         <button id="reload">reload</button>
++         <button id="erase">Erase</button>
++      </div>
++      <div>
++         <button id="settings">settings</button>
++      </div>
 +   </header>
 +   <main>
-+      <div id="browser-container"></div>
-+      <label id="splash">Firefox Focus</label>
++      <div id="browser-container" class="when-url"></div>
++      <label id="splash" class="when-no-url">Firefox Focus</label>
 +   </main>
-+   <footer><button>back</button><button>forward</button><button>reload</button><button>settings</button></footer>
-+   <script src="chrome://browser/content/companion/companion.js"></script>
++   <footer></footer>
++   <script src="chrome://browser/content/focus/focus.js"></script>
 +</body>
 +
 +</html>
 \ No newline at end of file
-diff --git a/browser/components/companion/content/companion.js b/browser/components/companion/content/companion.js
+diff --git a/browser/components/focus/content/focus.js b/browser/components/focus/content/focus.js
 new file mode 100644
 --- /dev/null
-+++ b/browser/components/companion/content/companion.js
-@@ -0,0 +1,95 @@
++++ b/browser/components/focus/content/focus.js
+@@ -0,0 +1,425 @@
 +var { XPCOMUtils } = ChromeUtils.import(
 +  "resource://gre/modules/XPCOMUtils.jsm"
 +);
@@ -22661,20 +22625,364 @@ new file mode 100644
 +// lazy module getters
 +
 +XPCOMUtils.defineLazyModuleGetters(this, {
-+  Companion: "resource:///modules/Companion.jsm",
-+  CompanionWindow: "resource:///modules/Companion.jsm",
-+  BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.jsm",
++  Focus: "resource:///modules/Focus.jsm",
++  FocusWindow: "resource:///modules/Focus.jsm",
++  PromiseUtils: "resource://gre/modules/PromiseUtils.jsm",
++  UrlbarInput: "resource:///modules/UrlbarInput.jsm",
++  UrlbarPrefs: "resource:///modules/UrlbarPrefs.jsm",
++  UrlbarProviderSearchTips: "resource:///modules/UrlbarProviderSearchTips.jsm",
++  UrlbarTokenizer: "resource:///modules/UrlbarTokenizer.jsm",
++  UrlbarUtils: "resource:///modules/UrlbarUtils.jsm",
 +});
 +
-+console.log("Hello from focus", window);
++/* Start stuff needed for awesomebar */
++
++var {SitePermissions} = ChromeUtils.import("resource:///modules/SitePermissions.jsm", {});
++var gInitialPages = [
++  "about:blank",
++  "about:newtab",
++  "about:home",
++  "about:privatebrowsing",
++  "about:welcomeback",
++  "about:sessionrestore",
++  "about:welcome",
++  "about:newinstall",
++];
++
++function isInitialPage(url) {
++  if (!(url instanceof Ci.nsIURI)) {
++    try {
++      url = Services.io.newURI(url);
++    } catch (ex) {
++      return false;
++    }
++  }
++
++  let nonQuery = url.prePath + url.filePath;
++  return gInitialPages.includes(nonQuery) || nonQuery == BROWSER_NEW_TAB_URL;
++}
++
++
++
++window.gBrowser = {
++  tabContainer: document.documentElement,
++  get selectedBrowser() {
++    return browser;
++  },
++  get selectedTab() {
++    return document.createElement("span");
++  },
++  get currentURI() {
++    return this.selectedBrowser.currentURI;
++  },
++  get userTypedValue() {},
++  set userTypedValue(val) {},
++  removeTab() {},
++  addTabsProgressListener() {},
++  announceWindowCreated() {},
++  getTabForBrowser() {},
++  setPageInfo() {},
++
++  /**
++   * BEGIN FORWARDED BROWSER PROPERTIES.  IF YOU ADD A PROPERTY TO THE BROWSER ELEMENT
++   * MAKE SURE TO ADD IT HERE AS WELL.
++   */
++  get canGoBack() {
++    return this.selectedBrowser.canGoBack;
++  },
++
++  get canGoForward() {
++    return this.selectedBrowser.canGoForward;
++  },
++
++  goBack(requireUserInteraction) {
++    return this.selectedBrowser.goBack(requireUserInteraction);
++  },
++
++  goForward(requireUserInteraction) {
++    return this.selectedBrowser.goForward(requireUserInteraction);
++  },
++
++  reload() {
++    return this.selectedBrowser.reload();
++  },
++
++  reloadWithFlags(aFlags) {
++    return this.selectedBrowser.reloadWithFlags(aFlags);
++  },
++
++  stop() {
++    return this.selectedBrowser.stop();
++  },
++};
++
++window.gBrowserInit = {};
++
++XPCOMUtils.defineLazyGetter(
++  gBrowserInit,
++  "_firstContentWindowPaintDeferred",
++  () => PromiseUtils.defer()
++);
++
++XPCOMUtils.defineLazyGetter(this, "gURLBar", () => {
++  let urlbar = new UrlbarInput({
++    textbox: document.getElementById("urlbar"),
++    eventTelemetryCategory: "urlbar",
++  });
++
++  let beforeFocusOrSelect = event => {
++    console.trace();
++  };
++  urlbar.addEventListener("beforefocus", beforeFocusOrSelect);
++  urlbar.addEventListener("beforeselect", beforeFocusOrSelect);
++
++  return urlbar;
++});
++
++let obs = {
++
++  QueryInterface: ChromeUtils.generateQI([
++    "nsIObserver",
++    "nsISupportsWeakReference",
++  ]),
++  observe: function(subject, topic, data) {
++    if (topic == "urlbar-user-start-navigation") {
++      console.log("nav");
++      loadURI();
++    }
++  }
++}
++Services.obs.addObserver(obs, "urlbar-user-start-navigation", true);
++
++
++let toolbar = document.createXULElement("toolbar");
++toolbar.append(
++  MozXULElement.parseXULToFragment(`
++<hbox id="urlbar" flex="1"
++                context=""
++                focused="true"
++                pageproxystate="invalid">
++            <hbox id="urlbar-background"/>
++            <hbox id="urlbar-input-container"
++                  flex="1"
++                  pageproxystate="invalid">
++              <box id="urlbar-search-button"
++                   class="chromeclass-toolbar-additional"/>
++              <!-- Use onclick instead of normal popup= syntax since the popup
++                   code fires onmousedown, and hence eats our favicon drag events. -->
++              <box id="tracking-protection-icon-container" align="center"
++                   role="button"
++                   onclick="gProtectionsHandler.handleProtectionsButtonEvent(event);"
++                   onkeypress="gProtectionsHandler.handleProtectionsButtonEvent(event);"
++                   onmouseover="gProtectionsHandler.onTrackingProtectionIconHoveredOrFocused();"
++                   onfocus="gProtectionsHandler.onTrackingProtectionIconHoveredOrFocused();"
++                   tooltip="tracking-protection-icon-tooltip">
++                <box id="tracking-protection-icon-box">
++                  <image id="tracking-protection-icon"/>
++                  <box id="tracking-protection-icon-animatable-box" flex="1">
++                    <image id="tracking-protection-icon-animatable-image" flex="1"/>
++                  </box>
++                </box>
++                <tooltip id="tracking-protection-icon-tooltip">
++                  <description id="tracking-protection-icon-tooltip-label" class="tooltip-label"/>
++                </tooltip>
++              </box>
++              <box id="identity-box" role="button"
++                   align="center"
++                   data-l10n-id="urlbar-identity-button"
++                   pageproxystate="invalid"
++                   onclick="gIdentityHandler.handleIdentityButtonEvent(event);"
++                   onkeypress="gIdentityHandler.handleIdentityButtonEvent(event);"
++                   ondragstart="gIdentityHandler.onDragStart(event);">
++                <image id="identity-icon"
++                       consumeanchor="identity-box"
++                       onclick="PageProxyClickHandler(event);"/>
++                <image id="permissions-granted-icon"
++                       data-l10n-id="urlbar-permissions-granted"/>
++                <box style="pointer-events: none;">
++                    <image class="sharing-icon" id="webrtc-sharing-icon"/>
++                    <image class="sharing-icon geo-icon" id="geo-sharing-icon"/>
++                    <image class="sharing-icon xr-icon" id="xr-sharing-icon"/>
++                </box>
++                <box id="blocked-permissions-container" align="center">
++                  <image data-permission-id="geo" class="blocked-permission-icon geo-icon" role="button"
++                         data-l10n-id="urlbar-geolocation-blocked"/>
++                  <image data-permission-id="xr" class="blocked-permission-icon xr-icon" role="button"
++                         data-l10n-id="urlbar-xr-blocked"/>
++                  <image data-permission-id="desktop-notification" class="blocked-permission-icon desktop-notification-icon" role="button"
++                         data-l10n-id="urlbar-web-notifications-blocked"/>
++                  <image data-permission-id="camera" class="blocked-permission-icon camera-icon" role="button"
++                         data-l10n-id="urlbar-camera-blocked"/>
++                  <image data-permission-id="microphone" class="blocked-permission-icon microphone-icon" role="button"
++                         data-l10n-id="urlbar-microphone-blocked"/>
++                  <image data-permission-id="screen" class="blocked-permission-icon screen-icon" role="button"
++                         data-l10n-id="urlbar-screen-blocked"/>
++                  <image data-permission-id="persistent-storage" class="blocked-permission-icon persistent-storage-icon" role="button"
++                         data-l10n-id="urlbar-persistent-storage-blocked"/>
++                  <image data-permission-id="popup" class="blocked-permission-icon popup-icon" role="button"
++                         data-l10n-id="urlbar-popup-blocked"/>
++                  <image data-permission-id="autoplay-media" class="blocked-permission-icon autoplay-media-icon" role="button"
++                         data-l10n-id="urlbar-autoplay-media-blocked"/>
++                  <image data-permission-id="canvas" class="blocked-permission-icon canvas-icon" role="button"
++                         data-l10n-id="urlbar-canvas-blocked"/>
++                  <image data-permission-id="midi" class="blocked-permission-icon midi-icon" role="button"
++                         data-l10n-id="urlbar-midi-blocked"/>
++                  <image data-permission-id="install" class="blocked-permission-icon install-icon" role="button"
++                         data-l10n-id="urlbar-install-blocked"/>
++                </box>
++                <box id="notification-popup-box"
++                     hidden="true"
++                     onmouseover="document.getElementById('identity-box').classList.add('no-hover');"
++                     onmouseout="document.getElementById('identity-box').classList.remove('no-hover');"
++                     align="center">
++                  <image id="default-notification-icon" class="notification-anchor-icon" role="button"
++                         data-l10n-id="urlbar-default-notification-anchor"/>
++                  <image id="geo-notification-icon" class="notification-anchor-icon geo-icon" role="button"
++                         data-l10n-id="urlbar-geolocation-notification-anchor"/>
++                  <image id="xr-notification-icon" class="notification-anchor-icon xr-icon" role="button"
++                         data-l10n-id="urlbar-xr-notification-anchor"/>
++                  <image id="autoplay-media-notification-icon" class="notification-anchor-icon autoplay-media-icon" role="button"
++                         data-l10n-id="urlbar-autoplay-notification-anchor"/>
++                  <image id="addons-notification-icon" class="notification-anchor-icon install-icon" role="button"
++                         data-l10n-id="urlbar-addons-notification-anchor"/>
++                  <image id="canvas-notification-icon" class="notification-anchor-icon" role="button"
++                         data-l10n-id="urlbar-canvas-notification-anchor"/>
++                  <image id="indexedDB-notification-icon" class="notification-anchor-icon indexedDB-icon" role="button"
++                         data-l10n-id="urlbar-indexed-db-notification-anchor"/>
++                  <image id="password-notification-icon" class="notification-anchor-icon login-icon" role="button"
++                         data-l10n-id="urlbar-password-notification-anchor"/>
++                  <stack id="plugins-notification-icon" class="notification-anchor-icon" role="button" align="center" data-l10n-id="urlbar-plugins-notification-anchor">
++                    <image class="plugin-icon" />
++                    <image id="plugin-icon-badge" />
++                  </stack>
++                  <image id="web-notifications-notification-icon" class="notification-anchor-icon desktop-notification-icon" role="button"
++                         data-l10n-id="urlbar-web-notification-anchor"/>
++                  <image id="webRTC-shareDevices-notification-icon" class="notification-anchor-icon camera-icon" role="button"
++                         data-l10n-id="urlbar-web-rtc-share-devices-notification-anchor"/>
++                  <image id="webRTC-shareMicrophone-notification-icon" class="notification-anchor-icon microphone-icon" role="button"
++                         data-l10n-id="urlbar-web-rtc-share-microphone-notification-anchor"/>
++                  <image id="webRTC-shareScreen-notification-icon" class="notification-anchor-icon screen-icon" role="button"
++                         data-l10n-id="urlbar-web-rtc-share-screen-notification-anchor"/>
++                  <image id="servicesInstall-notification-icon" class="notification-anchor-icon service-icon" role="button"
++                         data-l10n-id="urlbar-services-notification-anchor"/>
++                  <image id="translate-notification-icon" class="notification-anchor-icon translation-icon" role="button"
++                         data-l10n-id="urlbar-translate-notification-anchor"/>
++                  <image id="translated-notification-icon" class="notification-anchor-icon translation-icon in-use" role="button"
++                         data-l10n-id="urlbar-translated-notification-anchor"/>
++                  <image id="eme-notification-icon" class="notification-anchor-icon drm-icon" role="button"
++                         data-l10n-id="urlbar-eme-notification-anchor"/>
++                  <image id="persistent-storage-notification-icon" class="notification-anchor-icon persistent-storage-icon" role="button"
++                         data-l10n-id="urlbar-persistent-storage-notification-anchor"/>
++                  <image id="midi-notification-icon" class="notification-anchor-icon midi-icon" role="button"
++                         data-l10n-id="urlbar-midi-notification-anchor"/>
++                  <image id="webauthn-notification-icon" class="notification-anchor-icon" role="button"
++                         data-l10n-id="urlbar-web-authn-anchor"/>
++                  <image id="storage-access-notification-icon" class="notification-anchor-icon storage-access-icon" role="button"
++                         data-l10n-id="urlbar-storage-access-anchor"/>
++                </box>
++                <image id="remote-control-icon"
++                       data-l10n-id="urlbar-remote-control-notification-anchor"/>
++                <label id="identity-icon-label" class="plain" crop="center" flex="1"/>
++              </box>
++              <box id="urlbar-label-box" align="center">
++                <label id="urlbar-label-switchtab" class="urlbar-label" data-l10n-id="urlbar-switch-to-tab"/>
++                <label id="urlbar-label-extension" class="urlbar-label" data-l10n-id="urlbar-extension"/>
++                <label id="urlbar-label-search-mode" class="urlbar-label"/>
++              </box>
++              <html:div id="urlbar-search-mode-indicator">
++                <html:span id="urlbar-search-mode-indicator-title"/>
++                <html:div id="urlbar-search-mode-indicator-close"
++                       class="close-button"
++                       role="button"/>
++              </html:div>
++              <moz-input-box tooltip="aHTMLTooltip"
++                             class="urlbar-input-box"
++                             flex="1"
++                             role="combobox"
++                             aria-owns="urlbar-results">
++                <html:input id="urlbar-scheme"
++                            required="required"/>
++                <html:input id="urlbar-input"
++                            anonid="input"
++                            aria-controls="urlbar-results"
++                            aria-autocomplete="both"
++                            inputmode="mozAwesomebar"
++                            data-l10n-id="urlbar-placeholder"
++                            data-l10n-attrs="placeholder"/>
++              </moz-input-box>
++              <image id="urlbar-go-button"
++                     class="urlbar-icon"
++                     onclick="gURLBar.handleCommand(event);"
++                     data-l10n-id="urlbar-go-button"/>
++              <hbox id="page-action-buttons" context="pageActionContextMenu">
++                <toolbartabstop/>
++                <hbox id="contextual-feature-recommendation" role="button" hidden="true">
++                  <hbox id="cfr-label-container">
++                    <label id="cfr-label"/>
++                  </hbox>
++                  <image id="cfr-button"
++                         class="urlbar-icon urlbar-page-action"
++                         role="presentation"/>
++                </hbox>
++                <hbox id="userContext-icons" hidden="true">
++                  <label id="userContext-label"/>
++                  <image id="userContext-indicator"/>
++                </hbox>
++                <image id="reader-mode-button"
++                       class="urlbar-icon urlbar-page-action"
++                       tooltip="dynamic-shortcut-tooltip"
++                       role="button"
++                       hidden="true"
++                       onclick="AboutReaderParent.buttonClick(event);"/>
++                <toolbarbutton id="urlbar-zoom-button"
++                       onclick="FullZoom.reset(); FullZoom.resetScalingZoom();"
++                       tooltip="dynamic-shortcut-tooltip"
++                       hidden="true"/>
++                <box id="pageActionSeparator" class="urlbar-page-action"/>
++                <image id="pageActionButton"
++                       class="urlbar-icon urlbar-page-action"
++                       role="button"
++                       data-l10n-id="urlbar-page-action-button"
++                       onmousedown="BrowserPageActions.mainButtonClicked(event);"
++                       onkeypress="BrowserPageActions.mainButtonClicked(event);"/>
++                <image id="pocket-button"
++                       class="urlbar-icon urlbar-page-action"
++                       data-l10n-id="urlbar-pocket-button"
++                       role="button"
++                       hidden="true"
++                       onclick="BrowserPageActions.doCommandForAction(PageActions.actionForID('pocket'), event, this);"/>
++                <hbox id="star-button-box"
++                      hidden="true"
++                      class="urlbar-icon-wrapper urlbar-page-action"
++                      onclick="BrowserPageActions.doCommandForAction(PageActions.actionForID('bookmark'), event, this);">
++                  <image id="star-button"
++                         class="urlbar-icon"
++                         role="button"/>
++                  <hbox id="star-button-animatable-box">
++                    <image id="star-button-animatable-image"
++                           role="presentation"/>
++                  </hbox>
++                </hbox>
++              </hbox>
++            </hbox>
++          </hbox>
++      `)
++);
++document.querySelector("header").prepend(toolbar)
++
++document.querySelector("#urlbar").setAttribute("breakout", "true");
++
++/* End stuff needed for awesomebar */
++
++// console.log("Hello from focus", window);
 +
 +let browser = null;
 +function getBrowser() {
 +  if (!browser) {
++    browser = document.createXULElement("browser");
 +    // todo contextmenu="contentAreaContextMenu"
 +    // todo tooltip="aHTMLTooltip"
 +    // todo selectmenulist="ContentSelectDropdown remote="true" autocompletepopup="PopupAutoComplete"
-+    browser = document.createXULElement("browser");
 +
 +    browser.setAttribute("maychangeremoteness", "true");
 +    browser.setAttribute("message", "true");
@@ -22687,85 +22995,72 @@ new file mode 100644
 +  }
 +  return browser;
 +}
-+
 +window.addEventListener(
 +  "DOMContentLoaded",
 +  () => {
-+    // TODO: Replace with awesomebar
-+    document.querySelector("#url").addEventListener("change", loadURI);
-+    document.querySelector("#url").addEventListener("keydown", e => {
-+      if (e.keyCode == 13) {
-+        loadURI();
-+      }
++    // todo browser events like securitychange
++    getBrowser();
++    gURLBar.addEventListener("change", () => {
++      loadURI();
 +    });
++    document.querySelector("#back").addEventListener("click", () => {
++      gBrowser.goBack();
++    });
++    document.querySelector("#forward").addEventListener("click", () => {
++      gBrowser.goForward();
++    });
++    document.querySelector("#reload").addEventListener("click", () => {
++      gBrowser.reload();
++    });
++    document.querySelector("#go").addEventListener("click", loadURI);
++    // document.querySelector("#url").addEventListener("change", loadURI);
++    // document.querySelector("#url").addEventListener("keydown", e => {
++    //   if (e.keyCode == 13) {
++    //     loadURI();
++    //   }
++    // });
 +    document.querySelector("#erase").addEventListener("click", erase);
 +  },
 +  { once: true }
 +);
 +
 +function loadURI() {
-+  let val = document.querySelector("#url").value;
-+  console.log(val);
++  let val = gURLBar.value; // todo what should do?
 +  getBrowser().setAttribute("src", val);
++  console.trace();
 +  document.body.classList.add("has-url");
 +}
 +
 +function erase() {
++  console.trace();
 +  document.body.classList.remove("has-url");
 +  if (browser) {
 +    browser.remove();
 +  }
-+  browser = null;
++  getBrowser();
 +}
-+
-+// function render() {
-+//   let container = document.querySelector("#window-list");
-+//   container.textContent = "";
-+//   for (let window of BrowserWindowTracker.orderedWindows) {
-+//     let winContainer = document.createElement("li");
-+//     winContainer.textContent = window.document.title;
-+//     for (let tab of window.ownerGlobal.gBrowser.tabs) {
-+//       winContainer.append(
-+//         ` | ${window.ownerGlobal.gBrowser.getTabTooltip(tab)}`
-+//       );
-+//     }
-+//     container.append(winContainer);
-+//   }
-+// }
-+
-+// BrowserWindowTracker.addEventListener("onwindowadded", render);
-+// BrowserWindowTracker.addEventListener("onwindowremoved", render);
-+// BrowserWindowTracker.addEventListener("onwindowchanged", render);
-+
-+// render();
-+
-+// document.querySelector("#new-window").addEventListener("click", () => {
-+//   let win = BrowserWindowTracker.getTopWindow({ private: false });
-+//   if (win) {
-+//     win.OpenBrowserWindow();
-+//   }
-+// });
-diff --git a/browser/components/companion/content/jar.mn b/browser/components/companion/content/jar.mn
+diff --git a/browser/components/focus/content/jar.mn b/browser/components/focus/content/jar.mn
 new file mode 100644
 --- /dev/null
-+++ b/browser/components/companion/content/jar.mn
-@@ -0,0 +1,5 @@
++++ b/browser/components/focus/content/jar.mn
+@@ -0,0 +1,6 @@
 +
 +browser.jar:
-+  content/browser/companion/companion.html
-+  content/browser/companion/companion.css
-+  content/browser/companion/companion.js
-diff --git a/browser/components/companion/content/moz.build b/browser/components/companion/content/moz.build
++  content/browser/focus/focus.html
++  content/browser/focus/focus2.html
++  content/browser/focus/focus.css
++  content/browser/focus/focus.js
+diff --git a/browser/components/focus/content/moz.build b/browser/components/focus/content/moz.build
 new file mode 100644
 --- /dev/null
-+++ b/browser/components/companion/content/moz.build
++++ b/browser/components/focus/content/moz.build
 @@ -0,0 +1,2 @@
 +
 +JAR_MANIFESTS += ["jar.mn"]
-diff --git a/browser/components/companion/moz.build b/browser/components/companion/moz.build
+diff --git a/browser/components/focus/moz.build b/browser/components/focus/moz.build
 new file mode 100644
 --- /dev/null
-+++ b/browser/components/companion/moz.build
++++ b/browser/components/focus/moz.build
 @@ -0,0 +1,16 @@
 +# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
 +# vim: set filetype=python:
@@ -22778,7 +23073,7 @@ new file mode 100644
 +]
 +
 +EXTRA_JS_MODULES += [
-+    "Companion.jsm",
++    "Focus.jsm",
 +]
 +
 +with Files("**"):
@@ -22790,7 +23085,7 @@ diff --git a/browser/components/moz.build b/browser/components/moz.build
      "about",
      "aboutlogins",
      "attribution",
-+    "companion",
++    "focus",
      "contextualidentity",
      "customizableui",
      "doh",
@@ -22802,7 +23097,7 @@ diff --git a/browser/confvars.sh b/browser/confvars.sh
  fi
  
 -BROWSER_CHROME_URL=chrome://browser/content/browser.xhtml
-+BROWSER_CHROME_URL=chrome://browser/content/companion/companion.html
++BROWSER_CHROME_URL=chrome://browser/content/focus/focus.html
  
  # MOZ_APP_DISPLAYNAME will be set by branding/configure.sh
  # MOZ_BRANDING_DIRECTORY is the default branding directory used when none is
@@ -22896,3 +23191,15 @@ diff --git a/browser/modules/BrowserWindowTracker.jsm b/browser/modules/BrowserW
 +}
 +
 +this.BrowserWindowTracker = new BWT();
+diff --git a/layout/base/PresShell.cpp b/layout/base/PresShell.cpp
+--- a/layout/base/PresShell.cpp
++++ b/layout/base/PresShell.cpp
+@@ -5268,6 +5268,8 @@ static bool IsTransparentContainerElemen
+ }
+ 
+ nscolor PresShell::GetDefaultBackgroundColorToDraw() {
++  return NS_RGB(232, 58, 123);
++  return NS_RGB(222, 48, 113);
+   if (!mPresContext || !mPresContext->GetBackgroundColorDraw()) {
+     return NS_RGB(255, 255, 255);
+   }
