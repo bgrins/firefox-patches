@@ -1,0 +1,235 @@
+
+# HG changeset patch
+# User Emilio Cobos Álvarez <emilio@crisal.io>
+# Date 1634738192 0
+# Node ID feea84165bf0c8622c415064d405d8fd5f7a1a7d
+# Parent  1688c63ebe62daa652befa06c54897301273fcf3
+Bug 1731714 - Add a document.getWireframe() API that gets some relevant rects in the viewport. r=mconley
+
+I added an option to return also the nodes because it's very helpful for
+debugging. A bunch of the "unknown" ones are just elements with
+transparent backgrounds (but still hit-testable), so we probably want to
+exclude them from the result list or what not to massively reduce the
+size of the returned object.
+
+But anyhow, this probably does for a prototype.
+
+Differential Revision: https://phabricator.services.mozilla.com/D128720
+
+diff --git a/dom/base/Document.cpp b/dom/base/Document.cpp
+--- a/dom/base/Document.cpp
++++ b/dom/base/Document.cpp
+@@ -251,16 +251,17 @@
+ #include "nsAttrValue.h"
+ #include "nsAttrValueInlines.h"
+ #include "nsBaseHashtable.h"
+ #include "nsBidiUtils.h"
+ #include "nsCRT.h"
+ #include "nsCSSPropertyID.h"
+ #include "nsCSSProps.h"
+ #include "nsCSSPseudoElements.h"
++#include "nsCSSRendering.h"
+ #include "nsCanvasFrame.h"
+ #include "nsCaseTreatment.h"
+ #include "nsCharsetSource.h"
+ #include "nsCommandManager.h"
+ #include "nsCommandParams.h"
+ #include "nsComponentManagerUtils.h"
+ #include "nsContentCreatorFunctions.h"
+ #include "nsContentList.h"
+@@ -391,16 +392,17 @@
+ #include "nsQueryObject.h"
+ #include "nsRange.h"
+ #include "nsRect.h"
+ #include "nsRefreshDriver.h"
+ #include "nsSandboxFlags.h"
+ #include "nsSerializationHelper.h"
+ #include "nsServiceManagerUtils.h"
+ #include "nsStringFlags.h"
++#include "nsStyleUtil.h"
+ #include "nsStringIterator.h"
+ #include "nsStyleSheetService.h"
+ #include "nsStyleStruct.h"
+ #include "nsTextNode.h"
+ #include "nsUnicharUtils.h"
+ #include "nsWrapperCache.h"
+ #include "nsWrapperCacheInlines.h"
+ #include "nsXPCOMCID.h"
+@@ -14447,16 +14449,98 @@ Element* Document::TopLayerPop(FunctionR
+       // The top element of the stack is now an in-doc element. Return here.
+       break;
+     }
+   }
+ 
+   return removedElement;
+ }
+ 
++void Document::GetWireframe(bool aIncludeNodes,
++                            Nullable<Wireframe>& aWireframe) {
++  using FrameForPointOptions = nsLayoutUtils::FrameForPointOptions;
++  using FrameForPointOption = nsLayoutUtils::FrameForPointOption;
++  FlushPendingNotifications(FlushType::Layout);
++
++  PresShell* shell = GetPresShell();
++  if (!shell) {
++    return;
++  }
++
++  nsPresContext* pc = shell->GetPresContext();
++  if (!pc) {
++    return;
++  }
++
++  auto& wireframe = aWireframe.SetValue();
++  nsStyleUtil::GetSerializedColorValue(shell->GetCanvasBackground(),
++                                       wireframe.mCanvasBackground.Construct());
++
++  FrameForPointOptions options;
++  options.mBits += FrameForPointOption::IgnoreCrossDoc;
++  options.mBits += FrameForPointOption::IgnorePaintSuppression;
++  options.mBits += FrameForPointOption::OnlyVisible;
++
++  AutoTArray<nsIFrame*, 32> frames;
++  const RelativeTo relativeTo{shell->GetRootFrame(),
++                              mozilla::ViewportType::Layout};
++  nsLayoutUtils::GetFramesForArea(relativeTo, pc->GetVisibleArea(), frames,
++                                  options);
++
++  // TODO(emilio): We could rewrite hit testing to return nsDisplayItem*s or
++  // something perhaps, but seems hard / like it'd involve at least some extra
++  // copying around, since they don't outlive GetFramesForArea.
++  auto& rects = wireframe.mRects.Construct();
++  if (!rects.SetCapacity(frames.Length(), fallible)) {
++    return;
++  }
++  for (nsIFrame* frame : frames) {
++    // Can't really fail because SetCapacity succeeded.
++    auto& taggedRect = *rects.AppendElement(fallible);
++    const auto r =
++        CSSRect::FromAppUnits(nsLayoutUtils::TransformFrameRectToAncestor(
++            frame, frame->GetRectRelativeToSelf(), relativeTo));
++    if (aIncludeNodes) {
++      if (nsIContent* c = frame->GetContent()) {
++        taggedRect.mNode.Construct(c);
++      }
++    }
++    taggedRect.mRect.Construct(MakeRefPtr<DOMRectReadOnly>(
++        ToSupports(this), r.x, r.y, r.width, r.height));
++    taggedRect.mType.Construct() = [&] {
++      if (frame->IsTextFrame()) {
++        nsStyleUtil::GetSerializedColorValue(
++            frame->StyleText()->mWebkitTextFillColor.CalcColor(frame),
++            taggedRect.mColor.Construct());
++        return WireframeRectType::Text;
++      }
++      if (frame->IsImageFrame() || frame->IsSVGOuterSVGFrame()) {
++        return WireframeRectType::Image;
++      }
++      if (frame->IsThemed()) {
++        return WireframeRectType::Background;
++      }
++      bool drawImage = false;
++      bool drawColor = false;
++      const nscolor color = nsCSSRendering::DetermineBackgroundColor(
++          pc, frame->Style(), frame, drawImage, drawColor);
++      if (drawImage &&
++          !frame->StyleBackground()->mImage.BottomLayer().mImage.IsNone()) {
++        return WireframeRectType::Image;
++      }
++      if (drawColor) {
++        nsStyleUtil::GetSerializedColorValue(color,
++                                             taggedRect.mColor.Construct());
++        return WireframeRectType::Background;
++      }
++      return WireframeRectType::Unknown;
++    }();
++  }
++}
++
+ Element* Document::GetTopLayerTop() {
+   if (mTopLayer.IsEmpty()) {
+     return nullptr;
+   }
+   uint32_t last = mTopLayer.Length() - 1;
+   nsCOMPtr<Element> element(do_QueryReferent(mTopLayer[last]));
+   NS_ASSERTION(element, "Should have a top layer element!");
+   NS_ASSERTION(element->IsInComposedDoc(),
+diff --git a/dom/base/Document.h b/dom/base/Document.h
+--- a/dom/base/Document.h
++++ b/dom/base/Document.h
+@@ -3397,16 +3397,19 @@ class Document : public nsINode,
+   void MozSetImageElement(const nsAString& aImageElementId, Element* aElement);
+   nsIURI* GetDocumentURIObject() const;
+   // Not const because all the fullscreen goop is not const
+   const char* GetFullscreenError(CallerType);
+   bool FullscreenEnabled(CallerType aCallerType) {
+     return !GetFullscreenError(aCallerType);
+   }
+ 
++  MOZ_CAN_RUN_SCRIPT void GetWireframe(bool aIncludeNodes,
++                                       Nullable<Wireframe>&);
++
+   Element* GetTopLayerTop();
+   // Return the fullscreen element in the top layer
+   Element* GetUnretargetedFullScreenElement() const;
+   bool Fullscreen() const { return !!GetUnretargetedFullScreenElement(); }
+   already_AddRefed<Promise> ExitFullscreen(ErrorResult&);
+   void ExitPointerLock() { PointerLockManager::Unlock(this); }
+   void GetFgColor(nsAString& aFgColor);
+   void SetFgColor(const nsAString& aFgColor);
+diff --git a/dom/webidl/Document.webidl b/dom/webidl/Document.webidl
+--- a/dom/webidl/Document.webidl
++++ b/dom/webidl/Document.webidl
+@@ -711,8 +711,30 @@ partial interface Document {
+   void setNotifyFormOrPasswordRemoved(boolean aShouldNotify);
+ };
+ 
+ // Extension to allow chrome code to detect initial about:blank documents.
+ partial interface Document {
+   [ChromeOnly]
+   readonly attribute boolean isInitialDocument;
+ };
++
++// Extension to allow chrome code to get some wireframe-like structure.
++enum WireframeRectType {
++  "image",
++  "background",
++  "text",
++  "unknown",
++};
++dictionary WireframeTaggedRect {
++  DOMRectReadOnly rect;
++  DOMString? color; /* Only relevant for "background" rects */
++  WireframeRectType type;
++  Node? node;
++};
++dictionary Wireframe {
++  DOMString canvasBackground;
++  sequence<WireframeTaggedRect> rects;
++};
++partial interface Document {
++  [ChromeOnly]
++  Wireframe? getWireframe(optional boolean aIncludeNodes = false);
++};
+diff --git a/layout/painting/moz.build b/layout/painting/moz.build
+--- a/layout/painting/moz.build
++++ b/layout/painting/moz.build
+@@ -10,16 +10,17 @@ with Files("**"):
+ EXPORTS += [
+     "ActiveLayerTracker.h",
+     "DisplayItemClip.h",
+     "DisplayItemClipChain.h",
+     "DisplayListClipState.h",
+     "HitTestInfo.h",
+     "LayerState.h",
+     "MatrixStack.h",
++    "nsCSSRendering.h",
+     "nsCSSRenderingBorders.h",
+     "nsCSSRenderingGradients.h",
+     "nsDisplayItemTypes.h",
+     "nsDisplayItemTypesList.h",
+     "nsDisplayList.h",
+     "nsDisplayListArenaTypes.h",
+     "nsDisplayListInvalidation.h",
+     "nsImageRenderer.h",
+

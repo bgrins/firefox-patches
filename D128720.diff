@@ -1,0 +1,158 @@
+diff --git a/dom/base/Document.h b/dom/base/Document.h
+--- a/dom/base/Document.h
++++ b/dom/base/Document.h
+@@ -3401,6 +3401,9 @@
+     return !GetFullscreenError(aCallerType);
+   }
+ 
++  MOZ_CAN_RUN_SCRIPT void GetWireframe(bool aIncludeNodes,
++                                       Nullable<Wireframe>&);
++
+   Element* GetTopLayerTop();
+   // Return the fullscreen element in the top layer
+   Element* GetUnretargetedFullScreenElement() const;
+diff --git a/dom/base/Document.cpp b/dom/base/Document.cpp
+--- a/dom/base/Document.cpp
++++ b/dom/base/Document.cpp
+@@ -256,6 +256,7 @@
+ #include "nsCSSPropertyID.h"
+ #include "nsCSSProps.h"
+ #include "nsCSSPseudoElements.h"
++#include "nsCSSRendering.h"
+ #include "nsCanvasFrame.h"
+ #include "nsCaseTreatment.h"
+ #include "nsCharsetSource.h"
+@@ -396,6 +397,7 @@
+ #include "nsSerializationHelper.h"
+ #include "nsServiceManagerUtils.h"
+ #include "nsStringFlags.h"
++#include "nsStyleUtil.h"
+ #include "nsStringIterator.h"
+ #include "nsStyleSheetService.h"
+ #include "nsStyleStruct.h"
+@@ -14444,6 +14446,84 @@
+   return removedElement;
+ }
+ 
++void Document::GetWireframe(bool aIncludeNodes,
++                            Nullable<Wireframe>& aWireframe) {
++  using FrameForPointOptions = nsLayoutUtils::FrameForPointOptions;
++  using FrameForPointOption = nsLayoutUtils::FrameForPointOption;
++  FlushPendingNotifications(FlushType::Layout);
++
++  PresShell* shell = GetPresShell();
++  if (!shell) {
++    return;
++  }
++
++  nsPresContext* pc = shell->GetPresContext();
++  if (!pc) {
++    return;
++  }
++
++  auto& wireframe = aWireframe.SetValue();
++  nsStyleUtil::GetSerializedColorValue(
++      shell->GetCanvasBackground(), wireframe.mCanvasBackground.Construct());
++
++  FrameForPointOptions options;
++  options.mBits += FrameForPointOption::IgnoreCrossDoc;
++  options.mBits += FrameForPointOption::IgnorePaintSuppression;
++  options.mBits += FrameForPointOption::OnlyVisible;
++
++  AutoTArray<nsIFrame*, 32> frames;
++  const RelativeTo relativeTo{shell->GetRootFrame(),
++                              mozilla::ViewportType::Layout};
++  nsLayoutUtils::GetFramesForArea(relativeTo, pc->GetVisibleArea(), frames,
++                                  options);
++
++  // TODO(emilio): We could rewrite hit testing to return nsDisplayItem*s or
++  // something perhaps, but seems hard / like it'd involve at least some extra
++  // copying around, since they don't outlive GetFramesForArea.
++  auto& rects = wireframe.mRects.Construct();
++  if (!rects.SetCapacity(frames.Length(), fallible)) {
++    return;
++  }
++  for (nsIFrame* frame : frames) {
++    // Can't really fail because SetCapacity succeeded.
++    auto& taggedRect = *rects.AppendElement(fallible);
++    const auto r =
++        CSSRect::FromAppUnits(nsLayoutUtils::TransformFrameRectToAncestor(
++            frame, frame->GetRectRelativeToSelf(), relativeTo));
++    if (aIncludeNodes) {
++      if (nsIContent* c = frame->GetContent()) {
++        taggedRect.mNode.Construct(c);
++      }
++    }
++    taggedRect.mRect.Construct(MakeRefPtr<DOMRectReadOnly>(
++        ToSupports(this), r.x, r.y, r.width, r.height));
++    taggedRect.mType.Construct() = [&] {
++      if (frame->IsTextFrame()) {
++        return WireframeRectType::Text;
++      }
++      if (frame->IsImageFrame() || frame->IsSVGOuterSVGFrame()) {
++        return WireframeRectType::Image;
++      }
++      if (frame->IsThemed()) {
++        return WireframeRectType::Background;
++      }
++      bool drawImage = false;
++      bool drawColor = false;
++      const nscolor color = nsCSSRendering::DetermineBackgroundColor(
++          pc, frame->Style(), frame, drawImage, drawColor);
++      if (drawImage && !frame->StyleBackground()->mImage.BottomLayer().mImage.IsNone()) {
++        return WireframeRectType::Image;
++      }
++      if (drawColor) {
++        nsStyleUtil::GetSerializedColorValue(color,
++                                             taggedRect.mColor.Construct());
++        return WireframeRectType::Background;
++      }
++      return WireframeRectType::Unknown;
++    }();
++  }
++}
++
+ Element* Document::GetTopLayerTop() {
+   if (mTopLayer.IsEmpty()) {
+     return nullptr;
+diff --git a/dom/webidl/Document.webidl b/dom/webidl/Document.webidl
+--- a/dom/webidl/Document.webidl
++++ b/dom/webidl/Document.webidl
+@@ -716,3 +716,25 @@
+   [ChromeOnly]
+   readonly attribute boolean isInitialDocument;
+ };
++
++// Extension to allow chrome code to get some wireframe-like structure.
++enum WireframeRectType {
++  "image",
++  "background",
++  "text",
++  "unknown",
++};
++dictionary WireframeTaggedRect {
++  DOMRectReadOnly rect;
++  DOMString? color; /* Only relevant for "background" rects */
++  WireframeRectType type;
++  Node? node;
++};
++dictionary Wireframe {
++  DOMString canvasBackground;
++  sequence<WireframeTaggedRect> rects;
++};
++partial interface Document {
++  [ChromeOnly]
++  Wireframe? getWireframe(optional boolean aIncludeNodes = false);
++};
+diff --git a/layout/painting/moz.build b/layout/painting/moz.build
+--- a/layout/painting/moz.build
++++ b/layout/painting/moz.build
+@@ -15,6 +15,7 @@
+     "HitTestInfo.h",
+     "LayerState.h",
+     "MatrixStack.h",
++    "nsCSSRendering.h",
+     "nsCSSRenderingBorders.h",
+     "nsCSSRenderingGradients.h",
+     "nsDisplayItemTypes.h",
+
