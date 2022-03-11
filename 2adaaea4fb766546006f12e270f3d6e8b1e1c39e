@@ -1,0 +1,773 @@
+
+# HG changeset patch
+# User Dave Townsend <dtownsend@oxymoronical.com>
+# Date 1646423629 0
+# Node ID 2adaaea4fb766546006f12e270f3d6e8b1e1c39e
+# Parent  7f96452dbcfd52e1405e308c9193ae74baac6c31
+Bug 1758087: Add about:doherror to inform the user that the DoH connection has failed. r=Gijs,fluent-reviewers
+
+Differential Revision: https://phabricator.services.mozilla.com/D140311
+
+diff --git a/browser/components/BrowserGlue.jsm b/browser/components/BrowserGlue.jsm
+--- a/browser/components/BrowserGlue.jsm
++++ b/browser/components/BrowserGlue.jsm
+@@ -181,16 +181,31 @@ let JSPROCESSACTORS = {
+ };
+ 
+ /**
+  * Fission-compatible JSWindowActor implementations.
+  * Detailed documentation of these options is in dom/docs/ipc/jsactors.rst,
+  * available at https://firefox-source-docs.mozilla.org/dom/ipc/jsactors.html
+  */
+ let JSWINDOWACTORS = {
++  AboutDoHError: {
++    parent: {
++      moduleURI: "resource:///actors/AboutDoHErrorParent.jsm",
++    },
++    child: {
++      moduleURI: "resource:///actors/AboutDoHErrorChild.jsm",
++      events: {
++        DoHAllowFallback: { wantUntrusted: true },
++        DoHRetry: { wantUntrusted: true },
++      },
++    },
++    matches: ["about:doherror?*"],
++    allFrames: true,
++  },
++
+   AboutLogins: {
+     parent: {
+       moduleURI: "resource:///actors/AboutLoginsParent.jsm",
+     },
+     child: {
+       moduleURI: "resource:///actors/AboutLoginsChild.jsm",
+       events: {
+         AboutLoginsCopyLoginDetail: { wantUntrusted: true },
+diff --git a/browser/components/about/AboutRedirector.cpp b/browser/components/about/AboutRedirector.cpp
+--- a/browser/components/about/AboutRedirector.cpp
++++ b/browser/components/about/AboutRedirector.cpp
+@@ -136,16 +136,20 @@ static const RedirEntry kRedirMap[] = {
+     {"protections", "chrome://browser/content/protections.html",
+      nsIAboutModule::URI_SAFE_FOR_UNTRUSTED_CONTENT |
+          nsIAboutModule::URI_MUST_LOAD_IN_CHILD | nsIAboutModule::ALLOW_SCRIPT |
+          nsIAboutModule::URI_CAN_LOAD_IN_PRIVILEGEDABOUT_PROCESS |
+          nsIAboutModule::IS_SECURE_CHROME_UI},
+     {"ion", "chrome://browser/content/ion.html",
+      nsIAboutModule::ALLOW_SCRIPT | nsIAboutModule::HIDE_FROM_ABOUTABOUT |
+          nsIAboutModule::IS_SECURE_CHROME_UI},
++    {"doherror", "chrome://browser/content/doh/aboutDoHError.xhtml",
++     nsIAboutModule::URI_SAFE_FOR_UNTRUSTED_CONTENT |
++         nsIAboutModule::ALLOW_SCRIPT | nsIAboutModule::URI_MUST_LOAD_IN_CHILD |
++         nsIAboutModule::HIDE_FROM_ABOUTABOUT},
+ };
+ 
+ static nsAutoCString GetAboutModuleName(nsIURI* aURI) {
+   nsAutoCString path;
+   aURI->GetPathQueryRef(path);
+ 
+   int32_t f = path.FindChar('#');
+   if (f >= 0) path.SetLength(f);
+diff --git a/browser/components/about/components.conf b/browser/components/about/components.conf
+--- a/browser/components/about/components.conf
++++ b/browser/components/about/components.conf
+@@ -2,16 +2,17 @@
+ # vim: set filetype=python:
+ # This Source Code Form is subject to the terms of the Mozilla Public
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ pages = [
+     'blocked',
+     'certerror',
++    'doherror',
+     'downloads',
+     'framecrashed',
+     'home',
+     'logins',
+     'loginsimportreport',
+     'newtab',
+     'ion',
+     'pocket-home',
+diff --git a/browser/components/doh/AboutDoHErrorChild.jsm b/browser/components/doh/AboutDoHErrorChild.jsm
+new file mode 100644
+--- /dev/null
++++ b/browser/components/doh/AboutDoHErrorChild.jsm
+@@ -0,0 +1,22 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++var EXPORTED_SYMBOLS = ["AboutDoHErrorChild"];
++
++class AboutDoHErrorChild extends JSWindowActorChild {
++  handleEvent(event) {
++    switch (event.type) {
++      case "DoHAllowFallback": {
++        this.sendAsyncMessage("DoH:AllowFallback");
++        break;
++      }
++      case "DoHRetry": {
++        this.sendAsyncMessage("DoH:Retry");
++        break;
++      }
++    }
++  }
++}
+diff --git a/browser/components/doh/AboutDoHErrorParent.jsm b/browser/components/doh/AboutDoHErrorParent.jsm
+new file mode 100644
+--- /dev/null
++++ b/browser/components/doh/AboutDoHErrorParent.jsm
+@@ -0,0 +1,57 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++var EXPORTED_SYMBOLS = ["AboutDoHErrorParent"];
++
++const { XPCOMUtils } = ChromeUtils.import(
++  "resource://gre/modules/XPCOMUtils.jsm"
++);
++
++XPCOMUtils.defineLazyModuleGetters(this, {
++  Services: "resource://gre/modules/Services.jsm",
++});
++
++XPCOMUtils.defineLazyServiceGetter(
++  this,
++  "dnsService",
++  "@mozilla.org/network/dns-service;1",
++  "nsIDNSService"
++);
++
++XPCOMUtils.defineLazyGlobalGetters(this, ["URLSearchParams"]);
++
++class AboutDoHErrorParent extends JSWindowActorParent {
++  receiveMessage({ name }) {
++    let params = new URLSearchParams(
++      this.browsingContext.currentWindowContext.documentURI.query
++    );
++    let url = params.get("u");
++    if (!url) {
++      return;
++    }
++
++    switch (name) {
++      case "DoH:AllowFallback": {
++        // Switch TRR to allow fallback and reload the url.
++        Services.prefs.setIntPref("network.trr.mode", 2);
++        dnsService.clearCache(true);
++
++        this.browsingContext.top.embedderElement.loadURI(url, {
++          triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
++          loadFlags: Ci.nsIWebNavigation.LOAD_FLAGS_REPLACE_HISTORY,
++        });
++        break;
++      }
++      case "DoH:Retry": {
++        this.browsingContext.top.embedderElement.loadURI(url, {
++          triggeringPrincipal: Services.scriptSecurityManager.getSystemPrincipal(),
++          loadFlags: Ci.nsIWebNavigation.LOAD_FLAGS_REPLACE_HISTORY,
++        });
++        break;
++      }
++    }
++  }
++}
+diff --git a/browser/components/doh/content/aboutDoHError.js b/browser/components/doh/content/aboutDoHError.js
+new file mode 100644
+--- /dev/null
++++ b/browser/components/doh/content/aboutDoHError.js
+@@ -0,0 +1,20 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++document.getElementById("retry").addEventListener("click", () => {
++  document.dispatchEvent(new CustomEvent("DoHRetry", { bubbles: true }));
++});
++
++document.getElementById("allowFallback").addEventListener("click", () => {
++  document.dispatchEvent(
++    new CustomEvent("DoHAllowFallback", { bubbles: true })
++  );
++});
++
++document.getElementById("learnMoreLink").addEventListener("click", () => {
++  let block = document.getElementById("learn-more-block");
++  block.hidden = !block.hidden;
++});
+diff --git a/browser/components/doh/content/aboutDoHError.xhtml b/browser/components/doh/content/aboutDoHError.xhtml
+new file mode 100644
+--- /dev/null
++++ b/browser/components/doh/content/aboutDoHError.xhtml
+@@ -0,0 +1,43 @@
++<?xml version="1.0" encoding="UTF-8"?>
++
++<!DOCTYPE html>
++<!-- This Source Code Form is subject to the terms of the Mozilla Public
++   - License, v. 2.0. If a copy of the MPL was not distributed with this
++   - file, You can obtain one at http://mozilla.org/MPL/2.0/. -->
++<html xmlns="http://www.w3.org/1999/xhtml">
++  <head>
++    <meta http-equiv="Content-Security-Policy" content="default-src chrome:; object-src 'none'" />
++    <meta name="color-scheme" content="light dark" />
++    <link rel="stylesheet" href="chrome://global/skin/in-content/info-pages.css" />
++    <link rel="stylesheet" href="chrome://browser/skin/aboutDoHError.css" />
++    <link rel="localization" href="branding/brand.ftl" />
++    <link rel="localization" href="browser/aboutDoHError.ftl" />
++    <link rel="icon" id="favicon" href="chrome://global/skin/icons/info.svg" />
++    <title data-l10n-id="doh-block-tracking-warning"></title>
++  </head>
++  <body>
++    <main class="container">
++      <div class="title">
++        <h2 data-l10n-id="doh-block-tracking-warning"></h2>
++        <h1 class="title-text" data-l10n-id="doh-block-block-headline"></h1>
++      </div>
++      <p id="insecure-explanation-unavailable" data-l10n-id="doh-block-explanation"></p>
++      <p id="learn-more-container">
++        <a id="learnMoreLink" target="_blank" data-l10n-id="doh-block-link-learn-more"></a>
++      </p>
++
++      <ul id="learn-more-block" hidden="true">
++          <li data-l10n-id="doh-block-details-1"></li>
++          <li data-l10n-id="doh-block-details-2"></li>
++          <li data-l10n-id="doh-block-details-3"></li>
++          <li data-l10n-id="doh-block-details-4"></li>
++      </ul>
++
++      <div class="button-container">
++        <button id="retry" data-l10n-id="doh-block-button-retry"></button>
++        <button id="allowFallback" data-l10n-id="doh-block-button-accept-tracking"></button>
++      </div>
++    </main>
++    <script src="chrome://browser/content/doh/aboutDoHError.js"></script>
++  </body>
++</html>
+diff --git a/browser/components/doh/jar.mn b/browser/components/doh/jar.mn
+new file mode 100644
+--- /dev/null
++++ b/browser/components/doh/jar.mn
+@@ -0,0 +1,7 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++browser.jar:
++        content/browser/doh/aboutDoHError.xhtml        (content/aboutDoHError.xhtml)
++        content/browser/doh/aboutDoHError.js           (content/aboutDoHError.js)
+diff --git a/browser/components/doh/moz.build b/browser/components/doh/moz.build
+--- a/browser/components/doh/moz.build
++++ b/browser/components/doh/moz.build
+@@ -9,14 +9,21 @@ with Files("**"):
+ 
+ EXTRA_JS_MODULES += [
+     "DoHConfig.jsm",
+     "DoHController.jsm",
+     "DoHHeuristics.jsm",
+     "TRRPerformance.jsm",
+ ]
+ 
++FINAL_TARGET_FILES.actors += [
++    "AboutDoHErrorChild.jsm",
++    "AboutDoHErrorParent.jsm",
++]
++
++JAR_MANIFESTS += ["jar.mn"]
++
+ TESTING_JS_MODULES += [
+     "DoHTestUtils.jsm",
+ ]
+ 
+ XPCSHELL_TESTS_MANIFESTS += ["test/unit/xpcshell.ini"]
+ BROWSER_CHROME_MANIFESTS += ["test/browser/browser.ini"]
+diff --git a/browser/components/doh/test/browser/browser.ini b/browser/components/doh/test/browser/browser.ini
+--- a/browser/components/doh/test/browser/browser.ini
++++ b/browser/components/doh/test/browser/browser.ini
+@@ -1,15 +1,16 @@
+ [DEFAULT]
+ head = head.js
+ 
+ [browser_cleanFlow.js]
+ skip-if = socketprocess_networking
+ [browser_dirtyEnable.js]
+ [browser_doorhangerUserReject.js]
++[browser_errorPage.js]
+ [browser_localStorageMigration.js]
+ [browser_NextDNSMigration.js]
+ [browser_policyOverride.js]
+ [browser_providerSteering.js]
+ [browser_remoteSettings_newProfile.js]
+ skip-if = os == 'win' && bits == 32 # Bug 1713464
+ [browser_remoteSettings_rollout.js]
+ skip-if = os == 'win' && bits == 32 # Bug 1713464
+diff --git a/browser/components/doh/test/browser/browser_errorPage.js b/browser/components/doh/test/browser/browser_errorPage.js
+new file mode 100644
+--- /dev/null
++++ b/browser/components/doh/test/browser/browser_errorPage.js
+@@ -0,0 +1,263 @@
++/* Any copyright is dedicated to the Public Domain.
++ * http://creativecommons.org/publicdomain/zero/1.0/
++ */
++
++"use strict";
++
++let dnsService = Cc["@mozilla.org/network/dns-service;1"].getService(
++  Ci.nsIDNSService
++);
++let dnsOverride = Cc["@mozilla.org/network/native-dns-override;1"].getService(
++  Ci.nsINativeDNSResolverOverride
++);
++
++let { HttpServer } = ChromeUtils.import("resource://testing-common/httpd.js");
++
++let gPort;
++
++function loadHandler(metadata, response) {
++  response.setStatusLine(metadata.httpVersion, 200, "Ok");
++  response.setHeader("Content-Type", "text/html", false);
++  let body = `
++    <!DOCTYPE HTML>
++      <html>
++        <head>
++          <meta charset='utf-8'>
++          <title>Ok</title>
++        </head>
++        <body>
++          Ok
++        </body>
++    </html>`;
++  response.bodyOutputStream.write(body, body.length);
++}
++
++add_setup(() => {
++  dnsOverride.addIPOverride("wubble.com", "127.0.0.1");
++  dnsOverride.addIPOverride("wibble.com", "127.0.0.1");
++
++  // Strict native fallback introduces a race condition we can ignore here.
++  Services.prefs.setBoolPref("network.trr.strict_native_fallback", false);
++  Services.prefs.setBoolPref("network.trr.show_error_page", true);
++
++  let httpServer = new HttpServer();
++  httpServer.registerPathHandler("/foo", loadHandler);
++  httpServer.start(-1);
++  gPort = httpServer.identity.primaryPort;
++
++  registerCleanupFunction(() => {
++    Services.prefs.clearUserPref("network.trr.mode");
++    Services.prefs.clearUserPref("network.trr.uri");
++    Services.prefs.clearUserPref("network.trr.strict_native_fallback");
++    Services.prefs.clearUserPref("network.trr.show_error_page");
++    dnsOverride.clearHostOverride("wubble.com");
++    dnsOverride.clearHostOverride("wibble.com");
++
++    httpServer.stop();
++  });
++});
++
++async function errorPageLoaded(browser) {
++  await BrowserTestUtils.browserLoaded(browser, false, null, true);
++
++  // Wait for the content to layout.
++  await SpecialPowers.spawn(browser, [], async () => {
++    await ContentTaskUtils.waitForCondition(() => {
++      let element = content.document.getElementById("learnMoreLink");
++      let { width } = element.getBoundingClientRect();
++      return width > 0;
++    });
++
++    await ContentTaskUtils.waitForCondition(() => {
++      let element = content.document.getElementById("retry");
++      let { width } = element.getBoundingClientRect();
++      return width > 0;
++    });
++  });
++}
++
++async function realPageLoaded(browser) {
++  await BrowserTestUtils.browserLoaded(browser);
++}
++
++add_task(async function test_reload() {
++  let TEST_URL = `http://wubble.com:${gPort}/foo`;
++
++  // Set TRR only mode and use our test server (which won't respond to TRR requests).
++  Services.prefs.setIntPref("network.trr.mode", 3);
++  Services.prefs.setCharPref("network.trr.uri", "https://example.com");
++
++  await BrowserTestUtils.withNewTab("about:blank", async browser => {
++    let loaded = errorPageLoaded(browser);
++    BrowserTestUtils.loadURI(browser, TEST_URL);
++    await loaded;
++
++    let { loadedPage, sourceUrl } = await SpecialPowers.spawn(
++      browser,
++      [],
++      async () => {
++        let documentURI = new content.URL(content.document.documentURI);
++        return {
++          loadedPage: content.document.documentURI.split("?")[0],
++          sourceUrl: documentURI.searchParams.get("u"),
++        };
++      }
++    );
++
++    Assert.equal(
++      loadedPage,
++      "about:doherror",
++      "Should have loaded the error page."
++    );
++    Assert.equal(
++      sourceUrl,
++      TEST_URL,
++      "Should have passed the right source page."
++    );
++
++    let sectionVisible = await SpecialPowers.spawn(browser, [], () =>
++      ContentTaskUtils.is_visible(
++        content.document.getElementById("learn-more-block")
++      )
++    );
++    Assert.ok(!sectionVisible, "Advanced section should be hidden.");
++
++    await BrowserTestUtils.synthesizeMouseAtCenter(
++      "#learnMoreLink",
++      {},
++      browser
++    );
++
++    await SpecialPowers.spawn(browser, [], () =>
++      ContentTaskUtils.waitForCondition(
++        () =>
++          ContentTaskUtils.is_visible(
++            content.document.getElementById("learn-more-block")
++          ),
++        "Wait for section to show"
++      )
++    );
++
++    await BrowserTestUtils.synthesizeMouseAtCenter(
++      "#learnMoreLink",
++      {},
++      browser
++    );
++
++    await SpecialPowers.spawn(browser, [], () =>
++      ContentTaskUtils.waitForCondition(
++        () =>
++          ContentTaskUtils.is_hidden(
++            content.document.getElementById("learn-more-block")
++          ),
++        "Wait for section to hide"
++      )
++    );
++
++    // Click to retry.
++    info("Retrying the load");
++    loaded = errorPageLoaded(browser);
++    await BrowserTestUtils.synthesizeMouseAtCenter("#retry", {}, browser);
++    await loaded;
++
++    ({ loadedPage, sourceUrl } = await SpecialPowers.spawn(
++      browser,
++      [],
++      async () => {
++        let documentURI = new content.URL(content.document.documentURI);
++        return {
++          loadedPage: content.document.documentURI.split("?")[0],
++          sourceUrl: documentURI.searchParams.get("u"),
++        };
++      }
++    ));
++
++    Assert.equal(
++      loadedPage,
++      "about:doherror",
++      "Should have loaded the error page."
++    );
++    Assert.equal(
++      sourceUrl,
++      TEST_URL,
++      "Should have passed the right source page."
++    );
++
++    // Manually allow fallback and try again
++    Services.prefs.setIntPref("network.trr.mode", 2);
++    dnsService.clearCache(true);
++    info("Retrying the load");
++    loaded = realPageLoaded(browser);
++    await BrowserTestUtils.synthesizeMouseAtCenter("#retry", {}, browser);
++    await loaded;
++
++    let loadedUrl = await SpecialPowers.spawn(
++      browser,
++      [],
++      () => content.document.documentURI
++    );
++
++    Assert.equal(loadedUrl, TEST_URL, "Should have loaded the right page.");
++  });
++});
++
++add_task(async () => {
++  let TEST_URL = `http://wibble.com:${gPort}/foo`;
++
++  // Set TRR only mode and use our test server (which won't respond to TRR requests).
++  Services.prefs.setIntPref("network.trr.mode", 3);
++  Services.prefs.setCharPref("network.trr.uri", "https://example.com");
++
++  await BrowserTestUtils.withNewTab("about:blank", async browser => {
++    let loaded = errorPageLoaded(browser);
++    BrowserTestUtils.loadURI(browser, TEST_URL);
++    await loaded;
++
++    let { loadedPage, sourceUrl } = await SpecialPowers.spawn(
++      browser,
++      [],
++      async () => {
++        let documentURI = new content.URL(content.document.documentURI);
++        return {
++          loadedPage: content.document.documentURI.split("?")[0],
++          sourceUrl: documentURI.searchParams.get("u"),
++        };
++      }
++    );
++
++    Assert.equal(
++      loadedPage,
++      "about:doherror",
++      "Should have loaded the error page."
++    );
++    Assert.equal(
++      sourceUrl,
++      TEST_URL,
++      "Should have passed the right source page."
++    );
++
++    // Allow the fallback and reload.
++    info("Retrying the load");
++    loaded = realPageLoaded(browser);
++    await BrowserTestUtils.synthesizeMouseAtCenter(
++      "#allowFallback",
++      {},
++      browser
++    );
++    await loaded;
++
++    let loadedUrl = await SpecialPowers.spawn(
++      browser,
++      [],
++      () => content.document.documentURI
++    );
++
++    Assert.equal(loadedUrl, TEST_URL, "Should have loaded the right page.");
++
++    Assert.equal(
++      Services.prefs.getIntPref("network.trr.mode"),
++      2,
++      "Should have configured TRR to allow the fallback"
++    );
++  });
++});
+diff --git a/browser/locales/en-US/browser/aboutDoHError.ftl b/browser/locales/en-US/browser/aboutDoHError.ftl
+new file mode 100644
+--- /dev/null
++++ b/browser/locales/en-US/browser/aboutDoHError.ftl
+@@ -0,0 +1,17 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++doh-block-tracking-warning = Tracking Warning
++doh-block-block-headline = Part of { -brand-short-name }’s anti-tracking protection has been blocked
++
++doh-block-explanation = To continue browsing you will need to turn this anti-tracking feature off. This means that ISPs and network providers will be able to see which websites you visit.
++
++doh-block-link-learn-more = Advanced Details…
++doh-block-details-1 = DNS is an initial setup step before you connect to any website
++doh-block-details-2 = { -brand-short-name } has enabled “DNS over HTTPS” which encrypts this initial step
++doh-block-details-3 = However DNS over HTTPS is unable to connect
++doh-block-details-4 = Unencrypted DNS is not blocked
++
++doh-block-button-retry = Retry with anti-tracking
++doh-block-button-accept-tracking = Accept tracking and continue
+diff --git a/browser/themes/shared/aboutDoHError.css b/browser/themes/shared/aboutDoHError.css
+new file mode 100644
+--- /dev/null
++++ b/browser/themes/shared/aboutDoHError.css
+@@ -0,0 +1,47 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++.title > h2 {
++  padding: 0;
++  margin: 0;
++  font-size: 17px;
++  font-weight: 500;
++}
++
++.title {
++  background-image: url("chrome://global/content/httpsonlyerror/secure-broken.svg");
++}
++
++em {
++  font-style: normal;
++  font-weight: 600;
++}
++
++#insecure-explanation-unavailable {
++  margin-bottom: 0.5em;
++}
++#learn-more-container {
++  margin-block: 0 2em;
++}
++
++.button-container {
++  display: flex;
++  flex-flow: row wrap;
++  justify-content: end;
++}
++
++@media only screen and (max-width: 480px) {
++  .button-container button {
++    width: 100%;
++    margin: 0.66em 0 0;
++  }
++}
++
++ul > li {
++  line-height: 1.5em;
++}
++
++.container {
++  position: relative;
++}
+diff --git a/browser/themes/shared/jar.inc.mn b/browser/themes/shared/jar.inc.mn
+--- a/browser/themes/shared/jar.inc.mn
++++ b/browser/themes/shared/jar.inc.mn
+@@ -2,16 +2,17 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ # This is not a complete / proper jar manifest. It is included by the
+ # actual theme-specific manifests, so that shared resources need only
+ # be specified once. As a result, the source file paths are relative
+ # to the location of the actual manifest.
+ 
++  skin/classic/browser/aboutDoHError.css                       (../shared/aboutDoHError.css)
+   skin/classic/browser/aboutFrameCrashed.css                   (../shared/aboutFrameCrashed.css)
+   skin/classic/browser/aboutNetError.css                       (../shared/aboutNetError.css)
+   skin/classic/browser/aboutRestartRequired.css                (../shared/aboutRestartRequired.css)
+   skin/classic/browser/aboutSessionRestore.css                 (../shared/aboutSessionRestore.css)
+   skin/classic/browser/aboutTabCrashed.css                     (../shared/aboutTabCrashed.css)
+   skin/classic/browser/aboutWelcomeBack.css                    (../shared/aboutWelcomeBack.css)
+   skin/classic/browser/blockedSite.css                         (../shared/blockedSite.css)
+   skin/classic/browser/error-pages.css                         (../shared/error-pages.css)
+diff --git a/docshell/base/nsDocShell.cpp b/docshell/base/nsDocShell.cpp
+--- a/docshell/base/nsDocShell.cpp
++++ b/docshell/base/nsDocShell.cpp
+@@ -37,16 +37,17 @@
+ #include "mozilla/SchedulerGroup.h"
+ #include "mozilla/ScopeExit.h"
+ #include "mozilla/ScrollTypes.h"
+ #include "mozilla/SimpleEnumerator.h"
+ #include "mozilla/StaticPrefs_browser.h"
+ #include "mozilla/StaticPrefs_docshell.h"
+ #include "mozilla/StaticPrefs_dom.h"
+ #include "mozilla/StaticPrefs_extensions.h"
++#include "mozilla/StaticPrefs_network.h"
+ #include "mozilla/StaticPrefs_privacy.h"
+ #include "mozilla/StaticPrefs_security.h"
+ #include "mozilla/StaticPrefs_ui.h"
+ #include "mozilla/StaticPrefs_fission.h"
+ #include "mozilla/StartupTimeline.h"
+ #include "mozilla/StorageAccess.h"
+ #include "mozilla/StoragePrincipalHelper.h"
+ #include "mozilla/Telemetry.h"
+@@ -105,16 +106,17 @@
+ #include "nsIChannelEventSink.h"
+ #include "nsIClassOfService.h"
+ #include "nsIConsoleReportCollector.h"
+ #include "nsIContent.h"
+ #include "nsIContentInlines.h"
+ #include "nsIContentSecurityPolicy.h"
+ #include "nsIContentViewer.h"
+ #include "nsIController.h"
++#include "nsIDNSService.h"
+ #include "nsIDocShellTreeItem.h"
+ #include "nsIDocShellTreeOwner.h"
+ #include "mozilla/dom/Document.h"
+ #include "nsIDocumentLoaderFactory.h"
+ #include "nsIDOMWindow.h"
+ #include "nsIEditingSession.h"
+ #include "nsIEffectiveTLDService.h"
+ #include "nsIExternalProtocolService.h"
+@@ -3833,16 +3835,34 @@ nsDocShell::DisplayLoadError(nsresult aE
+   // If the HTTPS-Only Mode upgraded this request and the upgrade might have
+   // caused this error, we replace the error-page with about:httpsonlyerror
+   bool isHttpsOnlyError =
+       nsHTTPSOnlyUtils::CouldBeHttpsOnlyError(aFailedChannel, aError);
+   if (isHttpsOnlyError) {
+     errorPage.AssignLiteral("httpsonlyerror");
+   }
+ 
++  // If the channel is in TRR only mode and this is a host error then use
++  // the DoH error page.
++  if ((aError == NS_ERROR_UNKNOWN_HOST ||
++       aError == NS_ERROR_UNKNOWN_PROXY_HOST) &&
++      StaticPrefs::network_trr_show_error_page()) {
++    nsIRequest::TRRMode mode = aFailedChannel ? aFailedChannel->GetTRRMode()
++                                              : nsIRequest::TRR_DEFAULT_MODE;
++    bool trrOnly = mode == nsIRequest::TRR_ONLY_MODE;
++    if (mode == nsIRequest::TRR_DEFAULT_MODE) {
++      trrOnly = Preferences::GetInt("network.trr.mode", 0) ==
++                nsIDNSService::MODE_TRRONLY;
++    }
++
++    if (trrOnly) {
++      errorPage.AssignLiteral("doherror");
++    }
++  }
++
+   if (nsCOMPtr<nsILoadURIDelegate> loadURIDelegate = GetLoadURIDelegate()) {
+     nsCOMPtr<nsIURI> errorPageURI;
+     rv = loadURIDelegate->HandleLoadError(
+         aURI, (isHttpsOnlyError ? NS_ERROR_HTTPS_ONLY : aError),
+         NS_ERROR_GET_MODULE(aError), getter_AddRefs(errorPageURI));
+     // If the docshell is going away there's no point in showing an error page.
+     if (NS_FAILED(rv) || mIsBeingDestroyed) {
+       *aDisplayedErrorPage = false;
+diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
+--- a/modules/libpref/init/StaticPrefList.yaml
++++ b/modules/libpref/init/StaticPrefList.yaml
+@@ -10546,16 +10546,22 @@
+   mirror: always
+ 
+ # Whether to use the connection info that is generated asynchronously.
+ - name: network.trr.async_connInfo
+   type: RelaxedAtomicBool
+   value: false
+   mirror: always
+ 
++# Whether to show an error in strict mode
++- name: network.trr.show_error_page
++  type: bool
++  value: false
++  mirror: always
++
+ # Allow the network changed event to get sent when a network topology or setup
+ # change is noticed while running.
+ - name: network.notify.changed
+   type: RelaxedAtomicBool
+   value: true
+   mirror: always
+ 
+ # Allow network detection of IPv6 related changes (bug 1245059)
+
