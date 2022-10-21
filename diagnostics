@@ -9,7 +9,7 @@ diff --git a/browser/actors/DiagnosticsCollectorChild.sys.mjs b/browser/actors/D
 new file mode 100644
 --- /dev/null
 +++ b/browser/actors/DiagnosticsCollectorChild.sys.mjs
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,54 @@
 +/* vim: set ts=2 sw=2 sts=2 et tw=80: */
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -22,17 +22,41 @@ new file mode 100644
 +
 +  actorCreated() {}
 +
-+  handleEvent(event) {
-+    // switch (event.)
-+    // console.log(event)
++  async handleEvent(event) {
 +    let content = event.target.ownerGlobal;
++    // console.log(this.manager.getActor("AboutReader"));
++    let actor = this.manager.getActor("PageInfo");
++
++    let media = await actor.getDocumentMedia(content.document);
++    let pageInfo = {
++      metaViewRows: actor.getMetaInfo(content.document),
++      docInfo: actor.getDocumentInfo(content.document),
++      windowInfo: actor.getWindowInfo(content),
++      media,
++    };
++    // console.log(JSON.stringify(pageInfo));
++    // let isReaderable = actor.canDoReadabilityCheck &&
++
++    // let actor = content.getActor("AboutReader");
++    // console.log(actor);
++    // actor.updateReaderButton(browser);
++
++    // https://searchfox.org/mozilla-central/source/dom/interfaces/base/nsIDOMWindowUtils.idl
 +    console.log("Load event");
-+    console.log(
-+      content.location.toString(),
-+      content.windowUtils.framesConstructed,
-+      content.windowUtils.framesReflowed,
-+      content.windowUtils.paintCount
-+    );
++    let metadata = {
++      url: content.location.toString(),
++      // framesConstructed: content.windowUtils.framesConstructed,
++      // framesReflowed: content.windowUtils.framesReflowed,
++      // paintCount: content.windowUtils.paintCount,
++      performanceEntries: content.performance.getEntries(),
++      pageInfo,
++    };
++    console.log(metadata);
++
++    this.sendAsyncMessage("DiagnosticsCollector:Write", {
++      metadata,
++    });
++
 +    // console.log(content, content.windowUtils, content.windowUtils.displayDPI);
 +  }
 +
@@ -44,39 +68,227 @@ diff --git a/browser/actors/DiagnosticsCollectorParent.sys.mjs b/browser/actors/
 new file mode 100644
 --- /dev/null
 +++ b/browser/actors/DiagnosticsCollectorParent.sys.mjs
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,221 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this
 + * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 +
-+const { BrowserWindowTracker } = ChromeUtils.import(
-+  "resource:///modules/BrowserWindowTracker.jsm"
-+);
++// const { XPCOMUtils } = ChromeUtils.importESModule(
++//   "resource://gre/modules/XPCOMUtils.sys.mjs"
++// );
++// XPCOMUtils.defineLazyGetter(this, "ZipWriter", function() {
++//   console.log("huh")
++//   return Components.Constructor("@mozilla.org/zipwriter;1", "nsIZipWriter");
++// });
 +
 +export class DiagnosticsCollectorParent extends JSWindowActorParent {
 +  receiveMessage(message) {
-+    console.log("DIAGNOSTICS COLLECTOR")
++    console.log("DIAGNOSTICS COLLECTOR");
 +    let browsingContext = this.manager.browsingContext;
 +    let browser = browsingContext.embedderElement;
 +    if (!browser) {
 +      return; // Can happen sometimes if browser is being destroyed
 +    }
 +
-+    let gBrowser = browser.ownerGlobal.gBrowser;
-+
 +    switch (message.name) {
-+      case "Browser:WindowCreated": {
-+        gBrowser.announceWindowCreated(browser, message.data.userContextId);
-+        BrowserWindowTracker.windowCreated(browser);
-+        break;
-+      }
++      case "DiagnosticsCollector:Write": {
++        let { metadata } = message.data;
++        let jsonString = JSON.stringify(metadata, null, 2);
 +
-+      case "Browser:FirstPaint": {
-+        browser.ownerGlobal.gBrowserInit._firstContentWindowPaintDeferred.resolve();
-+        break;
++        let options = {
++          url: metadata.url.toString(),
++          defaultFileName: "%hostname_Archive [%date]",
++          // compress: true,
++          compress: false,
++          jsonp: false,
++        };
++        // Save the HAR file if the file name is provided.
++        if (jsonString && options.defaultFileName) {
++          const file = getDefaultTargetFile(options);
++          if (file) {
++            HarUtils.saveToFile(file, jsonString, options.compress);
++          }
++        }
 +      }
 +    }
 +  }
++}
++
++const OPEN_FLAGS = {
++  RDONLY: parseInt("0x01", 16),
++  WRONLY: parseInt("0x02", 16),
++  CREATE_FILE: parseInt("0x08", 16),
++  APPEND: parseInt("0x10", 16),
++  TRUNCATE: parseInt("0x20", 16),
++  EXCL: parseInt("0x80", 16),
++};
++
++function formatDate(date) {
++  const year = String(date.getFullYear() % 100).padStart(2, "0");
++  const month = String(date.getMonth() + 1).padStart(2, "0");
++  const day = String(date.getDate()).padStart(2, "0");
++  const hour = String(date.getHours()).padStart(2, "0");
++  const minutes = String(date.getMinutes()).padStart(2, "0");
++  const seconds = String(date.getSeconds()).padStart(2, "0");
++
++  return `${year}-${month}-${day} ${hour}-${minutes}-${seconds}`;
++}
++
++/**
++ * Helper API for HAR export features.
++ */
++var HarUtils = {
++  getHarFileName(defaultFileName, jsonp, compress, hostname) {
++    const extension = jsonp ? ".jsonp" : ".json";
++
++    const now = new Date();
++    let name = defaultFileName.replace(/%date/g, formatDate(now));
++    name = name.replace(/%hostname/g, hostname);
++    name = name.replace(/\:/gm, "-", "");
++    name = name.replace(/\//gm, "_", "");
++
++    let fileName = name + extension;
++
++    // Default file extension is zip if compressing is on.
++    if (compress) {
++      fileName += ".zip";
++    }
++
++    return fileName;
++  },
++
++  /**
++   * Save HAR string into a given file. The file might be compressed
++   * if specified in the options.
++   *
++   * @param {File} file Target file where the HAR string (JSON)
++   * should be stored.
++   * @param {String} jsonString HAR data (JSON or JSONP)
++   * @param {Boolean} compress The result file is zipped if set to true.
++   */
++  saveToFile(file, jsonString, compress) {
++    const openFlags =
++      OPEN_FLAGS.WRONLY | OPEN_FLAGS.CREATE_FILE | OPEN_FLAGS.TRUNCATE;
++
++    try {
++      const foStream = Cc[
++        "@mozilla.org/network/file-output-stream;1"
++      ].createInstance(Ci.nsIFileOutputStream);
++
++      const permFlags = parseInt("0666", 8);
++      foStream.init(file, openFlags, permFlags, 0);
++
++      const convertor = Cc[
++        "@mozilla.org/intl/converter-output-stream;1"
++      ].createInstance(Ci.nsIConverterOutputStream);
++      convertor.init(foStream, "UTF-8");
++
++      // The entire jsonString can be huge so, write the data in chunks.
++      const chunkLength = 1024 * 1024;
++      for (let i = 0; i <= jsonString.length; i++) {
++        const data = jsonString.substr(i, chunkLength + 1);
++        if (data) {
++          convertor.writeString(data);
++        }
++
++        i = i + chunkLength;
++      }
++
++      // this closes foStream
++      convertor.close();
++    } catch (err) {
++      console.error(err);
++      return false;
++    }
++
++    // If no compressing then bail out.
++    if (!compress) {
++      return true;
++    }
++
++    // Remember name of the original file, it'll be replaced by a zip file.
++    const originalFilePath = file.path;
++    const originalFileName = file.leafName;
++
++    try {
++      // Rename using unique name (the file is going to be removed).
++      file.moveTo(null, "temp" + new Date().getTime() + "temphar");
++
++      // Create compressed file with the original file path name.
++      const zipFile = Cc["@mozilla.org/file/local;1"].createInstance(
++        Ci.nsIFile
++      );
++      zipFile.initWithPath(originalFilePath);
++
++      // The file within the zipped file doesn't use .zip extension.
++      let fileName = originalFileName;
++      if (fileName.indexOf(".zip") == fileName.length - 4) {
++        fileName = fileName.substr(0, fileName.indexOf(".zip"));
++      }
++
++      const ZipWriter = Components.Constructor(
++        "@mozilla.org/zipwriter;1",
++        "nsIZipWriter"
++      );
++      const zip = new ZipWriter();
++      zip.open(zipFile, openFlags);
++      zip.addEntryFile(
++        fileName,
++        Ci.nsIZipWriter.COMPRESSION_DEFAULT,
++        file,
++        false
++      );
++      zip.close();
++
++      // Remove the original file (now zipped).
++      file.remove(true);
++      return true;
++    } catch (err) {
++      console.error(err);
++
++      // Something went wrong (disk space?) rename the original file back.
++      file.moveTo(null, originalFileName);
++    }
++
++    return false;
++  },
++
++  getLocalDirectory(path) {
++    let dir;
++
++    if (!path) {
++      dir = Services.dirsvc.get("ProfD", Ci.nsIFile);
++      dir.append("diagnostics");
++      dir.append("logs");
++    } else {
++      dir = Cc["@mozilla.org/file/local;1"].createInstance(Ci.nsIFile);
++      dir.initWithPath(path);
++    }
++
++    return dir;
++  },
++};
++/**
++ * Returns target file for exported HAR data.
++ */
++function getDefaultTargetFile(options) {
++  const path =
++    options.defaultLogDir ||
++    Services.prefs.getCharPref("devtools.netmonitor.har.defaultLogDir");
++  const folder = HarUtils.getLocalDirectory(path);
++
++  const host = new URL(options.url);
++  const fileName = HarUtils.getHarFileName(
++    options.defaultFileName,
++    options.jsonp,
++    options.compress,
++    host.hostname
++  );
++
++  folder.append(fileName);
++  folder.createUnique(Ci.nsIFile.NORMAL_FILE_TYPE, parseInt("0666", 8));
++
++  return folder;
 +}
 diff --git a/browser/actors/moz.build b/browser/actors/moz.build
 --- a/browser/actors/moz.build
