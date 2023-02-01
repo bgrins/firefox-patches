@@ -1,0 +1,347 @@
+
+# HG changeset patch
+# User Mike Conley <mconley@mozilla.com>
+# Date 1673642530 18000
+# Node ID 90f27c4c2bc1dd079e6f5af7d7bd629d6d744b7b
+# Parent  52f9e6382dce26e3fcb66bf52fbcea0e73216aef
+Crop 'n pop prototype
+
+diff --git a/browser/actors/ScreenshotsComponentChild.sys.mjs b/browser/actors/ScreenshotsComponentChild.sys.mjs
+--- a/browser/actors/ScreenshotsComponentChild.sys.mjs
++++ b/browser/actors/ScreenshotsComponentChild.sys.mjs
+@@ -87,16 +87,24 @@ export class ScreenshotsComponentChild e
+     box.devicePixelRatio = this.contentWindow.devicePixelRatio;
+     this.sendAsyncMessage("Screenshots:DownloadScreenshot", {
+       title: this.getTitle(),
+       downloadBox: box,
+     });
+     this.endScreenshotsOverlay();
+   }
+ 
++  pipRegion(region) {
++    region.devicePixelRatio = this.contentWindow.devicePixelRatio;
++    this.sendAsyncMessage("Screenshots:PiPRegion", {
++      region,
++    });
++    this.endScreenshotsOverlay();
++  }
++
+   showPanel() {
+     this.sendAsyncMessage("Screenshots:ShowPanel");
+   }
+ 
+   hidePanel() {
+     this.sendAsyncMessage("Screenshots:HidePanel");
+   }
+ 
+diff --git a/browser/app/profile/firefox.js b/browser/app/profile/firefox.js
+--- a/browser/app/profile/firefox.js
++++ b/browser/app/profile/firefox.js
+@@ -2783,8 +2783,11 @@ pref("cookiebanners.ui.desktop.enabled",
+   pref("browser.swipe.navigation-icon-min-radius", -1);
+   pref("browser.swipe.navigation-icon-max-radius", -1);
+ #else
+   pref("browser.swipe.navigation-icon-start-position", -40);
+   pref("browser.swipe.navigation-icon-end-position", 60);
+   pref("browser.swipe.navigation-icon-min-radius", 12);
+   pref("browser.swipe.navigation-icon-max-radius", 20);
+ #endif
++
++pref("screenshots.browser.component.enabled", true);
++pref("media.getusermedia.browser.enabled", true);
+diff --git a/browser/components/screenshots/ScreenshotsOverlayChild.sys.mjs b/browser/components/screenshots/ScreenshotsOverlayChild.sys.mjs
+--- a/browser/components/screenshots/ScreenshotsOverlayChild.sys.mjs
++++ b/browser/components/screenshots/ScreenshotsOverlayChild.sys.mjs
+@@ -202,16 +202,21 @@ class AnonymousContentOverlay {
+         this.screenshotsContainer.getSelectionLayerBoxDimensions()
+       );
+     });
+     this.addEventListenerForElement("download", "click", (event, targetId) => {
+       this.screenshotsChild.requestDownloadScreenshot(
+         this.screenshotsContainer.getSelectionLayerBoxDimensions()
+       );
+     });
++    this.addEventListenerForElement("pip", "click", (event, targetId) => {
++      this.screenshotsChild.pipRegion(
++        this.screenshotsContainer.getSelectionLayerBoxDimensions()
++      );
++    });
+ 
+     // The pointerdown event is added to the selection buttons to prevent the
+     // pointerdown event from occurring on the "screenshots-overlay-container"
+     this.addEventListenerForElement(
+       "cancel",
+       "pointerdown",
+       (event, targetId) => {
+         event.stopPropagation();
+@@ -226,16 +231,19 @@ class AnonymousContentOverlay {
+     );
+     this.addEventListenerForElement(
+       "download",
+       "pointerdown",
+       (event, targetId) => {
+         event.stopPropagation();
+       }
+     );
++    this.addEventListenerForElement("pip", "pointerdown", (event, targetId) => {
++      event.stopPropagation();
++    });
+ 
+     this.addEventListenerForElement(
+       this.overlayId,
+       "pointerdown",
+       (event, targetId) => {
+         this.dragStart(event, targetId);
+       }
+     );
+@@ -345,16 +353,17 @@ class AnonymousContentOverlay {
+             <div id="mover-bottomRight" class="mover-target direction-bottomRight">
+               <div class="mover"></div>
+             </div>
+           </div>
+           <div id="buttons" style="display:none;">
+             <button id="cancel" class="screenshots-button" title="${cancel.value}" aria-label="${cancel.value}"><img/></button>
+             <button id="copy" class="screenshots-button" title="${copy.value}" aria-label="${copy.value}"><img/>${copy.value}</button>
+             <button id="download" class="screenshots-button" title="${download.value}" aria-label="${download.value}"><img/>${download.value}</button>
++            <button id="pip" class="screenshots-button" title="Picture-in-Picture"><img src="chrome://global/skin/media/picture-in-picture-open.svg"/>Picture-in-Picture</button>
+           </div>
+         </div>
+       </div>
+     </div>`;
+ 
+     const parser = new this.contentDocument.ownerGlobal.DOMParser();
+     const tmpDoc = parser.parseFromSafeString(htmlString, "text/html");
+     const fragment = this.contentDocument.createDocumentFragment();
+diff --git a/browser/components/screenshots/ScreenshotsUtils.sys.mjs b/browser/components/screenshots/ScreenshotsUtils.sys.mjs
+--- a/browser/components/screenshots/ScreenshotsUtils.sys.mjs
++++ b/browser/components/screenshots/ScreenshotsUtils.sys.mjs
+@@ -4,16 +4,17 @@
+ 
+ import { getFilename } from "chrome://browser/content/screenshots/fileHelpers.mjs";
+ 
+ const lazy = {};
+ 
+ ChromeUtils.defineESModuleGetters(lazy, {
+   Downloads: "resource://gre/modules/Downloads.sys.mjs",
+   FileUtils: "resource://gre/modules/FileUtils.sys.mjs",
++  PictureInPicture: "resource://gre/modules/PictureInPicture.sys.mjs",
+   PrivateBrowsingUtils: "resource://gre/modules/PrivateBrowsingUtils.sys.mjs",
+ });
+ 
+ const PanelPosition = "bottomright topright";
+ const PanelOffsetX = -33;
+ const PanelOffsetY = -8;
+ 
+ export class ScreenshotsComponentParent extends JSWindowActorParent {
+@@ -32,16 +33,22 @@ export class ScreenshotsComponentParent 
+         await ScreenshotsUtils.closePanel(browser);
+         let { title, downloadBox } = message.data;
+         ScreenshotsUtils.downloadScreenshotFromRegion(
+           title,
+           downloadBox,
+           browser
+         );
+         break;
++      case "Screenshots:PiPRegion": {
++        await ScreenshotsUtils.closePanel(browser);
++        let { region } = message.data;
++        ScreenshotsUtils.pipRegion(region, browser);
++        break;
++      }
+       case "Screenshots:ShowPanel":
+         ScreenshotsUtils.createOrDisplayButtons(browser);
+         break;
+       case "Screenshots:HidePanel":
+         ScreenshotsUtils.closePanel(browser);
+         break;
+     }
+   }
+@@ -415,16 +422,21 @@ export var ScreenshotsUtils = {
+     let { canvas, snapshot } = await this.createCanvas(box, browser);
+ 
+     let dataUrl = canvas.toDataURL();
+ 
+     await this.downloadScreenshot(title, dataUrl, browser);
+ 
+     snapshot.close();
+   },
++
++  pipRegion(region, browser) {
++    lazy.PictureInPicture.pipRegion(region, browser);
++  },
++
+   /**
+    * Download the screenshot
+    * @param title The title of the current page or null and getFilename will get the title
+    * @param dataUrl The image data
+    * @param browser The current browser
+    */
+   async downloadScreenshot(title, dataUrl, browser) {
+     // Guard against missing image data.
+diff --git a/toolkit/components/pictureinpicture/PictureInPicture.sys.mjs b/toolkit/components/pictureinpicture/PictureInPicture.sys.mjs
+--- a/toolkit/components/pictureinpicture/PictureInPicture.sys.mjs
++++ b/toolkit/components/pictureinpicture/PictureInPicture.sys.mjs
+@@ -1134,9 +1134,58 @@ export var PictureInPicture = {
+       xulStore.getValue(PLAYER_URI, "picture-in-picture", "width")
+     );
+     let height = parseInt(
+       xulStore.getValue(PLAYER_URI, "picture-in-picture", "height")
+     );
+ 
+     return { top, left, width, height };
+   },
++
++  async pipRegion(region, originatingBrowser) {
++    let window = originatingBrowser.ownerGlobal;
++    let devices = null;
++    let observer = {
++      observe(subject, topic, data) {
++        devices = [...subject.QueryInterface(Ci.nsIMutableArray).enumerate()];
++      },
++    };
++    Services.obs.addObserver(observer, "getUserMedia:privileged:allow");
++    window.document.notifyUserGestureActivation();
++    await window.navigator.mediaDevices.getUserMedia({
++      video: { mediaSource: "window" },
++    });
++    Services.obs.removeObserver(observer, "getUserMedia:privileged:allow");
++    let browserDevice = devices.find(d => {
++      let device = d.QueryInterface(Ci.nsIMediaDevice);
++      return (
++        device.mediaSource == "browser" &&
++        parseInt(device.rawId, 10) == originatingBrowser.browserId
++      );
++    });
++
++    let deviceId = browserDevice.rawId;
++
++    window.document.notifyUserGestureActivation();
++    let stream = await window.navigator.mediaDevices.getUserMedia({
++      video: {
++        mediaSource: "window",
++        deviceId,
++      },
++    });
++
++    let videoWidth = region.width;
++    let videoHeight = region.height;
++
++    let win = await this.openPipWindow(window, { videoHeight, videoWidth });
++    win.setupStreamingRegion({
++      id: gNextWindowID.toString(),
++      originatingBrowser,
++      stream,
++      region,
++    });
++
++    this.weakWinToBrowser.set(win, originatingBrowser);
++    this.addPiPBrowserToWeakMap(originatingBrowser);
++
++    gNextWindowID++;
++  },
+ };
+diff --git a/toolkit/components/pictureinpicture/content/player.js b/toolkit/components/pictureinpicture/content/player.js
+--- a/toolkit/components/pictureinpicture/content/player.js
++++ b/toolkit/components/pictureinpicture/content/player.js
+@@ -89,16 +89,20 @@ function hideSubtitlesButton() {
+ function setScrubberPosition(position) {
+   Player.setScrubberPosition(position);
+ }
+ 
+ function setTimestamp(timeString) {
+   Player.setTimestamp(timeString);
+ }
+ 
++function setupStreamingRegion(args) {
++  Player.setupStreamingRegion(args);
++}
++
+ /**
+  * The Player object handles initializing the player, holds state, and handles
+  * events for updating state.
+  */
+ let Player = {
+   WINDOW_EVENTS: [
+     "click",
+     "contextmenu",
+@@ -1146,9 +1150,79 @@ let Player = {
+     } else {
+       resultHeight = MIN_HEIGHT;
+       resultWidth = Math.round(MIN_HEIGHT * aspectRatio);
+     }
+ 
+     document.documentElement.style.minWidth = resultWidth + "px";
+     document.documentElement.style.minHeight = resultHeight + "px";
+   },
++
++  setupStreamingRegion({ id, originatingBrowser, stream, region }) {
++    this.id = id;
++
++    let holder = document.querySelector(".player-holder");
++    let browser = document.getElementById("browser");
++
++    let originatingRect = originatingBrowser.getBoundingClientRect();
++    let video = document.createElement("video");
++    let canvas = document.createElement("canvas");
++    canvas.width = region.width;
++    canvas.height = region.height;
++    video.srcObject = stream;
++    video.autoplay = true;
++
++    holder.replaceChild(canvas, browser);
++
++    let tick = () => {
++      let ctx = canvas.getContext("2d");
++
++      ctx.drawImage(
++        video,
++        originatingRect.left + region.x1,
++        originatingRect.top + region.y1,
++        region.width,
++        region.height,
++        0,
++        0,
++        region.width,
++        region.height
++      );
++
++      //ctx.drawImage(video, 0, 0);
++      /*
++      ctx.beginPath();
++      ctx.strokeStyle = "red";
++      ctx.rect(
++        originatingRect.left + minX,
++        originatingRect.top + minY,
++        maxX - minX,
++        maxY - minY
++      );
++      ctx.stroke();*/
++
++      requestAnimationFrame(tick);
++    };
++    requestAnimationFrame(tick);
++
++    this.actor = originatingBrowser.browsingContext.currentWindowGlobal.getActor(
++      "PictureInPicture"
++    );
++
++    PictureInPicture.weakPipToWin.set(this.actor, window);
++
++    for (let eventType of this.WINDOW_EVENTS) {
++      addEventListener(eventType, this);
++    }
++
++    this.revealControls(false);
++
++    this.lastScreenX = window.screenX;
++    this.lastScreenY = window.screenY;
++
++    // alwaysontop windows are not focused by default, so we have to do it
++    // ourselves. We use requestAnimationFrame since we have to wait until the
++    // window is visible before it can focus.
++    window.requestAnimationFrame(() => {
++      window.focus();
++    });
++  },
+ };
+

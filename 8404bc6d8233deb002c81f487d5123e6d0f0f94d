@@ -1,0 +1,576 @@
+
+# HG changeset patch
+# User Mike Conley <mconley@mozilla.com>
+# Date 1674486066 18000
+# Node ID 8404bc6d8233deb002c81f487d5123e6d0f0f94d
+# Parent  eadea8a10f38cf8643042bdcaa743dcc1cbd26ab
+Arbitrary web content pip - prototype 2 (clever overflow) - resize and subframe support.
+
+diff --git a/dom/base/Document.cpp b/dom/base/Document.cpp
+--- a/dom/base/Document.cpp
++++ b/dom/base/Document.cpp
+@@ -18025,6 +18025,12 @@ void Document::GetConnectedShadowRoots(
+   AppendToArray(aOut, mComposedShadowRoots);
+ }
+ 
++void Document::GoFullscreenForPiP(Element& aElement) {
++  SetFullscreenElement(aElement);
++}
++
++void Document::ExitFullscreenForPiP() { CleanupFullscreenState(); }
++
+ bool Document::HasPictureInPictureChildElement() const {
+   return mPictureInPictureChildElementCount > 0;
+ }
+diff --git a/dom/base/Document.h b/dom/base/Document.h
+--- a/dom/base/Document.h
++++ b/dom/base/Document.h
+@@ -3202,6 +3202,9 @@ class Document : public nsINode,
+   // WebIDL method for chrome code.
+   void GetConnectedShadowRoots(nsTArray<RefPtr<ShadowRoot>>&) const;
+ 
++  void GoFullscreenForPiP(Element& aElement);
++  void ExitFullscreenForPiP();
++
+   // Notifies any responsive content added by AddResponsiveContent upon media
+   // features values changing.
+   void NotifyMediaFeatureValuesChanged();
+diff --git a/dom/webidl/Document.webidl b/dom/webidl/Document.webidl
+--- a/dom/webidl/Document.webidl
++++ b/dom/webidl/Document.webidl
+@@ -481,6 +481,11 @@ partial interface Document {
+    */
+   [ChromeOnly]
+   sequence<ShadowRoot> getConnectedShadowRoots();
++
++  [ChromeOnly]
++  undefined goFullscreenForPiP(Element aElement);
++  [ChromeOnly]
++  undefined exitFullscreenForPiP();
+ };
+ 
+ dictionary BlockParsingOptions {
+diff --git a/layout/style/res/ua.css b/layout/style/res/ua.css
+--- a/layout/style/res/ua.css
++++ b/layout/style/res/ua.css
+@@ -360,6 +360,13 @@
+   transform: none !important;
+ }
+ 
++:fullscreen html|*[mconley-mode] {
++  width: 100vw !important;
++  height: 100vh !important;
++  padding: 0 !important;
++  margin: 0 !important;
++}
++
+ xul|*:fullscreen:not(:root, [hidden="true"]) {
+   /* The position: fixed; property above used to force the computed display
+    * value to block. It is no longer the case now, so we manually set it here to
+diff --git a/toolkit/actors/PictureInPictureChild.sys.mjs b/toolkit/actors/PictureInPictureChild.sys.mjs
+--- a/toolkit/actors/PictureInPictureChild.sys.mjs
++++ b/toolkit/actors/PictureInPictureChild.sys.mjs
+@@ -9,12 +9,14 @@ ChromeUtils.defineESModuleGetters(lazy, 
+   ContentDOMReference: "resource://gre/modules/ContentDOMReference.sys.mjs",
+   DeferredTask: "resource://gre/modules/DeferredTask.sys.mjs",
+   KEYBOARD_CONTROLS: "resource://gre/modules/PictureInPictureControls.sys.mjs",
++  LayoutUtils: "resource://gre/modules/LayoutUtils.sys.mjs",
+   Rect: "resource://gre/modules/Geometry.sys.mjs",
+   TOGGLE_POLICIES: "resource://gre/modules/PictureInPictureControls.sys.mjs",
+   TOGGLE_POLICY_STRINGS:
+     "resource://gre/modules/PictureInPictureControls.sys.mjs",
+ });
+ 
++
+ const { WebVTT } = ChromeUtils.import("resource://gre/modules/vtt.jsm");
+ import { setTimeout, clearTimeout } from "resource://gre/modules/Timer.sys.mjs";
+ import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
+@@ -192,6 +194,7 @@ export class PictureInPictureLauncherChi
+       playing: PictureInPictureChild.videoIsPlaying(video),
+       videoHeight: video.videoHeight,
+       videoWidth: video.videoWidth,
++      videoRect: lazy.LayoutUtils._rectToClientRect(this.contentWindow, video.getBoundingClientRect()),
+       videoRef,
+       ccEnabled: lazy.DISPLAY_TEXT_TRACKS_PREF,
+       webVTTSubtitles: !!video.textTracks?.length,
+@@ -1770,6 +1773,11 @@ export class PictureInPictureChild exten
+     if (video) {
+       this.untrackOriginatingVideo(video);
+     }
++
++    if (this.document.fullscreenElement) {
++      this.document.exitFullscreenForPiP();
++    }
++
+     this.sendAsyncMessage("PictureInPicture:Close", {
+       reason,
+     });
+@@ -1794,8 +1802,8 @@ export class PictureInPictureChild exten
+   receiveMessage(message) {
+     switch (message.name) {
+       case "PictureInPicture:SetupPlayer": {
+-        const { videoRef } = message.data;
+-        this.setupPlayer(videoRef);
++        const { videoRef, fullscreenMode } = message.data;
++        this.setupPlayer(videoRef, fullscreenMode);
+         break;
+       }
+       case "PictureInPicture:Play": {
+@@ -2028,7 +2036,7 @@ export class PictureInPictureChild exten
+    * properly, or a pre-existing Picture-in-Picture window has gone
+    * away due to an unexpected error.
+    */
+-  async setupPlayer(videoRef) {
++  async setupPlayer(videoRef, fullscreenMode) {
+     const video = await lazy.ContentDOMReference.resolve(videoRef);
+ 
+     this.weakVideo = Cu.getWeakReference(video);
+@@ -2041,75 +2049,79 @@ export class PictureInPictureChild exten
+       return;
+     }
+ 
+-    this.videoWrapper = applyWrapper(this, originatingVideo);
++    if (fullscreenMode) {
++      // Do... what, exactly?
++    } else {
++      this.videoWrapper = applyWrapper(this, originatingVideo);
+ 
+-    let loadPromise = new Promise(resolve => {
+-      this.contentWindow.addEventListener("load", resolve, {
+-        once: true,
+-        mozSystemGroup: true,
+-        capture: true,
++      let loadPromise = new Promise(resolve => {
++        this.contentWindow.addEventListener("load", resolve, {
++          once: true,
++          mozSystemGroup: true,
++          capture: true,
++        });
+       });
+-    });
+-    this.contentWindow.location.reload();
+-    await loadPromise;
++      this.contentWindow.location.reload();
++      await loadPromise;
+ 
+-    // We're committed to adding the video to this window now. Ensure we track
+-    // the content window before we do so, so that the toggle actor can
+-    // distinguish this new video we're creating from web-controlled ones.
+-    this.weakPlayerContent = Cu.getWeakReference(this.contentWindow);
+-    gPlayerContents.add(this.contentWindow);
++      // We're committed to adding the video to this window now. Ensure we track
++      // the content window before we do so, so that the toggle actor can
++      // distinguish this new video we're creating from web-controlled ones.
++      this.weakPlayerContent = Cu.getWeakReference(this.contentWindow);
++      gPlayerContents.add(this.contentWindow);
+ 
+-    let doc = this.document;
+-    let playerVideo = doc.createElement("video");
+-    playerVideo.id = "playervideo";
+-    let textTracks = doc.createElement("div");
++      let doc = this.document;
++      let playerVideo = doc.createElement("video");
++      playerVideo.id = "playervideo";
++      let textTracks = doc.createElement("div");
+ 
+-    doc.body.style.overflow = "hidden";
+-    doc.body.style.margin = "0";
++      doc.body.style.overflow = "hidden";
++      doc.body.style.margin = "0";
+ 
+-    // Force the player video to assume maximum height and width of the
+-    // containing window
+-    playerVideo.style.height = "100vh";
+-    playerVideo.style.width = "100vw";
+-    playerVideo.style.backgroundColor = "#000";
++      // Force the player video to assume maximum height and width of the
++      // containing window
++      playerVideo.style.height = "100vh";
++      playerVideo.style.width = "100vw";
++      playerVideo.style.backgroundColor = "#000";
+ 
+-    // Load text tracks container in the content process so that
+-    // we can load text tracks without having to constantly
+-    // access the parent process.
+-    textTracks.id = "texttracks";
+-    // When starting pip, player controls are expected to appear.
+-    textTracks.setAttribute("overlap-video-controls", true);
+-    doc.body.appendChild(playerVideo);
+-    doc.body.appendChild(textTracks);
+-    // Load text tracks stylesheet
+-    let textTracksStyleSheet = this.createTextTracksStyleSheet();
+-    doc.head.appendChild(textTracksStyleSheet);
++      // Load text tracks container in the content process so that
++      // we can load text tracks without having to constantly
++      // access the parent process.
++      textTracks.id = "texttracks";
++      // When starting pip, player controls are expected to appear.
++      textTracks.setAttribute("overlap-video-controls", true);
++      doc.body.appendChild(playerVideo);
++      doc.body.appendChild(textTracks);
++      // Load text tracks stylesheet
++      let textTracksStyleSheet = this.createTextTracksStyleSheet();
++      doc.head.appendChild(textTracksStyleSheet);
+ 
+-    this.setTextTrackFontSize();
++      this.setTextTrackFontSize();
+ 
+-    originatingVideo.cloneElementVisually(playerVideo);
++      originatingVideo.cloneElementVisually(playerVideo);
+ 
+-    let shadowRoot = originatingVideo.openOrClosedShadowRoot;
+-    if (originatingVideo.getTransformToViewport().a == -1) {
+-      shadowRoot.firstChild.setAttribute("flipped", true);
+-      playerVideo.style.transform = "scaleX(-1)";
+-    }
++      let shadowRoot = originatingVideo.openOrClosedShadowRoot;
++      if (originatingVideo.getTransformToViewport().a == -1) {
++        shadowRoot.firstChild.setAttribute("flipped", true);
++        playerVideo.style.transform = "scaleX(-1)";
++      }
+ 
+-    this.onCueChange = this.onCueChange.bind(this);
+-    this.trackOriginatingVideo(originatingVideo);
++      this.onCueChange = this.onCueChange.bind(this);
++      this.trackOriginatingVideo(originatingVideo);
+ 
+-    this.contentWindow.addEventListener(
+-      "unload",
+-      () => {
+-        let video = this.getWeakVideo();
+-        if (video) {
+-          this.untrackOriginatingVideo(video);
+-          video.stopCloningElementVisually();
+-        }
+-        this.weakVideo = null;
+-      },
+-      { once: true }
+-    );
++      this.contentWindow.addEventListener(
++        "unload",
++        () => {
++          let video = this.getWeakVideo();
++          if (video) {
++            this.untrackOriginatingVideo(video);
++            video.stopCloningElementVisually();
++          }
++          this.weakVideo = null;
++        },
++        { once: true }
++      );
++    }
+   }
+ 
+   play() {
+diff --git a/toolkit/components/pictureinpicture/PictureInPicture.sys.mjs b/toolkit/components/pictureinpicture/PictureInPicture.sys.mjs
+--- a/toolkit/components/pictureinpicture/PictureInPicture.sys.mjs
++++ b/toolkit/components/pictureinpicture/PictureInPicture.sys.mjs
+@@ -382,7 +382,18 @@ export var PictureInPicture = {
+     tab.addEventListener("TabSwapPictureInPicture", this);
+ 
+     let pipId = gNextWindowID.toString();
+-    win.setupPlayer(pipId, wgp, videoData.videoRef);
++
++    // TODO: Pref
++    let fullscreenMode = true;
++    win.setupPlayer(
++      pipId,
++      wgp,
++      videoData.videoRef,
++      fullscreenMode,
++      browser,
++      videoData
++    );
++
+     gNextWindowID++;
+ 
+     this.weakWinToBrowser.set(win, browser);
+@@ -551,7 +562,9 @@ export var PictureInPicture = {
+    *     The height of the player window.
+    */
+   fitToScreen(requestingWin, videoData) {
+-    let { videoHeight, videoWidth } = videoData;
++    // let { videoHeight, videoWidth } = videoData;
++    let videoHeight = videoData.videoRect.height;
++    let videoWidth = videoData.videoRect.width;
+ 
+     const isPlayer = requestingWin.document.location.href == PLAYER_URI;
+ 
+@@ -685,6 +698,7 @@ export var PictureInPicture = {
+     height = videoHeight * screenCssToDesktopScale;
+     let aspectRatio = videoWidth / videoHeight;
+ 
++    /*
+     if (videoHeight > MAX_HEIGHT || videoWidth > MAX_WIDTH) {
+       // We're bigger than the max.
+       // Take the largest dimension and clamp it to the associated max.
+@@ -704,7 +718,7 @@ export var PictureInPicture = {
+         height = MAX_HEIGHT;
+         width = Math.round(MAX_HEIGHT * aspectRatio);
+       }
+-    }
++    }*/
+ 
+     // Now that we have the dimensions of the video, we need to figure out how
+     // to position it in the bottom right corner. Since we know the width of the
+@@ -1082,6 +1096,7 @@ export var PictureInPicture = {
+    * @param {Window} win The Picture-in-Picture window
+    */
+   savePosition(win) {
++    return;
+     let xulStore = Services.xulStore;
+ 
+     // We store left / top position in desktop pixels, like SessionStore does,
+@@ -1124,6 +1139,7 @@ export var PictureInPicture = {
+   loadPosition() {
+     let xulStore = Services.xulStore;
+ 
++    /*
+     let left = parseInt(
+       xulStore.getValue(PLAYER_URI, "picture-in-picture", "left")
+     );
+@@ -1135,8 +1151,8 @@ export var PictureInPicture = {
+     );
+     let height = parseInt(
+       xulStore.getValue(PLAYER_URI, "picture-in-picture", "height")
+-    );
++    );*/
+ 
+-    return { top, left, width, height };
++    return { top: NaN, left: NaN, width: NaN, height: NaN };
+   },
+ };
+diff --git a/toolkit/components/pictureinpicture/content/player.js b/toolkit/components/pictureinpicture/content/player.js
+--- a/toolkit/components/pictureinpicture/content/player.js
++++ b/toolkit/components/pictureinpicture/content/player.js
+@@ -28,7 +28,7 @@ const IMPROVED_CONTROLS_ENABLED_PREF =
+ 
+ // Time to fade the Picture-in-Picture video controls after first opening.
+ const CONTROLS_FADE_TIMEOUT_MS = 3000;
+-const RESIZE_DEBOUNCE_RATE_MS = 500;
++const RESIZE_DEBOUNCE_RATE_MS = 50;
+ 
+ /**
+ Quadrants!
+@@ -52,8 +52,22 @@ const BOTTOM_RIGHT_QUADRANT = 4;
+  *    A reference to the video element that a Picture-in-Picture window
+  *    is being created for
+  */
+-function setupPlayer(id, wgp, videoRef) {
+-  Player.init(id, wgp, videoRef);
++function setupPlayer(
++  id,
++  wgp,
++  videoRef,
++  fullscreenMode,
++  originatingBrowser,
++  videoData
++) {
++  return Player.init(
++    id,
++    wgp,
++    videoRef,
++    fullscreenMode,
++    originatingBrowser,
++    videoData
++  );
+ }
+ 
+ /**
+@@ -154,7 +168,7 @@ let Player = {
+    *    A reference to the video element that a Picture-in-Picture window
+    *    is being created for
+    */
+-  init(id, wgp, videoRef) {
++  init(id, wgp, videoRef, fullscreenMode, originatingBrowser, videoData) {
+     this.id = id;
+ 
+     // State for whether or not we are adjusting the time via the scrubber
+@@ -183,11 +197,37 @@ let Player = {
+     );
+     holder.appendChild(browser);
+ 
++    if (fullscreenMode) {
++      let originatingWin = originatingBrowser.ownerGlobal;
++      let rect = originatingWin.windowUtils.getBoundsWithoutFlushing(
++        originatingBrowser
++      );
++      browser.style.maxWidth = rect.width + "px";
++      browser.style.minWidth = rect.width + "px";
++      browser.style.width = rect.width + "px";
++      browser.style.maxHeight = rect.height + "px";
++      browser.style.minHeight = rect.height + "px";
++      browser.style.height = rect.height + "px";
++
++      let topPx = -videoData.videoRect.y + "px";
++      let leftPx = -videoData.videoRect.x + "px";
++      browser.style.position = "relative";
++      browser.style.top = topPx;
++      browser.style.left = leftPx;
++      browser.style.transformOrigin = "top left";
++
++      let gBrowser = originatingBrowser.getTabBrowser();
++      let tab = gBrowser.getTabForBrowser(originatingBrowser);
++      gBrowser._swapBrowserDocShells(tab, browser);
++      gBrowser.removeTab(tab, { closeWindowWithLastTab: false });
++    }
++
+     this.actor = browser.browsingContext.currentWindowGlobal.getActor(
+       "PictureInPicture"
+     );
+     this.actor.sendAsyncMessage("PictureInPicture:SetupPlayer", {
+       videoRef,
++      fullscreenMode,
+     });
+ 
+     PictureInPicture.weakPipToWin.set(this.actor, window);
+@@ -262,6 +302,19 @@ let Player = {
+     this.alignEndControlsButtonTooltips();
+ 
+     this.resizeDebouncer = new DeferredTask(() => {
++      if (fullscreenMode) {
++        let newHeight = window.outerHeight;
++
++        // Determine the scaling factor
++        let scaleFactor = newHeight / videoData.videoRect.height;
++        browser.style.transform = `scale(${scaleFactor})`;
++
++        let topPx = -(videoData.videoRect.y * scaleFactor) + "px";
++        let leftPx = -(videoData.videoRect.x * scaleFactor) + "px";
++
++        browser.style.top = topPx;
++        browser.style.left = leftPx;
++      }
+       this.alignEndControlsButtonTooltips();
+       this.recordEvent("resize", {
+         width: window.outerWidth.toString(),
+@@ -289,6 +342,12 @@ let Player = {
+     } else {
+       document.querySelector("#medium").checked = "true";
+     }
++
++    if (fullscreenMode) {
++      this.controls.hidden = true;
++    }
++
++    return browser;
+   },
+ 
+   uninit() {
+@@ -1152,3 +1211,77 @@ let Player = {
+     document.documentElement.style.minHeight = resultHeight + "px";
+   },
+ };
++
++function nsBrowserAccess() {}
++
++nsBrowserAccess.prototype = {
++  QueryInterface: ChromeUtils.generateQI(["nsIBrowserDOMWindow"]),
++
++  createContentWindow(
++    aURI,
++    aOpenWindowInfo,
++    aWhere,
++    aFlags,
++    aTriggeringPrincipal,
++    aCsp
++  ) {
++    throw Components.Exception("", Cr.NS_ERROR_NOT_IMPLEMENTED);
++  },
++
++  openURI(aURI, aOpenWindowInfo, aWhere, aFlags, aTriggeringPrincipal, aCsp) {
++    throw Components.Exception("", Cr.NS_ERROR_NOT_IMPLEMENTED);
++  },
++
++  getContentWindowOrOpenURI(
++    aURI,
++    aOpenWindowInfo,
++    aWhere,
++    aFlags,
++    aTriggeringPrincipal,
++    aCsp,
++    aSkipLoad
++  ) {
++    throw Components.Exception("", Cr.NS_ERROR_NOT_IMPLEMENTED);
++  },
++
++  createContentWindowInFrame: function browser_createContentWindowInFrame(
++    aURI,
++    aParams,
++    aWhere,
++    aFlags,
++    aName
++  ) {
++    throw Components.Exception("", Cr.NS_ERROR_NOT_IMPLEMENTED);
++  },
++
++  openURIInFrame: function browser_openURIInFrame(
++    aURI,
++    aParams,
++    aWhere,
++    aFlags,
++    aName
++  ) {
++    throw Components.Exception("", Cr.NS_ERROR_NOT_IMPLEMENTED);
++  },
++
++  getContentWindowOrOpenURIInFrame: function browser_getContentWindowOrOpenURIInFrame(
++    aURI,
++    aParams,
++    aWhere,
++    aFlags,
++    aName,
++    aSkipLoad
++  ) {
++    throw Components.Exception("", Cr.NS_ERROR_NOT_IMPLEMENTED);
++  },
++
++  canClose() {
++    throw Components.Exception("", Cr.NS_ERROR_NOT_IMPLEMENTED);
++  },
++
++  get tabCount() {
++    throw Components.Exception("", Cr.NS_ERROR_NOT_IMPLEMENTED);
++  },
++};
++
++window.browserDOMWindow = new nsBrowserAccess();
+diff --git a/toolkit/components/pictureinpicture/content/player.xhtml b/toolkit/components/pictureinpicture/content/player.xhtml
+--- a/toolkit/components/pictureinpicture/content/player.xhtml
++++ b/toolkit/components/pictureinpicture/content/player.xhtml
+@@ -35,6 +35,9 @@
+       <xul:key data-l10n-id="picture-in-picture-toggle-shortcut-mac-alt" command="View:PictureInPicture" modifiers="accel,alt,shift"/>
+ #endif
+     </xul:keyset>
++    <div class="proto-controls">
++      <button onclick="Player.onClose();">Close</button>
++    </div>
+ 
+     <div class="player-holder">
+       <xul:browser type="content" primary="true" remote="true" remoteType="web" id="browser" tabindex="-1"></xul:browser>
+diff --git a/toolkit/themes/shared/pictureinpicture/player.css b/toolkit/themes/shared/pictureinpicture/player.css
+--- a/toolkit/themes/shared/pictureinpicture/player.css
++++ b/toolkit/themes/shared/pictureinpicture/player.css
+@@ -30,6 +30,22 @@ body:fullscreen {
+   -moz-window-dragging: no-drag;
+ }
+ 
++.proto-controls {
++  position: absolute;
++  background-color: black;
++  width: 100vw;
++  -moz-window-dragging: drag;
++  z-index: 1000000;
++}
++
++.proto-controls > button {
++  -moz-window-dragging: no-drag;
++}
++
++body:not(:hover) .proto-controls {
++  display: none;
++}
++
+ .player-holder {
+   display: flex;
+   flex-direction: column;
