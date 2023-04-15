@@ -1,0 +1,214 @@
+diff --git a/js/src/frontend/BytecodeEmitter.h b/js/src/frontend/BytecodeEmitter.h
+--- a/js/src/frontend/BytecodeEmitter.h
++++ b/js/src/frontend/BytecodeEmitter.h
+@@ -311,10 +311,15 @@
+   JumpList endOfDerivedClassConstructorBody = {};
+ 
+   // Jump target just before the final yield in a generator or async function.
+   JumpList finalYields = {};
+ 
++  // In order to heuristically determine the size of the allocation if this is a
++  // constructor function, we track expressions which add properties in the
++  // constructor.
++  uint32_t propertyAdditionEstimate = 0;
++
+   /*
+    * Note that BytecodeEmitters are magic: they own the arena "top-of-stack"
+    * space above their tempMark points. This means that you cannot alloc from
+    * tempLifoAlloc and save the pointer beyond the next BytecodeEmitter
+    * destruction.
+diff --git a/js/src/frontend/BytecodeEmitter.cpp b/js/src/frontend/BytecodeEmitter.cpp
+--- a/js/src/frontend/BytecodeEmitter.cpp
++++ b/js/src/frontend/BytecodeEmitter.cpp
+@@ -2456,15 +2456,23 @@
+   }
+ 
+   bool isFunction = sc->isFunctionBox();
+   uint16_t funLength = isFunction ? sc->asFunctionBox()->length() : 0;
+ 
++  uint32_t propertyCountEstimate = propertyAdditionEstimate;
++
++  // Add fields to the property count estimate.
++  if (isFunction && sc->asFunctionBox()->useMemberInitializers()) {
++    propertyCountEstimate +=
++        sc->asFunctionBox()->memberInitializers().numMemberInitializers;
++  }
++
+   return ImmutableScriptData::new_(
+       fc, mainOffset(), maxFixedSlots, nslots, bodyScopeIndex,
+       bytecodeSection().numICEntries(), isFunction, funLength,
+-      bytecodeSection().code(), bytecodeSection().notes(),
+-      bytecodeSection().resumeOffsetList().span(),
++      propertyCountEstimate, bytecodeSection().code(),
++      bytecodeSection().notes(), bytecodeSection().resumeOffsetList().span(),
+       bytecodeSection().scopeNoteList().span(),
+       bytecodeSection().tryNoteList().span());
+ }
+ 
+ bool BytecodeEmitter::getNslots(uint32_t* nslots) {
+@@ -4070,10 +4078,24 @@
+                                            ParseNode* rhs) {
+   JSOp compoundOp = CompoundAssignmentParseNodeKindToJSOp(kind);
+   bool isCompound = compoundOp != JSOp::Nop;
+   bool isInit = kind == ParseNodeKind::InitExpr;
+ 
++  // We estiamte the number of properties this could create
++  // if used as constructor merely by counting this.foo = assignment
++  // or init expressions;
++  //
++  // This currently doesn't handle this[x] = foo;
++  if (isInit || kind == ParseNodeKind::AssignExpr) {
++    if (lhs->isKind(ParseNodeKind::DotExpr)) {
++      if (lhs->as<PropertyAccess>().expression().isKind(
++              ParseNodeKind::ThisExpr)) {
++        propertyAdditionEstimate++;
++      }
++    }
++  }
++
+   MOZ_ASSERT_IF(isInit, lhs->isKind(ParseNodeKind::DotExpr) ||
+                             lhs->isKind(ParseNodeKind::ElemExpr) ||
+                             lhs->isKind(ParseNodeKind::PrivateMemberExpr));
+ 
+   // |name| is used within NameOpEmitter, so its lifetime must surpass |noe|.
+@@ -9413,10 +9435,11 @@
+   // If there are more initializers than can be represented, return invalid.
+   if (numFields + numPrivateInitializers >
+       MemberInitializers::MaxInitializers) {
+     return Nothing();
+   }
++
+   return Some(
+       MemberInitializers(hasPrivateBrand, numFields + numPrivateInitializers));
+ }
+ 
+ // Purpose of .fieldKeys:
+diff --git a/js/src/vm/JSFunction-inl.h b/js/src/vm/JSFunction-inl.h
+--- a/js/src/vm/JSFunction-inl.h
++++ b/js/src/vm/JSFunction-inl.h
+@@ -118,6 +118,16 @@
+   }
+ 
+   return cx->names().empty;
+ }
+ 
++inline js::gc::AllocKind JSFunction::getAllocKindForThis() const {
++  if (hasBytecode()) {
++    uint32_t propertyCountEstimate =
++        nonLazyScript()->immutableScriptData()->propertyCountEstimate;
++    return js::gc::GetGCObjectKind(std::max(4u, propertyCountEstimate));
++  }
++  // No further information, so we assume plain object allocation defualt.
++  return js::NewObjectGCKind();
++}
++
+ #endif /* vm_JSFunction_inl_h */
+diff --git a/js/src/vm/JSFunction.h b/js/src/vm/JSFunction.h
+--- a/js/src/vm/JSFunction.h
++++ b/js/src/vm/JSFunction.h
+@@ -654,10 +654,14 @@
+       kind = js::gc::AllocKind::FUNCTION_EXTENDED;
+     }
+     MOZ_ASSERT_IF(isTenured(), kind == asTenured().getAllocKind());
+     return kind;
+   }
++
++  // If we're constructing with this function, choose an appropriate
++  // allocKind.
++  js::gc::AllocKind getAllocKindForThis() const;
+ };
+ 
+ static_assert(sizeof(JSFunction) == sizeof(JS::shadow::Function),
+               "shadow interface must match actual interface");
+ 
+diff --git a/js/src/vm/JSScript.cpp b/js/src/vm/JSScript.cpp
+--- a/js/src/vm/JSScript.cpp
++++ b/js/src/vm/JSScript.cpp
+@@ -2874,12 +2874,12 @@
+ 
+ /* static */
+ js::UniquePtr<ImmutableScriptData> ImmutableScriptData::new_(
+     FrontendContext* fc, uint32_t mainOffset, uint32_t nfixed, uint32_t nslots,
+     GCThingIndex bodyScopeIndex, uint32_t numICEntries, bool isFunction,
+-    uint16_t funLength, mozilla::Span<const jsbytecode> code,
+-    mozilla::Span<const SrcNote> notes,
++    uint16_t funLength, uint32_t propertyCountEstimate,
++    mozilla::Span<const jsbytecode> code, mozilla::Span<const SrcNote> notes,
+     mozilla::Span<const uint32_t> resumeOffsets,
+     mozilla::Span<const ScopeNote> scopeNotes,
+     mozilla::Span<const TryNote> tryNotes) {
+   MOZ_RELEASE_ASSERT(code.Length() <= frontend::MaxBytecodeLength);
+ 
+@@ -2904,10 +2904,11 @@
+   data->mainOffset = mainOffset;
+   data->nfixed = nfixed;
+   data->nslots = nslots;
+   data->bodyScopeIndex = bodyScopeIndex;
+   data->numICEntries = numICEntries;
++  data->propertyCountEstimate = propertyCountEstimate;
+ 
+   if (isFunction) {
+     data->funLength = funLength;
+   }
+ 
+diff --git a/js/src/vm/PlainObject.cpp b/js/src/vm/PlainObject.cpp
+--- a/js/src/vm/PlainObject.cpp
++++ b/js/src/vm/PlainObject.cpp
+@@ -19,10 +19,11 @@
+ #include "vm/JSContext.h"    // JSContext
+ #include "vm/JSFunction.h"   // JSFunction
+ #include "vm/JSObject.h"     // JSObject, js::GetPrototypeFromConstructor
+ #include "vm/TaggedProto.h"  // js::TaggedProto
+ 
++#include "vm/JSFunction-inl.h"
+ #include "vm/JSObject-inl.h"  // js::NewObjectWithGroup, js::NewObjectGCKind
+ 
+ using namespace js;
+ 
+ using JS::Handle;
+@@ -45,11 +46,11 @@
+   Rooted<JSObject*> proto(cx);
+   if (!GetPrototypeFromConstructor(cx, newTarget, JSProto_Object, &proto)) {
+     return nullptr;
+   }
+ 
+-  js::gc::AllocKind allocKind = NewObjectGCKind();
++  js::gc::AllocKind allocKind = callee->getAllocKindForThis();
+ 
+   SharedShape* res;
+   if (proto && proto != cx->global()->maybeGetPrototype(JSProto_Object)) {
+     res = GetPlainObjectShapeWithProto(cx, proto, allocKind);
+   } else {
+diff --git a/js/src/vm/SharedStencil.h b/js/src/vm/SharedStencil.h
+--- a/js/src/vm/SharedStencil.h
++++ b/js/src/vm/SharedStencil.h
+@@ -440,10 +440,13 @@
+   GCThingIndex bodyScopeIndex;
+ 
+   // Number of IC entries to allocate in JitScript for Baseline ICs.
+   uint32_t numICEntries = 0;
+ 
++  // Property Count estimate
++  uint32_t propertyCountEstimate = 0;
++
+   // ES6 function length.
+   uint16_t funLength = 0;
+ 
+   // NOTE: The raw bytes of this structure are used for hashing so use explicit
+   // padding values as needed for predicatable results across compilers.
+@@ -517,12 +520,12 @@
+ 
+  public:
+   static js::UniquePtr<ImmutableScriptData> new_(
+       FrontendContext* fc, uint32_t mainOffset, uint32_t nfixed,
+       uint32_t nslots, GCThingIndex bodyScopeIndex, uint32_t numICEntries,
+-      bool isFunction, uint16_t funLength, mozilla::Span<const jsbytecode> code,
+-      mozilla::Span<const SrcNote> notes,
++      bool isFunction, uint16_t funLength, uint32_t propertyCountEstimate,
++      mozilla::Span<const jsbytecode> code, mozilla::Span<const SrcNote> notes,
+       mozilla::Span<const uint32_t> resumeOffsets,
+       mozilla::Span<const ScopeNote> scopeNotes,
+       mozilla::Span<const TryNote> tryNotes);
+ 
+   static js::UniquePtr<ImmutableScriptData> new_(
+
