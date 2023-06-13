@@ -1,0 +1,206 @@
+diff --git a/third_party/sqlite3/src/sqlite3.c b/third_party/sqlite3/src/sqlite3.c
+--- a/third_party/sqlite3/src/sqlite3.c
++++ b/third_party/sqlite3/src/sqlite3.c
+@@ -216994,10 +216994,11 @@
+   char *zDb;                      /* Database holding FTS index (e.g. "main") */
+   char *zName;                    /* Name of FTS index */
+   int nCol;                       /* Number of columns */
+   char **azCol;                   /* Column names */
+   u8 *abUnindexed;                /* True for unindexed columns */
++  u8 *abCompressed;               /* True for compressed columns */
+   int nPrefix;                    /* Number of prefix indexes */
+   int *aPrefix;                   /* Sizes in bytes of nPrefix prefix indexes */
+   int eContent;                   /* An FTS5_CONTENT value */
+   char *zContent;                 /* content table */
+   char *zContentRowid;            /* "content_rowid=" option value */
+@@ -217020,10 +217021,14 @@
+   char *zRankArgs;                /* Arguments to rank function */
+ 
+   /* If non-NULL, points to sqlite3_vtab.base.zErrmsg. Often NULL. */
+   char **pzErrmsg;
+ 
++  /* Optional registered sqlite function for de/compression */
++  char *zCompressFunc;
++  char *zUnCompressFunc;
++
+ #ifdef SQLITE_DEBUG
+   int bPrefixIndex;               /* True to use prefix-indexes */
+ #endif
+ };
+ 
+@@ -220672,10 +220677,30 @@
+       *pzErr = sqlite3_mprintf("malformed detail=... directive");
+     }
+     return rc;
+   }
+ 
++  if( sqlite3_strnicmp("compress", zCmd, nCmd)==0 ){
++    if( pConfig->zCompressFunc ){
++      *pzErr = sqlite3_mprintf("multiple compress=... directives");
++      rc = SQLITE_ERROR;
++    }else{
++      pConfig->zCompressFunc = sqlite3Fts5Strndup(&rc, zArg, -1);
++    }
++    return rc;
++  }
++
++  if( sqlite3_strnicmp("uncompress", zCmd, nCmd)==0 ){
++    if( pConfig->zUnCompressFunc ){
++      *pzErr = sqlite3_mprintf("multiple uncompress=... directives");
++      rc = SQLITE_ERROR;
++    }else{
++      pConfig->zUnCompressFunc = sqlite3Fts5Strndup(&rc, zArg, -1);
++    }
++    return rc;
++  }
++
+   *pzErr = sqlite3_mprintf("unrecognized option: \"%.*s\"", nCmd, zCmd);
+   return SQLITE_ERROR;
+ }
+ 
+ /*
+@@ -220756,10 +220781,12 @@
+     *pzErr = sqlite3_mprintf("reserved fts5 column name: %s", zCol);
+     rc = SQLITE_ERROR;
+   }else if( zArg ){
+     if( 0==sqlite3_stricmp(zArg, "unindexed") ){
+       p->abUnindexed[p->nCol] = 1;
++    }else if( 0==sqlite3_stricmp(zArg, "compressed") ){
++      p->abCompressed[p->nCol] = 1;
+     }else{
+       *pzErr = sqlite3_mprintf("unrecognized column option: %s", zArg);
+       rc = SQLITE_ERROR;
+     }
+   }
+@@ -220772,19 +220799,21 @@
+ ** Populate the Fts5Config.zContentExprlist string.
+ */
+ static int fts5ConfigMakeExprlist(Fts5Config *p){
+   int i;
+   int rc = SQLITE_OK;
++  const char *zFunc;
+   Fts5Buffer buf = {0, 0, 0};
+ 
+   sqlite3Fts5BufferAppendPrintf(&rc, &buf, "T.%Q", p->zContentRowid);
+   if( p->eContent!=FTS5_CONTENT_NONE ){
+     for(i=0; i<p->nCol; i++){
++      zFunc = p->abCompressed[i] ? p->zUnCompressFunc : "";
+       if( p->eContent==FTS5_CONTENT_EXTERNAL ){
+-        sqlite3Fts5BufferAppendPrintf(&rc, &buf, ", T.%Q", p->azCol[i]);
++        sqlite3Fts5BufferAppendPrintf(&rc, &buf, ", %s(T.%Q)", zFunc, p->azCol[i]);
+       }else{
+-        sqlite3Fts5BufferAppendPrintf(&rc, &buf, ", T.c%d", i);
++        sqlite3Fts5BufferAppendPrintf(&rc, &buf, ", %s(T.c%d)", zFunc, i);
+       }
+     }
+   }
+ 
+   assert( p->zContentExprlist==0 );
+@@ -220821,13 +220850,15 @@
+   if( pRet==0 ) return SQLITE_NOMEM;
+   memset(pRet, 0, sizeof(Fts5Config));
+   pRet->db = db;
+   pRet->iCookie = -1;
+ 
+-  nByte = nArg * (sizeof(char*) + sizeof(u8));
++  nByte = nArg * (sizeof(char*) + (sizeof(u8)*2));
+   pRet->azCol = (char**)sqlite3Fts5MallocZero(&rc, nByte);
+   pRet->abUnindexed = pRet->azCol ? (u8*)&pRet->azCol[nArg] : 0;
++  pRet->abCompressed = (u8*)&pRet->abUnindexed[nArg];
++  pRet->zCompressFunc = pRet->zUnCompressFunc = NULL;
+   pRet->zDb = sqlite3Fts5Strndup(&rc, azArg[1], -1);
+   pRet->zName = sqlite3Fts5Strndup(&rc, azArg[2], -1);
+   pRet->bColumnsize = 1;
+   pRet->eDetail = FTS5_DETAIL_FULL;
+ #ifdef SQLITE_DEBUG
+@@ -220881,10 +220912,25 @@
+ 
+     sqlite3_free(zOne);
+     sqlite3_free(zTwo);
+   }
+ 
++  if( rc==SQLITE_OK ){
++    int i;
++    for(i=0; i<pRet->nCol; i++){
++      if( pRet->abCompressed[i] ){
++        /*if at least one column was declared compress*/
++        if( !pRet->zCompressFunc || !pRet->zUnCompressFunc ) {
++          char const *zMiss = (pRet->zCompressFunc==0 ? "compress" : "uncompress");
++          rc = SQLITE_ERROR;
++          sqlite3Fts3ErrMsg(pzErr, "missing %s parameter in fts4 constructor", zMiss);
++        }
++        break;
++      }
++    }
++  }
++
+   /* If a tokenizer= option was successfully parsed, the tokenizer has
+   ** already been allocated. Otherwise, allocate an instance of the default
+   ** tokenizer (unicode61) now.  */
+   if( rc==SQLITE_OK && pRet->pTok==0 ){
+     rc = fts5ConfigDefaultTokenizer(pGlobal, pRet);
+@@ -220944,10 +220990,16 @@
+     sqlite3_free(pConfig->zRank);
+     sqlite3_free(pConfig->zRankArgs);
+     sqlite3_free(pConfig->zContent);
+     sqlite3_free(pConfig->zContentRowid);
+     sqlite3_free(pConfig->zContentExprlist);
++    if(pConfig->zCompressFunc) {
++      sqlite3_free(pConfig->zCompressFunc);
++    }
++    if(pConfig->zUnCompressFunc) {
++      sqlite3_free(pConfig->zUnCompressFunc);
++    }
+     sqlite3_free(pConfig);
+   }
+ }
+ 
+ /*
+@@ -234742,19 +234794,25 @@
+ 
+       case FTS5_STMT_INSERT_CONTENT:
+       case FTS5_STMT_REPLACE_CONTENT: {
+         int nCol = pC->nCol + 1;
+         char *zBind;
+-        int i;
++        const char *zFunc;
++        int i, zFuncSize, zBindSize, bSizeUsed;
+ 
+-        zBind = sqlite3_malloc64(1 + nCol*2);
++        /* Add 4 to take in account the extra '(?),' */
++        zFuncSize = (int)(pC->zCompressFunc ? strlen(pC->zCompressFunc) : 0)+4;
++        zBindSize = 1 + nCol*zFuncSize;
++        zBind = sqlite3_malloc(zBindSize);
+         if( zBind ){
++          bSizeUsed = 0;
+           for(i=0; i<nCol; i++){
+-            zBind[i*2] = '?';
+-            zBind[i*2 + 1] = ',';
++            zFunc = (i && pC->abCompressed[i-1]) ? pC->zCompressFunc : "";
++            sqlite3_snprintf(zBindSize-bSizeUsed, zBind+bSizeUsed, "%s(?),", zFunc);
++            bSizeUsed = (int)strlen(zBind);
+           }
+-          zBind[i*2-1] = '\0';
++          zBind[bSizeUsed-1] = '\0'; /* remove the last comma */
+           zSql = sqlite3_mprintf(azStmt[eStmt], pC->zDb, pC->zName, zBind);
+           sqlite3_free(zBind);
+         }
+         break;
+       }
+diff --git a/toolkit/components/places/nsPlacesTables.h b/toolkit/components/places/nsPlacesTables.h
+--- a/toolkit/components/places/nsPlacesTables.h
++++ b/toolkit/components/places/nsPlacesTables.h
+@@ -390,9 +390,11 @@
+ #define CREATE_CONTENTCACHE_TEXT                                  \
+   nsLiteralCString(                                               \
+       "CREATE VIRTUAL TABLE IF NOT EXISTS moz_contentcache_text " \
+       "USING FTS5("                                               \
+       "  text,"                                                   \
+-      "  tokenize=\"unicode61\""                                 \
++      "  tokenize=\"unicode61\","                                 \
++      "  compress=zip,"                                           \
++      "  uncompress=unzip"                                        \
+       ")")
+ 
+ #endif  // __nsPlacesTables_h__
+

@@ -1,0 +1,190 @@
+# HG changeset patch
+# Parent  2221c77487e621ed05b639ab05a3dd66c2b56fc5
+
+diff --git a/toolkit/components/places/Database.cpp b/toolkit/components/places/Database.cpp
+--- a/toolkit/components/places/Database.cpp
++++ b/toolkit/components/places/Database.cpp
+@@ -46,6 +46,8 @@
+ #define DATABASE_FILENAME u"places.sqlite"_ns
+ // Filename of the icons database.
+ #define DATABASE_FAVICONS_FILENAME u"favicons.sqlite"_ns
++// Filename of the contentcache database.
++#define DATABASE_CONTENTCACHE_FILENAME u"contentcache.sqlite"_ns
+ 
+ // Set to the database file name when it was found corrupt by a previous
+ // maintenance run.
+@@ -315,7 +317,9 @@ nsresult AttachDatabase(nsCOMPtr<mozISto
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
+   // The journal limit must be set apart for each database.
+-  nsAutoCString journalSizePragma("PRAGMA favicons.journal_size_limit = ");
++  nsAutoCString journalSizePragma("PRAGMA ");
++  journalSizePragma.Append(aName);
++  journalSizePragma.Append(".journal_size_limit = ");
+   journalSizePragma.AppendInt(DATABASE_MAX_WAL_BYTES +
+                               DATABASE_JOURNAL_OVERHEAD_BYTES);
+   Unused << aDBConn->ExecuteSimpleSQL(journalSizePragma);
+@@ -729,6 +733,71 @@ nsresult Database::EnsureFaviconsDatabas
+   return NS_OK;
+ }
+ 
++nsresult Database::EnsureContentCacheDatabaseAttached(
++    const nsCOMPtr<mozIStorageService>& aStorage) {
++  MOZ_ASSERT(NS_IsMainThread());
++
++  nsCOMPtr<nsIFile> databaseFile;
++  NS_GetSpecialDirectory(NS_APP_USER_PROFILE_50_DIR,
++                         getter_AddRefs(databaseFile));
++  NS_ENSURE_STATE(databaseFile);
++  nsresult rv = databaseFile->Append(DATABASE_CONTENTCACHE_FILENAME);
++  NS_ENSURE_SUCCESS(rv, rv);
++  nsString contentCachePath;
++  rv = databaseFile->GetPath(contentCachePath);
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  bool fileExists = false;
++  if (NS_SUCCEEDED(databaseFile->Exists(&fileExists)) && fileExists) {
++    return AttachDatabase(mMainConn, NS_ConvertUTF16toUTF8(contentCachePath),
++                          "contentcache"_ns);
++  }
++
++  // Open the database file, this will also create it.
++  nsCOMPtr<mozIStorageConnection> conn;
++  rv = aStorage->OpenUnsharedDatabase(databaseFile,
++                                      mozIStorageService::CONNECTION_DEFAULT,
++                                      getter_AddRefs(conn));
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  {
++    // Ensure we'll close the connection when done.
++    auto cleanup = MakeScopeExit([&]() {
++      // We cannot use AsyncClose() here, because by the time we try to ATTACH
++      // this database, its transaction could be still be running and that would
++      // cause the ATTACH query to fail.
++      MOZ_ALWAYS_TRUE(NS_SUCCEEDED(conn->Close()));
++    });
++
++    // Enable incremental vacuum for this database to minimize the size as the
++    // cache expires or items are removed.
++    rv = conn->ExecuteSimpleSQL("PRAGMA auto_vacuum = INCREMENTAL"_ns);
++    NS_ENSURE_SUCCESS(rv, rv);
++
++    int32_t defaultPageSize;
++    rv = conn->GetDefaultPageSize(&defaultPageSize);
++    NS_ENSURE_SUCCESS(rv, rv);
++    rv = SetupDurability(conn, defaultPageSize);
++    NS_ENSURE_SUCCESS(rv, rv);
++
++    // Update the database in a transaction.
++    mozStorageTransaction transaction(conn, false);
++    rv = transaction.Start();
++    NS_ENSURE_SUCCESS(rv, rv);
++    rv = conn->ExecuteSimpleSQL(CREATE_CONTENTCACHE_TEXT);
++    NS_ENSURE_SUCCESS(rv, rv);
++    rv = transaction.Commit();
++    NS_ENSURE_SUCCESS(rv, rv);
++
++    // The scope exit will take care of closing the connection.
++  }
++  rv = AttachDatabase(mMainConn, NS_ConvertUTF16toUTF8(contentCachePath),
++                      "contentcache"_ns);
++  NS_ENSURE_SUCCESS(rv, rv);
++
++  return NS_OK;
++}
++
+ nsresult Database::BackupAndReplaceDatabaseFile(
+     nsCOMPtr<mozIStorageService>& aStorage, const nsString& aDbFilename,
+     bool aTryToClone, bool aReopenConnection) {
+@@ -1059,6 +1128,24 @@ nsresult Database::SetupDatabaseConnecti
+   rv = mMainConn->ExecuteSimpleSQL(CREATE_ICONS_AFTERINSERT_TRIGGER);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
++  // Attach the contentcache database to the main connection.
++  rv = EnsureContentCacheDatabaseAttached(aStorage);
++  if (NS_FAILED(rv)) {
++    // The contentcache database may be corrupt. Try to replace and reattach it.
++    nsCOMPtr<nsIFile> contentCacheFile;
++    rv = NS_GetSpecialDirectory(NS_APP_USER_PROFILE_50_DIR,
++                                getter_AddRefs(contentCacheFile));
++    NS_ENSURE_SUCCESS(rv, rv);
++    rv = contentCacheFile->Append(DATABASE_CONTENTCACHE_FILENAME);
++    NS_ENSURE_SUCCESS(rv, rv);
++    rv = contentCacheFile->Remove(false);
++    if (NS_FAILED(rv) && rv != NS_ERROR_FILE_NOT_FOUND) {
++      return rv;
++    }
++    rv = EnsureFaviconsDatabaseAttached(aStorage);
++    NS_ENSURE_SUCCESS(rv, rv);
++  }
++
+   // We use our functions during migration, so initialize them now.
+   rv = InitFunctions();
+   NS_ENSURE_SUCCESS(rv, rv);
+@@ -1721,6 +1808,9 @@ nsresult Database::InitTempEntities() {
+   rv = mMainConn->ExecuteSimpleSQL(CREATE_PLACES_METADATA_AFTERDELETE_TRIGGER);
+   NS_ENSURE_SUCCESS(rv, rv);
+ 
++  rv = mMainConn->ExecuteSimpleSQL(CREATE_PLACES_CONTENTCACHE_TRIGGER);
++  NS_ENSURE_SUCCESS(rv, rv);
++
+   return NS_OK;
+ }
+ 
+diff --git a/toolkit/components/places/Database.h b/toolkit/components/places/Database.h
+--- a/toolkit/components/places/Database.h
++++ b/toolkit/components/places/Database.h
+@@ -225,6 +225,15 @@ class Database final : public nsIObserve
+       const nsCOMPtr<mozIStorageService>& aStorage);
+ 
+   /**
++   * Ensure the content cache database file exists.
++   *
++   * @param aStorage
++   *        mozStorage service instance.
++   */
++  nsresult EnsureContentCacheDatabaseAttached(
++      const nsCOMPtr<mozIStorageService>& aStorage);
++
++  /**
+    * Creates a database backup and replaces the original file with a new
+    * one.
+    *
+diff --git a/toolkit/components/places/nsPlacesTables.h b/toolkit/components/places/nsPlacesTables.h
+--- a/toolkit/components/places/nsPlacesTables.h
++++ b/toolkit/components/places/nsPlacesTables.h
+@@ -320,4 +320,14 @@
+       "  hash TEXT PRIMARY KEY "                              \
+       ") WITHOUT ROWID")
+ 
++// The content cache provides a full text search (FTS) capability for all
++// text webpage content that is visited.
++#define CREATE_CONTENTCACHE_TEXT                                  \
++  nsLiteralCString(                                               \
++      "CREATE VIRTUAL TABLE IF NOT EXISTS moz_contentcache_text " \
++      "USING FTS5("                                               \
++      "  text,"                                                   \
++      "  tokenize=\"unicode61\""                                 \
++      ")")
++
+ #endif  // __nsPlacesTables_h__
+diff --git a/toolkit/components/places/nsPlacesTriggers.h b/toolkit/components/places/nsPlacesTriggers.h
+--- a/toolkit/components/places/nsPlacesTriggers.h
++++ b/toolkit/components/places/nsPlacesTriggers.h
+@@ -352,6 +352,16 @@
+         "WHERE id = OLD.place_id;"                                            \
+         "END")
+ 
++// This trigger synchronizes the history removal with the content cache
++// database.
++#  define CREATE_PLACES_CONTENTCACHE_TRIGGER                   \
++    nsLiteralCString(                                          \
++        "CREATE TEMP TRIGGER moz_places_contentcache_trigger " \
++        "AFTER DELETE ON moz_places FOR EACH ROW "             \
++        "BEGIN "                                               \
++        "  DELETE FROM moz_contentcache_text "                 \
++        "  WHERE rowid = OLD.id; "                             \
++        "END ")
+ #  define CREATE_KEYWORDS_FOREIGNCOUNT_AFTERINSERT_TRIGGER                    \
+     nsLiteralCString(                                                         \
+         "CREATE TEMP TRIGGER moz_keywords_foreign_count_afterinsert_trigger " \
