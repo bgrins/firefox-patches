@@ -1,0 +1,344 @@
+
+# HG changeset patch
+# User Doug Thayer <dothayer@mozilla.com>
+# Date 1694023062 25200
+# Node ID d9120e7e258c6be2f4f59cd237ed4283b7edf38a
+# Parent  059b77df2394c7caf1061e1b817e004878738efa
+hacky single ion thread
+
+diff --git a/js/public/HelperThreadAPI.h b/js/public/HelperThreadAPI.h
+--- a/js/public/HelperThreadAPI.h
++++ b/js/public/HelperThreadAPI.h
+@@ -16,25 +16,27 @@
+ 
+ #include "jstypes.h"  // JS_PUBLIC_API
+ 
+ namespace JS {
+ 
+ // Argument passed to the task callback to indicate whether we're invoking it
+ // because a new task was added by the JS engine or because we're on a helper
+ // thread that just finished a task and there are other tasks pending.
+-enum class DispatchReason { NewTask, FinishedTask };
++enum class DispatchReason { NewTask, FinishedTask, NewIonTask };
+ 
+ /**
+  * Set callback to dispatch a tasks to an external thread pool.
+  *
+  * When the task runs it should call JS::RunHelperThreadTask.
+  */
+ using HelperThreadTaskCallback = void (*)(DispatchReason reason);
+ extern JS_PUBLIC_API void SetHelperThreadTaskCallback(
+     HelperThreadTaskCallback callback, size_t threadCount, size_t stackSize);
+ 
+ // Function to call from external thread pool to run a helper thread task.
+ extern JS_PUBLIC_API void RunHelperThreadTask();
+ 
++extern JS_PUBLIC_API void RunIonThreadTask();
++
+ }  // namespace JS
+ 
+ #endif  // js_HelperThreadAPI_h
+diff --git a/js/src/vm/HelperThreadState.h b/js/src/vm/HelperThreadState.h
+--- a/js/src/vm/HelperThreadState.h
++++ b/js/src/vm/HelperThreadState.h
+@@ -462,24 +462,29 @@ class GlobalHelperThreadState {
+                   const AutoLockHelperThreadState& locked);
+   void submitTask(DelazifyTask* task, const AutoLockHelperThreadState& locked);
+   bool submitTask(UniquePtr<FreeDelazifyTask> task,
+                   const AutoLockHelperThreadState& locked);
+   bool submitTask(PromiseHelperTask* task);
+   bool submitTask(GCParallelTask* task,
+                   const AutoLockHelperThreadState& locked);
+   void runOneTask(AutoLockHelperThreadState& lock);
++  void runOneIonTask(AutoLockHelperThreadState& lock);
+   void runTaskLocked(HelperThreadTask* task, AutoLockHelperThreadState& lock);
+ 
+   using Selector = HelperThreadTask* (
+       GlobalHelperThreadState::*)(const AutoLockHelperThreadState&);
+   static const Selector selectors[];
++  static const Selector ionSelectors[];
+ 
+   HelperThreadTask* findHighestPriorityTask(
+       const AutoLockHelperThreadState& locked);
++
++  HelperThreadTask* findHighestPriorityIonTask(
++      const AutoLockHelperThreadState& locked);
+ };
+ 
+ static inline bool IsHelperThreadStateInitialized() {
+   extern GlobalHelperThreadState* gHelperThreadState;
+   return gHelperThreadState;
+ }
+ 
+ static inline GlobalHelperThreadState& HelperThreadState() {
+diff --git a/js/src/vm/HelperThreads.cpp b/js/src/vm/HelperThreads.cpp
+--- a/js/src/vm/HelperThreads.cpp
++++ b/js/src/vm/HelperThreads.cpp
+@@ -260,17 +260,17 @@ bool GlobalHelperThreadState::submitTask
+   if (!ionWorklist(locked).append(task)) {
+     return false;
+   }
+ 
+   // The build is moving off-thread. Freeze the LifoAlloc to prevent any
+   // unwanted mutations.
+   task->alloc().lifoAlloc()->setReadOnly();
+ 
+-  dispatch(DispatchReason::NewTask, locked);
++  dispatch(DispatchReason::NewIonTask, locked);
+   return true;
+ }
+ 
+ bool js::StartOffThreadIonFree(jit::IonCompileTask* task,
+                                const AutoLockHelperThreadState& lock) {
+   js::UniquePtr<jit::IonFreeTask> freeTask =
+       js::MakeUnique<jit::IonFreeTask>(task);
+   if (!freeTask) {
+@@ -283,17 +283,17 @@ bool js::StartOffThreadIonFree(jit::IonC
+ bool GlobalHelperThreadState::submitTask(
+     UniquePtr<jit::IonFreeTask> task, const AutoLockHelperThreadState& locked) {
+   MOZ_ASSERT(isInitialized(locked));
+ 
+   if (!ionFreeList(locked).append(std::move(task))) {
+     return false;
+   }
+ 
+-  dispatch(DispatchReason::NewTask, locked);
++  dispatch(DispatchReason::NewIonTask, locked);
+   return true;
+ }
+ 
+ /*
+  * Move an IonCompilationTask for which compilation has either finished, failed,
+  * or been cancelled into the global finished compilation list. All off thread
+  * compilations which are started must eventually be finished.
+  */
+@@ -1217,16 +1217,21 @@ void GlobalHelperThreadState::finishThre
+ #ifdef DEBUG
+ void GlobalHelperThreadState::assertIsLockedByCurrentThread() const {
+   gHelperThreadLock.assertOwnedByCurrentThread();
+ }
+ #endif  // DEBUG
+ 
+ void GlobalHelperThreadState::dispatch(
+     DispatchReason reason, const AutoLockHelperThreadState& locked) {
++  if (reason == DispatchReason::NewIonTask) {
++    dispatchTaskCallback(reason);
++    return;
++  }
++
+   if (canStartTasks(locked) && tasksPending_ < threadCount) {
+     // This doesn't guarantee that we don't dispatch more tasks to the external
+     // pool than necessary if tasks are taking a long time to start, but it does
+     // limit the number.
+     tasksPending_++;
+ 
+     // The hazard analysis can't tell that the callback doesn't GC.
+     JS::AutoSuppressGCAnalysis nogc;
+@@ -2105,51 +2110,65 @@ void GlobalHelperThreadState::trace(JSTr
+   }
+ }
+ 
+ // Definition of helper thread tasks.
+ //
+ // Priority is determined by the order they're listed here.
+ const GlobalHelperThreadState::Selector GlobalHelperThreadState::selectors[] = {
+     &GlobalHelperThreadState::maybeGetGCParallelTask,
+-    &GlobalHelperThreadState::maybeGetIonCompileTask,
+     &GlobalHelperThreadState::maybeGetWasmTier1CompileTask,
+     &GlobalHelperThreadState::maybeGetPromiseHelperTask,
+     &GlobalHelperThreadState::maybeGetParseTask,
+     &GlobalHelperThreadState::maybeGetFreeDelazifyTask,
+     &GlobalHelperThreadState::maybeGetDelazifyTask,
+     &GlobalHelperThreadState::maybeGetCompressionTask,
+-    &GlobalHelperThreadState::maybeGetLowPrioIonCompileTask,
+     &GlobalHelperThreadState::maybeGetIonFreeTask,
+     &GlobalHelperThreadState::maybeGetWasmTier2CompileTask,
+     &GlobalHelperThreadState::maybeGetWasmTier2GeneratorTask};
+ 
++const GlobalHelperThreadState::Selector
++    GlobalHelperThreadState::ionSelectors[] = {
++        &GlobalHelperThreadState::maybeGetIonCompileTask,
++        &GlobalHelperThreadState::maybeGetLowPrioIonCompileTask,
++        &GlobalHelperThreadState::maybeGetIonFreeTask};
++
+ bool GlobalHelperThreadState::canStartTasks(
+     const AutoLockHelperThreadState& lock) {
+-  return canStartGCParallelTask(lock) || canStartIonCompileTask(lock) ||
+-         canStartWasmTier1CompileTask(lock) ||
++  return canStartGCParallelTask(lock) || canStartWasmTier1CompileTask(lock) ||
+          canStartPromiseHelperTask(lock) || canStartParseTask(lock) ||
+          canStartFreeDelazifyTask(lock) || canStartDelazifyTask(lock) ||
+-         canStartCompressionTask(lock) || canStartIonFreeTask(lock) ||
+-         canStartWasmTier2CompileTask(lock) ||
++         canStartCompressionTask(lock) || canStartWasmTier2CompileTask(lock) ||
+          canStartWasmTier2GeneratorTask(lock);
+ }
+ 
+ void JS::RunHelperThreadTask() {
+   MOZ_ASSERT(CanUseExtraThreads());
+ 
+   AutoLockHelperThreadState lock;
+ 
+   if (!gHelperThreadState || HelperThreadState().isTerminating(lock)) {
+     return;
+   }
+ 
+   HelperThreadState().runOneTask(lock);
+ }
+ 
++void JS::RunIonThreadTask() {
++  MOZ_ASSERT(CanUseExtraThreads());
++
++  AutoLockHelperThreadState lock;
++
++  if (!gHelperThreadState || HelperThreadState().isTerminating(lock)) {
++    return;
++  }
++
++  HelperThreadState().runOneIonTask(lock);
++}
++
+ void GlobalHelperThreadState::runOneTask(AutoLockHelperThreadState& lock) {
+   MOZ_ASSERT(tasksPending_ > 0);
+   tasksPending_--;
+ 
+   // The selectors may depend on the HelperThreadState not changing between task
+   // selection and task execution, in particular, on new tasks not being added
+   // (because of the lifo structure of the work lists). Unlocking the
+   // HelperThreadState between task selection and execution is not well-defined.
+@@ -2157,29 +2176,55 @@ void GlobalHelperThreadState::runOneTask
+   if (task) {
+     runTaskLocked(task, lock);
+     dispatch(DispatchReason::FinishedTask, lock);
+   }
+ 
+   notifyAll(lock);
+ }
+ 
++void GlobalHelperThreadState::runOneIonTask(AutoLockHelperThreadState& lock) {
++  // The selectors may depend on the HelperThreadState not changing between task
++  // selection and task execution, in particular, on new tasks not being added
++  // (because of the lifo structure of the work lists). Unlocking the
++  // HelperThreadState between task selection and execution is not well-defined.
++  HelperThreadTask* task = findHighestPriorityIonTask(lock);
++  if (task) {
++    runTaskLocked(task, lock);
++  }
++
++  notifyAll(lock);
++}
++
+ HelperThreadTask* GlobalHelperThreadState::findHighestPriorityTask(
+     const AutoLockHelperThreadState& locked) {
+   // Return the highest priority task that is ready to start, or nullptr.
+ 
+   for (const auto& selector : selectors) {
+     if (auto* task = (this->*(selector))(locked)) {
+       return task;
+     }
+   }
+ 
+   return nullptr;
+ }
+ 
++HelperThreadTask* GlobalHelperThreadState::findHighestPriorityIonTask(
++    const AutoLockHelperThreadState& locked) {
++  // Return the highest priority task that is ready to start, or nullptr.
++
++  for (const auto& selector : ionSelectors) {
++    if (auto* task = (this->*(selector))(locked)) {
++      return task;
++    }
++  }
++
++  return nullptr;
++}
++
+ void GlobalHelperThreadState::runTaskLocked(HelperThreadTask* task,
+                                             AutoLockHelperThreadState& locked) {
+   JS::AutoSuppressGCAnalysis nogc;
+ 
+   HelperThreadState().helperTasks(locked).infallibleEmplaceBack(task);
+ 
+   ThreadType threadType = task->threadType();
+   js::oom::SetThreadType(threadType);
+diff --git a/js/xpconnect/src/XPCJSContext.cpp b/js/xpconnect/src/XPCJSContext.cpp
+--- a/js/xpconnect/src/XPCJSContext.cpp
++++ b/js/xpconnect/src/XPCJSContext.cpp
+@@ -1181,31 +1181,73 @@ class HelperThreadTaskHandler : public T
+     return true;
+   }
+ #endif
+ 
+  private:
+   ~HelperThreadTaskHandler() = default;
+ };
+ 
+-static void DispatchOffThreadTask(JS::DispatchReason) {
+-  TaskController::Get()->AddTask(MakeAndAddRef<HelperThreadTaskHandler>());
++volatile uint32_t sStarted = 0;
++volatile uint32_t sQueued = 0;
++HANDLE sIonThreadSemaphore = nullptr;
++PRThread* sIonThread = nullptr;
++PRThread* sIonThread2 = nullptr;
++
++static void DispatchOffThreadTask(JS::DispatchReason reason) {
++  if (reason == JS::DispatchReason::NewIonTask) {
++    InterlockedIncrement(&sQueued);
++    ReleaseSemaphore(sIonThreadSemaphore, 1, 0);
++  } else {
++    TaskController::Get()->AddTask(MakeAndAddRef<HelperThreadTaskHandler>());
++  }
+ }
+ 
+ static bool CreateSelfHostedSharedMemory(JSContext* aCx,
+                                          JS::SelfHostedCache aBuf) {
+   auto& shm = xpc::SelfHostedShmem::GetSingleton();
+   MOZ_RELEASE_ASSERT(shm.Content().IsEmpty());
+   // Failures within InitFromParent output warnings but do not cause
+   // unrecoverable failures.
+   shm.InitFromParent(aBuf);
+   return true;
+ }
+ 
++static bool DoNextIonTask() {
++  uint32_t originalStarted = sStarted;
++  if (originalStarted == sQueued) {
++    return true;
++  }
++
++  uint32_t trueStarted = InterlockedCompareExchange(
++      (LONG volatile*)&sStarted, originalStarted + 1, originalStarted);
++  if (trueStarted == originalStarted) {
++    JS::RunIonThreadTask();
++  }
++
++  return false;
++}
++
++static void IonThreadFunc(void* arg) {
++  while (true) {
++    if (DoNextIonTask()) {
++      WaitForSingleObject(sIonThreadSemaphore, INFINITE);
++    }
++  }
++}
++
+ nsresult XPCJSContext::Initialize() {
++  sIonThreadSemaphore = CreateSemaphoreEx(0, 0, 2, 0, 0, SEMAPHORE_ALL_ACCESS);
++  sIonThread =
++      PR_CreateThread(PR_USER_THREAD, &IonThreadFunc, this, PR_PRIORITY_LOW,
++                      PR_GLOBAL_THREAD, PR_JOINABLE_THREAD, 262144);
++  sIonThread2 =
++      PR_CreateThread(PR_USER_THREAD, &IonThreadFunc, this, PR_PRIORITY_LOW,
++                      PR_GLOBAL_THREAD, PR_JOINABLE_THREAD, 262144);
++
+   if (StaticPrefs::javascript_options_external_thread_pool_DoNotUseDirectly()) {
+     size_t threadCount = TaskController::GetPoolThreadCount();
+     size_t stackSize = TaskController::GetThreadStackSize();
+     SetHelperThreadTaskCallback(&DispatchOffThreadTask, threadCount, stackSize);
+   }
+ 
+   nsresult rv =
+       CycleCollectedJSContext::Initialize(nullptr, JS::DefaultHeapMaxBytes);
+
