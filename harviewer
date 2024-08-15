@@ -1,0 +1,879 @@
+# HG changeset patch
+# Parent  6ec3ba998cc5e840c2d005e867780ebc80fa5beb
+
+diff --git a/browser/components/harviewer/Converter.sys.mjs b/browser/components/harviewer/Converter.sys.mjs
+new file mode 100644
+--- /dev/null
++++ b/browser/components/harviewer/Converter.sys.mjs
+@@ -0,0 +1,17 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/*
++ * Create instances of the JSON view converter.
++ */
++export function Converter() {
++  const { require } = ChromeUtils.importESModule(
++    "resource://devtools/shared/loader/Loader.sys.mjs"
++  );
++  const {
++    JsonViewService,
++  } = require("resource://devtools/client/jsonview/converter-child.js");
++
++  return JsonViewService.createInstance();
++}
+diff --git a/browser/components/harviewer/Sniffer.sys.mjs b/browser/components/harviewer/Sniffer.sys.mjs
+new file mode 100644
+--- /dev/null
++++ b/browser/components/harviewer/Sniffer.sys.mjs
+@@ -0,0 +1,67 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
++
++const gPrefs = {};
++
++XPCOMUtils.defineLazyPreferenceGetter(
++  gPrefs,
++  "gEnabled",
++  "browser.harviewer.enabled"
++);
++
++console.log("HarViewer enabled", gPrefs.gEnabled);
++
++const HAR_VIEW_MIME_TYPE = "application/vnd.mozilla.json.view";
++
++function getContentDisposition(channel) {
++  try {
++    return channel.contentDisposition;
++  } catch (e) {
++    // Channel doesn't support content dispositions
++    return null;
++  }
++}
++
++/**
++ * This component represents a sniffer (implements nsIContentSniffer
++ * interface) responsible for changing top level 'application/json'
++ * document types to: 'application/vnd.mozilla.json.view'.
++ *
++ * This internal type is consequently rendered by JSON View component
++ * that represents the JSON through a viewer interface.
++ *
++ * This is done in the .js file rather than a .jsm to avoid creating
++ * a compartment at startup when no JSON is being viewed.
++ */
++export class Sniffer {
++  getMIMETypeFromContent(request) {
++    console.log("Getting mime type from HAR", request);
++    if (request instanceof Ci.nsIChannel) {
++      // JSON View is enabled only for top level loads only.
++      if (
++        gPrefs.gEnabled &&
++        request.loadInfo?.isTopLevelLoad &&
++        request.loadFlags & Ci.nsIChannel.LOAD_DOCUMENT_URI &&
++        getContentDisposition(request) != Ci.nsIChannel.DISPOSITION_ATTACHMENT
++      ) {
++        // Check the response content type and if it's a valid type
++        // such as application/json or application/manifest+json
++        // change it to new internal type consumed by JSON View.
++        if (/^application\/(?:.+\+)?har$/.test(request.contentType)) {
++          return HAR_VIEW_MIME_TYPE;
++        }
++      } else if (request.contentType === HAR_VIEW_MIME_TYPE) {
++        return "application/har";
++      }
++    }
++
++    return "";
++  }
++}
++
++Sniffer.prototype.QueryInterface = ChromeUtils.generateQI([
++  "nsIContentSniffer",
++]);
+diff --git a/browser/components/harviewer/components.conf b/browser/components/harviewer/components.conf
+new file mode 100644
+--- /dev/null
++++ b/browser/components/harviewer/components.conf
+@@ -0,0 +1,26 @@
++# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++HAR_VIEW_MIME_TYPE = "application/vnd.mozilla.har.view"
++
++Classes = [
++    {
++        'cid': '{4148c488-dca1-49fc-a621-2a0097a62422}',
++        'contract_ids': ['@mozilla.org/devtools/jsonview-sniffer;1'],
++        'esModule': 'chrome://browser/content/harviewer/Sniffer.sys.mjs',
++        'constructor': 'Sniffer',
++        'categories': {
++            'net-content-sniffers': 'HARView',
++            'net-and-orb-content-sniffers': 'HARView',
++         },
++    },
++    {
++        'cid': '{d8c9acee-dec5-11e4-8c75-1681e6b88ec1}',
++        'contract_ids': ['@mozilla.org/streamconv;1?from=%s&to=*/*' % HAR_VIEW_MIME_TYPE],
++        'esModule': 'chrome://browser/content/harviewer/Converter.sys.mjs',
++        'constructor': 'Converter',
++    },
++]
+diff --git a/browser/components/harviewer/converter-child.js b/browser/components/harviewer/converter-child.js
+new file mode 100644
+--- /dev/null
++++ b/browser/components/harviewer/converter-child.js
+@@ -0,0 +1,430 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++const lazy = {};
++ChromeUtils.defineESModuleGetters(lazy, {
++  NetUtil: "resource://gre/modules/NetUtil.sys.mjs",
++});
++
++const {
++  getTheme,
++  addThemeObserver,
++  removeThemeObserver,
++} = require("resource://devtools/client/shared/theme.js");
++
++const BinaryInput = Components.Constructor(
++  "@mozilla.org/binaryinputstream;1",
++  "nsIBinaryInputStream",
++  "setInputStream"
++);
++const BufferStream = Components.Constructor(
++  "@mozilla.org/io/arraybuffer-input-stream;1",
++  "nsIArrayBufferInputStream",
++  "setData"
++);
++
++const kCSP = "default-src 'none'; script-src resource:; img-src 'self';";
++
++// Localization
++loader.lazyGetter(this, "jsonViewStrings", () => {
++  return Services.strings.createBundle(
++    "chrome://devtools/locale/jsonview.properties"
++  );
++});
++
++/**
++ * This object detects 'application/vnd.mozilla.json.view' content type
++ * and converts it into a JSON Viewer application that allows simple
++ * JSON inspection.
++ *
++ * Inspired by JSON View: https://github.com/bhollis/jsonview/
++ */
++function Converter() {}
++
++Converter.prototype = {
++  QueryInterface: ChromeUtils.generateQI([
++    "nsIStreamConverter",
++    "nsIStreamListener",
++    "nsIRequestObserver",
++  ]),
++
++  get wrappedJSObject() {
++    return this;
++  },
++
++  /**
++   * This component works as such:
++   * 1. asyncConvertData captures the listener
++   * 2. onStartRequest fires, initializes stuff, modifies the listener
++   *    to match our output type
++   * 3. onDataAvailable decodes and inserts data into a text node
++   * 4. onStopRequest flushes data and spits back to the listener
++   * 5. convert does nothing, it's just the synchronous version
++   *    of asyncConvertData
++   */
++  convert(fromStream) {
++    return fromStream;
++  },
++
++  asyncConvertData(fromType, toType, listener) {
++    this.listener = listener;
++  },
++  getConvertedType() {
++    return "text/html";
++  },
++
++  onDataAvailable(request, inputStream, offset, count) {
++    // Decode and insert data.
++    const buffer = new ArrayBuffer(count);
++    new BinaryInput(inputStream).readArrayBuffer(count, buffer);
++    this.decodeAndInsertBuffer(buffer);
++  },
++
++  onStartRequest(request) {
++    // Set the content type to HTML in order to parse the doctype, styles
++    // and scripts. The JSON will be manually inserted as text.
++    request.QueryInterface(Ci.nsIChannel);
++    request.contentType = "text/html";
++
++    // Tweak the request's principal in order to allow the related HTML document
++    // used to display raw JSON to be able to load resource://devtools files
++    // from the jsonview document.
++    const uri = lazy.NetUtil.newURI("resource://devtools/client/jsonview/");
++    const resourcePrincipal =
++      Services.scriptSecurityManager.createContentPrincipal(
++        uri,
++        request.loadInfo.originAttributes
++      );
++    request.owner = resourcePrincipal;
++
++    const headers = getHttpHeaders(request);
++
++    // Enforce strict CSP:
++    try {
++      request.QueryInterface(Ci.nsIHttpChannel);
++      request.setResponseHeader("Content-Security-Policy", kCSP, false);
++      request.setResponseHeader(
++        "Content-Security-Policy-Report-Only",
++        "",
++        false
++      );
++    } catch (ex) {
++      // If this is not an HTTP channel we can't and won't do anything.
++    }
++
++    // Don't honor the charset parameter and use UTF-8 (see bug 741776).
++    request.contentCharset = "UTF-8";
++    this.decoder = new TextDecoder("UTF-8");
++
++    // Changing the content type breaks saving functionality. Fix it.
++    fixSave(request);
++
++    // Start the request.
++    this.listener.onStartRequest(request);
++
++    // Initialize stuff.
++    const win = getWindowForRequest(request);
++    if (!win || !Components.isSuccessCode(request.status)) {
++      return;
++    }
++
++    // We compare actual pointer identities here rather than using .equals(),
++    // because if things went correctly then the document must have exactly
++    // the principal we reset it to above. If not, something went wrong.
++    if (win.document.nodePrincipal != resourcePrincipal) {
++      // Whatever that document is, it's not ours.
++      request.cancel(Cr.NS_BINDING_ABORTED);
++      return;
++    }
++
++    this.data = exportData(win, headers);
++    insertJsonData(win, this.data.json);
++    win.addEventListener("contentMessage", onContentMessage, false, true);
++    keepThemeUpdated(win);
++
++    // Send the initial HTML code.
++    const buffer = new TextEncoder().encode(initialHTML(win.document)).buffer;
++    const stream = new BufferStream(buffer, 0, buffer.byteLength);
++    this.listener.onDataAvailable(request, stream, 0, stream.available());
++  },
++
++  onStopRequest(request, statusCode) {
++    // Flush data if we haven't been canceled.
++    if (Components.isSuccessCode(statusCode)) {
++      this.decodeAndInsertBuffer(new ArrayBuffer(0), true);
++    }
++
++    // Stop the request.
++    this.listener.onStopRequest(request, statusCode);
++    this.listener = null;
++    this.decoder = null;
++    this.data = null;
++  },
++
++  // Decodes an ArrayBuffer into a string and inserts it into the page.
++  decodeAndInsertBuffer(buffer, flush = false) {
++    // Decode the buffer into a string.
++    const data = this.decoder.decode(buffer, { stream: !flush });
++
++    // Using `appendData` instead of `textContent +=` is important to avoid
++    // repainting previous data.
++    this.data.json.appendData(data);
++  },
++};
++
++// Lets "save as" save the original JSON, not the viewer.
++// To save with the proper extension we need the original content type,
++// which has been replaced by application/vnd.mozilla.json.view
++function fixSave(request) {
++  let match;
++  if (request instanceof Ci.nsIHttpChannel) {
++    try {
++      const header = request.getResponseHeader("Content-Type");
++      match = header.match(/^(application\/(?:[^;]+\+)?json)(?:;|$)/);
++    } catch (err) {
++      // Handled below
++    }
++  } else {
++    const uri = request.QueryInterface(Ci.nsIChannel).URI.spec;
++    match = uri.match(/^data:(application\/(?:[^;,]+\+)?json)[;,]/);
++  }
++  let originalType;
++  if (match) {
++    originalType = match[1];
++  } else {
++    originalType = "application/json";
++  }
++  request.QueryInterface(Ci.nsIWritablePropertyBag);
++  request.setProperty("contentType", originalType);
++}
++
++function getHttpHeaders(request) {
++  const headers = {
++    response: [],
++    request: [],
++  };
++  // The request doesn't have to be always nsIHttpChannel
++  // (e.g. in case of data: URLs)
++  if (request instanceof Ci.nsIHttpChannel) {
++    request.visitResponseHeaders({
++      visitHeader(name, value) {
++        headers.response.push({ name, value });
++      },
++    });
++    request.visitRequestHeaders({
++      visitHeader(name, value) {
++        headers.request.push({ name, value });
++      },
++    });
++  }
++  return headers;
++}
++
++let jsonViewStringDict = null;
++function getAllStrings() {
++  if (!jsonViewStringDict) {
++    jsonViewStringDict = {};
++    for (const string of jsonViewStrings.getSimpleEnumeration()) {
++      jsonViewStringDict[string.key] = string.value;
++    }
++  }
++  return jsonViewStringDict;
++}
++
++// The two following methods are duplicated from NetworkHelper.sys.mjs
++// to avoid pulling the whole NetworkHelper as a dependency during
++// initialization.
++
++/**
++ * Gets the nsIDOMWindow that is associated with request.
++ *
++ * @param nsIHttpChannel request
++ * @returns nsIDOMWindow or null
++ */
++function getWindowForRequest(request) {
++  try {
++    return getRequestLoadContext(request).associatedWindow;
++  } catch (ex) {
++    // On some request notificationCallbacks and loadGroup are both null,
++    // so that we can't retrieve any nsILoadContext interface.
++    // Fallback on nsILoadInfo to try to retrieve the request's window.
++    // (this is covered by test_network_get.html and its CSS request)
++    return request.loadInfo.loadingDocument?.defaultView;
++  }
++}
++
++/**
++ * Gets the nsILoadContext that is associated with request.
++ *
++ * @param nsIHttpChannel request
++ * @returns nsILoadContext or null
++ */
++function getRequestLoadContext(request) {
++  try {
++    return request.notificationCallbacks.getInterface(Ci.nsILoadContext);
++  } catch (ex) {
++    // Ignore.
++  }
++
++  try {
++    return request.loadGroup.notificationCallbacks.getInterface(
++      Ci.nsILoadContext
++    );
++  } catch (ex) {
++    // Ignore.
++  }
++
++  return null;
++}
++
++// Exports variables that will be accessed by the non-privileged scripts.
++function exportData(win, headers) {
++  const json = new win.Text();
++  const JSONView = Cu.cloneInto(
++    {
++      headers,
++      json,
++      readyState: "uninitialized",
++      Locale: getAllStrings(),
++    },
++    win,
++    {
++      wrapReflectors: true,
++    }
++  );
++  try {
++    Object.defineProperty(Cu.waiveXrays(win), "JSONView", {
++      value: JSONView,
++      configurable: true,
++      enumerable: true,
++      writable: true,
++    });
++  } catch (error) {
++    console.error(error);
++  }
++  return { json };
++}
++
++// Builds an HTML string that will be used to load stylesheets and scripts.
++function initialHTML(doc) {
++  // Creates an element with the specified type, attributes and children.
++  function element(type, attributes = {}, children = []) {
++    const el = doc.createElement(type);
++    for (const [attr, value] of Object.entries(attributes)) {
++      el.setAttribute(attr, value);
++    }
++    el.append(...children);
++    return el;
++  }
++
++  let os;
++  const platform = Services.appinfo.OS;
++  if (platform.startsWith("WINNT")) {
++    os = "win";
++  } else if (platform.startsWith("Darwin")) {
++    os = "mac";
++  } else {
++    os = "linux";
++  }
++
++  const baseURI = "resource://devtools/client/jsonview/";
++
++  return (
++    "<!DOCTYPE html>\n" +
++    element(
++      "html",
++      {
++        platform: os,
++        class: "theme-" + getTheme(),
++        dir: Services.locale.isAppLocaleRTL ? "rtl" : "ltr",
++      },
++      [
++        element("head", {}, [
++          element("meta", {
++            "http-equiv": "Content-Security-Policy",
++            content: kCSP,
++          }),
++          element("link", {
++            rel: "stylesheet",
++            type: "text/css",
++            href: "chrome://devtools-jsonview-styles/content/main.css",
++          }),
++        ]),
++        element("body", {}, [
++          element("div", { id: "content" }, [element("div", { id: "json" })]),
++          element("script", {
++            src: baseURI + "lib/require.js",
++            "data-main": baseURI + "viewer-config.js",
++          }),
++        ]),
++      ]
++    ).outerHTML
++  );
++}
++
++// We insert the received data into a text node, which should be appended into
++// the #json element so that the JSON is still displayed even if JS is disabled.
++// However, the HTML parser is not synchronous, so this function uses a mutation
++// observer to detect the creation of the element. Then the text node is appended.
++function insertJsonData(win, json) {
++  new win.MutationObserver(function (mutations, observer) {
++    for (const { target, addedNodes } of mutations) {
++      if (target.nodeType == 1 && target.id == "content") {
++        for (const node of addedNodes) {
++          if (node.nodeType == 1 && node.id == "json") {
++            observer.disconnect();
++            node.append(json);
++            return;
++          }
++        }
++      }
++    }
++  }).observe(win.document, {
++    childList: true,
++    subtree: true,
++  });
++}
++
++function keepThemeUpdated(win) {
++  const listener = function () {
++    win.document.documentElement.className = "theme-" + getTheme();
++  };
++  addThemeObserver(listener);
++  win.addEventListener(
++    "unload",
++    function () {
++      removeThemeObserver(listener);
++      win = null;
++    },
++    { once: true }
++  );
++}
++
++// Chrome <-> Content communication
++function onContentMessage(e) {
++  // Do not handle events from different documents.
++  const win = this;
++  if (win != e.target) {
++    return;
++  }
++
++  const value = e.detail.value;
++  switch (e.detail.type) {
++    case "save":
++      win.docShell.messageManager.sendAsyncMessage(
++        "devtools:jsonview:save",
++        value
++      );
++  }
++}
++
++function createInstance() {
++  return new Converter();
++}
++
++exports.JsonViewService = {
++  createInstance,
++};
+diff --git a/browser/components/harviewer/har-viewer.js b/browser/components/harviewer/har-viewer.js
+new file mode 100644
+--- /dev/null
++++ b/browser/components/harviewer/har-viewer.js
+@@ -0,0 +1,210 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++"use strict";
++
++define(function (require) {
++  const { render } = require("devtools/client/shared/vendor/react-dom");
++  const { createFactories } = require("devtools/client/shared/react-utils");
++  const { MainTabbedArea } = createFactories(
++    require("devtools/client/jsonview/components/MainTabbedArea")
++  );
++  const TreeViewClass = require("devtools/client/shared/components/tree/TreeView");
++
++  const AUTO_EXPAND_MAX_SIZE = 100 * 1024;
++  const AUTO_EXPAND_MAX_LEVEL = 7;
++  const TABS = {
++    JSON: 0,
++    RAW_DATA: 1,
++    HEADERS: 2,
++  };
++
++  let prettyURL;
++  let theApp;
++
++  // Application state object.
++  const input = {
++    jsonText: JSONView.json,
++    jsonPretty: null,
++    headers: JSONView.headers,
++    activeTab: 0,
++    prettified: false,
++    expandedNodes: new Set(),
++  };
++
++  /**
++   * Application actions/commands. This list implements all commands
++   * available for the JSON viewer.
++   */
++  input.actions = {
++    onCopyJson() {
++      const text = input.prettified ? input.jsonPretty : input.jsonText;
++      copyString(text.textContent);
++    },
++
++    onSaveJson() {
++      if (input.prettified && !prettyURL) {
++        prettyURL = URL.createObjectURL(
++          new window.Blob([input.jsonPretty.textContent])
++        );
++      }
++      dispatchEvent("save", input.prettified ? prettyURL : null);
++    },
++
++    onCopyHeaders() {
++      let value = "";
++      const isWinNT =
++        document.documentElement.getAttribute("platform") === "win";
++      const eol = isWinNT ? "\r\n" : "\n";
++
++      const responseHeaders = input.headers.response;
++      for (let i = 0; i < responseHeaders.length; i++) {
++        const header = responseHeaders[i];
++        value += header.name + ": " + header.value + eol;
++      }
++
++      value += eol;
++
++      const requestHeaders = input.headers.request;
++      for (let i = 0; i < requestHeaders.length; i++) {
++        const header = requestHeaders[i];
++        value += header.name + ": " + header.value + eol;
++      }
++
++      copyString(value);
++    },
++
++    onSearch(value) {
++      theApp.setState({ searchFilter: value });
++    },
++
++    onPrettify() {
++      if (input.json instanceof Error) {
++        // Cannot prettify invalid JSON
++        return;
++      }
++      if (input.prettified) {
++        theApp.setState({ jsonText: input.jsonText });
++      } else {
++        if (!input.jsonPretty) {
++          input.jsonPretty = new Text(JSON.stringify(input.json, null, "  "));
++        }
++        theApp.setState({ jsonText: input.jsonPretty });
++      }
++
++      input.prettified = !input.prettified;
++    },
++
++    onCollapse() {
++      input.expandedNodes.clear();
++      theApp.forceUpdate();
++    },
++
++    onExpand() {
++      input.expandedNodes = TreeViewClass.getExpandedNodes(input.json);
++      theApp.setState({ expandedNodes: input.expandedNodes });
++    },
++  };
++
++  /**
++   * Helper for copying a string to the clipboard.
++   *
++   * @param {String} string The text to be copied.
++   */
++  function copyString(string) {
++    document.addEventListener(
++      "copy",
++      event => {
++        event.clipboardData.setData("text/plain", string);
++        event.preventDefault();
++      },
++      { once: true }
++    );
++
++    document.execCommand("copy", false, null);
++  }
++
++  /**
++   * Helper for dispatching an event. It's handled in chrome scope.
++   *
++   * @param {String} type Event detail type
++   * @param {Object} value Event detail value
++   */
++  function dispatchEvent(type, value) {
++    const data = {
++      detail: {
++        type,
++        value,
++      },
++    };
++
++    const contentMessageEvent = new CustomEvent("contentMessage", data);
++    window.dispatchEvent(contentMessageEvent);
++  }
++
++  /**
++   * Render the main application component. It's the main tab bar displayed
++   * at the top of the window. This component also represents ReacJS root.
++   */
++  const content = document.getElementById("content");
++  const promise = (async function parseJSON() {
++    if (document.readyState == "loading") {
++      // If the JSON has not been loaded yet, render the Raw Data tab first.
++      input.json = {};
++      input.activeTab = TABS.RAW_DATA;
++      return new Promise(resolve => {
++        document.addEventListener("DOMContentLoaded", resolve, { once: true });
++      })
++        .then(parseJSON)
++        .then(async () => {
++          // Now update the state and switch to the JSON tab.
++          await appIsReady;
++          theApp.setState({
++            activeTab: TABS.JSON,
++            json: input.json,
++            expandedNodes: input.expandedNodes,
++          });
++        });
++    }
++
++    // If the JSON has been loaded, parse it immediately before loading the app.
++    const jsonString = input.jsonText.textContent;
++    try {
++      input.json = JSON.parse(jsonString);
++    } catch (err) {
++      input.json = err;
++      // Display the raw data tab for invalid json
++      input.activeTab = TABS.RAW_DATA;
++    }
++
++    // Expand the document by default if its size isn't bigger than 100KB.
++    if (
++      !(input.json instanceof Error) &&
++      jsonString.length <= AUTO_EXPAND_MAX_SIZE
++    ) {
++      input.expandedNodes = TreeViewClass.getExpandedNodes(input.json, {
++        maxLevel: AUTO_EXPAND_MAX_LEVEL,
++      });
++    }
++    return undefined;
++  })();
++
++  const appIsReady = new Promise(resolve => {
++    render(MainTabbedArea(input), content, function () {
++      theApp = this;
++      resolve();
++
++      // Send readyState change notification event to the window. Can be useful for
++      // tests as well as extensions.
++      JSONView.readyState = "interactive";
++      window.dispatchEvent(new CustomEvent("AppReadyStateChange"));
++
++      promise.then(() => {
++        // Another readyState change notification event.
++        JSONView.readyState = "complete";
++        window.dispatchEvent(new CustomEvent("AppReadyStateChange"));
++      });
++    });
++  });
++});
+diff --git a/browser/components/harviewer/jar.mn b/browser/components/harviewer/jar.mn
+new file mode 100644
+--- /dev/null
++++ b/browser/components/harviewer/jar.mn
+@@ -0,0 +1,6 @@
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++browser.jar:
++    content/browser/harviewer/har-viewer.js
+diff --git a/browser/components/harviewer/moz.build b/browser/components/harviewer/moz.build
+new file mode 100644
+--- /dev/null
++++ b/browser/components/harviewer/moz.build
+@@ -0,0 +1,24 @@
++# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++DIRS += ["components", "css", "lib"]
++
++DevToolsModules(
++    "converter-child.js",
++    "Converter.sys.mjs",
++    "json-viewer.js",
++    "Sniffer.sys.mjs",
++    "viewer-config.js",
++)
++
++XPCOM_MANIFESTS += [
++    "components.conf",
++]
++
++BROWSER_CHROME_MANIFESTS += ["test/browser.toml"]
++
++with Files("**"):
++    BUG_COMPONENT = ("DevTools", "JSON Viewer")
+diff --git a/browser/components/harviewer/viewer-config.js b/browser/components/harviewer/viewer-config.js
+new file mode 100644
+--- /dev/null
++++ b/browser/components/harviewer/viewer-config.js
+@@ -0,0 +1,43 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++/* global requirejs */
++
++"use strict";
++
++// Send readyState change notification event to the window. It's useful for tests.
++JSONView.readyState = "loading";
++window.dispatchEvent(new CustomEvent("AppReadyStateChange"));
++
++// Services is required in the Reps bundle but can't be loaded in the json-viewer.
++// Since it's only used for the ObjectInspector, that the json-viewer does not use, we
++// can mock it. The mock should be removed when we un-bundle reps, (i.e. land individual
++// files instead of a big bundle).
++define("ServicesMock", () => ({ appinfo: {} }));
++// custom-formatter is required in the Reps bundle but 1. we don't need in the JSON Viewer,
++// and 2. it causes issues as this requires the ObjectInspector, which can't be loaded
++// via requirejs.
++define("CustomFormatterMock", () => ({}));
++
++/**
++ * RequireJS configuration for JSON Viewer.
++ *
++ * React module ID is using exactly the same (relative) path as the rest
++ * of the code base, so it's consistent and modules can be easily reused.
++ */
++require.config({
++  baseUrl: "resource://devtools/client/jsonview/",
++  paths: {
++    devtools: "resource://devtools",
++  },
++  map: {
++    "*": {
++      Services: "ServicesMock",
++      "devtools/client/shared/components/reps/reps/custom-formatter":
++        "CustomFormatterMock",
++    },
++  },
++});
++
++// Load the main panel module
++requirejs(["json-viewer"]);
+diff --git a/modules/libpref/init/all.js b/modules/libpref/init/all.js
+--- a/modules/libpref/init/all.js
++++ b/modules/libpref/init/all.js
+@@ -4014,6 +4014,9 @@ pref("services.common.log.logger.tokense
+ // Enable the JSON View tool (an inspector for application/json documents).
+ pref("devtools.jsonview.enabled", true);
+ 
++// Enable the HAR View tool (an inspector for application/json documents).
++pref("browser.harviewer.enabled", true);
++
+ // Default theme ("auto", "dark" or "light").
+ pref("devtools.theme", "auto", sticky);
+ 

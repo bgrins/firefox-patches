@@ -1,0 +1,172 @@
+diff --git a/browser/components/BrowserGlue.sys.mjs b/browser/components/BrowserGlue.sys.mjs
+--- a/browser/components/BrowserGlue.sys.mjs
++++ b/browser/components/BrowserGlue.sys.mjs
+@@ -3191,17 +3191,22 @@ BrowserGlue.prototype = {
+         name: "QuickSuggest.init",
+         task: () => {
+           lazy.QuickSuggest.init();
+         },
+       },
+ 
+       {
+         name: "DAPTelemetrySender.startup",
+-        condition: lazy.TelemetryUtils.isTelemetryEnabled,
++        condition:
++          AppConstants.MOZ_TELEMETRY_REPORTING &&
++          Services.prefs.getBoolPref(
++            "datareporting.healthreport.uploadEnabled",
++            false
++          ),
+         task: async () => {
+           await lazy.DAPTelemetrySender.startup();
+         },
+       },
+ 
+       {
+         name: "ShoppingUtils.init",
+         task: () => {
+diff --git a/browser/components/preferences/privacy.js b/browser/components/preferences/privacy.js
+--- a/browser/components/preferences/privacy.js
++++ b/browser/components/preferences/privacy.js
+@@ -24,16 +24,18 @@ const CONTENT_BLOCKING_PREFS = [
+   "privacy.fingerprintingProtection",
+   "privacy.fingerprintingProtection.pbmode",
+ ];
+ 
+ const PREF_OPT_OUT_STUDIES_ENABLED = "app.shield.optoutstudies.enabled";
+ const PREF_NORMANDY_ENABLED = "app.normandy.enabled";
+ 
+ const PREF_ADDON_RECOMMENDATIONS_ENABLED = "browser.discovery.enabled";
++const PREF_PRIVATE_ATTRIBUTION_ENABLED =
++  "dom.private-attribution.submission.enabled";
+ 
+ const PREF_PASSWORD_GENERATION_AVAILABLE = "signon.generation.available";
+ const { BEHAVIOR_REJECT_TRACKER_AND_PARTITION_FOREIGN } = Ci.nsICookieService;
+ 
+ const PASSWORD_MANAGER_PREF_ID = "services.passwordSavingEnabled";
+ 
+ ChromeUtils.defineLazyGetter(this, "AlertsServiceDND", function () {
+   try {
+@@ -1235,16 +1237,26 @@ var gPrivacyPane = {
+         "click",
+         gPrivacyPane.showDataDeletion
+       );
+       if (AppConstants.MOZ_NORMANDY) {
+         this.initOptOutStudyCheckbox();
+       }
+       this.initAddonRecommendationsCheckbox();
+     }
++    dataCollectionCheckboxHandler({
++      checkbox: document.getElementById("privateAttribution"),
++      pref: PREF_PRIVATE_ATTRIBUTION_ENABLED,
++      matchPref() {
++        return AppConstants.MOZ_TELEMETRY_REPORTING;
++      },
++      isDisabled() {
++        return !AppConstants.MOZ_TELEMETRY_REPORTING;
++      },
++    });
+ 
+     let signonBundle = document.getElementById("signonBundle");
+     let pkiBundle = document.getElementById("pkiBundle");
+     appendSearchKeywords("showPasswords", [
+       signonBundle.getString("loginsDescriptionAll2"),
+     ]);
+     appendSearchKeywords("viewSecurityDevicesButton", [
+       pkiBundle.getString("enable_fips"),
+diff --git a/dom/privateattribution/PrivateAttributionService.sys.mjs b/dom/privateattribution/PrivateAttributionService.sys.mjs
+--- a/dom/privateattribution/PrivateAttributionService.sys.mjs
++++ b/dom/privateattribution/PrivateAttributionService.sys.mjs
+@@ -1,21 +1,32 @@
+ /* vim: set ts=2 sw=2 sts=2 et tw=80: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ const lazy = {};
+ 
++import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
++import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
++
+ ChromeUtils.defineESModuleGetters(lazy, {
+   IndexedDB: "resource://gre/modules/IndexedDB.sys.mjs",
+   DAPTelemetrySender: "resource://gre/modules/DAPTelemetrySender.sys.mjs",
+-  TelemetryUtils: "resource://gre/modules/TelemetryUtils.sys.mjs",
+ });
+ 
++XPCOMUtils.defineLazyPreferenceGetter(
++  lazy,
++  "gIsTelemetrySendingEnabled",
++  "datareporting.healthreport.uploadEnabled",
++  true,
++  null,
++  val => val && AppConstants.MOZ_TELEMETRY_REPORTING
++);
++
+ const MAX_CONVERSIONS = 2;
+ const DAY_IN_MILLI = 1000 * 60 * 60 * 24;
+ const CONVERSION_RESET_MILLI = 7 * DAY_IN_MILLI;
+ const DAP_TIMEOUT_MILLI = 30000;
+ 
+ /**
+  *
+  */
+@@ -259,13 +270,13 @@ export class PrivateAttributionService {
+     );
+   }
+ 
+   getModelProp(type) {
+     return this.models[type ? type : "default"];
+   }
+ 
+   isEnabled() {
+-    return this._testForceEnabled || lazy.TelemetryUtils.isTelemetryEnabled;
++    return this._testForceEnabled || lazy.gIsTelemetrySendingEnabled;
+   }
+ 
+   QueryInterface = ChromeUtils.generateQI([Ci.nsIPrivateAttributionService]);
+ }
+diff --git a/dom/privateattribution/tests/xpcshell/test_ppa.js b/dom/privateattribution/tests/xpcshell/test_ppa.js
+--- a/dom/privateattribution/tests/xpcshell/test_ppa.js
++++ b/dom/privateattribution/tests/xpcshell/test_ppa.js
+@@ -6,16 +6,20 @@ https://creativecommons.org/publicdomain
+ const { HttpServer } = ChromeUtils.importESModule(
+   "resource://testing-common/httpd.sys.mjs"
+ );
+ 
+ const { PrivateAttributionService } = ChromeUtils.importESModule(
+   "resource://gre/modules/PrivateAttributionService.sys.mjs"
+ );
+ 
++const { AppConstants } = ChromeUtils.importESModule(
++  "resource://gre/modules/AppConstants.sys.mjs"
++);
++
+ const BinaryInputStream = Components.Constructor(
+   "@mozilla.org/binaryinputstream;1",
+   "nsIBinaryInputStream",
+   "setInputStream"
+ );
+ 
+ const BinaryOutputStream = Components.Constructor(
+   "@mozilla.org/binaryoutputstream;1",
+@@ -141,17 +145,18 @@ add_setup(async function () {
+ 
+ add_task(async function testIsEnabled() {
+   Services.fog.testResetFOG();
+ 
+   // isEnabled should match the telemetry preference without the test flag
+   const ppa1 = new PrivateAttributionService();
+   Assert.equal(
+     ppa1.isEnabled(),
+-    Services.prefs.getBoolPref("toolkit.telemetry.enabled")
++    AppConstants.MOZ_TELEMETRY_REPORTING &&
++      Services.prefs.getBoolPref("datareporting.healthreport.uploadEnabled")
+   );
+ 
+   // Should always be enabled with the test flag
+   const ppa2 = new PrivateAttributionService({ testForceEnabled: true });
+   Assert.ok(ppa2.isEnabled());
+ });
+ 
+ add_task(async function testSuccessfulConversion() {

@@ -1,0 +1,755 @@
+diff --git a/dom/base/Navigator.h b/dom/base/Navigator.h
+--- a/dom/base/Navigator.h
++++ b/dom/base/Navigator.h
+@@ -40,10 +40,11 @@
+ class ArrayBufferOrArrayBufferViewOrBlobOrFormDataOrUSVStringOrURLSearchParams;
+ class ServiceWorkerContainer;
+ class CredentialsContainer;
+ class Clipboard;
+ class LockManager;
++class PrivateAttribution;
+ class HTMLMediaElement;
+ class AudioContext;
+ class WakeLockJS;
+ }  // namespace dom
+ namespace webgpu {
+@@ -207,10 +208,11 @@
+ 
+   mozilla::dom::CredentialsContainer* Credentials();
+   dom::Clipboard* Clipboard();
+   webgpu::Instance* Gpu();
+   dom::LockManager* Locks();
++  dom::PrivateAttribution* PrivateAttribution();
+ 
+   static bool Webdriver();
+ 
+   void GetLanguages(nsTArray<nsString>& aLanguages);
+ 
+@@ -298,11 +300,12 @@
+   RefPtr<dom::MediaCapabilities> mMediaCapabilities;
+   RefPtr<dom::MediaSession> mMediaSession;
+   RefPtr<AddonManager> mAddonManager;
+   RefPtr<webgpu::Instance> mWebGpu;
+   RefPtr<Promise> mSharePromise;  // Web Share API related
+-  RefPtr<dom::LockManager> mLocks;
++  RefPtr<LockManager> mLocks;
++  RefPtr<dom::PrivateAttribution> mPrivateAttribution;
+   RefPtr<dom::UserActivation> mUserActivation;
+   RefPtr<dom::WakeLockJS> mWakeLock;
+ };
+ 
+ }  // namespace mozilla::dom
+diff --git a/dom/base/Navigator.cpp b/dom/base/Navigator.cpp
+--- a/dom/base/Navigator.cpp
++++ b/dom/base/Navigator.cpp
+@@ -19,10 +19,11 @@
+ #include "mozilla/dom/File.h"
+ #include "Geolocation.h"
+ #include "nsIClassOfService.h"
+ #include "nsIHttpProtocolHandler.h"
+ #include "nsIContentPolicy.h"
++#include "nsIPrivateAttributionService.h"
+ #include "nsContentPolicyUtils.h"
+ #include "nsISupportsPriority.h"
+ #include "nsIWebProtocolHandlerRegistrar.h"
+ #include "nsCharSeparatedTokenizer.h"
+ #include "nsContentUtils.h"
+@@ -39,15 +40,17 @@
+ #include "mozilla/StorageAccess.h"
+ #include "mozilla/Telemetry.h"
+ #include "BatteryManager.h"
+ #include "mozilla/dom/CredentialsContainer.h"
+ #include "mozilla/dom/Clipboard.h"
++#include "mozilla/dom/ContentChild.h"
+ #include "mozilla/dom/FeaturePolicyUtils.h"
+ #include "mozilla/dom/GamepadServiceTest.h"
+ #include "mozilla/dom/MediaCapabilities.h"
+ #include "mozilla/dom/MediaSession.h"
+ #include "mozilla/dom/power/PowerManagerService.h"
++#include "mozilla/dom/PrivateAttribution.h"
+ #include "mozilla/dom/LockManager.h"
+ #include "mozilla/dom/MIDIAccessManager.h"
+ #include "mozilla/dom/MIDIOptionsBinding.h"
+ #include "mozilla/dom/Permissions.h"
+ #include "mozilla/dom/ServiceWorkerContainer.h"
+@@ -159,10 +162,11 @@
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mMediaCapabilities)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mMediaSession)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mAddonManager)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWebGpu)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mLocks)
++  NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mPrivateAttribution)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mUserActivation)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWakeLock)
+ 
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mWindow)
+   NS_IMPL_CYCLE_COLLECTION_TRAVERSE(mMediaKeySystemAccessManager)
+@@ -248,10 +252,12 @@
+     // call Shutdown() to do that.
+     mLocks->Shutdown();
+     mLocks = nullptr;
+   }
+ 
++  mPrivateAttribution = nullptr;
++
+   mUserActivation = nullptr;
+ 
+   mSharePromise = nullptr;
+ 
+   mWakeLock = nullptr;
+@@ -2271,10 +2277,17 @@
+     mLocks = dom::LockManager::Create(*GetWindow()->AsGlobal());
+   }
+   return mLocks;
+ }
+ 
++dom::PrivateAttribution* Navigator::PrivateAttribution() {
++  if (!mPrivateAttribution) {
++    mPrivateAttribution = new dom::PrivateAttribution(GetWindow()->AsGlobal());
++  }
++  return mPrivateAttribution;
++}
++
+ /* static */
+ bool Navigator::Webdriver() {
+ #ifdef ENABLE_WEBDRIVER
+   nsCOMPtr<nsIMarionette> marionette = do_GetService(NS_MARIONETTE_CONTRACTID);
+   if (marionette) {
+diff --git a/dom/ipc/ContentParent.h b/dom/ipc/ContentParent.h
+--- a/dom/ipc/ContentParent.h
++++ b/dom/ipc/ContentParent.h
+@@ -441,10 +441,19 @@
+   virtual mozilla::ipc::IPCResult RecvPHalConstructor(
+       PHalParent* aActor) override {
+     return PContentParent::RecvPHalConstructor(aActor);
+   }
+ 
++  mozilla::ipc::IPCResult RecvAttributionEvent(
++      const nsACString& aHost, PrivateAttributionImpressionType aType,
++      uint32_t aIndex, const nsAString& aAd, const nsACString& aTargetHost);
++  mozilla::ipc::IPCResult RecvAttributionConversion(
++      const nsACString& aHost, const nsAString& aTask, uint32_t aHistogramSize,
++      const Maybe<uint32_t>& aLoopbackDays,
++      const Maybe<PrivateAttributionImpressionType>& aImpressionType,
++      const nsTArray<nsString>& aAds, const nsTArray<nsCString>& aSourceHosts);
++
+   PHeapSnapshotTempFileHelperParent* AllocPHeapSnapshotTempFileHelperParent();
+ 
+   PRemoteSpellcheckEngineParent* AllocPRemoteSpellcheckEngineParent();
+ 
+   bool CycleCollectWithLogs(bool aDumpAllTraces,
+diff --git a/dom/ipc/ContentParent.cpp b/dom/ipc/ContentParent.cpp
+--- a/dom/ipc/ContentParent.cpp
++++ b/dom/ipc/ContentParent.cpp
+@@ -15,13 +15,15 @@
+ #include "mozilla/CmdLineAndEnvUtils.h"
+ #include "BrowserParent.h"
+ 
+ #include "chrome/common/process_watcher.h"
+ #include "mozilla/Result.h"
++#include "mozilla/Services.h"
+ #include "mozilla/XREAppData.h"
+ #include "nsComponentManagerUtils.h"
+ #include "nsIBrowserDOMWindow.h"
++#include "nsIPrivateAttributionService.h"
+ 
+ #include "GMPServiceParent.h"
+ #include "HandlerServiceParent.h"
+ #include "IHistory.h"
+ #include <map>
+@@ -1242,10 +1244,39 @@
+   mGMPCreated = true;
+ 
+   return IPC_OK();
+ }
+ 
++IPCResult ContentParent::RecvAttributionEvent(
++    const nsACString& aHost, PrivateAttributionImpressionType aType,
++    uint32_t aIndex, const nsAString& aAd, const nsACString& aTargetHost) {
++  nsCOMPtr<nsIPrivateAttributionService> pa =
++      components::PrivateAttribution::Service();
++  if (NS_WARN_IF(!pa)) {
++    return IPC_OK();
++  }
++  pa->OnAttributionEvent(aHost, GetEnumString(aType), aIndex, aAd, aTargetHost);
++  return IPC_OK();
++}
++
++IPCResult ContentParent::RecvAttributionConversion(
++    const nsACString& aHost, const nsAString& aTask, uint32_t aHistogramSize,
++    const Maybe<uint32_t>& aLoopbackDays,
++    const Maybe<PrivateAttributionImpressionType>& aImpressionType,
++    const nsTArray<nsString>& aAds, const nsTArray<nsCString>& aSourceHosts) {
++  nsCOMPtr<nsIPrivateAttributionService> pa =
++      components::PrivateAttribution::Service();
++  if (NS_WARN_IF(!pa)) {
++    return IPC_OK();
++  }
++  pa->OnAttributionConversion(
++      aHost, aTask, aHistogramSize, aLoopbackDays.valueOr(0),
++      aImpressionType ? GetEnumString(*aImpressionType) : EmptyCString(), aAds,
++      aSourceHosts);
++  return IPC_OK();
++}
++
+ Atomic<bool, mozilla::Relaxed> sContentParentTelemetryEventEnabled(false);
+ 
+ /*static*/
+ void ContentParent::LogAndAssertFailedPrincipalValidationInfo(
+     nsIPrincipal* aPrincipal, const char* aMethod) {
+diff --git a/dom/ipc/PContent.ipdl b/dom/ipc/PContent.ipdl
+--- a/dom/ipc/PContent.ipdl
++++ b/dom/ipc/PContent.ipdl
+@@ -158,10 +158,11 @@
+ using mozilla::dom::Wireframe from "mozilla/dom/DocumentBinding.h";
+ using mozilla::PerfStats::MetricMask from "mozilla/PerfStats.h";
+ [RefCounted] using class nsIX509Cert from "nsIX509Cert.h";
+ using nsIDNSService::ResolverMode from "nsIDNSService.h";
+ using mozilla::dom::UserActivation::Modifiers from "mozilla/dom/UserActivation.h";
++using mozilla::dom::PrivateAttributionImpressionType from "mozilla/dom/PrivateAttributionIPCUtils.h";
+ 
+ union ChromeRegistryItem
+ {
+     ChromePackage;
+     OverrideMapping;
+@@ -1968,9 +1969,20 @@
+     // Used by the child process to signal that it is ready to start fuzzing.
+     // This can in particular be used to wait for a particular event in a
+     // test document before taking the snapshot and starting e.g. IPC fuzzing.
+     async SignalFuzzingReady();
+ #endif
++
++  async AttributionEvent(nsCString aSourceHost,
++                         PrivateAttributionImpressionType aType,
++                         uint32_t aIndex, nsString aAd, nsCString aTargetHost);
++
++  async AttributionConversion(nsCString aSourceHost, nsString aTask,
++                              uint32_t aHistogramSize,
++                              uint32_t? aLoopbackDays,
++                              PrivateAttributionImpressionType? aImpressionType,
++                              nsString[] aAds,
++                              nsCString[] aImpressionSourceHosts);
+ };
+ 
+ }
+ }
+diff --git a/dom/moz.build b/dom/moz.build
+--- a/dom/moz.build
++++ b/dom/moz.build
+@@ -72,10 +72,11 @@
+     "ipc",
+     "workers",
+     "audiochannel",
+     "broadcastchannel",
+     "messagechannel",
++    "privateattribution",
+     "promise",
+     "smil",
+     "streams",
+     "url",
+     "webauthn",
+diff --git a/dom/origin-trials/OriginTrials.cpp b/dom/origin-trials/OriginTrials.cpp
+--- a/dom/origin-trials/OriginTrials.cpp
++++ b/dom/origin-trials/OriginTrials.cpp
+@@ -210,10 +210,12 @@
+   switch (aTrial) {
+     case OriginTrial::TestTrial:
+       return StaticPrefs::dom_origin_trials_test_trial_state();
+     case OriginTrial::CoepCredentialless:
+       return StaticPrefs::dom_origin_trials_coep_credentialless_state();
++    case OriginTrial::PrivateAttribution:
++      return StaticPrefs::dom_origin_trials_private_attribution_state();
+     case OriginTrial::MAX:
+       MOZ_ASSERT_UNREACHABLE("Unknown trial!");
+       break;
+   }
+   return 0;
+diff --git a/dom/origin-trials/ffi/lib.rs b/dom/origin-trials/ffi/lib.rs
+--- a/dom/origin-trials/ffi/lib.rs
++++ b/dom/origin-trials/ffi/lib.rs
+@@ -8,19 +8,21 @@
+ #[repr(u8)]
+ pub enum OriginTrial {
+     // NOTE(emilio): 0 is reserved for WebIDL usage.
+     TestTrial = 1,
+     CoepCredentialless = 2,
++    PrivateAttribution = 3,
+ 
+     MAX,
+ }
+ 
+ impl OriginTrial {
+     fn from_str(s: &str) -> Option<Self> {
+         Some(match s {
+             "TestTrial" => Self::TestTrial,
+             "CoepCredentialless" => Self::CoepCredentialless,
++            "PrivateAttribution" => Self::PrivateAttribution,
+             _ => return None,
+         })
+     }
+ }
+ 
+diff --git a/dom/origin-trials/tests/mochitest/mochitest.toml b/dom/origin-trials/tests/mochitest/mochitest.toml
+--- a/dom/origin-trials/tests/mochitest/mochitest.toml
++++ b/dom/origin-trials/tests/mochitest/mochitest.toml
+@@ -11,13 +11,15 @@
+ #  * Test interfaces only exposed on DEBUG builds.
+ #  * xorigin tests run in example.org rather than example.com, so token
+ #    verification fails, expectedly.
+ skip-if = [
+   "!debug",
+-  "xorigin", # AudioWorklet requires secure context
++  "xorigin",
+ ]
+ 
++# We want to test that trials are exposed in worklets, and AudioWorklet
++# requires secure context.
+ scheme = "https"
+ 
+ ["test_expired_token.html"]
+ 
+ ["test_header_simple.html"]
+diff --git a/dom/origin-trials/tests/mochitest/test_meta_simple.html b/dom/origin-trials/tests/mochitest/test_meta_simple.html
+--- a/dom/origin-trials/tests/mochitest/test_meta_simple.html
++++ b/dom/origin-trials/tests/mochitest/test_meta_simple.html
+@@ -1,13 +1,17 @@
+ <!doctype html>
+ <!-- Created with: mktoken --origin 'https://example.com' --feature TestTrial --expiry 'Wed, 01 Jan 3000 01:00:00 +0100' --sign test-keys/test-ecdsa.pkcs8 -->
+ <meta http-equiv="origin-trial" content="AyGdETIKWLLqe+chG57f74gZcjYSfbdYAapEq7DA49E6CmaYaPmaoXh/4tAe5XJJJdwwpFVal7hz/irC+Wvp1HgAAABLeyJvcmlnaW4iOiJodHRwczovL2V4YW1wbGUuY29tIiwiZmVhdHVyZSI6IlRlc3RUcmlhbCIsImV4cGlyeSI6MzI1MDM2ODAwMDB9">
+ <!-- Created with: mktoken --origin 'https://example.com' --feature CoepCredentialless --expiry 'Wed, 01 Jan 3000 01:00:00 +0100' --sign test-keys/test-ecdsa.pkcs8 -->
+ <meta http-equiv="origin-trial" content="Az+DK2Kczk8Xz1cAlD+TkvPZmuM2uJZ2CFefbp2hLuCU9FbUqxWTyQ2tEYr50r0syKELcOZLAPaABw8aYTLHn5YAAABUeyJvcmlnaW4iOiJodHRwczovL2V4YW1wbGUuY29tIiwiZmVhdHVyZSI6IkNvZXBDcmVkZW50aWFsbGVzcyIsImV4cGlyeSI6MzI1MDM2ODAwMDB9">
++<!-- Created with: mktoken --origin 'https://example.com' --feature PrivateAttribution --expiry 'Wed, 01 Jan 3000 01:00:00 +0100' --sign test-keys/test-ecdsa.pkcs8 -->
++<meta http-equiv="origin-trial" content="A39jvTkkSoAueJadvVP6xeapNZVQLJgqbI6hwQc3kIYm0O96hc8WjpRwFVOnI+gN9zAQbQLEJEcibsRVAxQJ0bIAAABUeyJvcmlnaW4iOiJodHRwczovL2V4YW1wbGUuY29tIiwiZmVhdHVyZSI6IlByaXZhdGVBdHRyaWJ1dGlvbiIsImV4cGlyeSI6MzI1MDM2ODAwMDB9">
+ <script src="/tests/SimpleTest/SimpleTest.js"></script>
+ <script src="common.js"></script>
+ <script>
+   assertTestTrialActive(true);
+   add_task(function() {
+     ok(!!SpecialPowers.DOMWindowUtils.isCoepCredentialless(), "CoepCredentialless trial works.");
++    ok(navigator.privateAttribution, "PrivateAttribution trial works.");
++    ok('PrivateAttribution' in window, "PrivateAttribution trial works.");
+   });
+ </script>
+diff --git a/dom/origin-trials/tests/mochitest/test_trial_hidden.html b/dom/origin-trials/tests/mochitest/test_trial_hidden.html
+--- a/dom/origin-trials/tests/mochitest/test_trial_hidden.html
++++ b/dom/origin-trials/tests/mochitest/test_trial_hidden.html
+@@ -1,6 +1,10 @@
+ <!doctype html>
+ <script src="/tests/SimpleTest/SimpleTest.js"></script>
+ <script src="common.js"></script>
+ <script>
+   assertTestTrialActive(false);
++  add_task(function() {
++    ok(!navigator.privateAttribution, "PrivateAttribution trial disabled.");
++    ok(!('PrivateAttribution' in window), "PrivateAttribution trial disabled.");
++  });
+ </script>
+diff --git a/dom/privateattribution/PrivateAttribution.h b/dom/privateattribution/PrivateAttribution.h
+new file mode 100644
+--- /dev/null
++++ b/dom/privateattribution/PrivateAttribution.h
+@@ -0,0 +1,48 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim:set ts=2 sw=2 sts=2 et cindent: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_PrivateAttribution_h
++#define mozilla_dom_PrivateAttribution_h
++
++#include "nsWrapperCache.h"
++#include "nsCOMPtr.h"
++
++class nsIGlobalObject;
++namespace mozilla {
++class ErrorResult;
++}
++
++namespace mozilla::dom {
++
++struct PrivateAttributionImpressionOptions;
++struct PrivateAttributionConversionOptions;
++
++class PrivateAttribution final : public nsWrapperCache {
++ public:
++  NS_INLINE_DECL_CYCLE_COLLECTING_NATIVE_REFCOUNTING(PrivateAttribution)
++  NS_DECL_CYCLE_COLLECTION_NATIVE_WRAPPERCACHE_CLASS(PrivateAttribution)
++
++  explicit PrivateAttribution(nsIGlobalObject* aGlobal);
++  static already_AddRefed<PrivateAttribution> Create(nsIGlobalObject& aGlobal);
++
++  nsIGlobalObject* GetParentObject() const { return mOwner; }
++  JSObject* WrapObject(JSContext*, JS::Handle<JSObject*> aGivenProto) override;
++
++  void SaveImpression(const PrivateAttributionImpressionOptions&, ErrorResult&);
++  void MeasureConversion(const PrivateAttributionConversionOptions&,
++                         ErrorResult&);
++
++ private:
++  [[nodiscard]] bool GetSourceHost(nsACString&, ErrorResult&);
++
++  ~PrivateAttribution();
++
++  nsCOMPtr<nsIGlobalObject> mOwner;
++};
++
++}  // namespace mozilla::dom
++
++#endif  // mozilla_dom_PrivateAttribution_h
+diff --git a/dom/privateattribution/PrivateAttribution.cpp b/dom/privateattribution/PrivateAttribution.cpp
+new file mode 100644
+--- /dev/null
++++ b/dom/privateattribution/PrivateAttribution.cpp
+@@ -0,0 +1,123 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim:set ts=2 sw=2 sts=2 et cindent: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "PrivateAttribution.h"
++#include "mozilla/dom/BindingUtils.h"
++#include "mozilla/dom/ContentChild.h"
++#include "mozilla/dom/PrivateAttributionBinding.h"
++#include "mozilla/Components.h"
++#include "nsIGlobalObject.h"
++#include "nsIPrivateAttributionService.h"
++#include "nsXULAppAPI.h"
++#include "nsURLHelper.h"
++
++namespace mozilla::dom {
++
++NS_IMPL_CYCLE_COLLECTION_WRAPPERCACHE(PrivateAttribution, mOwner)
++
++PrivateAttribution::PrivateAttribution(nsIGlobalObject* aGlobal)
++    : mOwner(aGlobal) {
++  MOZ_ASSERT(aGlobal);
++}
++
++JSObject* PrivateAttribution::WrapObject(JSContext* aCx,
++                                         JS::Handle<JSObject*> aGivenProto) {
++  return PrivateAttribution_Binding::Wrap(aCx, this, aGivenProto);
++}
++
++PrivateAttribution::~PrivateAttribution() = default;
++
++bool PrivateAttribution::GetSourceHost(nsACString& aSourceHost,
++                                       ErrorResult& aRv) {
++  MOZ_ASSERT(mOwner);
++  nsIPrincipal* prin = mOwner->PrincipalOrNull();
++  if (!prin || NS_FAILED(prin->GetHost(aSourceHost))) {
++    aRv.ThrowInvalidStateError("Couldn't get source host");
++    return false;
++  }
++  return true;
++}
++
++[[nodiscard]] static bool ValidateHost(const nsACString& aHost,
++                                       ErrorResult& aRv) {
++  if (!net_IsValidHostName(aHost)) {
++    aRv.ThrowSyntaxError(aHost + " is not a valid host name"_ns);
++    return false;
++  }
++  return true;
++}
++
++void PrivateAttribution::SaveImpression(
++    const PrivateAttributionImpressionOptions& aOptions, ErrorResult& aRv) {
++  nsAutoCString source;
++  if (!GetSourceHost(source, aRv)) {
++    return;
++  }
++
++  if (!ValidateHost(aOptions.mTarget, aRv)) {
++    return;
++  }
++
++  if (XRE_IsParentProcess()) {
++    nsCOMPtr<nsIPrivateAttributionService> pa =
++        components::PrivateAttribution::Service();
++    if (NS_WARN_IF(!pa)) {
++      return;
++    }
++    pa->OnAttributionEvent(source, GetEnumString(aOptions.mType),
++                           aOptions.mIndex, aOptions.mAd, aOptions.mTarget);
++    return;
++  }
++
++  auto* content = ContentChild::GetSingleton();
++  if (NS_WARN_IF(!content)) {
++    return;
++  }
++  content->SendAttributionEvent(source, aOptions.mType, aOptions.mIndex,
++                                aOptions.mAd, aOptions.mTarget);
++}
++
++void PrivateAttribution::MeasureConversion(
++    const PrivateAttributionConversionOptions& aOptions, ErrorResult& aRv) {
++  nsAutoCString source;
++  if (!GetSourceHost(source, aRv)) {
++    return;
++  }
++  for (const nsACString& host : aOptions.mSources) {
++    if (!ValidateHost(host, aRv)) {
++      return;
++    }
++  }
++  if (XRE_IsParentProcess()) {
++    nsCOMPtr<nsIPrivateAttributionService> pa =
++        components::PrivateAttribution::Service();
++    if (NS_WARN_IF(!pa)) {
++      return;
++    }
++    pa->OnAttributionConversion(
++        source, aOptions.mTask, aOptions.mHistogramSize,
++        aOptions.mLookbackDays.WasPassed() ? aOptions.mLookbackDays.Value() : 0,
++        aOptions.mImpression.WasPassed()
++            ? GetEnumString(aOptions.mImpression.Value())
++            : EmptyCString(),
++        aOptions.mAds, aOptions.mSources);
++    return;
++  }
++
++  auto* content = ContentChild::GetSingleton();
++  if (NS_WARN_IF(!content)) {
++    return;
++  }
++  content->SendAttributionConversion(
++      source, aOptions.mTask, aOptions.mHistogramSize,
++      aOptions.mLookbackDays.WasPassed() ? Some(aOptions.mLookbackDays.Value())
++                                         : Nothing(),
++      aOptions.mImpression.WasPassed() ? Some(aOptions.mImpression.Value())
++                                       : Nothing(),
++      aOptions.mAds, aOptions.mSources);
++}
++
++}  // namespace mozilla::dom
+diff --git a/dom/privateattribution/PrivateAttributionIPCUtils.h b/dom/privateattribution/PrivateAttributionIPCUtils.h
+new file mode 100644
+--- /dev/null
++++ b/dom/privateattribution/PrivateAttributionIPCUtils.h
+@@ -0,0 +1,22 @@
++/* -*- Mode: C++; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set ts=8 sts=2 et sw=2 tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#ifndef mozilla_dom_PrivateAttributionIPCUtils_h
++#define mozilla_dom_PrivateAttributionIPCUtils_h
++
++#include "mozilla/dom/PrivateAttributionBinding.h"
++#include "mozilla/dom/BindingIPCUtils.h"
++
++namespace IPC {
++
++template <>
++struct ParamTraits<mozilla::dom::PrivateAttributionImpressionType>
++    : public mozilla::dom::WebIDLEnumSerializer<
++          mozilla::dom::PrivateAttributionImpressionType> {};
++
++}  // namespace IPC
++
++#endif
+diff --git a/dom/privateattribution/PrivateAttributionService.sys.mjs b/dom/privateattribution/PrivateAttributionService.sys.mjs
+new file mode 100644
+--- /dev/null
++++ b/dom/privateattribution/PrivateAttributionService.sys.mjs
+@@ -0,0 +1,31 @@
++/* vim: set ts=2 sw=2 sts=2 et tw=80: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++/**
++ *
++ */
++export class PrivateAttributionService {
++  onAttributionEvent(sourceHost, type, index, ad, targetHost) {
++    dump(
++      `onAttributionEvent(${sourceHost}, ${type}, ${index}, ${ad}, ${targetHost})\n`
++    );
++  }
++
++  onAttributionConversion(
++    sourceHost,
++    task,
++    histogramSize,
++    loopbackDays,
++    impressionType,
++    ads,
++    sourceHosts
++  ) {
++    dump(
++      `onAttributionConversion(${sourceHost}, ${task}, ${histogramSize}, ${loopbackDays}, ${impressionType}, ${ads}, ${sourceHosts})\n`
++    );
++  }
++
++  QueryInterface = ChromeUtils.generateQI([Ci.nsIPrivateAttributionService]);
++}
+diff --git a/dom/privateattribution/components.conf b/dom/privateattribution/components.conf
+new file mode 100644
+--- /dev/null
++++ b/dom/privateattribution/components.conf
+@@ -0,0 +1,15 @@
++# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++Classes = [
++    {
++        'cid': '{57d16147-1deb-46ac-8f1c-1140b5e1ddfd}',
++        'name': 'PrivateAttribution',
++        'contract_ids': ['@mozilla.org/private-attribution;1'],
++        'esModule': 'resource://gre/modules/PrivateAttributionService.sys.mjs',
++        'constructor': 'PrivateAttributionService',
++    },
++]
+diff --git a/dom/privateattribution/moz.build b/dom/privateattribution/moz.build
+new file mode 100644
+--- /dev/null
++++ b/dom/privateattribution/moz.build
+@@ -0,0 +1,35 @@
++# -*- Mode: python; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++with Files("**"):
++    BUG_COMPONENT = ("Core", "DOM: Core & HTML")
++
++EXPORTS.mozilla.dom += [
++    "PrivateAttribution.h",
++    "PrivateAttributionIPCUtils.h",
++]
++
++UNIFIED_SOURCES += [
++    "PrivateAttribution.cpp",
++]
++
++XPIDL_SOURCES += [
++    "nsIPrivateAttributionService.idl",
++]
++
++XPIDL_MODULE = "privateattribution"
++
++XPCOM_MANIFESTS += [
++    "components.conf",
++]
++
++EXTRA_JS_MODULES += [
++    "PrivateAttributionService.sys.mjs",
++]
++
++include("/ipc/chromium/chromium-config.mozbuild")
++
++FINAL_LIBRARY = "xul"
+diff --git a/dom/privateattribution/nsIPrivateAttributionService.idl b/dom/privateattribution/nsIPrivateAttributionService.idl
+new file mode 100644
+--- /dev/null
++++ b/dom/privateattribution/nsIPrivateAttributionService.idl
+@@ -0,0 +1,14 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 4 -*-
++ *
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "nsISupports.idl"
++
++[scriptable, uuid(c7e7fc54-4133-4191-bd40-cc2b77fd21bc)]
++interface nsIPrivateAttributionService : nsISupports
++{
++  void onAttributionEvent(in ACString sourceHost, in ACString type, in uint32_t index, in AString ad, in ACString targetHost);
++  void onAttributionConversion(in ACString sourceHost, in AString task, in uint32_t histogramSize, in uint32_t loopbackDays, in ACString impressionType, in Array<AString> ads, in Array<ACString> sourceHosts);
++};
+diff --git a/dom/webidl/Navigator.webidl b/dom/webidl/Navigator.webidl
+--- a/dom/webidl/Navigator.webidl
++++ b/dom/webidl/Navigator.webidl
+@@ -392,5 +392,11 @@
+ [SecureContext]
+ partial interface Navigator {
+   [SameObject, Pref="dom.screenwakelock.enabled"]
+   readonly attribute WakeLock wakeLock;
+ };
++
++[SecureContext]
++partial interface Navigator {
++  [SameObject, Trial="PrivateAttribution"]
++  readonly attribute PrivateAttribution privateAttribution;
++};
+diff --git a/dom/webidl/PrivateAttribution.webidl b/dom/webidl/PrivateAttribution.webidl
+new file mode 100644
+--- /dev/null
++++ b/dom/webidl/PrivateAttribution.webidl
+@@ -0,0 +1,29 @@
++/* -*- Mode: IDL; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++enum PrivateAttributionImpressionType { "view", "click" };
++
++dictionary PrivateAttributionImpressionOptions {
++  PrivateAttributionImpressionType type = "view";
++  required unsigned long index;
++  required DOMString ad;
++  required UTF8String target;
++};
++
++dictionary PrivateAttributionConversionOptions {
++  required DOMString task;
++  required unsigned long histogramSize;
++
++  unsigned long lookbackDays;
++  PrivateAttributionImpressionType impression;
++  sequence<DOMString> ads = [];
++  sequence<UTF8String> sources = [];
++};
++
++[Trial="PrivateAttribution", SecureContext, Exposed=Window]
++interface PrivateAttribution {
++  [Throws] undefined saveImpression(PrivateAttributionImpressionOptions options);
++  [Throws] undefined measureConversion(PrivateAttributionConversionOptions options);
++};
+diff --git a/dom/webidl/moz.build b/dom/webidl/moz.build
+--- a/dom/webidl/moz.build
++++ b/dom/webidl/moz.build
+@@ -802,10 +802,11 @@
+     "PermissionStatus.webidl",
+     "Plugin.webidl",
+     "PluginArray.webidl",
+     "PointerEvent.webidl",
+     "PopoverInvokerElement.webidl",
++    "PrivateAttribution.webidl",
+     "ProcessingInstruction.webidl",
+     "Promise.webidl",
+     "PushEvent.webidl",
+     "PushManager.webidl",
+     "PushManager.webidl",
+diff --git a/modules/libpref/init/StaticPrefList.yaml b/modules/libpref/init/StaticPrefList.yaml
+--- a/modules/libpref/init/StaticPrefList.yaml
++++ b/modules/libpref/init/StaticPrefList.yaml
+@@ -3214,10 +3214,17 @@
+ - name: dom.origin-trials.coep-credentialless.state
+   type: RelaxedAtomicInt32
+   value: 0
+   mirror: always
+ 
++# Origin trial state for Private Attribution
++# 0: normal, 1: always-enabled, 2: always-disabled
++- name: dom.origin-trials.private-attribution.state
++  type: RelaxedAtomicInt32
++  value: 0
++  mirror: always
++
+ # Is support for Window.paintWorklet enabled?
+ - name: dom.paintWorklet.enabled
+   type: bool
+   value: false
+   mirror: always
+

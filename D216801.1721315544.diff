@@ -1,0 +1,211 @@
+diff --git a/browser/components/BrowserGlue.sys.mjs b/browser/components/BrowserGlue.sys.mjs
+--- a/browser/components/BrowserGlue.sys.mjs
++++ b/browser/components/BrowserGlue.sys.mjs
+@@ -3194,11 +3194,16 @@
+         },
+       },
+ 
+       {
+         name: "DAPTelemetrySender.startup",
+-        condition: lazy.TelemetryUtils.isTelemetryEnabled,
++        condition:
++          AppConstants.MOZ_TELEMETRY_REPORTING &&
++          Services.prefs.getBoolPref(
++            "datareporting.healthreport.uploadEnabled",
++            false
++          ),
+         task: async () => {
+           await lazy.DAPTelemetrySender.startup();
+         },
+       },
+ 
+diff --git a/browser/components/preferences/privacy.js b/browser/components/preferences/privacy.js
+--- a/browser/components/preferences/privacy.js
++++ b/browser/components/preferences/privacy.js
+@@ -27,10 +27,12 @@
+ 
+ const PREF_OPT_OUT_STUDIES_ENABLED = "app.shield.optoutstudies.enabled";
+ const PREF_NORMANDY_ENABLED = "app.normandy.enabled";
+ 
+ const PREF_ADDON_RECOMMENDATIONS_ENABLED = "browser.discovery.enabled";
++const PREF_PRIVATE_ATTRIBUTION_ENABLED =
++  "dom.private-attribution.submission.enabled";
+ 
+ const PREF_PASSWORD_GENERATION_AVAILABLE = "signon.generation.available";
+ const { BEHAVIOR_REJECT_TRACKER_AND_PARTITION_FOREIGN } = Ci.nsICookieService;
+ 
+ const PASSWORD_MANAGER_PREF_ID = "services.passwordSavingEnabled";
+@@ -1238,10 +1240,20 @@
+       if (AppConstants.MOZ_NORMANDY) {
+         this.initOptOutStudyCheckbox();
+       }
+       this.initAddonRecommendationsCheckbox();
+     }
++    dataCollectionCheckboxHandler({
++      checkbox: document.getElementById("privateAttribution"),
++      pref: PREF_PRIVATE_ATTRIBUTION_ENABLED,
++      matchPref() {
++        return AppConstants.MOZ_TELEMETRY_REPORTING;
++      },
++      isDisabled() {
++        return !AppConstants.MOZ_TELEMETRY_REPORTING;
++      },
++    });
+ 
+     let signonBundle = document.getElementById("signonBundle");
+     let pkiBundle = document.getElementById("pkiBundle");
+     appendSearchKeywords("showPasswords", [
+       signonBundle.getString("loginsDescriptionAll2"),
+diff --git a/dom/privateattribution/PrivateAttribution.h b/dom/privateattribution/PrivateAttribution.h
+--- a/dom/privateattribution/PrivateAttribution.h
++++ b/dom/privateattribution/PrivateAttribution.h
+@@ -34,10 +34,12 @@
+   void SaveImpression(const PrivateAttributionImpressionOptions&, ErrorResult&);
+   void MeasureConversion(const PrivateAttributionConversionOptions&,
+                          ErrorResult&);
+ 
+  private:
++  static bool ShouldRecord();
++
+   [[nodiscard]] bool GetSourceHostIfNonPrivate(nsACString&, ErrorResult&);
+ 
+   ~PrivateAttribution();
+ 
+   nsCOMPtr<nsIGlobalObject> mOwner;
+diff --git a/dom/privateattribution/PrivateAttribution.cpp b/dom/privateattribution/PrivateAttribution.cpp
+--- a/dom/privateattribution/PrivateAttribution.cpp
++++ b/dom/privateattribution/PrivateAttribution.cpp
+@@ -28,10 +28,19 @@
+   return PrivateAttribution_Binding::Wrap(aCx, this, aGivenProto);
+ }
+ 
+ PrivateAttribution::~PrivateAttribution() = default;
+ 
++bool PrivateAttribution::ShouldRecord() {
++#ifdef MOZ_TELEMETRY_REPORTING
++  return (StaticPrefs::dom_private_attribution_submission_enabled() &&
++          StaticPrefs::datareporting_healthreport_uploadEnabled());
++#else
++  return false;
++#endif
++}
++
+ bool PrivateAttribution::GetSourceHostIfNonPrivate(nsACString& aSourceHost,
+                                                    ErrorResult& aRv) {
+   MOZ_ASSERT(mOwner);
+   nsIPrincipal* prin = mOwner->PrincipalOrNull();
+   if (!prin || NS_FAILED(prin->GetHost(aSourceHost))) {
+@@ -53,11 +62,11 @@
+   return true;
+ }
+ 
+ void PrivateAttribution::SaveImpression(
+     const PrivateAttributionImpressionOptions& aOptions, ErrorResult& aRv) {
+-  if (!StaticPrefs::dom_private_attribution_submission_enabled()) {
++  if (!ShouldRecord()) {
+     return;
+   }
+ 
+   nsAutoCString source;
+   if (!GetSourceHostIfNonPrivate(source, aRv)) {
+@@ -87,11 +96,11 @@
+                                 aOptions.mAd, aOptions.mTarget);
+ }
+ 
+ void PrivateAttribution::MeasureConversion(
+     const PrivateAttributionConversionOptions& aOptions, ErrorResult& aRv) {
+-  if (!StaticPrefs::dom_private_attribution_submission_enabled()) {
++  if (!ShouldRecord()) {
+     return;
+   }
+ 
+   nsAutoCString source;
+   if (!GetSourceHostIfNonPrivate(source, aRv)) {
+diff --git a/dom/privateattribution/PrivateAttributionService.sys.mjs b/dom/privateattribution/PrivateAttributionService.sys.mjs
+--- a/dom/privateattribution/PrivateAttributionService.sys.mjs
++++ b/dom/privateattribution/PrivateAttributionService.sys.mjs
+@@ -3,16 +3,32 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ const lazy = {};
+ 
++import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
++import { AppConstants } from "resource://gre/modules/AppConstants.sys.mjs";
++
+ ChromeUtils.defineESModuleGetters(lazy, {
+   IndexedDB: "resource://gre/modules/IndexedDB.sys.mjs",
+   DAPTelemetrySender: "resource://gre/modules/DAPTelemetrySender.sys.mjs",
+-  TelemetryUtils: "resource://gre/modules/TelemetryUtils.sys.mjs",
+ });
+ 
++XPCOMUtils.defineLazyPreferenceGetter(
++  lazy,
++  "gIsTelemetrySendingEnabled",
++  "datareporting.healthreport.uploadEnabled",
++  true
++);
++
++XPCOMUtils.defineLazyPreferenceGetter(
++  lazy,
++  "gIsPPAEnabled",
++  "dom.private-attribution.submission.enabled",
++  true
++);
++
+ const MAX_CONVERSIONS = 2;
+ const DAY_IN_MILLI = 1000 * 60 * 60 * 24;
+ const CONVERSION_RESET_MILLI = 7 * DAY_IN_MILLI;
+ const DAP_TIMEOUT_MILLI = 30000;
+ 
+@@ -262,10 +278,15 @@
+   getModelProp(type) {
+     return this.models[type ? type : "default"];
+   }
+ 
+   isEnabled() {
+-    return this._testForceEnabled || lazy.TelemetryUtils.isTelemetryEnabled;
++    return (
++      this._testForceEnabled ||
++      (lazy.gIsTelemetrySendingEnabled &&
++        AppConstants.MOZ_TELEMETRY_REPORTING &&
++        lazy.gIsPPAEnabled)
++    );
+   }
+ 
+   QueryInterface = ChromeUtils.generateQI([Ci.nsIPrivateAttributionService]);
+ }
+diff --git a/dom/privateattribution/tests/xpcshell/test_ppa.js b/dom/privateattribution/tests/xpcshell/test_ppa.js
+--- a/dom/privateattribution/tests/xpcshell/test_ppa.js
++++ b/dom/privateattribution/tests/xpcshell/test_ppa.js
+@@ -9,10 +9,14 @@
+ 
+ const { PrivateAttributionService } = ChromeUtils.importESModule(
+   "resource://gre/modules/PrivateAttributionService.sys.mjs"
+ );
+ 
++const { AppConstants } = ChromeUtils.importESModule(
++  "resource://gre/modules/AppConstants.sys.mjs"
++);
++
+ const BinaryInputStream = Components.Constructor(
+   "@mozilla.org/binaryinputstream;1",
+   "nsIBinaryInputStream",
+   "setInputStream"
+ );
+@@ -144,11 +148,13 @@
+ 
+   // isEnabled should match the telemetry preference without the test flag
+   const ppa1 = new PrivateAttributionService();
+   Assert.equal(
+     ppa1.isEnabled(),
+-    Services.prefs.getBoolPref("toolkit.telemetry.enabled")
++    AppConstants.MOZ_TELEMETRY_REPORTING &&
++      Services.prefs.getBoolPref("datareporting.healthreport.uploadEnabled") &&
++      Services.prefs.getBoolPref("dom.private-attribution.submission.enabled")
+   );
+ 
+   // Should always be enabled with the test flag
+   const ppa2 = new PrivateAttributionService({ testForceEnabled: true });
+   Assert.ok(ppa2.isEnabled());
+
