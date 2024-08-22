@@ -1,0 +1,237 @@
+# HG changeset patch
+# Parent  da046994a08d488bc7b3ca30aff150f74c2dbf35
+
+diff --git a/browser/base/content/navigator-toolbox.inc.xhtml b/browser/base/content/navigator-toolbox.inc.xhtml
+--- a/browser/base/content/navigator-toolbox.inc.xhtml
++++ b/browser/base/content/navigator-toolbox.inc.xhtml
+@@ -223,6 +223,9 @@
+                 <image id="identity-icon"/>
+                 <label id="identity-icon-label" crop="center" flex="1"/>
+               </box>
++              <box id="replay-selector-box">
++                <html:select id="replay-page-selector"></html:select>
++              </box>
+               <box id="identity-permission-box"
+                    data-l10n-id="urlbar-permissions-granted"
+                    role="button"
+diff --git a/browser/components/tabbrowser/content/tabbrowser.js b/browser/components/tabbrowser/content/tabbrowser.js
+--- a/browser/components/tabbrowser/content/tabbrowser.js
++++ b/browser/components/tabbrowser/content/tabbrowser.js
+@@ -28,6 +28,29 @@
+     LOAD_FLAGS_DISABLE_TRR,
+   } = Ci.nsIWebNavigation;
+ 
++  
++  /**
++   * Updates the User Context UI indicators if the browser is in a non-default context
++   */
++  function updateReplayUIIndicator() {
++    if (!gBrowser._replayBrowserMap.has(gBrowser.selectedBrowser)) {
++      document.documentElement.removeAttribute("remotecontrol");
++    } else {
++      document.documentElement.setAttribute("remotecontrol", "true");
++      // Pipe through to a dropdown for page selector in URL bar
++      let replayData = gBrowser._replayBrowserMap.get(gBrowser.selectedBrowser);
++      let pages = replayData.pages;
++      let pageSelector = document.getElementById("replay-page-selector");
++      for (let i = 0; i < pages.length; i++) {
++        let option = document.createElement("option");
++        option.value = i;
++        option.textContent = pages[i].likelyURL;
++        pageSelector.appendChild(option);
++      }
++
++    }
++  }
++  
+   /**
+    * Updates the User Context UI indicators if the browser is in a non-default context
+    */
+@@ -208,6 +231,13 @@
+      */
+     _tabForBrowser: new WeakMap(),
+ 
++    _replayBrowserMap: new WeakMap(),
++    setReplayBrowser(browser, harData) {
++      console.log("into gBrowser", browser, harData);
++      this._replayBrowserMap.set(browser, harData);
++      updateReplayUIIndicator();
++    },
++
+     /**
+      * `_createLazyBrowser` will define properties on the unbound lazy browser
+      * which correspond to properties defined in MozBrowser which will be bound to
+@@ -1273,6 +1303,9 @@
+ 
+       this._selectedBrowser = newBrowser;
+       this._selectedTab = newTab;
++
++      updateReplayUIIndicator();
++  
+       this.showTab(newTab);
+ 
+       this._appendStatusPanel();
+@@ -7191,6 +7224,8 @@
+           aFlags & Ci.nsIWebProgressListener.LOCATION_CHANGE_ERROR_PAGE
+         );
+ 
++        // TODO BRIAN
++
+         // We need to clear the typed value
+         // if the document failed to load, to make sure the urlbar reflects the
+         // failed URI (particularly for SSL errors). However, don't clear the value
+diff --git a/devtools/client/jsonview/converter-child.js b/devtools/client/jsonview/converter-child.js
+--- a/devtools/client/jsonview/converter-child.js
++++ b/devtools/client/jsonview/converter-child.js
+@@ -42,7 +42,9 @@ loader.lazyGetter(this, "jsonViewStrings
+  *
+  * Inspired by JSON View: https://github.com/bhollis/jsonview/
+  */
+-function Converter() {}
++function Converter() {
++  this.buffers = [];
++}
+ 
+ Converter.prototype = {
+   QueryInterface: ChromeUtils.generateQI([
+@@ -80,6 +82,7 @@ Converter.prototype = {
+     // Decode and insert data.
+     const buffer = new ArrayBuffer(count);
+     new BinaryInput(inputStream).readArrayBuffer(count, buffer);
++    this.buffers.push(buffer);
+     this.decodeAndInsertBuffer(buffer);
+   },
+ 
+@@ -125,6 +128,8 @@ Converter.prototype = {
+     // Start the request.
+     this.listener.onStartRequest(request);
+ 
++    this.browserId = getBrowserIdForRequest(request);
++
+     // Initialize stuff.
+     const win = getWindowForRequest(request);
+     if (!win || !Components.isSuccessCode(request.status)) {
+@@ -155,6 +160,73 @@ Converter.prototype = {
+     // Flush data if we haven't been canceled.
+     if (Components.isSuccessCode(statusCode)) {
+       this.decodeAndInsertBuffer(new ArrayBuffer(0), true);
++
++      function mergeArrayBuffers(buffers) {
++        // Calculate total length
++        const totalLength = buffers.reduce(
++          (sum, buffer) => sum + buffer.byteLength,
++          0
++        );
++
++        // Create a new ArrayBuffer
++        const result = new ArrayBuffer(totalLength);
++
++        // Create a Uint8Array view of the new ArrayBuffer
++        const uint8Array = new Uint8Array(result);
++
++        // Copy data from each buffer
++        let offset = 0;
++        for (const buffer of buffers) {
++          uint8Array.set(new Uint8Array(buffer), offset);
++          offset += buffer.byteLength;
++        }
++
++        return result;
++      }
++
++      try {
++        let jsonObject = JSON.parse(
++          new TextDecoder("UTF-8").decode(mergeArrayBuffers(this.buffers))
++        );
++        let isLikelyHAR =
++          jsonObject.log?.pages && jsonObject.log?.pages?.entries;
++        if (isLikelyHAR) {
++          let pages = jsonObject.log.pages.map(page => {
++            let id = page.id;
++            let likelyURL;
++
++            // HTTP Archive
++            try {
++              likelyURL = new URL(page._URL);
++            } catch (e) {
++              try {
++                let firstRequest = jsonObject.log.entries
++                  .filter(entry => entry.pageref === id)
++                  .sort((a, b) => a.startedDateTime - b.startedDateTime)[0];
++                likelyURL = new URL(firstRequest.request.url);
++              } catch (e) {}
++            }
++
++            return {
++              likelyURL: likelyURL?.toString(),
++              id,
++            };
++          });
++
++          const win = getWindowForRequest(request);
++          console.log(pages, "About to notify",  Services.appinfo.processType == Services.appinfo.PROCESS_TYPE_DEFAULT);
++          win.docShell.messageManager.sendAsyncMessage(
++            "devtools:jsonview:har-detected",
++            {
++              pages,
++              json: jsonObject,
++            }
++          );
++          
++        }
++      } catch (e) {
++        console.error(e);
++      }
+     }
+ 
+     // Stop the request.
+@@ -280,6 +352,21 @@ function getRequestLoadContext(request) 
+   return null;
+ }
+ 
++/**
++ * Gets the nsIDOMWindow that is associated with request.
++ *
++ * @param nsIHttpChannel request
++ * @returns browsingContextId or null
++ */
++function getBrowserIdForRequest(request) {
++  try {
++    // return getRequestLoadContext(request).browsingContext.id;
++    return getRequestLoadContext(request).browsingContext.browserId;
++  } catch (ex) {
++    return null;
++  }
++}
++
+ // Exports variables that will be accessed by the non-privileged scripts.
+ function exportData(win, headers) {
+   const json = new win.Text();
+diff --git a/devtools/startup/DevToolsStartup.sys.mjs b/devtools/startup/DevToolsStartup.sys.mjs
+--- a/devtools/startup/DevToolsStartup.sys.mjs
++++ b/devtools/startup/DevToolsStartup.sys.mjs
+@@ -1345,6 +1345,7 @@ const JsonView = {
+     // This is never removed as there is no particular need to unregister
+     // it during shutdown.
+     Services.mm.addMessageListener("devtools:jsonview:save", this.onSave);
++    Services.mm.addMessageListener("devtools:jsonview:har-detected", this.onHARDetected);
+   },
+ 
+   // Message handlers for events from child processes
+@@ -1353,6 +1354,16 @@ const JsonView = {
+    * Save JSON to a file needs to be implemented here
+    * in the parent process.
+    */
++  onHARDetected(message) {
++    const browser = message.target;
++    const chrome = browser.ownerGlobal;
++    chrome.gBrowser.setReplayBrowser(browser, message.data);
++  },
++
++  /**
++   * Save JSON to a file needs to be implemented here
++   * in the parent process.
++   */
+   onSave(message) {
+     const browser = message.target;
+     const chrome = browser.ownerGlobal;
