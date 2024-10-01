@@ -1,0 +1,188 @@
+
+# HG changeset patch
+# User Michael van Straten <mvanstraten@mozilla.com>
+# Date 1723475434 -7200
+# Node ID 0100ebcdfa87b88c8abc6ec59703b430701f2525
+# Parent  dd9ecdd569c245a44abe748c3c5df10f418e9da2
+Bug 1889347 - Test worst-case opentelemetry performance impact
+
+Differential Revision: https://phabricator.services.mozilla.com/D219956
+
+
+diff --git a/nvim b/nvim
+new file mode 100644
+--- /dev/null
++++ b/nvim
+@@ -0,0 +1,1 @@
++xpcom/build/XPCOMInit.cpp
+diff --git a/third_party/opentelemetry-cpp/api/include/opentelemetry/trace/context.h b/third_party/opentelemetry-cpp/api/include/opentelemetry/trace/context.h
+--- a/third_party/opentelemetry-cpp/api/include/opentelemetry/trace/context.h
++++ b/third_party/opentelemetry-cpp/api/include/opentelemetry/trace/context.h
+@@ -1,25 +1,29 @@
+ // Copyright The OpenTelemetry Authors
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include "opentelemetry/context/context.h"
+ #include "opentelemetry/nostd/shared_ptr.h"
+ #include "opentelemetry/trace/default_span.h"
+ #include "opentelemetry/version.h"
+ 
++extern std::atomic<uint64_t> g_GetSpanCount;
++
+ OPENTELEMETRY_BEGIN_NAMESPACE
+ namespace trace
+ {
+ 
+ // Get Span from explicit context
+ inline nostd::shared_ptr<Span> GetSpan(const context::Context &context) noexcept
+ {
++  g_GetSpanCount.fetch_add(1);
+   context::ContextValue span = context.GetValue(kSpanKey);
+   if (nostd::holds_alternative<nostd::shared_ptr<Span>>(span))
+   {
+     return nostd::get<nostd::shared_ptr<Span>>(span);
+   }
+   return nostd::shared_ptr<Span>(new DefaultSpan(SpanContext::GetInvalid()));
+ }
+ 
+diff --git a/xpcom/base/nsDebug.h b/xpcom/base/nsDebug.h
+--- a/xpcom/base/nsDebug.h
++++ b/xpcom/base/nsDebug.h
+@@ -12,16 +12,19 @@
+ 
+ #include "nsXPCOM.h"
+ #include "mozilla/Assertions.h"
+ #include "mozilla/glue/Debug.h"
+ #include "mozilla/DbgMacro.h"
+ #include "mozilla/Likely.h"
+ #include <stdarg.h>
+ 
++#include "opentelemetry/trace/context.h"
++#include "opentelemetry/context/runtime_context.h"
++
+ #ifdef DEBUG
+ #  include "mozilla/ErrorNames.h"
+ #  include "mozilla/IntegerPrintfMacros.h"
+ #  include "mozilla/Printf.h"
+ #endif
+ 
+ /**
+  * Warn if the given condition is true. The condition is evaluated in both
+@@ -272,23 +275,26 @@ inline void MOZ_PretendNoReturn() MOZ_PR
+ #  define NS_ENSURE_SUCCESS_BODY(res, ret) \
+     NS_WARNING("NS_ENSURE_SUCCESS(" #res ", " #ret ") failed");
+ 
+ #  define NS_ENSURE_SUCCESS_BODY_VOID(res) \
+     NS_WARNING("NS_ENSURE_SUCCESS_VOID(" #res ") failed");
+ 
+ #endif
+ 
+-#define NS_ENSURE_SUCCESS(res, ret)                                \
+-  do {                                                             \
+-    nsresult __rv = res; /* Don't evaluate |res| more than once */ \
+-    if (NS_FAILED(__rv)) {                                         \
+-      NS_ENSURE_SUCCESS_BODY(res, ret)                             \
+-      return ret;                                                  \
+-    }                                                              \
++#define NS_ENSURE_SUCCESS(res, ret)                                  \
++  do {                                                               \
++    nsresult __rv = res; /* Don't evaluate |res| more than once */   \
++    if (NS_FAILED(__rv)) {                                           \
++      auto activeSpan = opentelemetry::trace::GetSpan(               \
++          opentelemetry::context::RuntimeContext::GetCurrent());     \
++      activeSpan->AddEvent("no-op event", {{"__line__", __LINE__}}); \
++      NS_ENSURE_SUCCESS_BODY(res, ret)                               \
++      return ret;                                                    \
++    }                                                                \
+   } while (false)
+ 
+ #define NS_ENSURE_SUCCESS_VOID(res)    \
+   do {                                 \
+     nsresult __rv = res;               \
+     if (NS_FAILED(__rv)) {             \
+       NS_ENSURE_SUCCESS_BODY_VOID(res) \
+       return;                          \
+diff --git a/xpcom/base/nsError.h b/xpcom/base/nsError.h
+--- a/xpcom/base/nsError.h
++++ b/xpcom/base/nsError.h
+@@ -8,30 +8,37 @@
+ #define nsError_h__
+ 
+ #ifndef __cplusplus
+ #  error nsError.h no longer supports C sources
+ #endif
+ 
+ #include "mozilla/Attributes.h"
+ #include "mozilla/Likely.h"
++#include "opentelemetry/context/runtime_context.h"
++#include "opentelemetry/trace/context.h"
+ 
+ #include <stdint.h>
+ 
+ #define NS_ERROR_SEVERITY_SUCCESS 0
+ #define NS_ERROR_SEVERITY_ERROR 1
+ 
+ #include "ErrorList.h"  // IWYU pragma: export
+ 
+ /**
+  * @name Standard Error Handling Macros
+  * @return 0 or 1 (false/true with bool type for C++)
+  */
+ 
+ inline uint32_t NS_FAILED_impl(nsresult aErr) {
++  if ((bool)static_cast<uint32_t>(aErr) & 0x80000000) {
++    auto activeSpan = opentelemetry::trace::GetSpan(
++        opentelemetry::context::RuntimeContext::GetCurrent());
++    activeSpan->AddEvent("no-op event", {{"__line__", __LINE__}});
++  }
+   return static_cast<uint32_t>(aErr) & 0x80000000;
+ }
+ #define NS_FAILED(_nsresult) ((bool)MOZ_UNLIKELY(NS_FAILED_impl(_nsresult)))
+ #define NS_SUCCEEDED(_nsresult) ((bool)MOZ_LIKELY(!NS_FAILED_impl(_nsresult)))
+ 
+ /* Check that our enum type is actually uint32_t as expected */
+ static_assert(((nsresult)0) < ((nsresult)-1),
+               "nsresult must be an unsigned type");
+diff --git a/xpcom/build/XPCOMInit.cpp b/xpcom/build/XPCOMInit.cpp
+--- a/xpcom/build/XPCOMInit.cpp
++++ b/xpcom/build/XPCOMInit.cpp
+@@ -589,30 +589,35 @@ NS_InitMinimalXPCOM() {
+ //   - Release the Registry held by Component Manager
+ //   - Finally, release the component manager itself
+ //
+ EXPORT_XPCOM_API(nsresult)
+ NS_ShutdownXPCOM(nsIServiceManager* aServMgr) {
+   return mozilla::ShutdownXPCOM(aServMgr);
+ }
+ 
++std::atomic<uint64_t> g_GetSpanCount(0);
++
+ namespace mozilla {
+ 
+ void SetICUMemoryFunctions() {
+   static bool sICUReporterInitialized = false;
+   if (!sICUReporterInitialized) {
+     if (!JS_SetICUMemoryFunctions(ICUReporter::Alloc, ICUReporter::Realloc,
+                                   ICUReporter::Free)) {
+       MOZ_CRASH("JS_SetICUMemoryFunctions failed.");
+     }
+     sICUReporterInitialized = true;
+   }
+ }
+ 
+ nsresult ShutdownXPCOM(nsIServiceManager* aServMgr) {
++  printf("`opentelemetry::trace::GetSpan` got called %llu times.\n",
++         static_cast<unsigned long long>(g_GetSpanCount.load()));
++
+   // Make sure the hang monitor is enabled for shutdown.
+   BackgroundHangMonitor().NotifyActivity();
+ 
+   if (!NS_IsMainThread()) {
+     MOZ_CRASH("Shutdown on wrong thread");
+   }
+ 
+   // Notify observers of xpcom shutting down
+
