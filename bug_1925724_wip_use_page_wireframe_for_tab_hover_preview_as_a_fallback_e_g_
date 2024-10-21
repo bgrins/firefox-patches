@@ -1,0 +1,204 @@
+# HG changeset patch
+# User Brian Grinstead <bgrinstead@mozilla.com>
+# Date 1729207967 25200
+#      Thu Oct 17 16:32:47 2024 -0700
+# Node ID 421f1b4ffdc52460ec59dd42119feaaa1f6b4ddd
+# Parent  0546d4eb64297ccaf6e91978a9747fbb98e7de6d
+Bug 1925724 - WIP - Use page wireframe for tab hover preview as a fallback (e.g., for unloaded tabs)
+
+Differential Revision: https://phabricator.services.mozilla.com/D226080
+
+diff --git a/browser/components/tabbrowser/content/tab-hover-preview.mjs b/browser/components/tabbrowser/content/tab-hover-preview.mjs
+--- a/browser/components/tabbrowser/content/tab-hover-preview.mjs
++++ b/browser/components/tabbrowser/content/tab-hover-preview.mjs
+@@ -5,6 +5,10 @@
+ var { XPCOMUtils } = ChromeUtils.importESModule(
+   "resource://gre/modules/XPCOMUtils.sys.mjs"
+ );
++const lazy = {};
++ChromeUtils.defineESModuleGetters(lazy, {
++  PageWireframes: "resource://gre/modules/PageWireframes.sys.mjs",
++});
+ 
+ const ZERO_DELAY_ACTIVATION_TIME = 300;
+ 
+@@ -55,6 +59,12 @@ export default class TabHoverPreviewPane
+       "browser.tabs.tooltipsShowPidAndActiveness",
+       false
+     );
++    XPCOMUtils.defineLazyPreferenceGetter(
++      this,
++      "_prefCollectWireframes",
++      "browser.history.collectWireframes",
++      false
++    );
+ 
+     this._panelOpener = new TabPreviewPanelTimedFunction(
+       () => {
+@@ -108,6 +118,16 @@ export default class TabHoverPreviewPane
+     }
+   }
+ 
++  _hasValidWireframeState(tab) {
++    return (
++      this._prefCollectWireframes &&
++      this._prefDisplayThumbnail &&
++      tab &&
++      !tab.selected &&
++      !!lazy.PageWireframes.getWireframeState(tab)
++    );
++  }
++
+   _hasValidThumbnailState(tab) {
+     return (
+       this._prefDisplayThumbnail &&
+@@ -122,6 +142,11 @@ export default class TabHoverPreviewPane
+     let tab = this._tab;
+ 
+     if (!this._hasValidThumbnailState(tab)) {
++      let wireframeElement = lazy.PageWireframes.getWireframeElementForTab(tab);
++      if (wireframeElement) {
++        this._thumbnailElement = wireframeElement;
++        this._updatePreview();
++      }
+       return;
+     }
+     let thumbnailCanvas = this._win.document.createElement("canvas");
+@@ -229,7 +254,8 @@ export default class TabHoverPreviewPane
+     );
+     thumbnailContainer.classList.toggle(
+       "hide-thumbnail",
+-      !this._hasValidThumbnailState(this._tab)
++      !this._hasValidThumbnailState(this._tab) &&
++        !this._hasValidWireframeState(this._tab)
+     );
+     if (thumbnailContainer.firstChild != this._thumbnailElement) {
+       thumbnailContainer.replaceChildren();
+diff --git a/toolkit/components/thumbnails/PageWireframes.sys.mjs b/toolkit/components/thumbnails/PageWireframes.sys.mjs
+new file mode 100644
+--- /dev/null
++++ b/toolkit/components/thumbnails/PageWireframes.sys.mjs
+@@ -0,0 +1,112 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++const lazy = {};
++ChromeUtils.defineESModuleGetters(lazy, {
++  SessionStore: "resource:///modules/sessionstore/SessionStore.sys.mjs",
++});
++
++export const PageWireframes = {
++  getWireframeState(tab) {
++    if (!tab) {
++      return null;
++    }
++    const sessionHistory = JSON.parse(lazy.SessionStore.getTabState(tab));
++    return (
++      sessionHistory &&
++      sessionHistory.entries[sessionHistory.index - 1].wireframe
++    );
++  },
++
++  getWireframeElementForTab(tab) {
++    const wireframe = this.getWireframeState(tab);
++    return wireframe && this.getWireframeElement(wireframe, tab.ownerDocument);
++  },
++
++  /**
++   * Converts a color encoded as a uint32_t (Gecko's nscolor format)
++   * to an rgb string.
++   *
++   * @param {Number} nscolor
++   *   An RGB color encoded in nscolor format.
++   * @return {String}
++   *   A string of the form "rgb(r, g, b)".
++   */
++  nscolorToRGB(nscolor) {
++    let r = nscolor & 0xff;
++    let g = (nscolor >> 8) & 0xff;
++    let b = (nscolor >> 16) & 0xff;
++    return `rgb(${r}, ${g}, ${b})`;
++  },
++
++  /**
++   * Converts a color encoded as a uint32_t (Gecko's nscolor format)
++   * to an rgb string.
++   *
++   * @param {Object} wireframe
++   *   See Bug 1731714 and dom/webidl/Document.webidl for the Wireframe dictionary
++   * @param {Document} document
++   *   A Document to crate SVG elements.
++   * @return {SVGElement}
++   *   The rendered wireframe
++   */
++  getWireframeElement(wireframe, document) {
++    const SVG_NS = "http://www.w3.org/2000/svg";
++    let svg = document.createElementNS(SVG_NS, "svg");
++
++    // Currently guessing width & height from rects on the object, it would be better to
++    // save these on the wireframe object itself.
++    let width = wireframe.rects.reduce(
++      (max, rect) => Math.max(max, rect.x + rect.width),
++      0
++    );
++    let height = wireframe.rects.reduce(
++      (max, rect) => Math.max(max, rect.y + rect.height),
++      0
++    );
++    svg.classList.add("preview-image");
++
++    svg.setAttributeNS(null, "viewBox", `0 0 ${width} ${height}`);
++    svg.style.backgroundColor = this.nscolorToRGB(wireframe.canvasBackground);
++
++    const DEFAULT_FILL = "color-mix(in srgb, black 10%, transparent)";
++
++    for (let rectObj of wireframe.rects) {
++      // For now we'll skip rects that have an unknown classification, since
++      // it's not clear how we should treat them.
++      if (rectObj.type == "unknown") {
++        continue;
++      }
++
++      let rectEl = document.createElementNS(SVG_NS, "rect");
++      rectEl.setAttribute("x", rectObj.x);
++      rectEl.setAttribute("y", rectObj.y);
++      rectEl.setAttribute("width", rectObj.width);
++      rectEl.setAttribute("height", rectObj.height);
++
++      let fill;
++      switch (rectObj.type) {
++        case "background": {
++          fill = this.nscolorToRGB(rectObj.color);
++          break;
++        }
++        case "image": {
++          fill = rectObj.color
++            ? this.nscolorToRGB(rectObj.color)
++            : DEFAULT_FILL;
++          break;
++        }
++        case "text": {
++          fill = DEFAULT_FILL;
++          break;
++        }
++      }
++
++      rectEl.setAttribute("fill", fill);
++
++      svg.appendChild(rectEl);
++    }
++    return svg;
++  },
++};
+diff --git a/toolkit/components/thumbnails/moz.build b/toolkit/components/thumbnails/moz.build
+--- a/toolkit/components/thumbnails/moz.build
++++ b/toolkit/components/thumbnails/moz.build
+@@ -16,6 +16,7 @@ EXTRA_JS_MODULES += [
+     "PageThumbs.worker.js",
+     "PageThumbsStorageService.sys.mjs",
+     "PageThumbUtils.sys.mjs",
++    "PageWireframes.sys.mjs",
+ ]
+ 
+ XPIDL_SOURCES += [
