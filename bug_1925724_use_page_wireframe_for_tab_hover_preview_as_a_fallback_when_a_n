@@ -2,12 +2,57 @@
 # User Brian Grinstead <bgrinstead@mozilla.com>
 # Date 1729207967 25200
 #      Thu Oct 17 16:32:47 2024 -0700
-# Node ID 421f1b4ffdc52460ec59dd42119feaaa1f6b4ddd
-# Parent  0546d4eb64297ccaf6e91978a9747fbb98e7de6d
-Bug 1925724 - WIP - Use page wireframe for tab hover preview as a fallback (e.g., for unloaded tabs)
+# Node ID 51ef7a31f03fa3c06d8542603f9bad8285919402
+# Parent  c47ccf99a981e193a2d58482cd0c6dd0a85b4935
+Bug 1925724 - Use page wireframe for tab hover preview as a fallback when a normal thumnail is not available;r=mconley
+
+This will only work when the pref is enabled (browser.history.collectWireframes), and is being landed primarily
+to allow some expanded testing to see if it's worth cleaning this up further and turning it on.
 
 Differential Revision: https://phabricator.services.mozilla.com/D226080
 
+diff --git a/browser/components/sessionstore/test/browser_sessionHistory.js b/browser/components/sessionstore/test/browser_sessionHistory.js
+--- a/browser/components/sessionstore/test/browser_sessionHistory.js
++++ b/browser/components/sessionstore/test/browser_sessionHistory.js
+@@ -291,38 +291,3 @@ add_task(async function test_slow_subfra
+   // Cleanup.
+   gBrowser.removeTab(tab);
+ });
+-
+-/**
+- * Ensure that document wireframes can be persisted when they're enabled.
+- */
+-add_task(async function test_wireframes() {
+-  // Wireframes only works when Fission is enabled.
+-  if (!Services.appinfo.fissionAutostart) {
+-    ok(true, "Skipping test_wireframes when Fission is not enabled.");
+-    return;
+-  }
+-
+-  await SpecialPowers.pushPrefEnv({
+-    set: [["browser.history.collectWireframes", true]],
+-  });
+-
+-  let tab = BrowserTestUtils.addTab(gBrowser, "http://example.com");
+-  let browser = tab.linkedBrowser;
+-  await promiseBrowserLoaded(browser);
+-
+-  await TabStateFlusher.flush(browser);
+-  let { entries } = JSON.parse(ss.getTabState(tab));
+-
+-  // Check the number of children.
+-  is(entries.length, 1, "there is one shistory entry");
+-
+-  // Check for the wireframe
+-  ok(entries[0].wireframe, "A wireframe was captured and serialized.");
+-  ok(
+-    entries[0].wireframe.rects.length,
+-    "Several wireframe rects were captured."
+-  );
+-
+-  // Cleanup.
+-  gBrowser.removeTab(tab);
+-});
 diff --git a/browser/components/tabbrowser/content/tab-hover-preview.mjs b/browser/components/tabbrowser/content/tab-hover-preview.mjs
 --- a/browser/components/tabbrowser/content/tab-hover-preview.mjs
 +++ b/browser/components/tabbrowser/content/tab-hover-preview.mjs
@@ -74,11 +119,83 @@ diff --git a/browser/components/tabbrowser/content/tab-hover-preview.mjs b/brows
      );
      if (thumbnailContainer.firstChild != this._thumbnailElement) {
        thumbnailContainer.replaceChildren();
+diff --git a/browser/components/tabbrowser/test/browser/tabs/browser_tab_preview.js b/browser/components/tabbrowser/test/browser/tabs/browser_tab_preview.js
+--- a/browser/components/tabbrowser/test/browser/tabs/browser_tab_preview.js
++++ b/browser/components/tabbrowser/test/browser/tabs/browser_tab_preview.js
+@@ -342,6 +342,68 @@ add_task(async function thumbnailTests()
+ });
+ 
+ /**
++ * Verify that non-selected tabs display a wireframe in their preview
++ * when enabled, and the tab is unable to provide a thumbnail (e.g. unloaded).
++ */
++add_task(async function wireframeTests() {
++  const { TabStateFlusher } = ChromeUtils.importESModule(
++    "resource:///modules/sessionstore/TabStateFlusher.sys.mjs"
++  );
++  await SpecialPowers.pushPrefEnv({
++    set: [
++      ["browser.tabs.hoverPreview.showThumbnails", true],
++      ["browser.history.collectWireframes", true],
++    ],
++  });
++
++  const tab1 = await BrowserTestUtils.openNewForegroundTab(
++    gBrowser,
++    "data:text/html,<html><head><title>First New Tab</title></head><body>Hello</body></html>"
++  );
++  const tab2 = await BrowserTestUtils.openNewForegroundTab(
++    gBrowser,
++    "about:blank"
++  );
++
++  // Discard the first tab so it can't provide a thumbnail image
++  await TabStateFlusher.flush(tab1.linkedBrowser);
++  gBrowser.discardBrowser(tab1, true);
++
++  const previewPanel = document.getElementById("tab-preview-panel");
++
++  let thumbnailUpdated = BrowserTestUtils.waitForEvent(
++    previewPanel,
++    "previewThumbnailUpdated",
++    false,
++    evt => evt.detail.thumbnail
++  );
++  await openPreview(tab1);
++  await thumbnailUpdated;
++  Assert.ok(
++    previewPanel.querySelectorAll(".tab-preview-thumbnail-container svg")
++      .length,
++    "Tab1 preview contains wireframe"
++  );
++
++  const previewHidden = BrowserTestUtils.waitForPopupEvent(
++    previewPanel,
++    "hidden"
++  );
++
++  BrowserTestUtils.removeTab(tab1);
++  BrowserTestUtils.removeTab(tab2);
++  await SpecialPowers.popPrefEnv();
++
++  // Removing the tab should close the preview.
++  await previewHidden;
++
++  // Move the mouse outside of the tab strip.
++  EventUtils.synthesizeMouseAtCenter(document.documentElement, {
++    type: "mouseover",
++  });
++});
++
++/**
+  * make sure delay is applied when mouse leaves tabstrip
+  * but not when moving between tabs on the tabstrip
+  */
 diff --git a/toolkit/components/thumbnails/PageWireframes.sys.mjs b/toolkit/components/thumbnails/PageWireframes.sys.mjs
 new file mode 100644
 --- /dev/null
 +++ b/toolkit/components/thumbnails/PageWireframes.sys.mjs
-@@ -0,0 +1,112 @@
+@@ -0,0 +1,126 @@
 +/* This Source Code Form is subject to the terms of the Mozilla Public
 + * License, v. 2.0. If a copy of the MPL was not distributed with this file,
 + * You can obtain one at http://mozilla.org/MPL/2.0/. */
@@ -89,17 +206,31 @@ new file mode 100644
 +});
 +
 +export const PageWireframes = {
++  /**
++   * Returns the wireframe object for the current index of the session history
++   * for the given tab. The wireframe will only exist with browser.history.collectWireframes.
++   *
++   * @param {Object} tab
++   * @return {Object} wireframe
++   *   See dom/webidl/Document.webidl for the Wireframe dictionary
++   */
 +  getWireframeState(tab) {
 +    if (!tab) {
 +      return null;
 +    }
-+    const sessionHistory = JSON.parse(lazy.SessionStore.getTabState(tab));
++    const sessionHistory = lazy.SessionStore.getSessionHistory(tab);
 +    return (
-+      sessionHistory &&
-+      sessionHistory.entries[sessionHistory.index - 1].wireframe
++      sessionHistory && sessionHistory.entries[sessionHistory.index]?.wireframe
 +    );
 +  },
 +
++  /**
++   * Returns an SVG preview for the wireframe at the current index of the session history
++   * for the given tab. The wireframe will only exist with browser.history.collectWireframes.
++   *
++   * @param {Object} tab
++   * @return {SVGElement}
++   */
 +  getWireframeElementForTab(tab) {
 +    const wireframe = this.getWireframeState(tab);
 +    return wireframe && this.getWireframeElement(wireframe, tab.ownerDocument);
@@ -205,29 +336,69 @@ diff --git a/toolkit/components/thumbnails/moz.build b/toolkit/components/thumbn
 diff --git a/toolkit/components/thumbnails/test/browser.toml b/toolkit/components/thumbnails/test/browser.toml
 --- a/toolkit/components/thumbnails/test/browser.toml
 +++ b/toolkit/components/thumbnails/test/browser.toml
-@@ -82,3 +82,5 @@ skip-if = ["true"] # Bug 1592079
+@@ -80,3 +80,5 @@ skip-if = ["verify && debug && os == 'li
+ skip-if = ["true"] # Bug 1592079
  
  ["browser_thumbnails_update.js"]
- skip-if = ["os == 'win'"] #Bug 1539947
 +
 +["browser_thumbnails_wireframe_basic.js"]
 diff --git a/toolkit/components/thumbnails/test/browser_thumbnails_wireframe_basic.js b/toolkit/components/thumbnails/test/browser_thumbnails_wireframe_basic.js
 new file mode 100644
 --- /dev/null
 +++ b/toolkit/components/thumbnails/test/browser_thumbnails_wireframe_basic.js
-@@ -0,0 +1,15 @@
+@@ -0,0 +1,42 @@
 +/* Any copyright is dedicated to the Public Domain.
 + * http://creativecommons.org/publicdomain/zero/1.0/ */
 +
++/**
++ * Ensure that document wireframes are persisted when enabled,
++ * and that we can generate previews for them.
++ */
 +add_task(async function thumbnails_bg_basic() {
-+  let url = "http://www.example.com/";
-+  ok(!thumbnailExists(url), "Thumbnail should not be cached yet.");
++  // Wireframes only works when Fission is enabled.
++  if (!Services.appinfo.fissionAutostart) {
++    ok(true, "Skipping test_wireframes when Fission is not enabled.");
++    return;
++  }
 +
-+  let capturePromise = bgAddPageThumbObserver(url);
-+  let [capturedURL] = await bgCapture(url);
-+  is(capturedURL, url, "Captured URL should be URL passed to capture");
-+  await capturePromise;
++  await SpecialPowers.pushPrefEnv({
++    set: [["browser.history.collectWireframes", true]],
++  });
 +
-+  ok(thumbnailExists(url), "Thumbnail should be cached after capture");
-+  removeThumbnail(url);
++  let tab = await BrowserTestUtils.openNewForegroundTab(
++    gBrowser,
++    "http://www.example.com/"
++  );
++  await TabStateFlusher.flush(tab.linkedBrowser);
++  info("Checking a loaded tab");
++  checkWireframeForTab(tab);
++
++  await BrowserTestUtils.switchTab(gBrowser, gBrowser.tabs[0]);
++  gBrowser.discardBrowser(tab, true);
++
++  info("Checking a discarded tab");
++  checkWireframeForTab(tab);
++
++  gBrowser.removeTab(tab);
 +});
++
++function checkWireframeForTab(tab) {
++  let wireframe = PageWireframes.getWireframeState(tab);
++  ok(wireframe, "After load: Got wireframe state");
++  Assert.greater(wireframe.rects.length, 0, "After load: Got wireframe rects");
++  let wireframeElement = PageWireframes.getWireframeElementForTab(tab);
++  is(wireframeElement.tagName, "svg", "Got wireframe element");
++}
+diff --git a/toolkit/components/thumbnails/test/head.js b/toolkit/components/thumbnails/test/head.js
+--- a/toolkit/components/thumbnails/test/head.js
++++ b/toolkit/components/thumbnails/test/head.js
+@@ -8,7 +8,9 @@ ChromeUtils.defineESModuleGetters(this, 
+   PageThumbs: "resource://gre/modules/PageThumbs.sys.mjs",
+   PageThumbsStorage: "resource://gre/modules/PageThumbs.sys.mjs",
+   PlacesTestUtils: "resource://testing-common/PlacesTestUtils.sys.mjs",
++  PageWireframes: "resource://gre/modules/PageWireframes.sys.mjs",
+   SessionStore: "resource:///modules/sessionstore/SessionStore.sys.mjs",
++  TabStateFlusher: "resource:///modules/sessionstore/TabStateFlusher.sys.mjs",
+ });
+ 
+ XPCOMUtils.defineLazyServiceGetter(
